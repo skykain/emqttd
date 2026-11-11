@@ -1,0 +1,428 @@
+%%--------------------------------------------------------------------
+%% Copyright (c) 2017-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
+%%--------------------------------------------------------------------
+
+-module(emqx_access_control).
+
+-include("emqx.hrl").
+-include("emqx_access_control.hrl").
+-include("logger.hrl").
+
+-export([
+    authenticate/1,
+    authorize/3,
+    authorize/4,
+    format_action/1
+]).
+
+-type authz_result() :: allow | deny.
+-type authorize_hook_result() ::
+    #{
+        result := authz_result(),
+        from := term(),
+        %% Optional cache control for authorization result.
+        %% is_cacheable=false tells EMQX not to store this result
+        %% in authz cache for the current topic/action.
+        is_cacheable => boolean()
+    }.
+
+-type authn_result() :: #{
+    is_superuser => boolean(),
+    client_attrs => #{binary() => binary()},
+    clientid_override => binary(),
+    expire_at => non_neg_integer(),
+    %% Authentication may return ACL rules that will reside in client info
+    %% for the later use in authorizers. See emqx_authz_client_info module.
+    acl => term()
+}.
+
+%% Returned as 'Authentication-Data' property to the client.
+-type authn_data() :: binary().
+
+%% Stash for several-step authentication.
+-type authn_cache() :: map().
+
+-type authenticate_hook_result() ::
+    ignore
+    | ok
+    | {ok, authn_result()}
+    | {ok, authn_result(), authn_data()}
+    | {continue, authn_cache()}
+    | {continue, authn_data(), authn_cache()}
+    | {error, term()}.
+
+-export_type([
+    authenticate_hook_result/0,
+    authorize_hook_result/0,
+    authn_result/0,
+    authn_data/0,
+    authn_cache/0,
+    authz_result/0
+]).
+
+-ifdef(TEST).
+-compile(export_all).
+-compile(nowarn_export_all).
+%% TEST
+-endif.
+
+-define(TRACE_RESULT(Label, Result, Reason), begin
+    ?TRACE(Label, ?AUTHN_TRACE_TAG, #{
+        result => (Result),
+        reason => (Reason)
+    }),
+    Result
+end).
+
+-define(DEFAULT_AUTH_RESULT_PT_KEY, {?MODULE, default_authn_result}).
+-define(IS_AUTH_ERROR(Result),
+    (Result =:= client_identifier_not_valid orelse
+        Result =:= bad_username_or_password orelse
+        Result =:= bad_clientid_or_password orelse
+        Result =:= not_authorized orelse
+        Result =:= server_unavailable orelse
+        Result =:= server_busy orelse
+        Result =:= banned orelse
+        Result =:= bad_authentication_method orelse
+        Result =:= quota_exceeded)
+).
+
+-ifdef(TEST).
+-define(DEFAULT_AUTH_RESULT, ok).
+-else.
+-define(DEFAULT_AUTH_RESULT, ignore).
+-endif.
+
+%%--------------------------------------------------------------------
+%% APIs
+%%--------------------------------------------------------------------
+
+%% Keep defensive rejection of unexpected hook callback results.
+-dialyzer({no_match, [authenticate/1]}).
+
+-spec authenticate(emqx_types:clientinfo()) ->
+    {ok, authn_result()}
+    | {ok, authn_result(), authn_data()}
+    | {continue, authn_cache()}
+    | {continue, authn_data(), authn_cache()}
+    | {error, emqx_types:auth_result()}.
+authenticate(Credential) ->
+    %% pre-hook quick authentication or
+    %% if auth backend returning nothing but just 'ok'
+    %% it means it's not a superuser, or there is no way to tell.
+    NotSuperUser = #{is_superuser => false},
+    case pre_hook_authenticate(Credential) of
+        ok ->
+            on_authentication_complete_success(Credential, NotSuperUser, anonymous),
+            {ok, NotSuperUser};
+        continue ->
+            case client_authenticate(Credential, default_authn_result()) of
+                ignore ->
+                    on_authentication_complete_no_hooks(Credential, NotSuperUser);
+                ok ->
+                    on_authentication_complete_success(Credential, NotSuperUser, ok),
+                    {ok, NotSuperUser};
+                {ok, AuthResult} = OkResult ->
+                    on_authentication_complete_success(Credential, AuthResult, ok),
+                    OkResult;
+                {ok, AuthResult, _AuthData} = OkResult ->
+                    on_authentication_complete_success(Credential, AuthResult, ok),
+                    OkResult;
+                {error, Reason} = Error when ?IS_AUTH_ERROR(Reason) ->
+                    on_authentication_complete_error(Credential, Reason),
+                    Error;
+                {error, Reason} ->
+                    %% Unknown error, treat as not_authorized
+                    on_authentication_complete_error(Credential, Reason),
+                    {error, not_authorized};
+                {continue, _AuthCache} = IncompleteResult ->
+                    IncompleteResult;
+                {continue, _AuthData, _AuthCache} = IncompleteResult ->
+                    IncompleteResult;
+                Other ->
+                    ?SLOG(error, #{
+                        msg => "unknown_authentication_result_format",
+                        result => Other
+                    }),
+                    on_authentication_complete_error(Credential, not_authorized),
+                    {error, not_authorized}
+            end;
+        {error, Reason} = Error ->
+            on_authentication_complete_error(Credential, Reason),
+            Error
+    end.
+
+%% @doc Check Authorization
+-spec authorize(emqx_authz_context:t(), emqx_types:pubsub(), emqx_types:topic()) ->
+    authz_result().
+authorize(AuthzContext, Action, Topic) ->
+    authorize(AuthzContext, Action, Topic, #{}).
+
+-spec authorize(
+    emqx_authz_context:t(), emqx_types:pubsub(), emqx_types:topic(), #{cache => boolean()}
+) -> authz_result().
+authorize(AuthzContext, Action, Topic0, Opts) ->
+    AuthzConf = emqx_config:get([authorization], #{}),
+    IncludeMountpoint = maps:get(include_mountpoint, AuthzConf, false),
+    Topic = maybe_mount_prefix(IncludeMountpoint, AuthzContext, Topic0),
+    {Result, _Cacheable} =
+        case maps:get(cache, Opts, true) andalso authz_cache_conf(AuthzConf, Topic) of
+            #{ttl := TTL} -> check_authorization_cache(AuthzContext, Action, Topic, TTL);
+            false -> do_authorize_with_cache_policy(AuthzContext, Action, Topic)
+        end,
+    inc_authz_metrics(Result),
+    Result.
+
+%% @doc Get default authentication result.
+%% The default result is used when none of the authentication hooks
+%% handled the authentication.
+%%
+%% In a release, only the restrictive result is used.
+%% That is, if authn is enabled for a listener and there is no
+%% result from the hooks (or no hooks) then we deny the connection.
+%%
+%% In tests, we use the permissive result to avoid setting up
+%% authentication for numerous tests.
+
+-spec default_authn_result() -> ok | ignore.
+default_authn_result() ->
+    persistent_term:get(?DEFAULT_AUTH_RESULT_PT_KEY, ?DEFAULT_AUTH_RESULT).
+
+-ifdef(TEST).
+
+-spec set_default_authn_permissive() -> ok.
+set_default_authn_permissive() ->
+    set_default_auth_result(ok).
+
+-spec set_default_authn_restrictive() -> ok.
+set_default_authn_restrictive() ->
+    set_default_auth_result(ignore).
+
+set_default_auth_result(Result) ->
+    _ = persistent_term:put(?DEFAULT_AUTH_RESULT_PT_KEY, Result),
+    ok.
+
+%% TEST
+-endif.
+
+%%--------------------------------------------------------------------
+%% Internal Functions
+%%--------------------------------------------------------------------
+
+-spec pre_hook_authenticate(emqx_types:clientinfo()) ->
+    ok | continue | {error, not_authorized}.
+pre_hook_authenticate(#{enable_authn := false}) ->
+    ?TRACE_RESULT("PRE_HOOK_AUTHN", ok, authentication_not_enabled);
+pre_hook_authenticate(#{enable_authn := quick_deny_anonymous} = Credential) ->
+    case is_username_defined(Credential) of
+        true ->
+            continue;
+        false ->
+            ?TRACE_RESULT("PRE_HOOK_AUTHN", {error, not_authorized}, quick_deny_anonymous)
+    end;
+pre_hook_authenticate(_) ->
+    continue.
+
+is_username_defined(#{username := undefined}) -> false;
+is_username_defined(#{username := <<>>}) -> false;
+is_username_defined(#{username := _Username}) -> true;
+is_username_defined(_) -> false.
+
+%% Return the cache config when the cache applies to the topic, else `false`.
+authz_cache_conf(#{cache := CacheConf}, Topic) ->
+    emqx_authz_cache:is_enabled(CacheConf, Topic) andalso CacheConf.
+
+check_authorization_cache(AuthzContext, Action, Topic, TTL) ->
+    case emqx_authz_cache:get_authz_cache(Action, Topic, TTL) of
+        not_found ->
+            inc_authz_metrics(cache_miss),
+            {AuthzResult, Cacheable} = do_authorize_with_cache_policy(AuthzContext, Action, Topic),
+            case Cacheable of
+                true -> emqx_authz_cache:put_authz_cache(Action, Topic, AuthzResult);
+                false -> ok
+            end,
+            {AuthzResult, Cacheable};
+        AuthzResult ->
+            emqx_hooks:'client.check_authz_complete'(
+                AuthzContext, Action, Topic, AuthzResult, cache
+            ),
+            inc_authz_metrics(cache_hit),
+            {AuthzResult, true}
+    end.
+
+do_authorize_with_cache_policy(AuthzContext, Action, Topic) ->
+    NoMatch = emqx:get_config([authorization, no_match], deny),
+    Default = #{result => NoMatch, from => default},
+    case client_authorize(AuthzContext, Action, Topic, Default) of
+        AuthzResult = #{result := Result} when Result == allow; Result == deny ->
+            From = maps:get(from, AuthzResult, unknown),
+            ok = log_result(Topic, Action, From, Result),
+            emqx_hooks:'client.check_authz_complete'(
+                AuthzContext, Action, Topic, Result, From
+            ),
+            {Result, should_cache_authz_result(AuthzResult)};
+        Other ->
+            ?SLOG(error, #{
+                msg => "unknown_authorization_return_format",
+                expected_example => "#{result => allow, from => default}",
+                got => Other
+            }),
+            emqx_hooks:'client.check_authz_complete'(
+                AuthzContext, Action, Topic, deny, unknown_return_format
+            ),
+            {deny, true}
+    end.
+
+maybe_mount_prefix(false = _IncludeMountpoint, _AuthzContext, Topic0) ->
+    Topic0;
+maybe_mount_prefix(
+    true = _IncludeMountpoint, #{mountpoint := Mountpoint} = _AuthzContext, Topic0
+) when
+    is_binary(Mountpoint)
+->
+    emqx_mountpoint:mount(Mountpoint, Topic0);
+maybe_mount_prefix(true = _IncludeMountpoint, _AuthzContext, Topic0) ->
+    Topic0.
+
+should_cache_authz_result(AuthzResult) ->
+    maps:get(is_cacheable, AuthzResult, true).
+
+log_result(Topic, Action, From, Result) ->
+    LogMeta = fun() ->
+        #{
+            topic => Topic,
+            action => format_action(Action),
+            source => format_from(From)
+        }
+    end,
+    do_log_result(Action, Result, LogMeta).
+
+do_log_result(_Action, allow, LogMeta) ->
+    ?SLOG(debug, (LogMeta())#{msg => "authorization_permission_allowed"}, #{tag => "AUTHZ"});
+do_log_result(?AUTHZ_PUBLISH_MATCH_MAP(_, _), deny, LogMeta) ->
+    %% for publish action, we do not log permission deny at warning level here
+    %% because it will be logged as cannot_publish_to_topic_due_to_not_authorized
+    ?SLOG(info, (LogMeta())#{msg => "authorization_permission_denied"}, #{tag => "AUTHZ"});
+do_log_result(_, deny, LogMeta) ->
+    ?SLOG_THROTTLE(
+        warning,
+        (LogMeta())#{msg => authorization_permission_denied},
+        #{tag => "AUTHZ"}
+    ).
+
+%% @private Format authorization rules source.
+format_from(default) ->
+    "'authorization.no_match' config";
+format_from(unknown) ->
+    "'client.authorize' hook callback";
+format_from(Type) ->
+    Type.
+
+%% @doc Format enriched action info for logging.
+format_action(?AUTHZ_SUBSCRIBE_MATCH_MAP(QoS)) ->
+    "SUBSCRIBE(" ++ format_qos(QoS) ++ ")";
+format_action(?AUTHZ_PUBLISH_MATCH_MAP(QoS, Retain)) ->
+    "PUBLISH(" ++ format_qos(QoS) ++ "," ++ format_retain_flag(Retain) ++ ")".
+
+format_qos(QoS) ->
+    "Q" ++ integer_to_list(QoS).
+
+format_retain_flag(true) ->
+    "R1";
+format_retain_flag(false) ->
+    "R0".
+
+client_authenticate(ClientInfo, Acc) ->
+    Policy = emqx_security_profile:policy(access_control_hook_failure),
+    ok = emqx_metrics:inc_global('client.authenticate'),
+    T1 = erlang:monotonic_time(),
+    Value =
+        case Policy of
+            ignore ->
+                {ok, emqx_hooks:'client.authenticate'(ClientInfo, Acc)};
+            interrupt ->
+                emqx_hooks:'client.authenticate_strict'(ClientInfo, Acc)
+        end,
+    T2 = erlang:monotonic_time(),
+    observe_hook_timing('client.authenticate', T1, T2),
+    case Value of
+        {ok, Result} -> Result;
+        {error, _Reason} -> ignore
+    end.
+
+client_authorize(Context, Action, Topic, Acc) ->
+    Policy = emqx_security_profile:policy(access_control_hook_failure),
+    ok = emqx_metrics:inc_global('client.authorize'),
+    T1 = erlang:monotonic_time(),
+    Value =
+        case Policy of
+            ignore ->
+                {ok, emqx_hooks:'client.authorize'(Context, Action, Topic, Acc)};
+            interrupt ->
+                emqx_hooks:'client.authorize_strict'(Context, Action, Topic, Acc)
+        end,
+    T2 = erlang:monotonic_time(),
+    observe_hook_timing('client.authorize', T1, T2),
+    case Value of
+        {ok, Result} -> Result;
+        {error, _Reason} -> #{result => deny, from => default_on_fail}
+    end.
+
+-compile({inline, [observe_hook_timing/3]}).
+observe_hook_timing(Name, T1, T2) ->
+    try
+        emqx_metrics_worker:observe_hist(
+            ?ACCESS_CONTROL_METRICS_WORKER,
+            Name,
+            total_latency,
+            erlang:convert_time_unit(T2 - T1, native, millisecond)
+        )
+    catch
+        _:_ ->
+            ok
+    end.
+
+-compile({inline, [inc_authz_metrics/1]}).
+inc_authz_metrics(allow) ->
+    emqx_metrics:inc_global('authorization.allow');
+inc_authz_metrics(deny) ->
+    emqx_metrics:inc_global('authorization.deny');
+inc_authz_metrics(cache_hit) ->
+    emqx_metrics:inc_global('authorization.cache_hit');
+inc_authz_metrics(cache_miss) ->
+    emqx_metrics:inc_global('authorization.cache_miss').
+
+inc_authn_metrics(error) ->
+    emqx_metrics:inc_global('authentication.failure');
+inc_authn_metrics(ok) ->
+    emqx_metrics:inc_global('authentication.success');
+inc_authn_metrics(anonymous) ->
+    emqx_metrics:inc_global('client.auth.anonymous'),
+    emqx_metrics:inc_global('authentication.success.anonymous'),
+    emqx_metrics:inc_global('authentication.success').
+
+on_authentication_complete_no_hooks(#{enable_authn := false} = Credential, Extra) ->
+    on_authentication_complete_success(Credential, Extra, anonymous),
+    {ok, Extra};
+on_authentication_complete_no_hooks(Credential, _Extra) ->
+    on_authentication_complete_error(Credential, no_authn_hooks),
+    {error, not_authorized}.
+
+on_authentication_complete_error(Credential, Reason) ->
+    emqx_hooks:'client.check_authn_complete'(
+        Credential,
+        #{
+            reason_code => Reason
+        }
+    ),
+    inc_authn_metrics(error).
+
+on_authentication_complete_success(Credential, Result, Type) ->
+    emqx_hooks:'client.check_authn_complete'(
+        Credential,
+        Result#{
+            reason_code => success,
+            is_anonymous => (Type =:= anonymous)
+        }
+    ),
+    inc_authn_metrics(Type).

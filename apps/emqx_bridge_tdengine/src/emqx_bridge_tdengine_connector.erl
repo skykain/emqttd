@@ -1,0 +1,419 @@
+%%--------------------------------------------------------------------
+%% Copyright (c) 2023-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
+%%--------------------------------------------------------------------
+
+-module(emqx_bridge_tdengine_connector).
+
+-behaviour(emqx_connector_examples).
+
+-behaviour(emqx_resource).
+
+-include_lib("hocon/include/hoconsc.hrl").
+-include_lib("emqx/include/logger.hrl").
+-include_lib("emqx/include/emqx_trace.hrl").
+-include_lib("typerefl/include/types.hrl").
+-include_lib("snabbkaffe/include/snabbkaffe.hrl").
+-include_lib("emqx_resource/include/emqx_resource.hrl").
+
+-export([namespace/0, roots/0, fields/1, desc/1]).
+
+%% `emqx_resource' API
+-export([
+    resource_type/0,
+    callback_mode/0,
+    on_start/2,
+    on_stop/2,
+    on_query/3,
+    on_batch_query/3,
+    on_get_status/2,
+    on_add_channel/4,
+    on_remove_channel/3,
+    on_get_channels/1,
+    on_get_channel_status/3,
+    on_format_query_result/1
+]).
+
+-export([connector_examples/1]).
+
+-export([connect/1, do_get_status/2, execute/3, do_batch_insert/6]).
+
+-import(hoconsc, [enum/1]).
+
+-define(TD_DEFAULT_PORT, 6041).
+
+-define(TD_HOST_OPTIONS, #{
+    default_port => ?TD_DEFAULT_PORT
+}).
+
+-define(TD_HOST_OPTIONS_CLOUD, #{
+    default_port => 443,
+    supported_schemes => ["https"]
+}).
+
+-define(CONNECTOR_TYPE, tdengine).
+
+namespace() -> "tdengine_connector".
+
+%%=====================================================================
+%% V1 Hocon schema
+roots() ->
+    [{config, #{type => hoconsc:ref(?MODULE, config)}}].
+
+fields(config) ->
+    base_config(true);
+%%=====================================================================
+%% V2 Hocon schema
+
+fields("config_connector") ->
+    emqx_connector_schema:common_fields() ++
+        base_config(false) ++
+        token_field() ++
+        emqx_connector_schema:resource_opts_ref(?MODULE, connector_resource_opts);
+fields(connector_resource_opts) ->
+    emqx_connector_schema:resource_opts_fields();
+fields("post") ->
+    emqx_connector_schema:type_and_name_fields(enum([tdengine])) ++ fields("config_connector");
+fields("put") ->
+    fields("config_connector");
+fields("get") ->
+    emqx_bridge_v2_api:status_fields() ++ fields("post").
+
+base_config(HasDatabase) ->
+    DBFields = emqx_connector_schema_lib:relational_db_fields(#{password => #{required => false}}),
+    [
+        {server, server()}
+        | maybe_without_database(DBFields, HasDatabase)
+    ] ++
+        emqx_connector_schema_lib:verify_peer_ssl_fields().
+
+token_field() ->
+    [{token, hoconsc:mk(binary(), #{required => false, desc => ?DESC("token")})}].
+
+desc(config) ->
+    ?DESC("desc_config");
+desc(connector_resource_opts) ->
+    ?DESC(emqx_resource_schema, "resource_opts");
+desc("config_connector") ->
+    ?DESC("desc_config");
+desc(Method) when Method =:= "get"; Method =:= "put"; Method =:= "post" ->
+    ["Configuration for TDengine using `", string:to_upper(Method), "` method."];
+desc(_) ->
+    undefined.
+
+maybe_without_database(Fields, true) ->
+    Fields;
+maybe_without_database(Fields, false) ->
+    lists:keydelete(database, 1, Fields).
+
+server() ->
+    Meta = #{
+        required => true,
+        desc => ?DESC("server"),
+        converter => fun emqx_schema:convert_servers/2,
+        validator => fun validator_server/1
+    },
+    hoconsc:mk(string(), Meta).
+
+validator_server(Str) ->
+    case emqx_schema:str(Str) of
+        "" ->
+            throw("cannot_be_empty");
+        "undefined" ->
+            throw("cannot_be_empty");
+        _ ->
+            _ = parse_server(Str),
+            ok
+    end.
+
+parse_server(Str0) ->
+    Str = emqx_schema:str(Str0),
+    case Str of
+        "https://" ++ _ ->
+            emqx_schema:parse_server(Str, ?TD_HOST_OPTIONS_CLOUD);
+        _ ->
+            emqx_schema:parse_server(Str, ?TD_HOST_OPTIONS)
+    end.
+
+%%=====================================================================
+%% V2 Hocon schema
+connector_examples(Method) ->
+    [
+        #{
+            <<"tdengine">> =>
+                #{
+                    summary => <<"TDengine Connector">>,
+                    value => emqx_connector_schema:connector_values(
+                        Method, ?CONNECTOR_TYPE, connector_example_values()
+                    )
+                }
+        }
+    ].
+
+connector_example_values() ->
+    #{
+        name => <<"tdengine_connector">>,
+        type => tdengine,
+        enable => true,
+        server => <<"127.0.0.1:6041">>,
+        pool_size => 8,
+        username => <<"root">>,
+        password => <<"******">>
+    }.
+
+%%========================================================================================
+%% `emqx_resource' API
+%%========================================================================================
+resource_type() -> tdengine.
+
+callback_mode() -> always_sync.
+
+on_start(
+    InstanceId,
+    #{
+        server := Server,
+        pool_size := PoolSize,
+        ssl := SSLOpts0,
+        resource_opts := #{health_check_timeout := HCTimeout}
+    } = Config
+) ->
+    ?SLOG(info, #{
+        msg => "starting_tdengine_connector",
+        connector => InstanceId,
+        config => emqx_utils:redact(Config)
+    }),
+    Server1 = parse_server(Server),
+    Options0 =
+        case maps:get(scheme, Server1, undefined) of
+            "https" ->
+                [{https_enabled, true}];
+            _ ->
+                []
+        end,
+    #{hostname := Host, port := Port} = Server1,
+    SSLOpts = emqx_connector_lib:to_hackney_tls_client_opts(SSLOpts0),
+    Options = [
+        {host, to_bin(Host)},
+        {port, Port},
+        {username, maps:get(username, Config, undefined)},
+        {password, maps:get(password, Config, undefined)},
+        {token, maps:get(token, Config, undefined)},
+        {pool_size, PoolSize},
+        {pool, InstanceId},
+        {ssl_opts, SSLOpts}
+        | Options0
+    ],
+    State = #{
+        health_check_timeout => HCTimeout,
+        pool_name => InstanceId,
+        channels => #{}
+    },
+    case emqx_resource_pool:start(InstanceId, ?MODULE, Options) of
+        ok ->
+            {ok, State};
+        Error ->
+            Error
+    end.
+
+on_stop(InstanceId, _State) ->
+    ?SLOG(info, #{
+        msg => "stopping_tdengine_connector",
+        connector => InstanceId
+    }),
+    ?tp(tdengine_connector_stop, #{instance_id => InstanceId}),
+    emqx_resource_pool:stop(InstanceId).
+
+on_query(InstanceId, {ChannelId, Data}, #{channels := Channels} = State) ->
+    case maps:find(ChannelId, Channels) of
+        {ok, #{sql_plan := Plan, opts := Opts} = ChannelState} ->
+            RenderOpts = render_opts(maps:get(channel_conf, ChannelState, #{})),
+            case emqx_sql_plan:render(Plan, Data, RenderOpts) of
+                {ok, Query} ->
+                    emqx_trace:rendered_action_template(ChannelId, #{query => Query}),
+                    do_query_job(InstanceId, {?MODULE, execute, [Query, Opts]}, State);
+                {error, Reason} ->
+                    {error, {unrecoverable_error, Reason}}
+            end;
+        _ ->
+            {error, {unrecoverable_error, {invalid_channel_id, ChannelId}}}
+    end.
+
+%% aggregate the batch queries to one SQL is a heavy job, we should put it in the worker process
+on_batch_query(
+    InstanceId,
+    [{ChannelId, _Data = #{}} | _] = BatchReq,
+    #{channels := Channels} = State
+) ->
+    case maps:find(ChannelId, Channels) of
+        {ok, #{sql_plan := Plan, opts := Opts} = ChannelState} ->
+            TraceRenderedCTX = emqx_trace:make_rendered_action_template_trace_context(ChannelId),
+            ChannelConf = maps:get(channel_conf, ChannelState, #{}),
+            do_query_job(
+                InstanceId,
+                {?MODULE, do_batch_insert, [Plan, BatchReq, Opts, TraceRenderedCTX, ChannelConf]},
+                State
+            );
+        _ ->
+            {error, {unrecoverable_error, {invalid_channel_id, ChannelId}}}
+    end;
+on_batch_query(InstanceId, BatchReq, _State) ->
+    LogMeta = #{connector => InstanceId, request => BatchReq},
+    ?SLOG(error, LogMeta#{msg => "invalid_request"}),
+    {error, {unrecoverable_error, invalid_request}}.
+
+on_format_query_result({ok, ResultMap}) ->
+    #{result => ok, info => ResultMap};
+on_format_query_result(Result) ->
+    Result.
+
+on_get_status(_InstanceId, ConnState) ->
+    #{
+        pool_name := PoolName,
+        health_check_timeout := HCTimeout
+    } = ConnState,
+    Opts = #{
+        timeout => HCTimeout,
+        check_fn => {?MODULE, do_get_status, [HCTimeout]}
+    },
+    Res = emqx_resource_pool:common_health_check_workers(PoolName, Opts),
+    case Res of
+        {Status, Reason} ->
+            {Status, enhance_reason(Reason)};
+        Status ->
+            Status
+    end.
+
+do_get_status(Conn, HCTimeout) ->
+    try
+        tdengine:insert(
+            Conn,
+            "select server_version()",
+            [],
+            HCTimeout
+        )
+    of
+        {ok, _} ->
+            ok;
+        {error, _} = Error ->
+            Error
+    catch
+        _Type:Reason ->
+            {error, Reason}
+    end.
+
+enhance_reason(timeout) ->
+    connection_timeout;
+enhance_reason(Reason) ->
+    Reason.
+
+on_add_channel(
+    _InstanceId,
+    #{channels := Channels} = OldState,
+    ChannelId,
+    #{
+        parameters := #{database := Database, sql := SQL} = ChannelConf
+    }
+) ->
+    case maps:is_key(ChannelId, Channels) of
+        true ->
+            {error, already_exists};
+        _ ->
+            case parse_prepare_sql(SQL) of
+                {ok, Result} ->
+                    Opts = [{db_name, Database}],
+                    Channel = Result#{opts => Opts, channel_conf => ChannelConf},
+                    Channels2 = Channels#{ChannelId => Channel},
+                    {ok, OldState#{channels := Channels2}};
+                Error ->
+                    Error
+            end
+    end.
+
+on_remove_channel(_InstanceId, #{channels := Channels} = OldState, ChannelId) ->
+    {ok, OldState#{channels => maps:remove(ChannelId, Channels)}}.
+
+on_get_channels(InstanceId) ->
+    emqx_bridge_v2:get_channels_for_connector(InstanceId).
+
+on_get_channel_status(InstanceId, ChannelId, #{channels := Channels} = State) ->
+    case maps:is_key(ChannelId, Channels) of
+        true ->
+            on_get_status(InstanceId, State);
+        _ ->
+            ?status_disconnected
+    end.
+
+%%========================================================================================
+%% Helper fns
+%%========================================================================================
+
+do_query_job(InstanceId, Job, #{pool_name := PoolName} = State) ->
+    ?TRACE(
+        "QUERY",
+        "tdengine_connector_received",
+        #{connector => InstanceId, job => Job, state => State}
+    ),
+    Result = ecpool:pick_and_do(PoolName, Job, no_handover),
+    case Result of
+        {error, Reason} ->
+            ?tp(
+                tdengine_connector_query_return,
+                #{instance_id => InstanceId, error => Reason}
+            ),
+            ?SLOG(error, #{
+                msg => "tdengine_connector_do_query_failed",
+                connector => InstanceId,
+                job => Job,
+                reason => Reason
+            }),
+            case Reason of
+                ecpool_empty ->
+                    {error, {recoverable_error, Reason}};
+                _ ->
+                    Result
+            end;
+        _ ->
+            ?tp(
+                tdengine_connector_query_return,
+                #{instance_id => InstanceId, result => Result}
+            ),
+            Result
+    end.
+
+execute(Conn, Query, Opts) ->
+    tdengine:insert(Conn, Query, Opts).
+
+do_batch_insert(Conn, Plan, BatchReqs, Opts, TraceRenderedCTX, ChannelConf) ->
+    DataList = [Data || {_, Data} <- BatchReqs],
+    case emqx_sql_plan:render_batch(Plan, DataList, render_opts(ChannelConf)) of
+        {ok, SQL} ->
+            try
+                emqx_trace:rendered_action_template_with_ctx(
+                    TraceRenderedCTX,
+                    #{query => SQL}
+                ),
+                execute(Conn, SQL, Opts)
+            catch
+                error:?EMQX_TRACE_STOP_ACTION_MATCH = Reason ->
+                    {error, Reason}
+            end;
+        {error, Reason} ->
+            {error, {unrecoverable_error, Reason}}
+    end.
+
+connect(Opts) ->
+    %% TODO: teach `tdengine` to accept 0-arity closures as passwords.
+    {value, {password, Secret}, OptsRest} = lists:keytake(password, 1, Opts),
+    NOpts = [{password, emqx_secret:unwrap(Secret)} | OptsRest],
+    tdengine:start_link(NOpts).
+
+parse_prepare_sql(SQL) ->
+    case emqx_sql_plan:compile(emqx_bridge_tdengine_sql, SQL) of
+        {ok, Plan} -> {ok, #{sql_plan => Plan}};
+        {error, Reason} -> {error, Reason}
+    end.
+
+to_bin(List) when is_list(List) ->
+    unicode:characters_to_binary(List, utf8).
+
+render_opts(ChannelConf) ->
+    #{undefined_vars_as_null => maps:get(undefined_vars_as_null, ChannelConf, false)}.

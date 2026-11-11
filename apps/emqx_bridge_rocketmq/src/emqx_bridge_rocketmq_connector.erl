@@ -1,0 +1,634 @@
+%%--------------------------------------------------------------------
+%% Copyright (c) 2022-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
+%%--------------------------------------------------------------------
+
+-module(emqx_bridge_rocketmq_connector).
+
+-behaviour(emqx_resource).
+
+-include_lib("emqx_resource/include/emqx_resource.hrl").
+-include_lib("typerefl/include/types.hrl").
+-include_lib("emqx/include/logger.hrl").
+-include_lib("snabbkaffe/include/snabbkaffe.hrl").
+-include_lib("hocon/include/hoconsc.hrl").
+
+-export([roots/0, fields/1, namespace/0]).
+
+%% `emqx_resource' API
+-export([
+    resource_type/0,
+    callback_mode/0,
+    on_start/2,
+    on_stop/2,
+    on_query/3,
+    on_batch_query/3,
+    on_get_status/2,
+    on_add_channel/4,
+    on_remove_channel/3,
+    on_get_channels/1,
+    on_get_channel_status/3
+]).
+
+-import(hoconsc, [mk/2]).
+
+-define(ROCKETMQ_HOST_OPTIONS, #{
+    default_port => 9876
+}).
+
+%% Allocatable resources
+-define(client_id, client_id).
+-define(producer_cache(RES_ID, TOPIC), {producer_cache, RES_ID, TOPIC}).
+
+-elvis([{elvis_style, no_invalid_dynamic_calls, disable}]).
+%% for the existing binary_to_atom
+-elvis([{elvis_style, no_common_caveats_call, disable}]).
+
+%%=====================================================================
+%% Hocon schema
+
+namespace() -> rocketmq.
+
+roots() ->
+    [{config, #{type => hoconsc:ref(?MODULE, config)}}].
+
+fields(config) ->
+    [
+        {servers, servers()},
+        {rocketmq_namespace,
+            mk(
+                binary(),
+                #{
+                    required => false,
+                    aliases => [namespace],
+                    desc => ?DESC(rocketmq_namespace)
+                }
+            )},
+        {topic,
+            mk(
+                emqx_schema:template(),
+                #{default => <<"TopicTest">>, desc => ?DESC(topic)}
+            )},
+        {access_key,
+            mk(
+                binary(),
+                #{default => <<>>, desc => ?DESC("access_key")}
+            )},
+        {secret_key, emqx_schema_secret:mk(#{default => <<>>, desc => ?DESC("secret_key")})},
+        {security_token, emqx_schema_secret:mk(#{default => <<>>, desc => ?DESC(security_token)})},
+        {sync_timeout,
+            mk(
+                emqx_schema:timeout_duration(),
+                #{default => <<"3s">>, desc => ?DESC(sync_timeout)}
+            )},
+        {refresh_interval,
+            mk(
+                emqx_schema:timeout_duration(),
+                #{default => <<"3s">>, desc => ?DESC(refresh_interval)}
+            )},
+        {send_buffer,
+            mk(
+                emqx_schema:bytesize(),
+                #{default => <<"1024KB">>, desc => ?DESC(send_buffer)}
+            )},
+
+        {pool_size, fun emqx_connector_schema_lib:pool_size/1},
+        {auto_reconnect, fun emqx_connector_schema_lib:auto_reconnect/1}
+    ] ++ emqx_connector_schema_lib:ssl_fields().
+
+servers() ->
+    Meta = #{desc => ?DESC("servers")},
+    emqx_schema:servers_sc(Meta, ?ROCKETMQ_HOST_OPTIONS).
+
+%%========================================================================================
+%% `emqx_resource' API
+%%========================================================================================
+
+resource_type() -> rocketmq.
+
+callback_mode() -> always_sync.
+
+on_start(
+    InstanceId,
+    #{
+        servers := BinServers,
+        access_key := AccessKey,
+        secret_key := SecretKey,
+        security_token := SecurityToken,
+        ssl := SSLOptsMap
+    } = Config
+) ->
+    ?SLOG(info, #{
+        msg => "starting_rocketmq_connector",
+        connector => InstanceId,
+        config => redact(Config)
+    }),
+    Servers = lists:map(
+        fun(#{hostname := Host, port := Port}) -> {Host, Port} end,
+        emqx_schema:parse_servers(BinServers, ?ROCKETMQ_HOST_OPTIONS)
+    ),
+    ClientId = client_id(InstanceId),
+    ACLInfo = acl_info(AccessKey, SecretKey, SecurityToken),
+    Namespace = maps:get(rocketmq_namespace, Config, <<>>),
+    ClientCfg0 = #{acl_info => ACLInfo, namespace => Namespace},
+    SSLOpts = emqx_tls_lib:to_client_opts(SSLOptsMap),
+    ClientCfg = emqx_utils_maps:put_if(ClientCfg0, ssl_opts, SSLOpts, SSLOpts =/= []),
+    State = #{
+        client_id => ClientId,
+        acl_info => ACLInfo,
+        namespace => Namespace,
+        installed_channels => #{},
+        ssl_opts => SSLOpts
+    },
+
+    ok = allocate(InstanceId, ?client_id, ClientId),
+    create_producers_map(ClientId),
+
+    case rocketmq:ensure_supervised_client(ClientId, Servers, ClientCfg) of
+        {ok, _Pid} ->
+            {ok, State};
+        {error, Reason0} ->
+            Reason = redact(Reason0),
+            ?tp(
+                rocketmq_connector_start_failed,
+                #{error => Reason}
+            ),
+            {error, Reason}
+    end.
+
+on_add_channel(
+    _InstId,
+    #{
+        installed_channels := InstalledChannels,
+        namespace := Namespace,
+        acl_info := ACLInfo,
+        ssl_opts := SSLOpts
+    } = OldState,
+    ChannelId,
+    ChannelConfig
+) ->
+    {ok, ChannelState} = create_channel_state(
+        ChannelId, ChannelConfig, ACLInfo, Namespace, SSLOpts
+    ),
+    NewInstalledChannels = maps:put(ChannelId, ChannelState, InstalledChannels),
+    %% Update state
+    NewState = OldState#{installed_channels => NewInstalledChannels},
+    {ok, NewState}.
+
+create_channel_state(
+    ActionResId,
+    #{parameters := Conf} = _ChannelConfig,
+    ACLInfo,
+    Namespace,
+    SSLOpts
+) ->
+    #{
+        topic := Topic,
+        sync_timeout := SyncTimeout,
+        strategy := Strategy
+    } = Conf,
+    TopicTks = emqx_placeholder:preproc_tmpl(Topic),
+    KeyTemplate = maybe_parse_template(maps:get(key, Conf, undefined)),
+    TagTemplate = maybe_parse_template(maps:get(tag, Conf, undefined)),
+    ProducerOpts = make_producer_opts(Conf, ACLInfo, Namespace, Strategy, SSLOpts),
+    Template = parse_template(Conf),
+    maybe_warn_deprecated_dispatch(ActionResId, Strategy),
+    ContextFn = mk_context_fn(Strategy, KeyTemplate, TagTemplate),
+    State = #{
+        key => KeyTemplate,
+        tag => TagTemplate,
+        topic => Topic,
+        topic_tokens => TopicTks,
+        template => Template,
+        context_fn => ContextFn,
+        sync_timeout => SyncTimeout,
+        acl_info => ACLInfo,
+        producers_opts => ProducerOpts
+    },
+    {ok, State}.
+
+on_remove_channel(
+    ConnResId,
+    #{
+        installed_channels := InstalledChannels
+    } = OldState,
+    ChanResId
+) ->
+    destroy_allocated_channel_resources(ConnResId, ChanResId),
+    NewInstalledChannels = maps:remove(ChanResId, InstalledChannels),
+    %% Update state
+    NewState = OldState#{installed_channels := NewInstalledChannels},
+    {ok, NewState}.
+
+on_get_channel_status(
+    _InstanceId,
+    ChannelId,
+    #{installed_channels := Channels, client_id := ClientId} = _State
+) ->
+    case maps:find(ChannelId, Channels) of
+        {ok, ChannelState} ->
+            check_topic_status(ClientId, ChannelState);
+        error ->
+            ?status_disconnected
+    end.
+
+%% A topic without placeholders is checked on the name server: it must have a route,
+%% or the broker must auto-create topics. The check also keeps the name server
+%% connection busy, which stops the name server from closing it as idle.
+%% A templated topic is only known per message, so it is not checked here.
+check_topic_status(ClientId, #{topic := Topic, topic_tokens := TopicTks} = ChannelState) ->
+    case is_static_topic(TopicTks) of
+        true ->
+            do_check_topic_status(ClientId, Topic, ChannelState);
+        false ->
+            ?status_connected
+    end.
+
+do_check_topic_status(ClientId, Topic, #{producers_opts := #{namespace := Namespace}}) ->
+    case rocketmq:check_topic(ClientId, Topic) of
+        ok ->
+            ?status_connected;
+        {error, {topic_not_found, #{remark := Remark}}} ->
+            {?status_disconnected, topic_not_found_msg(Topic, Namespace, Remark)};
+        {error, Reason} ->
+            {?status_connecting, format_reason(Reason)}
+    end.
+
+is_static_topic(TopicTks) ->
+    lists:all(
+        fun
+            ({str, _}) -> true;
+            (_) -> false
+        end,
+        TopicTks
+    ).
+
+topic_not_found_msg(Topic, Namespace, Remark) ->
+    Where =
+        case Namespace of
+            <<>> -> <<>>;
+            _ -> [" in namespace \"", Namespace, "\""]
+        end,
+    iolist_to_binary([
+        "Topic \"",
+        Topic,
+        "\" not found",
+        Where,
+        ", and the broker does not auto-create topics. Create the topic on the broker."
+        " Name server reply: ",
+        format_reason(Remark)
+    ]).
+
+on_get_channels(ResId) ->
+    emqx_bridge_v2:get_channels_for_connector(ResId).
+
+on_stop(InstanceId, _State) ->
+    ?SLOG(info, #{
+        msg => "stopping_rocketmq_connector",
+        connector => InstanceId
+    }),
+    destroy_allocated_channel_resources(InstanceId),
+    lists:foreach(
+        fun
+            ({_, ?client_id, ClientId}) ->
+                destory_producers_map(ClientId),
+                ok = rocketmq:stop_and_delete_supervised_client(ClientId);
+            ({_, ?producer_cache(_, _), Producer}) ->
+                _ = rocketmq:stop_and_delete_supervised_producers(Producer)
+        end,
+        emqx_resource:get_allocated_resources_list(InstanceId)
+    ),
+    ?tp("rocketmq_connector_stop", #{instance_id => InstanceId}),
+    ok.
+
+on_query(InstanceId, Query, State) ->
+    do_query(InstanceId, Query, send_sync, State).
+
+%% We only support batch inserts and all messages must have the same topic
+on_batch_query(InstanceId, [{_ChannelId, _Msg} | _] = Query, State) ->
+    do_query(InstanceId, Query, batch_send_sync, State);
+on_batch_query(_InstanceId, Query, _State) ->
+    {error, {unrecoverable_error, {invalid_request, Query}}}.
+
+on_get_status(_InstanceId, #{client_id := ClientId}) ->
+    case rocketmq_client_sup:find_client(ClientId) of
+        {ok, Pid} ->
+            status_result(rocketmq_client:get_connection_state(Pid));
+        {error, Reason} ->
+            {?status_connecting, Reason}
+    end.
+
+status_result(connected) -> ?status_connected;
+status_result(connecting) -> {?status_connecting, ~"still connecting"};
+status_result({disconnected, Reason}) -> {?status_disconnected, format_reason(Reason)};
+status_result({error, Reason}) -> {?status_connecting, format_reason(Reason)}.
+
+format_reason({tcp_connect_error, {Host, Port, Why}}) ->
+    iolist_to_binary(io_lib:format("TCP connect to ~s:~p failed: ~0p", [Host, Port, Why]));
+format_reason({tls_connect_error, {Host, Port, Why}}) ->
+    iolist_to_binary(io_lib:format("TLS handshake with ~s:~p failed: ~0p", [Host, Port, Why]));
+format_reason(tcp_closed) ->
+    <<"TCP connection closed by peer">>;
+format_reason(ssl_closed) ->
+    <<"TLS connection closed by peer">>;
+format_reason({ssl_error, Why}) ->
+    iolist_to_binary(io_lib:format("TLS error: ~0p", [Why]));
+format_reason(Text) when is_binary(Text) ->
+    Text;
+format_reason(Other) ->
+    iolist_to_binary(io_lib:format("~0p", [Other])).
+
+%%========================================================================================
+%% Helper fns
+%%========================================================================================
+
+destroy_allocated_channel_resources(ConnResId) ->
+    destroy_allocated_channel_resources(ConnResId, _ChanResId = '_').
+
+destroy_allocated_channel_resources(ConnResId, ChanResId) ->
+    Resources = emqx_resource:get_allocated_resources(ConnResId),
+    maps:foreach(
+        fun
+            (?producer_cache(Id, Topic) = Key, Producers) when
+                ChanResId == '_' orelse Id == ChanResId
+            ->
+                ProducerGroup = mk_producer_group(Id, Topic),
+                _ = rocketmq:stop_and_delete_supervised_producers(Producers),
+                maybe
+                    #{?client_id := Table} ?= Resources,
+                    try
+                        _ = ets:delete(Table, ProducerGroup)
+                    catch
+                        error:badarg -> ok
+                    end
+                end,
+                deallocate(ConnResId, Key);
+            (_, _) ->
+                ok
+        end,
+        Resources
+    ).
+
+do_query(
+    InstanceId,
+    Query,
+    QueryFunc,
+    #{
+        client_id := ClientId,
+        installed_channels := Channels
+    } = State
+) ->
+    ?TRACE(
+        "QUERY",
+        "rocketmq_connector_received",
+        #{connector => InstanceId, query => Query, state => redact(State)}
+    ),
+    ChannelId = get_channel_id(Query),
+    #{
+        topic_tokens := TopicTks,
+        template := Template,
+        context_fn := ContextFn,
+        sync_timeout := RequestTimeout,
+        producers_opts := ProducerOpts
+    } = maps:get(ChannelId, Channels),
+    TopicKey = get_topic_key(Query, TopicTks),
+    Data = apply_template(Query, Template, ContextFn),
+    ?tp("rocketmq_rendered_data", #{data => Data}),
+    emqx_trace:rendered_action_template(ChannelId, #{
+        topic_key => TopicKey,
+        data => Data,
+        request_timeout => RequestTimeout
+    }),
+    Result = safe_do_produce(
+        ChannelId, InstanceId, QueryFunc, ClientId, TopicKey, Data, ProducerOpts, RequestTimeout
+    ),
+    case Result of
+        {error, Reason} ->
+            ?tp(
+                rocketmq_connector_query_return,
+                #{error => Reason}
+            ),
+            %% The query is not logged: it carries the message payload, and the buffer
+            %% worker logs the same failure with the reason.
+            ?SLOG(error, #{
+                msg => "rocketmq_connector_do_query_failed",
+                connector => InstanceId,
+                action => ChannelId,
+                topic => TopicKey,
+                reason => Reason
+            }),
+            Result;
+        _ ->
+            ?tp(
+                rocketmq_connector_query_return,
+                #{result => Result}
+            ),
+            Result
+    end.
+
+get_channel_id({ChannelId, _}) -> ChannelId;
+get_channel_id([{ChannelId, _} | _]) -> ChannelId.
+
+safe_do_produce(
+    ChannelId, InstanceId, QueryFunc, ClientId, TopicKey, Data, ProducerOpts, RequestTimeout
+) ->
+    try
+        case get_producers(ChannelId, InstanceId, ClientId, TopicKey, ProducerOpts) of
+            {ok, Producers} ->
+                produce(InstanceId, QueryFunc, Producers, Data, RequestTimeout);
+            {error, StartError} ->
+                %% A message whose topic cannot be produced to is dropped. For a
+                %% topic without placeholders the health check marks the action
+                %% disconnected, so messages are held in the buffer instead.
+                {error, {unrecoverable_error, StartError}}
+        end
+    catch
+        _Type:Reason ->
+            {error, {unrecoverable_error, redact(Reason)}}
+    end.
+
+produce(_InstanceId, QueryFunc, Producers, Data, RequestTimeout) ->
+    rocketmq:QueryFunc(Producers, Data, RequestTimeout).
+
+parse_template(Config) ->
+    TemplateStr =
+        case maps:get(template, Config, undefined) of
+            undefined ->
+                <<"${.}">>;
+            <<>> ->
+                <<"${.}">>;
+            Template ->
+                Template
+        end,
+    emqx_placeholder:preproc_tmpl(TemplateStr).
+
+maybe_warn_deprecated_dispatch(ActionResId, Strategy) when is_binary(Strategy) ->
+    ?tp(warning, "rocketmq_deprecated_placeholder_strategy", #{
+        deprecated_since => <<"6.0.0">>,
+        hint => <<
+            "Using placeholder templates for key in the `strategy`"
+            " is deprecated.  Please use the `parameter.key` config and"
+            " set `parameters.strategy` to `key_dispatch`."
+        >>,
+        action => ActionResId
+    });
+maybe_warn_deprecated_dispatch(_ActionResId, _Strategy) ->
+    ok.
+
+mk_context_fn(key_dispatch, undefined = _KeyTemplate, _TagTemplate) ->
+    throw(<<"must provide a key template if strategy is key dispatch">>);
+mk_context_fn(_Strategy, KeyTemplate, TagTemplate) ->
+    fun(Msg) ->
+        Ctx0 = #{},
+        Ctx1 = maybe_add_rendered_key(KeyTemplate, key, Msg, Ctx0, key_render_opts()),
+        maybe_add_rendered_key(TagTemplate, tag, Msg, Ctx1)
+    end.
+
+get_topic_key({_, Msg}, TopicTks) ->
+    emqx_placeholder:proc_tmpl(TopicTks, Msg);
+get_topic_key([Query | _], TopicTks) ->
+    get_topic_key(Query, TopicTks).
+
+%% return a message data and its context,
+%% {binary(), rocketmq_producers:produce_context()})
+apply_template({_, Msg} = _Req, Template, ContextFn) ->
+    {
+        emqx_placeholder:proc_tmpl(Template, Msg),
+        ContextFn(Msg)
+    };
+apply_template([{_, _} | _] = Reqs, Template, ContextFn) ->
+    [
+        {emqx_placeholder:proc_tmpl(Template, Msg), ContextFn(Msg)}
+     || {_, Msg} <- Reqs
+    ].
+
+client_id(ResourceId) ->
+    case emqx_resource:is_dry_run(ResourceId) of
+        true ->
+            emqx_probe;
+        false ->
+            erlang:binary_to_atom(ResourceId, utf8)
+    end.
+
+redact(Msg) ->
+    emqx_utils:redact(Msg, fun is_sensitive_key/1).
+
+is_sensitive_key(secret_key) ->
+    true;
+is_sensitive_key(security_token) ->
+    true;
+is_sensitive_key(_) ->
+    false.
+
+make_producer_opts(
+    #{
+        send_buffer := SendBuff,
+        refresh_interval := RefreshInterval
+    },
+    ACLInfo,
+    Namespace,
+    Strategy,
+    SSLOpts
+) ->
+    ProducerOpts = #{
+        tcp_opts => [{sndbuf, SendBuff}],
+        ref_topic_route_interval => RefreshInterval,
+        acl_info => emqx_secret:wrap(ACLInfo),
+        namespace => Namespace,
+        partitioner =>
+            case Strategy of
+                roundrobin -> roundrobin;
+                _ -> key_dispatch
+            end
+    },
+    emqx_utils_maps:put_if(ProducerOpts, ssl_opts, SSLOpts, SSLOpts =/= []).
+
+acl_info(<<>>, _, _) ->
+    #{};
+acl_info(AccessKey, SecretKey, SecurityToken) when is_binary(AccessKey) ->
+    Info = #{
+        access_key => AccessKey,
+        secret_key => emqx_maybe:define(emqx_secret:unwrap(SecretKey), <<>>)
+    },
+    case emqx_maybe:define(emqx_secret:unwrap(SecurityToken), <<>>) of
+        <<>> ->
+            Info;
+        Token ->
+            Info#{security_token => Token}
+    end;
+acl_info(_, _, _) ->
+    #{}.
+
+create_producers_map(ClientId) ->
+    _ = ets:new(ClientId, [public, named_table, {read_concurrency, true}]),
+    ok.
+
+%% The resource manager will not terminate when restarting a resource,
+%% so manually destroying the ets table is necessary.
+destory_producers_map(ClientId) ->
+    case ets:whereis(ClientId) of
+        undefined ->
+            ok;
+        Tid ->
+            ets:delete(Tid)
+    end.
+
+get_producers(ChannelId, InstanceId, ClientId, Topic, ProducerOpts) ->
+    %% The topic need to be included in the name since we can have multiple
+    %% topics per channel due to templating.
+    ProducerGroup = mk_producer_group(ChannelId, Topic),
+    case ets:lookup(ClientId, ProducerGroup) of
+        [{_, Producers}] ->
+            {ok, Producers};
+        _ ->
+            %% TODO: the name needs to be an atom but this may cause atom leak so we
+            %% should figure out a way to avoid this
+            ProducerOpts2 = ProducerOpts#{name => binary_to_atom(ProducerGroup)},
+            maybe
+                {ok, Producers} ?=
+                    rocketmq:ensure_supervised_producers(
+                        ClientId, ProducerGroup, Topic, ProducerOpts2
+                    ),
+                ok = allocate(InstanceId, ?producer_cache(ChannelId, Topic), Producers),
+                ets:insert(ClientId, {ProducerGroup, Producers}),
+                {ok, Producers}
+            end
+    end.
+
+mk_producer_group(ChanResId, Topic) ->
+    iolist_to_binary([ChanResId, "_", Topic]).
+
+maybe_parse_template(undefined) ->
+    undefined;
+maybe_parse_template(Template) ->
+    emqx_template:parse(Template).
+
+maybe_add_rendered_key(Template, Key, Data, RocketMQCtx) ->
+    maybe_add_rendered_key(Template, Key, Data, RocketMQCtx, _RenderOpts = #{}).
+
+maybe_add_rendered_key(undefined, _Key, _Data, RocketMQCtx, _RenderOpts) ->
+    RocketMQCtx;
+maybe_add_rendered_key(Template, Key, Data, RocketMQCtx, RenderOpts) ->
+    {Rendered, _Errors} = emqx_template:render(Template, Data, RenderOpts),
+    RocketMQCtx#{Key => iolist_to_binary(Rendered)}.
+
+key_render_opts() ->
+    #{
+        var_trans => fun
+            (undefined) ->
+                %% Since the key may be absent on some kinds of events (ex:
+                %% `topic' is absent in `client.disconnected'), and this key is
+                %% used for routing, we generate a random key when it's absent to
+                %% better distribute the load, effectively making it `random'
+                %% dispatch if the key is absent and we are using `key_dispatch'.
+                %% Otherwise, it'll be deterministic.
+                emqx_utils:rand_id(8);
+            (X) ->
+                X
+        end
+    }.
+
+allocate(ConnResId, Key, Value) ->
+    ok = emqx_resource:allocate_resource(ConnResId, ?MODULE, Key, Value).
+
+deallocate(ConnResId, Key) ->
+    ok = emqx_resource:deallocate_resource(ConnResId, Key).

@@ -1,0 +1,1125 @@
+%%--------------------------------------------------------------------
+%% Copyright (c) 2020-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
+%%--------------------------------------------------------------------
+
+-module(emqx_authz_SUITE).
+
+-compile(nowarn_export_all).
+-compile(export_all).
+
+-include("emqx_authz.hrl").
+-include_lib("emqx/include/emqx_mqtt.hrl").
+-include_lib("emqx/include/emqx.hrl").
+-include_lib("emqx/include/emqx_hooks.hrl").
+-include_lib("eunit/include/eunit.hrl").
+-include_lib("common_test/include/ct.hrl").
+-include_lib("emqx/include/asserts.hrl").
+-include_lib("emqx/include/emqx_placeholder.hrl").
+-include_lib("snabbkaffe/include/snabbkaffe.hrl").
+
+-import(emqx_common_test_helpers, [on_exit/1]).
+
+all() ->
+    ProfileCases = profile_cases(),
+    [{group, legacy}, {group, hardened}] ++
+        (emqx_common_test_helpers:all(?MODULE) -- ProfileCases).
+
+groups() ->
+    ProfileCases = profile_cases(),
+    [{legacy, [], ProfileCases}, {hardened, [], ProfileCases}].
+
+init_per_group(Profile, Config) when Profile =:= legacy; Profile =:= hardened ->
+    ok = emqx_common_test_helpers:set_security_profile(Profile),
+    [{security_profile, Profile} | Config].
+
+end_per_group(Profile, _Config) when Profile =:= legacy; Profile =:= hardened ->
+    emqx_common_test_helpers:clear_security_profile().
+
+init_per_suite(Config) ->
+    Apps = emqx_cth_suite:start(
+        [
+            {emqx_conf,
+                emqx_authz_test_lib:emqx_appspec(#{
+                    config =>
+                        "authorization { cache { enable = false }, no_match = deny, sources = [] }"
+                        "\nlog.throttling.msgs = []"
+                })},
+            emqx_auth
+        ],
+        #{
+            work_dir => filename:join(?config(priv_dir, Config), ?MODULE)
+        }
+    ),
+    ok = emqx_authz_test_lib:register_fake_sources([http, redis, mongodb, mysql, postgresql]),
+    [{suite_apps, Apps} | Config].
+
+end_per_suite(Config) ->
+    {ok, _} = emqx:update_config(
+        [authorization],
+        #{
+            <<"no_match">> => <<"allow">>,
+            <<"cache">> => #{<<"enable">> => <<"true">>},
+            <<"sources">> => []
+        }
+    ),
+    ok = emqx_authz_test_lib:deregister_sources(),
+    emqx_cth_suite:stop(?config(suite_apps, Config)),
+    ok.
+
+init_per_testcase(TestCase, Config) when
+    TestCase =:= t_subscribe_deny_disconnect_publishes_last_will_testament;
+    TestCase =:= t_publish_last_will_testament_banned_client_connecting;
+    TestCase =:= t_publish_deny_disconnect_publishes_last_will_testament
+->
+    {ok, _} = emqx_authz:update(?CMD_REPLACE, []),
+    {ok, _} = emqx:update_config([authorization, deny_action], disconnect),
+    Config;
+init_per_testcase(_TestCase, Config) ->
+    _ = file:delete(emqx_authz_file:acl_conf_file()),
+    {ok, _} = emqx_authz:update(?CMD_REPLACE, []),
+    Config.
+
+end_per_testcase(TestCase, _Config) when
+    TestCase =:= t_subscribe_deny_disconnect_publishes_last_will_testament;
+    TestCase =:= t_publish_last_will_testament_banned_client_connecting;
+    TestCase =:= t_publish_deny_disconnect_publishes_last_will_testament
+->
+    {ok, _} = emqx:update_config([authorization, deny_action], ignore),
+    {ok, _} = emqx_authz:update(?CMD_REPLACE, []),
+    emqx_common_test_helpers:call_janitor(),
+    ok;
+end_per_testcase(_TestCase, _Config) ->
+    emqx_common_test_helpers:call_janitor(),
+    ok.
+
+t_vars_for_rule_query_peerport(_) ->
+    ClientInfo = #{peername => {{127, 0, 0, 1}, 1883}},
+    ?assertMatch(#{peerport := 1883}, emqx_authz_utils:authz_vars(ClientInfo)),
+    ?assertMatch(
+        #{peerport := 8883},
+        emqx_authz_utils:authz_vars(ClientInfo#{peerport => 8883})
+    ),
+    ?assertMatch(
+        #{peerport := 1883},
+        emqx_authz_utils:vars_for_rule_query(ClientInfo, ?AUTHZ_PUBLISH(?QOS_1, false))
+    ).
+
+t_client_info_acl_expire_uses_restricted_now_time(_) ->
+    Rule = emqx_authz_rule:compile({allow, all, publish, [<<"#">>]}),
+    ClientInfo = emqx_authz_test_lib:base_client_info(),
+    ACL = #{expire => 2, rules => [Rule]},
+    emqx_common_test_helpers:with_security_profile("hardened", fun() ->
+        UnexpiredContext = emqx_authz_context:make(ClientInfo#{acl => ACL, now_time => 1_000}),
+        ?assertEqual(
+            {matched, allow},
+            emqx_authz_client_info:authorize(UnexpiredContext, ?AUTHZ_PUBLISH, <<"t">>, #{})
+        ),
+        ExpiredContext = emqx_authz_context:make(ClientInfo#{acl => ACL, now_time => 3_000}),
+        ?assertEqual(
+            {matched, deny},
+            emqx_authz_client_info:authorize(ExpiredContext, ?AUTHZ_PUBLISH, <<"t">>, #{})
+        )
+    end).
+
+-define(SOURCE_HTTP, #{
+    <<"type">> => <<"http">>,
+    <<"enable">> => true,
+    <<"url">> => <<"https://example.com:443/a/b?c=d">>,
+    <<"headers">> => #{},
+    <<"ssl">> => #{<<"enable">> => true},
+    <<"method">> => <<"get">>,
+    <<"request_timeout">> => <<"5s">>
+}).
+-define(SOURCE_MONGODB, #{
+    <<"type">> => <<"mongodb">>,
+    <<"enable">> => true,
+    <<"mongo_type">> => <<"single">>,
+    <<"server">> => <<"127.0.0.1:27017">>,
+    <<"w_mode">> => <<"unsafe">>,
+    <<"pool_size">> => 1,
+    <<"database">> => <<"mqtt">>,
+    <<"ssl">> => #{<<"enable">> => false},
+    <<"collection">> => <<"authz">>,
+    <<"filter">> => #{<<"a">> => <<"b">>}
+}).
+-define(SOURCE_MYSQL, #{
+    <<"type">> => <<"mysql">>,
+    <<"enable">> => true,
+    <<"server">> => <<"127.0.0.1:27017">>,
+    <<"pool_size">> => 1,
+    <<"database">> => <<"mqtt">>,
+    <<"username">> => <<"xx">>,
+    <<"password">> => <<"ee">>,
+    <<"auto_reconnect">> => true,
+    <<"ssl">> => #{<<"enable">> => false},
+    <<"query">> => <<"abcb">>
+}).
+-define(SOURCE_POSTGRESQL, #{
+    <<"type">> => <<"postgresql">>,
+    <<"enable">> => true,
+    <<"server">> => <<"127.0.0.1:27017">>,
+    <<"pool_size">> => 1,
+    <<"database">> => <<"mqtt">>,
+    <<"username">> => <<"xx">>,
+    <<"password">> => <<"ee">>,
+    <<"auto_reconnect">> => true,
+    <<"ssl">> => #{<<"enable">> => false},
+    <<"query">> => <<"abcb">>
+}).
+-define(SOURCE_REDIS, #{
+    <<"type">> => <<"redis">>,
+    <<"redis_type">> => <<"single">>,
+    <<"enable">> => true,
+    <<"server">> => <<"127.0.0.1:27017">>,
+    <<"pool_size">> => 1,
+    <<"database">> => 0,
+    <<"password">> => <<"ee">>,
+    <<"auto_reconnect">> => true,
+    <<"ssl">> => #{<<"enable">> => false},
+    <<"cmd">> => <<"HGETALL mqtt_authz:", ?PH_USERNAME/binary>>
+}).
+
+-define(SOURCE_FILE(Rules), #{
+    <<"type">> => <<"file">>,
+    <<"enable">> => true,
+    <<"rules">> => Rules
+}).
+
+-define(SOURCE_FILE1,
+    ?SOURCE_FILE(
+        <<
+            "{allow,{username,\"^dashboard?\"},subscribe,[\"$SYS/#\"]}."
+            "\n{allow,{ipaddr,\"127.0.0.1\"},all,[\"$SYS/#\",\"#\"]}."
+        >>
+    )
+).
+-define(SOURCE_FILE2,
+    ?SOURCE_FILE(
+        <<
+            "{allow,{username,\"some_client\"},publish,[\"some_client/lwt\"]}.\n"
+            "{deny, all}."
+        >>
+    )
+).
+
+%% Allow all clients to publish or subscribe to topics with their alias as prefix.
+-define(SOURCE_FILE_CLIENT_ATTR,
+    ?SOURCE_FILE(
+        <<
+            "{allow,all,all,[\"${client_attrs.alias}/#\",\"client_attrs_backup\"]}.\n"
+            "{deny, all}."
+        >>
+    )
+).
+
+-define(SOURCE_FILE_CLIENT_NO_SUCH_ATTR,
+    ?SOURCE_FILE(
+        <<
+            "{allow,all,all,[\"${client_attrs.nonexist}/#\",\"client_attrs_backup\"]}.\n"
+            "{deny, all}."
+        >>
+    )
+).
+
+on_check_authz_complete(ClientInfo, Action, Topic, Result, From, TestPid) ->
+    Ctx = #{
+        clientinfo => ClientInfo,
+        action => Action,
+        topic => Topic,
+        result => Result,
+        from => From
+    },
+    TestPid ! {authz, Ctx},
+    ok.
+
+%%------------------------------------------------------------------------------
+%% Testcases
+%%------------------------------------------------------------------------------
+
+-define(UPDATE_ERROR(Err), {error, {pre_config_update, emqx_authz, Err}}).
+
+t_bad_file_source(_) ->
+    BadContent = ?SOURCE_FILE(<<"{allow,{username,\"bar\"}, publish, [\"test\"]}">>),
+    BadContentErr = {bad_acl_file_content, {1, erl_parse, ["syntax error before: ", []]}},
+    BadRule = ?SOURCE_FILE(<<"{allow,{username,\"bar\"},publish}.">>),
+    BadRuleErr = #{
+        reason => invalid_authorization_rule, value => {allow, {username, "bar"}, publish}
+    },
+    BadPermission = ?SOURCE_FILE(<<"{not_allow,{username,\"bar\"},publish,[\"test\"]}.">>),
+    BadPermissionErr = #{reason => invalid_authorization_permission, value => not_allow},
+    BadAction = ?SOURCE_FILE(<<"{allow,{username,\"bar\"},pubsub,[\"test\"]}.">>),
+    BadActionErr = #{reason => invalid_authorization_action, value => pubsub},
+    lists:foreach(
+        fun({Source, Error}) ->
+            File = emqx_authz_file:acl_conf_file(),
+            ?assertEqual({error, enoent}, file:read_file(File)),
+            ?assertEqual(?UPDATE_ERROR(Error), emqx_authz:update(?CMD_REPLACE, [Source])),
+            ?assertEqual(?UPDATE_ERROR(Error), emqx_authz:update(?CMD_PREPEND, Source)),
+            ?assertEqual(?UPDATE_ERROR(Error), emqx_authz:update(?CMD_APPEND, Source)),
+            %% Check file is not created if update failed;
+            ?assertEqual({error, enoent}, file:read_file(File))
+        end,
+        [
+            {BadContent, BadContentErr},
+            {BadRule, BadRuleErr},
+            {BadPermission, BadPermissionErr},
+            {BadAction, BadActionErr}
+        ]
+    ),
+    ?assertMatch(
+        [],
+        emqx_conf:get([authorization, sources], [])
+    ).
+
+t_good_file_source(_) ->
+    RuleBin = <<"{allow,{username,\"bar\"}, publish, [\"test\"]}.">>,
+    GoodFileSource = ?SOURCE_FILE(RuleBin),
+    File = emqx_authz_file:acl_conf_file(),
+    lists:foreach(
+        fun({Command, Argument}) ->
+            _ = file:delete(File),
+            ?assertMatch({ok, _}, emqx_authz:update(Command, Argument)),
+            ?assertEqual({ok, RuleBin}, file:read_file(File)),
+            {ok, _} = emqx_authz:update(?CMD_REPLACE, [])
+        end,
+        [
+            {?CMD_REPLACE, [GoodFileSource]},
+            {?CMD_PREPEND, GoodFileSource},
+            {?CMD_APPEND, GoodFileSource}
+        ]
+    ).
+
+t_update_source(_) ->
+    %% replace all
+    {ok, _} = emqx_authz:update(?CMD_REPLACE, [?SOURCE_MYSQL]),
+    {ok, _} = emqx_authz:update(?CMD_PREPEND, ?SOURCE_MONGODB),
+    {ok, _} = emqx_authz:update(?CMD_PREPEND, ?SOURCE_HTTP),
+    {ok, _} = emqx_authz:update(?CMD_APPEND, ?SOURCE_POSTGRESQL),
+    {ok, _} = emqx_authz:update(?CMD_APPEND, ?SOURCE_REDIS),
+    {ok, _} = emqx_authz:update(?CMD_APPEND, ?SOURCE_FILE1),
+
+    ?assertMatch(
+        [
+            #{type := http, enable := true},
+            #{type := mongodb, enable := true},
+            #{type := mysql, enable := true},
+            #{type := postgresql, enable := true},
+            #{type := redis, enable := true},
+            #{type := file, enable := true}
+        ],
+        emqx_conf:get([authorization, sources], [])
+    ),
+
+    {ok, _} = emqx_authz:update({?CMD_REPLACE, http}, ?SOURCE_HTTP#{<<"enable">> := true}),
+    {ok, _} = emqx_authz:update({?CMD_REPLACE, mongodb}, ?SOURCE_MONGODB#{<<"enable">> := true}),
+    {ok, _} = emqx_authz:update({?CMD_REPLACE, mysql}, ?SOURCE_MYSQL#{<<"enable">> := true}),
+    {ok, _} = emqx_authz:update({?CMD_REPLACE, postgresql}, ?SOURCE_POSTGRESQL#{
+        <<"enable">> := true
+    }),
+    {ok, _} = emqx_authz:update({?CMD_REPLACE, redis}, ?SOURCE_REDIS#{<<"enable">> := true}),
+    {ok, _} = emqx_authz:update({?CMD_REPLACE, file}, ?SOURCE_FILE1#{<<"enable">> := true}),
+
+    {ok, _} = emqx_authz:update({?CMD_REPLACE, http}, ?SOURCE_HTTP#{<<"enable">> := false}),
+    {ok, _} = emqx_authz:update({?CMD_REPLACE, mongodb}, ?SOURCE_MONGODB#{<<"enable">> := false}),
+    {ok, _} = emqx_authz:update({?CMD_REPLACE, mysql}, ?SOURCE_MYSQL#{<<"enable">> := false}),
+    {ok, _} = emqx_authz:update({?CMD_REPLACE, postgresql}, ?SOURCE_POSTGRESQL#{
+        <<"enable">> := false
+    }),
+    {ok, _} = emqx_authz:update({?CMD_REPLACE, redis}, ?SOURCE_REDIS#{<<"enable">> := false}),
+    {ok, _} = emqx_authz:update({?CMD_REPLACE, file}, ?SOURCE_FILE1#{<<"enable">> := false}),
+
+    ?assertMatch(
+        [
+            #{type := http, enable := false},
+            #{type := mongodb, enable := false},
+            #{type := mysql, enable := false},
+            #{type := postgresql, enable := false},
+            #{type := redis, enable := false},
+            #{type := file, enable := false}
+        ],
+        emqx_conf:get([authorization, sources], [])
+    ),
+    ?assertMatch(
+        [
+            #{type := http, enable := false},
+            #{type := mongodb, enable := false},
+            #{type := mysql, enable := false},
+            #{type := postgresql, enable := false},
+            #{type := redis, enable := false},
+            #{type := file, enable := false}
+        ],
+        emqx_authz:lookup_states()
+    ),
+
+    {ok, _} = emqx_authz:update(?CMD_REPLACE, []).
+
+t_replace_all(_) ->
+    RootKey = [<<"authorization">>],
+    Conf = emqx:get_raw_config(RootKey),
+    ?assertMatch(
+        {ok, _},
+        emqx_authz_utils:update_config(RootKey, Conf#{
+            <<"sources">> => [
+                ?SOURCE_FILE1,
+                ?SOURCE_REDIS,
+                ?SOURCE_POSTGRESQL,
+                ?SOURCE_MYSQL,
+                ?SOURCE_MONGODB,
+                ?SOURCE_HTTP
+            ]
+        })
+    ),
+    %% config
+    ?assertMatch(
+        [
+            #{type := file, enable := true},
+            #{type := redis, enable := true},
+            #{type := postgresql, enable := true},
+            #{type := mysql, enable := true},
+            #{type := mongodb, enable := true},
+            #{type := http, enable := true}
+        ],
+        emqx_conf:get([authorization, sources], [])
+    ),
+    %% hooks status
+    SourceStates = emqx_authz:lookup_states(),
+    ?assertMatch(
+        [
+            #{type := file, enable := true},
+            #{type := redis, enable := true},
+            #{type := postgresql, enable := true},
+            #{type := mysql, enable := true},
+            #{type := mongodb, enable := true},
+            #{type := http, enable := true}
+        ],
+        SourceStates
+    ),
+    ?assert(lists:all(fun(State) -> not maps:is_key(precondition, State) end, SourceStates)),
+    Ids = [http, mongodb, mysql, postgresql, redis, file],
+    %% metrics
+    lists:foreach(
+        fun(Id) ->
+            ?assert(emqx_metrics_worker:has_metrics(authz_metrics, Id), Id)
+        end,
+        Ids
+    ),
+
+    ?assertMatch(
+        {ok, _},
+        emqx_authz_utils:update_config(
+            RootKey,
+            Conf#{<<"sources">> => [?SOURCE_HTTP#{<<"enable">> => false}]}
+        )
+    ),
+    %% hooks status
+    ?assertMatch([#{type := http, enable := false}], emqx_authz:lookup_states()),
+    %% metrics
+    ?assert(emqx_metrics_worker:has_metrics(authz_metrics, http)),
+    lists:foreach(
+        fun(Id) ->
+            ?assertNot(emqx_metrics_worker:has_metrics(authz_metrics, Id), Id)
+        end,
+        Ids -- [http]
+    ),
+    ok.
+
+t_delete_source(_) ->
+    {ok, _} = emqx_authz:update(?CMD_REPLACE, [?SOURCE_HTTP]),
+
+    ?assertMatch([#{type := http, enable := true}], emqx_conf:get([authorization, sources], [])),
+
+    {ok, _} = emqx_authz:update({?CMD_DELETE, http}, #{}),
+
+    ?assertMatch([], emqx_conf:get([authorization, sources], [])).
+
+t_move_source(_) ->
+    {ok, _} = emqx_authz:update(
+        ?CMD_REPLACE,
+        [
+            ?SOURCE_HTTP,
+            ?SOURCE_MONGODB,
+            ?SOURCE_MYSQL,
+            ?SOURCE_POSTGRESQL,
+            ?SOURCE_REDIS,
+            ?SOURCE_FILE1
+        ]
+    ),
+    ?assertMatch(
+        [
+            #{type := http},
+            #{type := mongodb},
+            #{type := mysql},
+            #{type := postgresql},
+            #{type := redis},
+            #{type := file}
+        ],
+        emqx_authz:lookup_states()
+    ),
+
+    {ok, _} = emqx_authz:move(postgresql, ?CMD_MOVE_FRONT),
+    ?assertMatch(
+        [
+            #{type := postgresql},
+            #{type := http},
+            #{type := mongodb},
+            #{type := mysql},
+            #{type := redis},
+            #{type := file}
+        ],
+        emqx_authz:lookup_states()
+    ),
+
+    {ok, _} = emqx_authz:move(http, ?CMD_MOVE_REAR),
+    ?assertMatch(
+        [
+            #{type := postgresql},
+            #{type := mongodb},
+            #{type := mysql},
+            #{type := redis},
+            #{type := file},
+            #{type := http}
+        ],
+        emqx_authz:lookup_states()
+    ),
+
+    {ok, _} = emqx_authz:move(mysql, ?CMD_MOVE_BEFORE(postgresql)),
+    ?assertMatch(
+        [
+            #{type := mysql},
+            #{type := postgresql},
+            #{type := mongodb},
+            #{type := redis},
+            #{type := file},
+            #{type := http}
+        ],
+        emqx_authz:lookup_states()
+    ),
+
+    {ok, _} = emqx_authz:move(mongodb, ?CMD_MOVE_AFTER(http)),
+    ?assertMatch(
+        [
+            #{type := mysql},
+            #{type := postgresql},
+            #{type := redis},
+            #{type := file},
+            #{type := http},
+            #{type := mongodb}
+        ],
+        emqx_authz:lookup_states()
+    ),
+
+    ok.
+
+t_pre_config_update_crash(_) ->
+    ok = meck:new(emqx_authz_fake_source, [non_strict, passthrough, no_history]),
+    ok = meck:expect(emqx_authz_fake_source, write_files, fun(_) -> meck:exception(error, oops) end),
+    ?assertEqual(
+        {error, {pre_config_update, emqx_authz, oops}},
+        emqx_authz:update(?CMD_APPEND, ?SOURCE_HTTP)
+    ),
+    ok = meck:unload(emqx_authz_fake_source).
+
+t_authorizer_crash(Config) ->
+    {ExpectedResult, ExpectedCalls} =
+        case ?config(security_profile, Config) of
+            legacy -> {allow, [http, redis]};
+            hardened -> {deny, [http]}
+        end,
+    {Result, Calls} = authorize_with_crashing_http_and_allowing_redis(),
+    ?assertEqual(ExpectedResult, Result),
+    ?assertEqual(ExpectedCalls, Calls).
+
+-doc """
+Checks that each `ignore_backend_failures` value decides the authorization
+backend-failure outcome in the current security profile.
+""".
+t_authz_backend_failure_setting(Config) ->
+    on_exit(fun() ->
+        {ok, _} = emqx:update_config([authorization, ignore_backend_failures], per_security_profile)
+    end),
+    ProfileDefault =
+        case ?config(security_profile, Config) of
+            legacy -> ignore;
+            hardened -> deny
+        end,
+    lists:foreach(
+        fun({Value, Policy}) ->
+            {ok, _} = emqx:update_config([authorization, ignore_backend_failures], Value),
+            Expected =
+                case Policy of
+                    ignore -> {allow, [http, redis]};
+                    deny -> {deny, [http]}
+                end,
+            ?assertEqual(
+                {Value, Policy}, {Value, emqx_authz_utils:authz_backend_failure_policy()}
+            ),
+            ?assertEqual(
+                {Value, Expected}, {Value, authorize_with_crashing_http_and_allowing_redis()}
+            )
+        end,
+        [{per_security_profile, ProfileDefault}, {true, ignore}, {false, deny}]
+    ).
+
+t_get_enabled_authzs_none_enabled(_Config) ->
+    ?assertEqual([], emqx_authz:get_enabled_authzs()).
+
+t_get_enabled_authzs_some_enabled(_Config) ->
+    {ok, _} = emqx_authz:update(?CMD_REPLACE, [
+        ?SOURCE_POSTGRESQL, ?SOURCE_REDIS#{<<"enable">> := false}
+    ]),
+    ?assertEqual([postgresql], emqx_authz:get_enabled_authzs()).
+
+t_bad_precondition(_) ->
+    Source = ?SOURCE_HTTP#{<<"precondition">> => <<"not a valid precondition">>},
+    ?assertMatch(
+        {error, #{
+            kind := validation_error,
+            matched_type := "authz:http_get",
+            path := "authorization.sources.1.precondition",
+            reason := #{
+                cause := "bad_precondition_expression",
+                expression := <<"not a valid precondition">>
+            }
+        }},
+        emqx_authz:update(?CMD_REPLACE, [Source])
+    ).
+
+t_precondition_render_error_skips_source(_Config) ->
+    Source = ?SOURCE_HTTP#{<<"precondition">> => <<"nth(1, undefined_var)">>},
+    {ok, _} = emqx_authz:update(?CMD_REPLACE, [Source]),
+    ?check_trace(
+        begin
+            ClientInfo = emqx_authz_test_lib:base_client_info(),
+            deny = emqx_access_control:authorize(ClientInfo, ?AUTHZ_PUBLISH, <<"t">>),
+            ok
+        end,
+        fun(Trace) ->
+            ?assertMatch([], ?of_kind(fake_source_authz, Trace)),
+            ?assertMatch(
+                #{counters := #{total := 1, ignore := 1}},
+                emqx_metrics_worker:get_metrics(authz_metrics, http)
+            ),
+            ok
+        end
+    ).
+
+-doc "A source matching deny is logged at warning level with the source type and module.".
+t_source_denied_logged_at_warning(_Config) ->
+    Source = ?SOURCE_FILE(<<"{deny, all}.">>),
+    {ok, _} = emqx_authz:update(?CMD_REPLACE, [Source]),
+    ClientInfo = emqx_authz_test_lib:base_client_info(),
+    Logs = emqx_cth_log_capture:capture(fun() ->
+        deny = emqx_access_control:authorize(ClientInfo, ?AUTHZ_SUBSCRIBE, <<"t">>)
+    end),
+    ?assertMatch(
+        [
+            #{
+                msg := authorization_source_denied,
+                authorize_type := file,
+                module := emqx_authz_file
+            }
+            | _
+        ],
+        [M || #{msg := authorization_source_denied} = M <- Logs]
+    ).
+
+t_precondition_skips_source(_Config) ->
+    ClientInfo = #{
+        username => <<"u">>,
+        clientid => <<"c">>,
+        listener => <<"tcp:default">>,
+        client_attrs => #{<<"biz">> => <<"device">>},
+        is_superuser => false
+    },
+    HttpSource = ?SOURCE_HTTP#{<<"precondition">> => <<"str_eq(client_attrs.biz, 'order')">>},
+    RedisSource = ?SOURCE_REDIS#{<<"precondition">> => <<"str_eq(client_attrs.biz, 'device')">>},
+    {ok, _} = emqx_authz:update(?CMD_REPLACE, [HttpSource, RedisSource]),
+    ?check_trace(
+        begin
+            deny = emqx_access_control:authorize(ClientInfo, ?AUTHZ_PUBLISH, <<"t">>),
+            ok
+        end,
+        fun(Trace) ->
+            ?assertMatch(
+                [
+                    #{src := #{type := redis}}
+                ],
+                ?of_kind(fake_source_authz, Trace)
+            ),
+            ok
+        end
+    ).
+
+t_precondition_request_vars(_Config) ->
+    ClientInfo = #{
+        username => <<"u">>,
+        clientid => <<"c">>,
+        listener => <<"tcp:default">>,
+        client_attrs => #{<<"biz">> => <<"device">>},
+        is_superuser => false
+    },
+    TopicSource = ?SOURCE_HTTP#{
+        <<"precondition">> => <<"topic_match(topic, topic_join([clientid, '#']))">>
+    },
+    {ok, _} = emqx_authz:update(?CMD_REPLACE, [TopicSource]),
+    ?check_trace(
+        begin
+            deny = emqx_access_control:authorize(ClientInfo, ?AUTHZ_PUBLISH, <<"c/t">>),
+            deny = emqx_access_control:authorize(ClientInfo, ?AUTHZ_PUBLISH, <<"other/t">>),
+            ok
+        end,
+        fun(Trace) ->
+            ?assertMatch([_], ?of_kind(fake_source_authz, Trace)),
+            ok
+        end
+    ),
+    ActionSource = ?SOURCE_HTTP#{<<"precondition">> => <<"str_eq(action, 'publish')">>},
+    {ok, _} = emqx_authz:update(?CMD_REPLACE, [ActionSource]),
+    ?check_trace(
+        begin
+            deny = emqx_access_control:authorize(ClientInfo, ?AUTHZ_PUBLISH, <<"t">>),
+            deny = emqx_access_control:authorize(ClientInfo, ?AUTHZ_SUBSCRIBE, <<"c/t">>),
+            ok
+        end,
+        fun(Trace) ->
+            ?assertMatch([_], ?of_kind(fake_source_authz, Trace)),
+            ok
+        end
+    ).
+
+t_precondition_qos_is_not_available(_Config) ->
+    Source = ?SOURCE_HTTP#{<<"precondition">> => <<"num_eq(qos, 1)">>},
+    {ok, _} = emqx_authz:update(?CMD_REPLACE, [Source]),
+    ?check_trace(
+        begin
+            ClientInfo = emqx_authz_test_lib:base_client_info(),
+            deny = emqx_access_control:authorize(ClientInfo, ?AUTHZ_PUBLISH(?QOS_1), <<"t">>),
+            ok
+        end,
+        fun(Trace) ->
+            ?assertMatch([], ?of_kind(fake_source_authz, Trace)),
+            ok
+        end
+    ).
+
+t_subscribe_deny_disconnect_publishes_last_will_testament(_Config) ->
+    {ok, _} = emqx_authz:update(?CMD_REPLACE, [?SOURCE_FILE2]),
+    {ok, C} = emqtt:start_link([
+        {username, <<"some_client">>},
+        {will_topic, <<"some_client/lwt">>},
+        {will_payload, <<"should be published">>}
+    ]),
+    {ok, _} = emqtt:connect(C),
+    ok = emqx:subscribe(<<"some_client/lwt">>),
+    process_flag(trap_exit, true),
+
+    try
+        emqtt:subscribe(C, <<"unauthorized">>),
+        error(should_have_disconnected)
+    catch
+        exit:{{shutdown, tcp_closed}, _} ->
+            ok
+    end,
+
+    receive
+        {deliver, <<"some_client/lwt">>, #message{payload = <<"should be published">>}} ->
+            ok
+    after 2_000 ->
+        error(lwt_not_published)
+    end,
+
+    ok.
+
+t_publish_deny_disconnect_publishes_last_will_testament(_Config) ->
+    {ok, _} = emqx_authz:update(?CMD_REPLACE, [?SOURCE_FILE2]),
+    {ok, C} = emqtt:start_link([
+        {username, <<"some_client">>},
+        {will_topic, <<"some_client/lwt">>},
+        {will_payload, <<"should be published">>}
+    ]),
+    {ok, _} = emqtt:connect(C),
+    ok = emqx:subscribe(<<"some_client/lwt">>),
+    process_flag(trap_exit, true),
+
+    %% disconnect is async
+    Ref = monitor(process, C),
+    emqtt:publish(C, <<"some/topic">>, <<"unauthorized">>),
+    receive
+        {'DOWN', Ref, process, C, _} ->
+            ok
+    after 1_000 ->
+        error(client_should_have_been_disconnected)
+    end,
+    receive
+        {deliver, <<"some_client/lwt">>, #message{payload = <<"should be published">>}} ->
+            ok
+    after 2_000 ->
+        error(lwt_not_published)
+    end,
+
+    ok.
+
+t_publish_last_will_testament_denied_topic(_Config) ->
+    {ok, C} = emqtt:start_link([
+        {will_topic, <<"$SYS/lwt">>},
+        {will_payload, <<"should not be published">>}
+    ]),
+    {ok, _} = emqtt:connect(C),
+    ok = emqx:subscribe(<<"$SYS/lwt">>),
+    unlink(C),
+    ok = snabbkaffe:start_trace(),
+    {true, {ok, _}} = ?wait_async_action(
+        exit(C, kill),
+        #{?snk_kind := last_will_testament_publish_denied},
+        1_000
+    ),
+    ok = snabbkaffe:stop(),
+
+    receive
+        {deliver, <<"$SYS/lwt">>, #message{payload = <<"should not be published">>}} ->
+            error(lwt_should_not_be_published_to_forbidden_topic)
+    after 1_000 ->
+        ok
+    end,
+
+    ok.
+
+t_alias_prefix(Config) ->
+    {ok, _} = emqx_authz:update(?CMD_REPLACE, [?SOURCE_FILE_CLIENT_ATTR]),
+    %% '^.*-(.*)$': extract the suffix after the last '-'
+    {ok, Compiled} = emqx_variform:compile("concat(regex_extract(clientid,'^.*-(.*)$'))"),
+    emqx_config:put_zone_conf(default, [mqtt, client_attrs_init], [
+        #{
+            expression => Compiled,
+            set_as_attr => <<"alias">>
+        }
+    ]),
+    ClientId = <<"org1-name2">>,
+    SubTopic = <<"name2/#">>,
+    SubTopicNotAllowed = <<"name3/#">>,
+    {ok, C} = emqtt:start_link([{clientid, ClientId}, {proto_ver, v5}]),
+    ?assertMatch({ok, _}, emqtt:connect(C)),
+    ?assertMatch({ok, _, [?RC_SUCCESS]}, emqtt:subscribe(C, SubTopic)),
+    ?assertMatch({ok, _, [?RC_NOT_AUTHORIZED]}, emqtt:subscribe(C, SubTopicNotAllowed)),
+    ?assertMatch({ok, _, [?RC_NOT_AUTHORIZED]}, emqtt:subscribe(C, <<"/#">>)),
+    unlink(C),
+    emqtt:stop(C),
+    NonMatching = <<"clientid_which_has_no_dash">>,
+    {ok, C2} = emqtt:start_link([{clientid, NonMatching}, {proto_ver, v5}]),
+    ?assertMatch({ok, _}, emqtt:connect(C2)),
+    ExpectedBackupCode = expected_backup_code(Config),
+    ?assertMatch(
+        {ok, _, [ExpectedBackupCode]},
+        emqtt:subscribe(C2, <<"client_attrs_backup">>)
+    ),
+    %% assert '${client_attrs.alias}/#' is not rendered as '/#'
+    ?assertMatch({ok, _, [?RC_NOT_AUTHORIZED]}, emqtt:subscribe(C2, <<"/#">>)),
+    unlink(C2),
+    emqtt:stop(C2),
+    emqx_config:put_zone_conf(default, [mqtt, client_attrs_init], []),
+    ok.
+
+t_non_existing_attr(Config) ->
+    {ok, _} = emqx_authz:update(?CMD_REPLACE, [?SOURCE_FILE_CLIENT_NO_SUCH_ATTR]),
+    %% '^.*-(.*)$': extract the suffix after the last '-'
+    {ok, Compiled} = emqx_variform:compile("concat(regex_extract(clientid,'^.*-(.*)$'))"),
+    emqx_config:put_zone_conf(default, [mqtt, client_attrs_init], [
+        #{
+            expression => Compiled,
+            %% this is intended to be different from 'nonexist'
+            set_as_attr => <<"existing">>
+        }
+    ]),
+    ClientId = <<"org1-name3">>,
+    {ok, C} = emqtt:start_link([{clientid, ClientId}, {proto_ver, v5}]),
+    ?assertMatch({ok, _}, emqtt:connect(C)),
+    ExpectedBackupCode = expected_backup_code(Config),
+    ?assertMatch(
+        {ok, _, [ExpectedBackupCode]},
+        emqtt:subscribe(C, <<"client_attrs_backup">>)
+    ),
+    %% assert '${client_attrs.nonexist}/#' is not rendered as '/#'
+    ?assertMatch({ok, _, [?RC_NOT_AUTHORIZED]}, emqtt:subscribe(C, <<"/#">>)),
+    unlink(C),
+    emqtt:stop(C),
+    ok.
+
+%% client is allowed by ACL to publish to its LWT topic, is connected,
+%% and then gets banned and kicked out while connected.  Should not
+%% publish LWT.
+t_publish_last_will_testament_banned_client_connecting(_Config) ->
+    {ok, _} = emqx_authz:update(?CMD_REPLACE, [?SOURCE_FILE2]),
+    Username = <<"some_client">>,
+    ClientId = <<"some_clientid">>,
+    LWTPayload = <<"should not be published">>,
+    LWTTopic = <<"some_client/lwt">>,
+    ok = emqx:subscribe(<<"some_client/lwt">>),
+    {ok, C} = emqtt:start_link([
+        {clientid, ClientId},
+        {username, Username},
+        {will_topic, LWTTopic},
+        {will_payload, LWTPayload}
+    ]),
+    ?assertMatch({ok, _}, emqtt:connect(C)),
+
+    %% Now we ban the client while it is connected.
+    Now = erlang:system_time(second),
+    Who = emqx_banned:who(username, Username),
+    emqx_banned:create(#{
+        who => Who,
+        by => <<"test">>,
+        reason => <<"test">>,
+        at => Now,
+        until => Now + 120
+    }),
+    on_exit(fun() -> emqx_banned:delete(Who) end),
+    %% Now kick it as we do in the ban API.
+    process_flag(trap_exit, true),
+    ?check_trace(
+        begin
+            ok = emqx_cm:kick_session(ClientId),
+            receive
+                {deliver, LWTTopic, #message{payload = LWTPayload}} ->
+                    error(lwt_should_not_be_published_to_forbidden_topic)
+            after 2_000 -> ok
+            end,
+            ok
+        end,
+        fun(Trace) ->
+            ?assertMatch(
+                [
+                    #{
+                        client_banned := true,
+                        publishing_disallowed := false
+                    }
+                ],
+                ?of_kind(last_will_testament_publish_denied, Trace)
+            ),
+            ok
+        end
+    ),
+    ok = snabbkaffe:stop(),
+
+    ok.
+
+t_skipped_as_superuser(_Config) ->
+    ClientInfo = #{
+        clientid => <<"clientid">>,
+        username => <<"username">>,
+        peerhost => {127, 0, 0, 1},
+        zone => default,
+        listener => 'tcp:default',
+        is_superuser => true
+    },
+    AuthzContext = emqx_authz_context:make(ClientInfo),
+    ?check_trace(
+        begin
+            ?assertEqual(
+                allow,
+                emqx_access_control:authorize(
+                    AuthzContext, ?AUTHZ_PUBLISH(?QOS_0), <<"p/t/0">>
+                )
+            ),
+            ?assertEqual(
+                allow,
+                emqx_access_control:authorize(
+                    AuthzContext, ?AUTHZ_PUBLISH(?QOS_1), <<"p/t/1">>
+                )
+            ),
+            ?assertEqual(
+                allow,
+                emqx_access_control:authorize(
+                    AuthzContext, ?AUTHZ_PUBLISH(?QOS_2), <<"p/t/2">>
+                )
+            ),
+            ?assertEqual(
+                allow,
+                emqx_access_control:authorize(
+                    AuthzContext, ?AUTHZ_SUBSCRIBE(?QOS_0), <<"s/t/0">>
+                )
+            ),
+            ?assertEqual(
+                allow,
+                emqx_access_control:authorize(
+                    AuthzContext, ?AUTHZ_SUBSCRIBE(?QOS_1), <<"s/t/1">>
+                )
+            ),
+            ?assertEqual(
+                allow,
+                emqx_access_control:authorize(
+                    AuthzContext, ?AUTHZ_SUBSCRIBE(?QOS_2), <<"s/t/2">>
+                )
+            )
+        end,
+        fun(Trace) ->
+            ?assertMatch(
+                [
+                    #{
+                        reason := client_is_superuser,
+                        action := #{qos := ?QOS_0, action_type := publish}
+                    },
+                    #{
+                        reason := client_is_superuser,
+                        action := #{qos := ?QOS_1, action_type := publish}
+                    },
+                    #{
+                        reason := client_is_superuser,
+                        action := #{qos := ?QOS_2, action_type := publish}
+                    },
+                    #{
+                        reason := client_is_superuser,
+                        action := #{qos := ?QOS_0, action_type := subscribe}
+                    },
+                    #{
+                        reason := client_is_superuser,
+                        action := #{qos := ?QOS_1, action_type := subscribe}
+                    },
+                    #{
+                        reason := client_is_superuser,
+                        action := #{qos := ?QOS_2, action_type := subscribe}
+                    }
+                ],
+                ?of_kind(authz_skipped, Trace)
+            ),
+            ok
+        end
+    ),
+
+    ok = snabbkaffe:stop().
+
+-doc """
+Verifies that, when we set `authorization.include_mountpoint = true`, then authorization
+backends evaluate the original topics prefixed by `mountpoint`.
+""".
+t_mount_prefix_for_authz(_TCConfig) ->
+    Mountpoint = <<"mountpoint/">>,
+    ClientInfo = #{
+        clientid => <<"clientid">>,
+        username => <<"username">>,
+        peerhost => {127, 0, 0, 1},
+        zone => default,
+        listener => 'tcp:default',
+        mountpoint => Mountpoint,
+        is_superuser => false
+    },
+    on_exit(fun() ->
+        {ok, _} = emqx:update_config([authorization, include_mountpoint], false),
+        {ok, _} = emqx:remove_config([listeners, tcp, default, mountpoint]),
+        emqx_hooks:del('client.check_authz_complete', {?MODULE, on_check_authz_complete})
+    end),
+    {ok, _} = emqx:update_config([authorization, include_mountpoint], true),
+    {ok, _} = emqx:update_config([listeners, tcp, default, mountpoint], Mountpoint),
+    emqx_hooks:add(
+        'client.check_authz_complete',
+        {?MODULE, on_check_authz_complete, [self()]},
+        ?HP_LOWEST
+    ),
+    {ok, _} = emqx_authz:update(?CMD_REPLACE, [?SOURCE_MYSQL]),
+    Username = <<"imauser">>,
+    {ok, C1} = emqtt:start_link(),
+    {ok, _} = emqtt:connect(C1),
+    Topic1 = <<"t/1">>,
+    MountedTopic1 = emqx_mountpoint:mount(Mountpoint, Topic1),
+    Topic2 = <<"t/2">>,
+    MountedTopic2 = emqx_mountpoint:mount(Mountpoint, Topic2),
+    Topic3 = <<"t/3">>,
+    MountedTopic3 = emqx_mountpoint:mount(Mountpoint, Topic3),
+    Topic4 = <<"t/4">>,
+    MountedTopic4 = <<Username/binary, "/", Topic4/binary>>,
+    ?check_trace(
+        begin
+            emqx_access_control:authorize(
+                emqx_authz_context:make(ClientInfo), ?AUTHZ_SUBSCRIBE(?QOS_2), Topic1
+            ),
+            ?assertReceive({authz, #{topic := MountedTopic1}}),
+            %% Check that real client works
+            _ = emqtt:subscribe(C1, Topic2, [{qos, 1}]),
+            ?assertReceive({authz, #{topic := MountedTopic2}}),
+            _ = emqtt:publish(C1, Topic3, <<"hey">>, [{qos, 1}]),
+            ?assertReceive({authz, #{topic := MountedTopic3}}),
+            %% Check that templating works
+            {ok, _} = emqx:update_config([listeners, tcp, default, mountpoint], <<"${username}/">>),
+            {ok, C2} = emqtt:start_link(#{username => Username}),
+            {ok, _} = emqtt:connect(C2),
+            _ = emqtt:publish(C2, Topic4, <<"hey">>, [{qos, 1}]),
+            ?assertReceive({authz, #{topic := MountedTopic4}}),
+            emqtt:stop(C2),
+            %% Disable config
+            {ok, _} = emqx:update_config([authorization, include_mountpoint], false),
+            _ = emqtt:publish(C1, <<"t/3">>, <<"hey">>, [{qos, 1}]),
+            ?assertReceive({authz, #{topic := Topic3}}),
+            emqtt:stop(C1),
+            ok
+        end,
+        fun(Trace) ->
+            %% Backend receives the mounted topic
+            ?assertMatch(
+                [
+                    #{action := #{action_type := subscribe}, topic := MountedTopic1},
+                    #{action := #{action_type := subscribe}, topic := MountedTopic2},
+                    #{action := #{action_type := publish}, topic := MountedTopic3},
+                    #{action := #{action_type := publish}, topic := MountedTopic4},
+                    #{action := #{action_type := publish}, topic := Topic3}
+                ],
+                ?of_kind(fake_source_authz, Trace)
+            ),
+            ok
+        end
+    ),
+    snabbkaffe:stop(),
+    ok.
+
+authorize_with_crashing_http_and_allowing_redis() ->
+    TestPid = self(),
+    Ref = make_ref(),
+    ok = meck:new(emqx_authz_fake_source, [passthrough]),
+    try
+        ok = meck:expect(
+            emqx_authz_fake_source,
+            authorize,
+            fun
+                (_Client, _Action, _Topic, #{type := http}) ->
+                    TestPid ! {Ref, http},
+                    error(fake_authz_crash);
+                (_Client, _Action, _Topic, #{type := redis}) ->
+                    TestPid ! {Ref, redis},
+                    {matched, allow};
+                (Client, Action, Topic, Source) ->
+                    meck:passthrough([Client, Action, Topic, Source])
+            end
+        ),
+        {ok, _} = emqx_authz:update(?CMD_REPLACE, [?SOURCE_HTTP, ?SOURCE_REDIS]),
+        Result = emqx_access_control:authorize(
+            emqx_authz_context:make(emqx_authz_test_lib:base_client_info()),
+            ?AUTHZ_PUBLISH,
+            <<"t">>
+        ),
+        {Result, collect_authz_calls(Ref)}
+    after
+        ok = meck:unload(emqx_authz_fake_source)
+    end.
+
+profile_cases() ->
+    [
+        t_authorizer_crash,
+        t_authz_backend_failure_setting,
+        t_alias_prefix,
+        t_non_existing_attr
+    ].
+
+expected_backup_code(Config) ->
+    case ?config(security_profile, Config) of
+        legacy -> ?RC_SUCCESS;
+        hardened -> ?RC_NOT_AUTHORIZED
+    end.
+
+collect_authz_calls(Ref) ->
+    collect_authz_calls(Ref, []).
+
+collect_authz_calls(Ref, Acc) ->
+    receive
+        {Ref, Type} ->
+            collect_authz_calls(Ref, [Type | Acc])
+    after 0 ->
+        lists:reverse(Acc)
+    end.

@@ -1,0 +1,130 @@
+emqx_dashboard_sso_api {
+
+list_running.desc:
+"""List all running SSO backends"""
+list_running.label:
+"""Running Backends"""
+
+get_sso.desc:
+"""List all SSO backends"""
+get_sso.label:
+"""SSO Backends"""
+
+login.desc:
+"""Get Dashboard Auth Token."""
+login.label:
+"""Get Dashboard Auth Token"""
+
+get_backend.desc:
+"""Get details of a backend"""
+get_backend.label:
+"""Backend Details"""
+
+update_backend.desc:
+"""Update a backend"""
+update_backend.label:
+"""Update Backend"""
+
+delete_backend.desc:
+"""Delete a backend"""
+delete_backend.label:
+"""Delete Backend"""
+
+saml_sso_acs.desc:
+"""SAML SSO ACS URL"""
+
+sp_saml_metadata.desc:
+"""SP SAML Metadata"""
+
+redirect.desc:
+"""Redirect to IDP SSO login page"""
+
+login_failed401.desc:
+"""Login failed. Bad username or password"""
+
+backend_not_found.desc:
+"""Operate failed. Backend not exists"""
+
+backend_name.desc:
+"""Backend name"""
+
+backend_name.label:
+"""Backend Name"""
+
+running.desc:
+"""Is the backend running"""
+
+running.label:
+"""Running"""
+
+last_error.desc:
+"""Last error of this backend"""
+
+last_error.label:
+"""Last Error"""
+
+saml_sso_acs.label:
+"""SAML SSO ACS"""
+
+sp_saml_metadata.label:
+"""SP SAML Metadata"""
+
+
+
+backend_name_in_qs.desc:
+"""SSO backend name from query string."""
+backend_name_in_qs.label:
+"""Backend Name (Query)"""
+
+token_exchange.desc:
+"""Exchange a one-time SSO code for the actual login result (JWT token or MFA metadata). The code is consumed after a single use."""
+
+token_exchange.label:
+"""SSO Token Exchange"""
+
+bad_request.desc:
+"""Bad request. Invalid or expired SSO code."""
+
+sso_username.desc:
+"""SSO username from login metadata."""
+
+sso_username.label:
+"""SSO Username"""
+
+sso_backend.desc:
+"""SSO backend type (e.g. saml, oidc)."""
+
+sso_backend.label:
+"""SSO Backend"""
+
+mfa_action_setup.desc:
+"""MFA action indicator: mfa_setup. Returned by SSO login when the user must complete TOTP setup before issuing a session JWT."""
+mfa_action_setup.label:
+"""MFA Action: Setup"""
+
+mfa_action_verify.desc:
+"""MFA action indicator: mfa_verify. Returned by SSO login when the user must verify a TOTP code before issuing a session JWT."""
+mfa_action_verify.label:
+"""MFA Action: Verify"""
+
+setup_token_response.desc:
+"""Temporary setup token for MFA binding. Single-use, short-lived (5 minutes)."""
+setup_token_response.label:
+"""Setup Token"""
+
+verify_token_response.desc:
+"""Temporary verify token for MFA verification. Single-use, short-lived (5 minutes)."""
+verify_token_response.label:
+"""Verify Token"""
+
+mfa_mechanism.desc:
+"""MFA mechanism type. Currently only `totp` is supported."""
+mfa_mechanism.label:
+"""MFA Mechanism"""
+
+sso_code.desc:
+"""One-time SSO code obtained from the IdP redirect callback. Single-use; consumed by token exchange."""
+sso_code.label:
+"""SSO Code"""
+
+}

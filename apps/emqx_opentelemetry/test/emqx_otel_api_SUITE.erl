@@ -1,0 +1,446 @@
+%%--------------------------------------------------------------------
+%% Copyright (c) 2020-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
+%%--------------------------------------------------------------------
+-module(emqx_otel_api_SUITE).
+
+-compile(export_all).
+-compile(nowarn_export_all).
+
+-include_lib("eunit/include/eunit.hrl").
+-include_lib("common_test/include/ct.hrl").
+-include_lib("snabbkaffe/include/snabbkaffe.hrl").
+
+-define(OTEL_API_PATH, emqx_mgmt_api_test_util:api_path(["opentelemetry"])).
+-define(CONF_PATH, [opentelemetry]).
+-define(MASKED_EXPORTER_CONF, #{
+    <<"exporter">> := #{
+        <<"headers">> := #{<<"Authorization">> := <<"******">>},
+        <<"ssl_options">> := #{<<"password">> := <<"******">>}
+    }
+}).
+
+-define(CACERT, <<
+    "-----BEGIN CERTIFICATE-----\n"
+    "MIIDUTCCAjmgAwIBAgIJAPPYCjTmxdt/MA0GCSqGSIb3DQEBCwUAMD8xCzAJBgNV\n"
+    "BAYTAkNOMREwDwYDVQQIDAhoYW5nemhvdTEMMAoGA1UECgwDRU1RMQ8wDQYDVQQD\n"
+    "DAZSb290Q0EwHhcNMjAwNTA4MDgwNjUyWhcNMzAwNTA2MDgwNjUyWjA/MQswCQYD\n"
+    "VQQGEwJDTjERMA8GA1UECAwIaGFuZ3pob3UxDDAKBgNVBAoMA0VNUTEPMA0GA1UE\n"
+    "AwwGUm9vdENBMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAzcgVLex1\n"
+    "EZ9ON64EX8v+wcSjzOZpiEOsAOuSXOEN3wb8FKUxCdsGrsJYB7a5VM/Jot25Mod2\n"
+    "juS3OBMg6r85k2TWjdxUoUs+HiUB/pP/ARaaW6VntpAEokpij/przWMPgJnBF3Ur\n"
+    "MjtbLayH9hGmpQrI5c2vmHQ2reRZnSFbY+2b8SXZ+3lZZgz9+BaQYWdQWfaUWEHZ\n"
+    "uDaNiViVO0OT8DRjCuiDp3yYDj3iLWbTA/gDL6Tf5XuHuEwcOQUrd+h0hyIphO8D\n"
+    "tsrsHZ14j4AWYLk1CPA6pq1HIUvEl2rANx2lVUNv+nt64K/Mr3RnVQd9s8bK+TXQ\n"
+    "KGHd2Lv/PALYuwIDAQABo1AwTjAdBgNVHQ4EFgQUGBmW+iDzxctWAWxmhgdlE8Pj\n"
+    "EbQwHwYDVR0jBBgwFoAUGBmW+iDzxctWAWxmhgdlE8PjEbQwDAYDVR0TBAUwAwEB\n"
+    "/zANBgkqhkiG9w0BAQsFAAOCAQEAGbhRUjpIred4cFAFJ7bbYD9hKu/yzWPWkMRa\n"
+    "ErlCKHmuYsYk+5d16JQhJaFy6MGXfLgo3KV2itl0d+OWNH0U9ULXcglTxy6+njo5\n"
+    "CFqdUBPwN1jxhzo9yteDMKF4+AHIxbvCAJa17qcwUKR5MKNvv09C6pvQDJLzid7y\n"
+    "E2dkgSuggik3oa0427KvctFf8uhOV94RvEDyqvT5+pgNYZ2Yfga9pD/jjpoHEUlo\n"
+    "88IGU8/wJCx3Ds2yc8+oBg/ynxG8f/HmCC1ET6EHHoe2jlo8FpU/SgGtghS1YL30\n"
+    "IWxNsPrUP+XsZpBJy/mvOhE5QXo6Y35zDqqj8tI7AGmAWu22jg==\n"
+    "-----END CERTIFICATE-----"
+>>).
+
+all() ->
+    emqx_common_test_helpers:all(?MODULE).
+
+init_per_suite(Config) ->
+    %% This is called by emqx_machine in EMQX release
+    emqx_otel_app:configure_otel_deps(),
+    Apps = emqx_cth_suite:start(
+        [
+            emqx_conf,
+            emqx_management,
+            emqx_mgmt_api_test_util:emqx_dashboard(),
+            emqx_opentelemetry
+        ],
+        #{work_dir => emqx_cth_suite:work_dir(Config)}
+    ),
+    Auth = auth_header(),
+    [{suite_apps, Apps}, {auth, Auth} | Config].
+
+end_per_suite(Config) ->
+    emqx_cth_suite:stop(?config(suite_apps, Config)),
+    emqx_config:delete_override_conf_files(),
+    ok.
+
+init_per_testcase(_TC, Config) ->
+    emqx_conf:update(
+        ?CONF_PATH,
+        #{
+            <<"traces">> => #{<<"enable">> => false},
+            <<"metrics">> => #{<<"enable">> => false},
+            <<"logs">> => #{<<"enable">> => false}
+        },
+        #{}
+    ),
+    Config.
+
+end_per_testcase(_TC, _Config) ->
+    ok.
+
+auth_header() ->
+    {ok, API} = emqx_common_test_http:create_default_app(),
+    emqx_common_test_http:auth_header(API).
+
+update_config(Config) ->
+    URL = emqx_mgmt_api_test_util:uri(["opentelemetry"]),
+    emqx_mgmt_api_test_util:simple_request(#{
+        method => put,
+        url => URL,
+        body => Config
+    }).
+
+get_config() ->
+    URL = emqx_mgmt_api_test_util:uri(["opentelemetry"]),
+    emqx_mgmt_api_test_util:simple_request(#{
+        method => get,
+        url => URL
+    }).
+
+t_get(Config) ->
+    Auth = ?config(auth, Config),
+    Path = ?OTEL_API_PATH,
+    {ok, Resp} = emqx_mgmt_api_test_util:request_api(get, Path, Auth),
+    ?assertMatch(
+        #{
+            <<"traces">> := #{<<"enable">> := false},
+            <<"metrics">> := #{<<"enable">> := false},
+            <<"logs">> := #{<<"enable">> := false}
+        },
+        emqx_utils_json:decode(Resp)
+    ).
+
+t_put_enable_disable(Config) ->
+    Auth = ?config(auth, Config),
+    Path = ?OTEL_API_PATH,
+    EnableAllReq = #{
+        <<"traces">> => #{<<"enable">> => true},
+        <<"metrics">> => #{<<"enable">> => true},
+        <<"logs">> => #{<<"enable">> => true}
+    },
+    ?assertMatch({ok, _}, emqx_mgmt_api_test_util:request_api(put, Path, "", Auth, EnableAllReq)),
+    ?assertMatch(
+        #{
+            traces := #{enable := true},
+            metrics := #{enable := true},
+            logs := #{enable := true}
+        },
+        emqx:get_config(?CONF_PATH)
+    ),
+
+    DisableAllReq = #{
+        <<"traces">> => #{<<"enable">> => false},
+        <<"metrics">> => #{<<"enable">> => false},
+        <<"logs">> => #{<<"enable">> => false}
+    },
+    ?assertMatch({ok, _}, emqx_mgmt_api_test_util:request_api(put, Path, "", Auth, DisableAllReq)),
+    ?assertMatch(
+        #{
+            traces := #{enable := false},
+            metrics := #{enable := false},
+            logs := #{enable := false}
+        },
+        emqx:get_config(?CONF_PATH)
+    ).
+
+t_put_invalid(Config) ->
+    Auth = ?config(auth, Config),
+    Path = ?OTEL_API_PATH,
+
+    ?assertMatch(
+        {error, {_, 400, _}},
+        emqx_mgmt_api_test_util:request_api(put, Path, "", Auth, #{
+            <<"exporter">> => #{<<"endpoint">> => <<>>}
+        })
+    ),
+    ?assertMatch(
+        {error, {_, 400, _}},
+        emqx_mgmt_api_test_util:request_api(put, Path, "", Auth, #{
+            <<"exporter">> => #{<<"endpoint">> => <<"unknown://somehost.org">>}
+        })
+    ),
+    ?assertMatch(
+        {error, {_, 400, _}},
+        emqx_mgmt_api_test_util:request_api(put, Path, "", Auth, #{
+            <<"exporter">> => #{<<"endpoint">> => <<"https://somehost.org:99999">>}
+        })
+    ),
+    ?assertMatch(
+        {error, {_, 400, _}},
+        emqx_mgmt_api_test_util:request_api(put, Path, "", Auth, #{
+            <<"exporter">> => #{<<"endpoint">> => <<"https://somehost.org:99999">>}
+        })
+    ),
+    %% no port
+    ?assertMatch(
+        {error, {_, 400, _}},
+        emqx_mgmt_api_test_util:request_api(put, Path, "", Auth, #{
+            <<"exporter">> => #{<<"endpoint">> => <<"https://localhost">>}
+        })
+    ),
+    %% no scheme nor port
+    ?assertMatch(
+        {error, {_, 400, _}},
+        emqx_mgmt_api_test_util:request_api(put, Path, "", Auth, #{
+            <<"exporter">> => #{<<"endpoint">> => <<"localhost">>}
+        })
+    ),
+    %% no scheme
+    ?assertMatch(
+        {error, {_, 400, _}},
+        emqx_mgmt_api_test_util:request_api(put, Path, "", Auth, #{
+            <<"exporter">> => #{<<"endpoint">> => <<"localhost:443">>}
+        })
+    ),
+    ?assertMatch(
+        {error, {_, 400, _}},
+        emqx_mgmt_api_test_util:request_api(put, Path, "", Auth, #{
+            <<"exporter">> => #{<<"unknown_field">> => <<"foo">>}
+        })
+    ),
+    ?assertMatch(
+        {error, {_, 400, _}},
+        emqx_mgmt_api_test_util:request_api(put, Path, "", Auth, #{
+            <<"exporter">> => #{<<"protocol">> => <<"unknown">>}
+        })
+    ),
+    ?assertMatch(
+        {error, {_, 400, _}},
+        emqx_mgmt_api_test_util:request_api(put, Path, "", Auth, #{
+            <<"traces">> => #{<<"filter">> => #{<<"unknown_filter">> => <<"foo">>}}
+        })
+    ),
+    ?assertMatch(
+        {error, {_, 400, _}},
+        emqx_mgmt_api_test_util:request_api(put, Path, "", Auth, #{
+            <<"logs">> => #{<<"level">> => <<"foo">>}
+        })
+    ),
+    ?assertMatch(
+        {error, {_, 400, _}},
+        emqx_mgmt_api_test_util:request_api(put, Path, "", Auth, #{
+            <<"metrics">> => #{<<"interval">> => <<"foo">>}
+        })
+    ),
+    ?assertMatch(
+        {error, {_, 400, _}},
+        emqx_mgmt_api_test_util:request_api(put, Path, "", Auth, #{
+            <<"logs">> => #{<<"unknown_field">> => <<"foo">>}
+        })
+    ),
+    ?assertMatch(
+        {error, {_, 400, _}},
+        emqx_mgmt_api_test_util:request_api(put, Path, "", Auth, #{<<"unknown_field">> => <<"foo">>})
+    ).
+
+t_put_valid(Config) ->
+    Auth = ?config(auth, Config),
+    Path = ?OTEL_API_PATH,
+
+    ?assertMatch(
+        {ok, _},
+        emqx_mgmt_api_test_util:request_api(put, Path, "", Auth, #{
+            <<"exporter">> => #{<<"endpoint">> => <<"http://nohost.com:80/">>}
+        })
+    ),
+    ?assertEqual(<<"http://nohost.com:80/">>, emqx:get_config(?CONF_PATH ++ [exporter, endpoint])),
+
+    ?assertMatch(
+        {ok, _}, emqx_mgmt_api_test_util:request_api(put, Path, "", Auth, #{<<"exporter">> => #{}})
+    ),
+    ?assertMatch({ok, _}, emqx_mgmt_api_test_util:request_api(put, Path, "", Auth, #{})),
+    ?assertMatch(
+        {ok, _}, emqx_mgmt_api_test_util:request_api(put, Path, "", Auth, #{<<"traces">> => #{}})
+    ),
+    ?assertMatch(
+        {ok, _}, emqx_mgmt_api_test_util:request_api(put, Path, "", Auth, #{<<"logs">> => #{}})
+    ),
+    ?assertMatch(
+        {ok, _}, emqx_mgmt_api_test_util:request_api(put, Path, "", Auth, #{<<"metrics">> => #{}})
+    ),
+    ?assertMatch(
+        {ok, _},
+        emqx_mgmt_api_test_util:request_api(
+            put,
+            Path,
+            "",
+            Auth,
+            #{<<"exporter">> => #{}, <<"traces">> => #{}, <<"logs">> => #{}, <<"metrics">> => #{}}
+        )
+    ),
+    ?assertMatch(
+        {ok, _},
+        emqx_mgmt_api_test_util:request_api(
+            put,
+            Path,
+            "",
+            Auth,
+            #{
+                <<"exporter">> => #{
+                    <<"endpoint">> => <<"https://localhost:4317">>, <<"protocol">> => <<"grpc">>
+                },
+                <<"traces">> => #{
+                    <<"enable">> => true,
+                    <<"max_queue_size">> => 10,
+                    <<"exporting_timeout">> => <<"10s">>,
+                    <<"scheduled_delay">> => <<"20s">>,
+                    <<"filter">> => #{<<"trace_all">> => true}
+                },
+                <<"logs">> => #{
+                    <<"level">> => <<"warning">>,
+                    <<"max_queue_size">> => 100,
+                    <<"exporting_timeout">> => <<"10s">>,
+                    <<"scheduled_delay">> => <<"1s">>
+                },
+                <<"metrics">> => #{
+                    %% alias for "interval"
+                    <<"scheduled_delay">> => <<"15321ms">>
+                }
+            }
+        ),
+        %% alias check
+        ?assertEqual(15_321, emqx:get_config(?CONF_PATH ++ [metrics, interval]))
+    ).
+
+t_put_cert(Config) ->
+    Auth = ?config(auth, Config),
+    Path = ?OTEL_API_PATH,
+    SSL = #{<<"enable">> => true, <<"cacertfile">> => ?CACERT},
+    SSLDisabled = #{<<"enable">> => false, <<"cacertfile">> => ?CACERT},
+    Conf = #{<<"exporter">> => #{<<"ssl_options">> => SSL}},
+    Conf1 = #{<<"exporter">> => #{<<"ssl_options">> => SSLDisabled}},
+    {ok, Body} = emqx_mgmt_api_test_util:request_api(put, Path, "", Auth, Conf),
+    #{<<"exporter">> := #{<<"ssl_options">> := #{<<"cacertfile">> := CaFile}}} = emqx_utils_json:decode(
+        Body
+    ),
+    ct:pal("CA certfile: ~p", [CaFile]),
+    ?assert(filelib:is_file(CaFile)),
+    {ok, Body1} = emqx_mgmt_api_test_util:request_api(put, Path, "", Auth, Conf1),
+    #{<<"exporter">> := #{<<"ssl_options">> := #{<<"cacertfile">> := CaFile1}}} = emqx_utils_json:decode(
+        Body1
+    ),
+    ct:pal("CA certfile1: ~p", [CaFile1]),
+    ?assertNot(filelib:is_file(CaFile1)).
+
+%% The exporter configuration may carry credentials in `headers' and in
+%% `ssl_options.password': they must be masked in the responses, and submitting
+%% a masked body back must keep the stored values.
+t_config_redaction(Config) ->
+    Auth = ?config(auth, Config),
+    Path = ?OTEL_API_PATH,
+    HeaderSecret = <<"Bearer otel-header-secret">>,
+    TLSSecret = <<"otel-tls-secret">>,
+    Conf = #{
+        <<"exporter">> => #{
+            <<"endpoint">> => <<"http://localhost:4317">>,
+            <<"headers">> => #{<<"Authorization">> => HeaderSecret},
+            <<"ssl_options">> => #{<<"enable">> => false, <<"password">> => TLSSecret}
+        }
+    },
+    {ok, PutBody0} = emqx_mgmt_api_test_util:request_api(put, Path, "", Auth, Conf),
+    PutBody = iolist_to_binary(PutBody0),
+    ?assertMatch(?MASKED_EXPORTER_CONF, emqx_utils_json:decode(PutBody)),
+    ?assertEqual(nomatch, binary:match(PutBody, HeaderSecret)),
+    ?assertEqual(nomatch, binary:match(PutBody, TLSSecret)),
+
+    {ok, GetBody0} = emqx_mgmt_api_test_util:request_api(get, Path, Auth),
+    GetBody = iolist_to_binary(GetBody0),
+    GetConf = emqx_utils_json:decode(GetBody),
+    ?assertMatch(?MASKED_EXPORTER_CONF, GetConf),
+    ?assertEqual(nomatch, binary:match(GetBody, HeaderSecret)),
+    ?assertEqual(nomatch, binary:match(GetBody, TLSSecret)),
+
+    %% Re-submitting the masked body must not overwrite the stored values.
+    ?assertMatch({ok, _}, emqx_mgmt_api_test_util:request_api(put, Path, "", Auth, GetConf)),
+    ?assertEqual(
+        #{<<"Authorization">> => HeaderSecret},
+        emqx:get_raw_config([opentelemetry, exporter, headers])
+    ),
+    ?assertEqual(
+        TLSSecret,
+        emqx:get_raw_config([opentelemetry, exporter, ssl_options, password])
+    ),
+    {ok, GetBody1} = emqx_mgmt_api_test_util:request_api(get, Path, Auth),
+    ?assertMatch(?MASKED_EXPORTER_CONF, emqx_utils_json:decode(GetBody1)),
+
+    %% A failed update must neither crash nor echo the value it restored.
+    BadCert = #{
+        <<"exporter">> => #{
+            <<"ssl_options">> => #{
+                <<"enable">> => true,
+                <<"cacertfile">> => <<"not a pem">>,
+                <<"password">> => <<"******">>
+            }
+        }
+    },
+    {error, {{_, 400, _}, _ErrHeaders, ErrBody0}} = emqx_mgmt_api_test_util:request_api(
+        put, Path, [], Auth, BadCert, #{return_all => true}
+    ),
+    ?assertEqual(nomatch, binary:match(iolist_to_binary(ErrBody0), TLSSecret)),
+
+    ok.
+
+-doc """
+Smoke tests that verify that the api matches the root schema, by updating it with a
+dynatrace config.
+""".
+t_dynatrace(_TCConfig) ->
+    Conf = #{
+        ~"type" => ~"dynatrace",
+        ~"exporter" => #{
+            ~"auth" => #{
+                ~"enable" => true,
+                ~"kind" => ~"dynatrace_oauth2",
+                ~"client_id" => ~"myclientid",
+                ~"client_secret" => ~"myclientsecret",
+                ~"resource" => ~"someres",
+                ~"token_endpoint" => ~"https://127.0.0.1:9998/sso/oauth2/token"
+            },
+            ~"endpoint" => ~"https://127.0.0.1:9997/api/v2/otlp"
+        },
+        ~"logs" => #{~"enable" => true},
+        ~"traces" => #{~"enable" => true}
+    },
+    ?assertMatch({200, _}, update_config(Conf)),
+    ?assertMatch(
+        {200, #{
+            ~"type" := ~"dynatrace",
+            ~"exporter" := #{
+                ~"auth" := #{
+                    ~"enable" := true,
+                    ~"kind" := ~"dynatrace_oauth2",
+                    ~"client_id" := ~"myclientid",
+                    ~"client_secret" := ~"******",
+                    ~"resource" := ~"someres",
+                    ~"token_endpoint" := ~"https://127.0.0.1:9998/sso/oauth2/token"
+                },
+                ~"endpoint" := ~"https://127.0.0.1:9997/api/v2/otlp"
+            },
+            ~"logs" := #{~"enable" := true},
+            ~"traces" := #{~"enable" := true}
+        }},
+        get_config()
+    ),
+    %% should deobfuscate correctly
+    {200, ObfuscatedConf} = get_config(),
+    ?assertMatch({200, _}, update_config(ObfuscatedConf)),
+    WrappedSecret = emqx_config:get([opentelemetry, exporter, auth, client_secret]),
+    ?assertNotEqual(emqx_utils_redact:redacted_value(), WrappedSecret()),
+    %% endpoint validation
+    ConfInvalidEndpoint =
+        emqx_utils_maps:deep_merge(
+            Conf,
+            #{~"exporter" => #{~"endpoint" => ~"not_an_url"}}
+        ),
+    ?assertMatch(
+        {400, #{
+            ~"message" := #{
+                ~"kind" := ~"validation_error",
+                ~"path" := ~"root.exporter.endpoint"
+            }
+        }},
+        update_config(ConfInvalidEndpoint)
+    ),
+    ok.

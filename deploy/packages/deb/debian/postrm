@@ -19,12 +19,26 @@
 
 set -e
 
+# Remove the /opt/emqx convenience symlinks installed by postinst.
+# Only touch symlinks we own, so anything the user dropped into /opt/emqx is left alone.
+cleanup_opt_emqx() {
+    [ -d /opt/emqx ] || return 0
+    for entry in /opt/emqx/bin /opt/emqx/data /opt/emqx/etc /opt/emqx/lib \
+                 /opt/emqx/log /opt/emqx/plugins /opt/emqx/releases \
+                 /opt/emqx/erts-*; do
+        if [ -L "$entry" ]; then
+            rm -f "$entry"
+        fi
+    done
+    rmdir /opt/emqx 2>/dev/null || true
+}
+
 case "$1" in
     purge)
+        # force kill all processes owned by emqx, if any
+        pkill -9 -u emqx || true
         rm -f /etc/default/emqx
-
-        # ensure we remove the rc.d scripts installed by postinst
-        update-rc.d emqx remove >/dev/null
+        cleanup_opt_emqx
 
         if [ -d /var/lib/emqx ]; then
                 rm -r /var/lib/emqx
@@ -41,9 +55,8 @@ case "$1" in
         if [ -e /etc/init.d/emqx ]; then
                 rm  /etc/init.d/emqx
         fi
-        # Remove User & Group, killing any process owned by them
+        # Remove User & Group
         if getent passwd emqx >/dev/null; then
-                pkill -u emqx || true
                 deluser --quiet --system emqx
         fi
         if getent group emqx >/dev/null; then
@@ -58,11 +71,17 @@ case "$1" in
         if [ -d /usr/lib/emqx ]; then
                 rm -r /usr/lib/emqx
         fi
+
+        if systemctl status --no-pager; then
+          systemctl disable emqx;
+          rm -f /etc/systemd/emqx.service
+        fi
     ;;
 
     remove)
         rm /usr/bin/emqx
         rm /usr/bin/emqx_ctl
+        cleanup_opt_emqx
     ;;
 
     upgrade|failed-upgrade|abort-install|abort-upgrade|disappear)

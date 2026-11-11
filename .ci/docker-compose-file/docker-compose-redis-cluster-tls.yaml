@@ -1,12 +1,110 @@
-version: '3.9'
-
 services:
-  redis_server:
-    container_name: redis
-    image: redis:${REDIS_TAG}
+
+  redis-cluster-tls-1: &redis-node
+    container_name: redis-cluster-tls-1
+    hostname: redis-cluster-tls-1
+    image: public.ecr.aws/docker/library/redis:${REDIS_TAG}
     volumes:
-      - ../../apps/emqx_auth_redis/test/emqx_auth_redis_SUITE_data/certs:/tls
-      - ./redis/:/data/conf
-    command: bash -c "/bin/bash /data/conf/redis.sh --node cluster --tls-enabled && tail -f /var/log/redis-server.log"
+    - ./redis/cluster-tls:/usr/local/etc/redis
+    - ./certs/cert.pem:/etc/certs/cert.pem
+    - ./certs/key.pem:/etc/certs/key.pem
+    - ./certs/cacert.pem:/etc/certs/cacert.pem
+    - ./certs/client-cert.pem:/etc/certs/client.pem
+    - ./certs/client-key.pem:/etc/certs/client.key
+    command: >
+      sh -c 'exec redis-server /usr/local/etc/redis/redis.conf
+      --cluster-port 16379
+      --cluster-announce-ip "$$HOSTNAME"
+      --cluster-announce-port 6389
+      --cluster-announce-bus-port 16379
+      --tls-client-cert-file /etc/certs/client.pem
+      --tls-client-key-file /etc/certs/client.key
+      --cluster-preferred-endpoint-type hostname
+      --cluster-announce-hostname "$$HOSTNAME"'
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - redis-cli --tls --insecure --no-auth-warning -a public -p 6389 PING | grep -q PONG
+      interval: 2s
+      timeout: 5s
+      retries: 10
     networks:
       - emqx_bridge
+
+  redis-cluster-tls-2:
+    <<: *redis-node
+    container_name: redis-cluster-tls-2
+    hostname: redis-cluster-tls-2
+
+  redis-cluster-tls-3:
+    <<: *redis-node
+    container_name: redis-cluster-tls-3
+    hostname: redis-cluster-tls-3
+
+  redis-cluster-tls-4:
+    <<: *redis-node
+    container_name: redis-cluster-tls-4
+    hostname: redis-cluster-tls-4
+
+  redis-cluster-tls-5:
+    <<: *redis-node
+    container_name: redis-cluster-tls-5
+    hostname: redis-cluster-tls-5
+
+  redis-cluster-tls-6:
+    <<: *redis-node
+    container_name: redis-cluster-tls-6
+    hostname: redis-cluster-tls-6
+
+  redis-cluster-tls-create:
+    <<: *redis-node
+    container_name: redis-cluster-tls-create
+    hostname: redis-cluster-tls-create
+    # NOTE: keep this service alive after the one-shot cluster-create succeeds:
+    # `docker compose up --wait` fails when a waited container has exited, even
+    # with exit code 0, so exiting here is a startup race (whether the create
+    # finishes before or after the wait resolves decides pass/fail).
+    # The healthcheck also makes the wait assert the cluster actually formed,
+    # instead of merely that the create command was started.
+    command:
+      - sh
+      - -c
+      - >-
+        redis-cli
+        --cluster create
+        redis-cluster-tls-1:6389
+        redis-cluster-tls-2:6389
+        redis-cluster-tls-3:6389
+        redis-cluster-tls-4:6389
+        redis-cluster-tls-5:6389
+        redis-cluster-tls-6:6389
+        --cluster-replicas 1
+        --cluster-yes
+        --pass public
+        --no-auth-warning
+        --tls
+        --insecure
+        && exec tail -f /dev/null
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          redis-cli -h redis-cluster-tls-1 -p 6389 -a public --no-auth-warning
+          --tls --insecure cluster info | grep -q cluster_state:ok
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 5s
+    depends_on:
+      redis-cluster-tls-1:
+        condition: service_healthy
+      redis-cluster-tls-2:
+        condition: service_healthy
+      redis-cluster-tls-3:
+        condition: service_healthy
+      redis-cluster-tls-4:
+        condition: service_healthy
+      redis-cluster-tls-5:
+        condition: service_healthy
+      redis-cluster-tls-6:
+        condition: service_healthy

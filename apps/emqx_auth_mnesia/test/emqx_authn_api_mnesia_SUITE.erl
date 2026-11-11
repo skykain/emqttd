@@ -1,0 +1,1068 @@
+%%--------------------------------------------------------------------
+%% Copyright (c) 2021-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
+%%--------------------------------------------------------------------
+
+-module(emqx_authn_api_mnesia_SUITE).
+
+-compile(nowarn_export_all).
+-compile(export_all).
+
+-include_lib("emqx_auth/include/emqx_authn.hrl").
+-include_lib("eunit/include/eunit.hrl").
+-include_lib("common_test/include/ct.hrl").
+-include_lib("emqx/include/emqx_config.hrl").
+-include_lib("emqx/include/emqx_hooks.hrl").
+
+%%------------------------------------------------------------------------------
+%% Defs
+%%------------------------------------------------------------------------------
+
+-import(emqx_mgmt_api_test_util, [request/3, uri/1]).
+
+-define(TCP_DEFAULT, 'tcp:default').
+-define(OTHER_NS, <<"some_other_ns">>).
+
+-define(global, global).
+-define(ns, ns).
+
+%%------------------------------------------------------------------------------
+%% CT boilerplate
+%%------------------------------------------------------------------------------
+
+all() ->
+    [{group, legacy}, {group, hardened}].
+
+groups() ->
+    Tests = emqx_common_test_helpers:all_with_matrix(?MODULE),
+    [
+        {legacy, [], Tests},
+        {hardened, [], Tests}
+        | emqx_common_test_helpers:groups_with_matrix(?MODULE)
+    ].
+
+init_per_suite(Config) ->
+    emqx_common_test_helpers:clear_security_profile(),
+    Config.
+
+end_per_suite(_Config) ->
+    emqx_common_test_helpers:clear_security_profile().
+
+init_per_group(Profile, Config) when Profile =:= legacy; Profile =:= hardened ->
+    emqx_common_test_helpers:set_security_profile(Profile),
+    Apps = emqx_cth_suite:start(
+        [
+            emqx_ctl,
+            {emqx_conf,
+                emqx_authn_test_lib:emqx_appspec(#{
+                    config =>
+                        "mqtt.client_attrs_init = [{expression = \"user_property.ns\", set_as_attr = tns}]"
+                })},
+            emqx_auth,
+            emqx_auth_mnesia,
+            emqx_management,
+            emqx_mgmt_api_test_util:emqx_dashboard()
+        ],
+        #{work_dir => emqx_cth_suite:work_dir(Profile, Config)}
+    ),
+    ?AUTHN:delete_chain(?GLOBAL),
+    {ok, Chains} = ?AUTHN:list_chains(),
+    ?assertEqual(length(Chains), 0),
+    ok = emqx_hooks:add(
+        'namespace.resource_pre_create',
+        {?MODULE, on_namespace_resource_pre_create, []},
+        ?HP_HIGHEST
+    ),
+    [{apps, Apps}, {security_profile, Profile} | Config];
+init_per_group(?global, TCConfig) ->
+    AuthHeader = create_superuser(),
+    [
+        {auth_header, AuthHeader},
+        {namespace, ?global_ns}
+        | TCConfig
+    ];
+init_per_group(?ns, TCConfig) ->
+    GlobalAuthHeader = create_superuser(),
+    Namespace = <<"ns1">>,
+    Username = <<"ns_admin">>,
+    Password = <<"superSecureP@ss">>,
+    AdminRole = <<"ns:", Namespace/binary, "::administrator">>,
+    {200, _} = create_user_api(
+        #{
+            <<"username">> => Username,
+            <<"password">> => Password,
+            <<"role">> => AdminRole,
+            <<"description">> => <<"namespaced person">>
+        },
+        GlobalAuthHeader
+    ),
+    {200, #{<<"token">> := Token}} = login(#{
+        <<"username">> => Username,
+        <<"password">> => Password
+    }),
+    AuthHeader = bearer_auth_header(Token),
+    [
+        {auth_header, AuthHeader},
+        {namespace, Namespace}
+        | TCConfig
+    ];
+init_per_group(_Group, TCConfig) ->
+    TCConfig.
+
+end_per_group(Profile, Config) when Profile =:= legacy; Profile =:= hardened ->
+    emqx_cth_suite:stop(?config(apps, Config)),
+    emqx_common_test_helpers:clear_security_profile();
+end_per_group(_Group, _TCConfig) ->
+    ok.
+
+init_per_testcase(_Case, Config) ->
+    emqx_authn_test_lib:delete_authenticators(
+        [?CONF_NS_ATOM],
+        ?GLOBAL
+    ),
+
+    emqx_authn_test_lib:delete_authenticators(
+        [listeners, tcp, default, ?CONF_NS_ATOM],
+        ?TCP_DEFAULT
+    ),
+    Config.
+
+end_per_testcase(_, Config) ->
+    _ = persistent_term:erase({?MODULE, deleted_namespaces}),
+    Config.
+
+%%------------------------------------------------------------------------------
+%% Helper fns
+%%------------------------------------------------------------------------------
+
+on_namespace_resource_pre_create(#{namespace := Namespace}, ResCtx) ->
+    Deleted = persistent_term:get({?MODULE, deleted_namespaces}, []),
+    Exists = not lists:member(Namespace, Deleted),
+    {stop, ResCtx#{exists := Exists}}.
+
+%% Simulate a managed namespace that has been deleted: its resources no longer
+%% "exist" as far as `namespace.resource_pre_create' is concerned.
+mark_namespace_deleted(Namespace) ->
+    Deleted = persistent_term:get({?MODULE, deleted_namespaces}, []),
+    persistent_term:put({?MODULE, deleted_namespaces}, lists:usort([Namespace | Deleted])).
+
+put_auth_header(Header) ->
+    _ = put({?MODULE, authn}, Header),
+    ok.
+
+get_auth_header() ->
+    get({?MODULE, authn}).
+
+bearer_auth_header(Token) ->
+    {"Authorization", iolist_to_binary(["Bearer ", Token])}.
+
+create_superuser() ->
+    emqx_common_test_http:create_default_app(),
+    Username = <<"superuser">>,
+    Password = <<"secretP@ss1">>,
+    AdminRole = <<"administrator">>,
+    case emqx_dashboard_admin:add_user(Username, Password, AdminRole, <<"desc">>) of
+        {ok, _} ->
+            ok;
+        {error, <<"username_already_exists">>} ->
+            ok
+    end,
+    {200, #{<<"token">> := Token}} = login(#{<<"username">> => Username, <<"password">> => Password}),
+    {"Authorization", iolist_to_binary(["Bearer ", Token])}.
+
+login(Params) ->
+    URL = emqx_mgmt_api_test_util:api_path(["login"]),
+    emqx_mgmt_api_test_util:simple_request(#{
+        auth_header => [{"no", "auth"}],
+        method => post,
+        url => URL,
+        body => Params
+    }).
+
+create_user_api(Params, AuthHeader) ->
+    URL = emqx_mgmt_api_test_util:api_path(["users"]),
+    emqx_mgmt_api_test_util:simple_request(#{
+        auth_header => AuthHeader,
+        method => post,
+        url => URL,
+        body => Params
+    }).
+
+request(Method, Url) ->
+    request(Method, Url, []).
+
+ns_of(TCConfig) ->
+    proplists:get_value(namespace, TCConfig, ?global_ns).
+
+maybe_add_ns_qs(QueryParams, TCConfig) ->
+    case ns_of(TCConfig) of
+        ?global_ns -> QueryParams;
+        Namespace when is_binary(Namespace) -> QueryParams#{<<"ns">> => Namespace}
+    end.
+
+maybe_add_ns_user_info(UserInfo, TCConfig) ->
+    case ns_of(TCConfig) of
+        ?global_ns -> UserInfo;
+        Namespace when is_binary(Namespace) -> UserInfo#{<<"namespace">> => Namespace}
+    end.
+
+create_authenticator(Params) ->
+    URL = uri([?CONF_NS]),
+    emqx_mgmt_api_test_util:simple_request(#{
+        method => post,
+        url => URL,
+        body => Params
+    }).
+
+get_authenticator_status(QueryParams) ->
+    URL = uri([?CONF_NS, "password_based:built_in_database", "status"]),
+    emqx_mgmt_api_test_util:simple_request(#{
+        auth_header => get_auth_header(),
+        method => get,
+        url => URL,
+        query_params => QueryParams
+    }).
+
+add_user(Params) ->
+    URL = uri([?CONF_NS, "password_based:built_in_database", "users"]),
+    emqx_mgmt_api_test_util:simple_request(#{
+        auth_header => get_auth_header(),
+        method => post,
+        url => URL,
+        body => Params
+    }).
+
+add_user(Params, QueryParams) ->
+    URL = uri([?CONF_NS, "password_based:built_in_database", "users"]),
+    emqx_mgmt_api_test_util:simple_request(#{
+        auth_header => get_auth_header(),
+        method => post,
+        url => URL,
+        body => Params,
+        query_params => QueryParams
+    }).
+
+add_authenticator_user(AuthenticatorID, Params) ->
+    URL = uri([?CONF_NS, AuthenticatorID, "users"]),
+    emqx_mgmt_api_test_util:simple_request(#{
+        auth_header => get_auth_header(),
+        method => post,
+        url => URL,
+        body => Params
+    }).
+
+get_user(UserId, QueryParams) ->
+    URL = uri([?CONF_NS, "password_based:built_in_database", "users", UserId]),
+    emqx_mgmt_api_test_util:simple_request(#{
+        auth_header => get_auth_header(),
+        method => get,
+        url => URL,
+        query_params => QueryParams
+    }).
+
+update_user(UserId, Params, QueryParams) ->
+    URL = uri([?CONF_NS, "password_based:built_in_database", "users", UserId]),
+    emqx_mgmt_api_test_util:simple_request(#{
+        auth_header => get_auth_header(),
+        method => put,
+        url => URL,
+        body => Params,
+        query_params => QueryParams
+    }).
+
+delete_user(UserId, QueryParams) ->
+    URL = uri([?CONF_NS, "password_based:built_in_database", "users", UserId]),
+    emqx_mgmt_api_test_util:simple_request(#{
+        auth_header => get_auth_header(),
+        method => delete,
+        url => URL,
+        query_params => QueryParams
+    }).
+
+delete_user(UserId, QueryParams, Body) ->
+    URL = uri([?CONF_NS, "password_based:built_in_database", "users", UserId]),
+    emqx_mgmt_api_test_util:simple_request(#{
+        auth_header => get_auth_header(),
+        method => delete,
+        url => URL,
+        query_params => QueryParams,
+        body => Body
+    }).
+
+rotate_password(UserId, QueryParams) ->
+    URL = uri([
+        ?CONF_NS,
+        "password_based:built_in_database",
+        "users",
+        UserId,
+        "password",
+        "rotate"
+    ]),
+    emqx_mgmt_api_test_util:simple_request(#{
+        auth_header => get_auth_header(),
+        method => post,
+        url => URL,
+        query_params => QueryParams
+    }).
+
+rotate_authenticator_password(AuthenticatorID, UserId) ->
+    URL = uri([?CONF_NS, AuthenticatorID, "users", UserId, "password", "rotate"]),
+    emqx_mgmt_api_test_util:simple_request(#{
+        auth_header => get_auth_header(),
+        method => post,
+        url => URL
+    }).
+
+list_users(QueryParams) ->
+    URL = uri([?CONF_NS, "password_based:built_in_database", "users"]),
+    emqx_mgmt_api_test_util:simple_request(#{
+        auth_header => get_auth_header(),
+        method => get,
+        url => URL,
+        query_params => QueryParams
+    }).
+
+import_users_multipart(Params) ->
+    #{files := Files} = Params,
+    QueryParams = maps:get(query_params, Params, #{}),
+    URL = uri([?CONF_NS, "password_based:built_in_database", "import_users"]),
+    Res = emqx_mgmt_api_test_util:upload_request(#{
+        url => URL,
+        files => Files,
+        mime_type => <<"application/octet-stream">>,
+        other_params => [],
+        auth_token => get_auth_header(),
+        method => post,
+        query_params => QueryParams
+    }),
+    emqx_mgmt_api_test_util:simplify_decode_result(Res).
+
+import_users(Params, QueryParams) ->
+    import_users(Params, QueryParams, _Opts = #{}).
+
+import_users(Params, QueryParams, Opts) ->
+    URL = uri([?CONF_NS, "password_based:built_in_database", "import_users"]),
+    ContentType = maps:get(content_type, Opts, "application/json"),
+    emqx_mgmt_api_test_util:simple_request(#{
+        auth_header => get_auth_header(),
+        method => post,
+        url => URL,
+        body => Params,
+        query_params => QueryParams,
+        'content-type' => ContentType
+    }).
+
+%%------------------------------------------------------------------------------
+%% Test cases
+%%------------------------------------------------------------------------------
+
+t_authenticator_users() ->
+    [{matrix, true}].
+t_authenticator_users(matrix) ->
+    [[?global], [?ns]];
+t_authenticator_users(TCConfig) ->
+    {200, _} = create_authenticator(emqx_authn_test_lib:built_in_database_example()),
+
+    WithNsClientOpts = fun(Opts) ->
+        case ns_of(TCConfig) of
+            ?global_ns ->
+                Opts;
+            Namespace when is_binary(Namespace) ->
+                emqx_utils_maps:deep_put(
+                    [properties, 'User-Property'],
+                    Opts,
+                    [{<<"ns">>, Namespace}]
+                )
+        end
+    end,
+
+    {ok, Client} = emqtt:start_link(
+        WithNsClientOpts(#{
+            username => <<"u_event">>,
+            clientid => <<"c_event">>,
+            proto_ver => v5,
+            properties => #{'Session-Expiry-Interval' => 60}
+        })
+    ),
+
+    process_flag(trap_exit, true),
+    ?assertMatch({error, _}, emqtt:connect(Client)),
+    timer:sleep(300),
+
+    %% Using either global or namespaced admin user.
+    put_auth_header(?config(auth_header, TCConfig)),
+
+    {200, PageData0} = get_authenticator_status(#{}),
+    #{
+        <<"metrics">> := #{
+            <<"total">> := 1,
+            <<"success">> := 0,
+            <<"failed">> := 0,
+            <<"nomatch">> := 1
+        }
+    } = PageData0,
+
+    InvalidUsers0 = [
+        #{clientid => <<"u1">>, password => <<"p1">>},
+        #{user_id => <<"u2">>},
+        #{user_id => <<"u3">>, password => <<"p3">>, foobar => <<"foobar">>},
+        %% Empty username
+        #{user_id => <<"">>, password => <<"p3">>}
+    ],
+    InvalidUsers = lists:map(fun(U) -> maybe_add_ns_user_info(U, TCConfig) end, InvalidUsers0),
+
+    lists:foreach(
+        fun(User) -> {400, _} = add_user(User) end,
+        InvalidUsers
+    ),
+
+    %% Namespaced users cannot be superusers, so the is_superuser=true variant
+    %% is only exercised for the global admin.
+    U2IsSuperuser =
+        case ns_of(TCConfig) of
+            ?global_ns -> true;
+            _ -> false
+        end,
+    ValidUsers0 = [
+        #{user_id => <<"u1">>, password => <<"p1">>},
+        #{user_id => <<"u2">>, password => <<"p2">>, is_superuser => U2IsSuperuser},
+        #{user_id => <<"u3">>, password => <<"p3">>}
+    ],
+    ValidUsers = lists:map(fun(U) -> maybe_add_ns_user_info(U, TCConfig) end, ValidUsers0),
+
+    %% As a namespaced admin, attempting to create a superuser must be rejected.
+    maybe
+        true ?= ns_of(TCConfig) /= ?global_ns,
+        NsSuperUser = maybe_add_ns_user_info(
+            #{user_id => <<"u_super">>, password => <<"p">>, is_superuser => true},
+            TCConfig
+        ),
+        ?assertMatch({400, _}, add_user(NsSuperUser)),
+        ok
+    end,
+
+    NsAPIOut =
+        case ns_of(TCConfig) of
+            ?global_ns -> null;
+            Ns -> Ns
+        end,
+    lists:foreach(
+        fun(User) ->
+            {201, CreatedUser} = add_user(User),
+            ?assertMatch(
+                #{
+                    <<"user_id">> := _,
+                    <<"namespace">> := NsAPIOut
+                },
+                CreatedUser,
+                #{expected_ns => NsAPIOut}
+            )
+        end,
+        ValidUsers
+    ),
+
+    {ok, Client1} = emqtt:start_link(
+        WithNsClientOpts(#{
+            username => <<"u1">>,
+            password => <<"p1">>,
+            clientid => <<"c_event">>,
+            proto_ver => v5,
+            properties => #{'Session-Expiry-Interval' => 60}
+        })
+    ),
+    {ok, _} = emqtt:connect(Client1),
+    timer:sleep(300),
+    {200, PageData01} = get_authenticator_status(#{}),
+    #{
+        <<"metrics">> := #{
+            <<"total">> := 2,
+            <<"success">> := 1,
+            <<"failed">> := 0,
+            <<"nomatch">> := 1
+        }
+    } = PageData01,
+
+    {200, Page1Data} = list_users(
+        maybe_add_ns_qs(
+            #{
+                <<"page">> => <<"1">>,
+                <<"limit">> => <<"2">>
+            },
+            TCConfig
+        )
+    ),
+
+    #{
+        <<"data">> := Page1Users,
+        <<"meta">> :=
+            #{
+                <<"page">> := 1,
+                <<"limit">> := 2,
+                <<"count">> := 3
+            }
+    } = Page1Data,
+
+    {200, Page2Data} = list_users(
+        maybe_add_ns_qs(
+            #{
+                <<"page">> => <<"2">>,
+                <<"limit">> => <<"2">>
+            },
+            TCConfig
+        )
+    ),
+
+    #{
+        <<"data">> := Page2Users,
+        <<"meta">> :=
+            #{
+                <<"page">> := 2,
+                <<"limit">> := 2,
+                <<"count">> := 3
+            }
+    } = Page2Data,
+
+    ?assertEqual(2, length(Page1Users)),
+    ?assertEqual(1, length(Page2Users)),
+
+    ?assertEqual(
+        [<<"u1">>, <<"u2">>, <<"u3">>],
+        lists:usort([UserId || #{<<"user_id">> := UserId} <- Page1Users ++ Page2Users])
+    ),
+
+    {ExpectedSuperUsers, ExpectedNonSuperUsers} =
+        case ns_of(TCConfig) of
+            ?global_ns -> {[<<"u2">>], [<<"u1">>, <<"u3">>]};
+            _ -> {[], [<<"u1">>, <<"u2">>, <<"u3">>]}
+        end,
+
+    {200, Super1Data} = list_users(
+        maybe_add_ns_qs(
+            #{
+                <<"page">> => <<"1">>,
+                <<"limit">> => <<"3">>,
+                <<"is_superuser">> => <<"true">>
+            },
+            TCConfig
+        )
+    ),
+    #{<<"data">> := Super1Users} = Super1Data,
+    ?assertEqual(
+        ExpectedSuperUsers,
+        lists:usort([UserId || #{<<"user_id">> := UserId} <- Super1Users])
+    ),
+
+    {200, Super2Data} = list_users(
+        maybe_add_ns_qs(
+            #{
+                <<"page">> => <<"1">>,
+                <<"limit">> => <<"3">>,
+                <<"is_superuser">> => <<"false">>
+            },
+            TCConfig
+        )
+    ),
+    #{<<"data">> := Super2Users} = Super2Data,
+    ?assertEqual(
+        ExpectedNonSuperUsers,
+        lists:usort([UserId || #{<<"user_id">> := UserId} <- Super2Users])
+    ),
+
+    %% Global admin can manage other namespaces.
+
+    %% Global admin can create a distinct user in another namespace.
+    OtherNsUser = #{
+        <<"user_id">> => <<"u4">>, <<"password">> => <<"p1">>, <<"namespace">> => ?OTHER_NS
+    },
+    maybe
+        true ?= ns_of(TCConfig) == ?global_ns,
+        ?assertMatch({200, #{<<"data">> := []}}, list_users(#{<<"ns">> => ?OTHER_NS})),
+        ?assertMatch({201, #{<<"namespace">> := ?OTHER_NS}}, add_user(OtherNsUser)),
+        ?assertMatch({200, #{<<"data">> := [_]}}, list_users(#{<<"ns">> => ?OTHER_NS})),
+        ok
+    end,
+
+    %% Namespaced admin can only manage their own namespace.
+    maybe
+        true ?= ns_of(TCConfig) /= ?global_ns,
+        ?assertMatch({403, _}, list_users(#{<<"ns">> => ?OTHER_NS})),
+        ?assertMatch({403, _}, add_user(OtherNsUser)),
+        ok
+    end,
+
+    ok.
+
+t_authenticator_user() ->
+    [{matrix, true}].
+t_authenticator_user(matrix) ->
+    [[?global], [?ns]];
+t_authenticator_user(TCConfig) ->
+    {200, _} = create_authenticator(emqx_authn_test_lib:built_in_database_example()),
+    put_auth_header(?config(auth_header, TCConfig)),
+
+    User = maybe_add_ns_user_info(#{user_id => <<"u1">>, password => <<"p1">>}, TCConfig),
+    {201, _} = add_user(User),
+
+    {404, _} = get_user(<<"u123">>, maybe_add_ns_qs(#{}, TCConfig)),
+
+    {409, _} = add_user(User),
+
+    {200, FetchedUser} = get_user(<<"u1">>, maybe_add_ns_qs(#{}, TCConfig)),
+
+    ?assertMatch(#{<<"user_id">> := <<"u1">>}, FetchedUser),
+    ?assertNotMatch(#{<<"password">> := _}, FetchedUser),
+
+    {400, _} = update_user(<<"u1">>, #{}, maybe_add_ns_qs(#{}, TCConfig)),
+    {200, UnchangedUser} = get_user(<<"u1">>, maybe_add_ns_qs(#{}, TCConfig)),
+    ?assertEqual(FetchedUser, UnchangedUser),
+
+    %% Namespaced users cannot be marked as superuser; see new invariant.
+    ValidUserUpdates =
+        case ns_of(TCConfig) of
+            ?global_ns ->
+                [
+                    #{password => <<"p1">>},
+                    #{password => <<"p1">>, is_superuser => true}
+                ];
+            _ ->
+                [
+                    #{password => <<"p1">>},
+                    #{password => <<"p1">>, is_superuser => false}
+                ]
+        end,
+
+    lists:foreach(
+        fun(UserUpdate) ->
+            {200, _} = update_user(<<"u1">>, UserUpdate, maybe_add_ns_qs(#{}, TCConfig))
+        end,
+        ValidUserUpdates
+    ),
+
+    %% As a namespaced admin, attempting to promote a user to superuser must be
+    %% rejected.
+    maybe
+        true ?= ns_of(TCConfig) /= ?global_ns,
+        ?assertMatch(
+            {400, _},
+            update_user(
+                <<"u1">>,
+                #{password => <<"p1">>, is_superuser => true},
+                maybe_add_ns_qs(#{}, TCConfig)
+            )
+        ),
+        ok
+    end,
+
+    %% `namespace' is now an accepted body field (it selects the target
+    %% namespace), so it is no longer rejected here; `user_id' remains invalid in
+    %% an update body.
+    InvalidUserUpdates = [
+        #{user_id => <<"u1">>, password => <<"p1">>}
+    ],
+
+    lists:foreach(
+        fun(UserUpdate) ->
+            {400, _} = update_user(<<"u1">>, UserUpdate, maybe_add_ns_qs(#{}, TCConfig))
+        end,
+        InvalidUserUpdates
+    ),
+
+    {404, _} = delete_user(<<"u123">>, maybe_add_ns_qs(#{}, TCConfig)),
+    {204, _} = delete_user(<<"u1">>, maybe_add_ns_qs(#{}, TCConfig)),
+
+    %% N.B.: same username as existing user in different namespace
+    OtherNsUser = #{
+        <<"user_id">> => <<"u1">>, <<"password">> => <<"p1">>, <<"namespace">> => ?OTHER_NS
+    },
+    UpdateParams = #{<<"password">> => <<"p2">>},
+    maybe
+        true ?= ns_of(TCConfig) == ?global_ns,
+        ?assertMatch({201, #{<<"namespace">> := ?OTHER_NS}}, add_user(OtherNsUser)),
+        ?assertMatch({200, _}, update_user(<<"u1">>, UpdateParams, #{<<"ns">> => ?OTHER_NS})),
+        ?assertMatch({204, _}, delete_user(<<"u1">>, #{<<"ns">> => ?OTHER_NS})),
+        ?assertMatch({200, #{<<"data">> := []}}, list_users(#{<<"ns">> => ?OTHER_NS})),
+        ok
+    end,
+
+    %% Namespaced admin can only manage their own namespace.
+    maybe
+        true ?= ns_of(TCConfig) /= ?global_ns,
+        ?assertMatch({403, _}, update_user(<<"u1">>, UpdateParams, #{<<"ns">> => ?OTHER_NS})),
+        ?assertMatch({403, _}, delete_user(<<"u1">>, #{<<"ns">> => ?OTHER_NS})),
+        ok
+    end,
+
+    ok.
+
+%% Checks SCRAM API errors for missing passwords and unsupported rotation.
+t_scram_user_api_errors(_TCConfig) ->
+    put_auth_header(create_superuser()),
+    ScramConfig = #{
+        mechanism => <<"scram">>,
+        backend => <<"built_in_database">>,
+        algorithm => <<"sha512">>,
+        iteration_count => 4096
+    },
+    {200, _} = create_authenticator(ScramConfig),
+    AuthenticatorID = "scram:built_in_database",
+
+    {400, #{<<"message">> := PasswordRequired}} =
+        add_authenticator_user(AuthenticatorID, #{user_id => <<"scram-user">>}),
+    ?assertNotEqual(nomatch, binary:match(PasswordRequired, <<"Password is required">>)),
+
+    {201, _} = add_authenticator_user(AuthenticatorID, #{
+        user_id => <<"scram-user">>, password => <<"scram-password">>
+    }),
+    {400, #{<<"message">> := Unsupported}} =
+        rotate_authenticator_password(AuthenticatorID, <<"scram-user">>),
+    ?assertEqual(<<"Operation not supported in this authentication type">>, Unsupported),
+    ok.
+
+%% A global admin may select the target namespace of a built-in user delete via
+%% either the `namespace' body field or the `ns' query parameter; if both are
+%% given they must agree.
+t_delete_user_namespace_resolution(_TCConfig) ->
+    put_auth_header(create_superuser()),
+    {200, _} = create_authenticator(emqx_authn_test_lib:built_in_database_example()),
+    Ns = ?OTHER_NS,
+    User = #{<<"user_id">> => <<"u1">>, <<"password">> => <<"p1">>, <<"namespace">> => Ns},
+    %% `namespace' in the body (no query param) selects the namespace to delete from.
+    ?assertMatch({201, #{<<"namespace">> := Ns}}, add_user(User)),
+    ?assertMatch({200, #{<<"data">> := [_]}}, list_users(#{<<"ns">> => Ns})),
+    ?assertMatch({204, _}, delete_user(<<"u1">>, #{}, #{<<"namespace">> => Ns})),
+    ?assertMatch({200, #{<<"data">> := []}}, list_users(#{<<"ns">> => Ns})),
+    %% The `ns' query parameter alone selects the namespace.
+    ?assertMatch({201, _}, add_user(User)),
+    ?assertMatch({204, _}, delete_user(<<"u1">>, #{<<"ns">> => Ns}, #{})),
+    ?assertMatch({200, #{<<"data">> := []}}, list_users(#{<<"ns">> => Ns})),
+    %% A conflicting `ns' query parameter and `namespace' body field is rejected,
+    %% leaving the record untouched.
+    ?assertMatch({201, _}, add_user(User)),
+    ?assertMatch(
+        {400, _},
+        delete_user(<<"u1">>, #{<<"ns">> => Ns}, #{<<"namespace">> => <<"wrong_ns">>})
+    ),
+    ?assertMatch({200, #{<<"data">> := [_]}}, list_users(#{<<"ns">> => Ns})),
+    %% A `namespace' body field pointing at another namespace (where the user
+    %% does not exist) yields 404 rather than touching the record in `Ns'.
+    ?assertMatch({404, _}, delete_user(<<"u1">>, #{}, #{<<"namespace">> => <<"another_ns">>})),
+    ?assertMatch({200, #{<<"data">> := [_]}}, list_users(#{<<"ns">> => Ns})),
+    ?assertMatch({204, _}, delete_user(<<"u1">>, #{<<"ns">> => Ns})),
+    ok.
+
+%% A built-in user that belongs to a namespace which has since been deleted must
+%% still be deletable by a global admin (no "Managed namespace not found").
+t_delete_user_orphaned_namespace(_TCConfig) ->
+    put_auth_header(create_superuser()),
+    {200, _} = create_authenticator(emqx_authn_test_lib:built_in_database_example()),
+    Ns = ?OTHER_NS,
+    User = #{<<"user_id">> => <<"u1">>, <<"password">> => <<"p1">>, <<"namespace">> => Ns},
+    ?assertMatch({201, _}, add_user(User)),
+    %% The namespace is deleted out from under the record.
+    mark_namespace_deleted(Ns),
+    %% Creating in a now-missing namespace is still rejected ...
+    NewUser = #{<<"user_id">> => <<"u2">>, <<"password">> => <<"p2">>, <<"namespace">> => Ns},
+    ?assertMatch({400, #{<<"message">> := <<"Managed namespace not found">>}}, add_user(NewUser)),
+    %% ... but a global admin can still delete the orphaned record.
+    ?assertMatch({204, _}, delete_user(<<"u1">>, #{<<"ns">> => Ns})),
+    ok.
+
+%% A global admin may select the target namespace of a built-in user update via
+%% the `namespace' body field.
+t_update_user_namespace_in_body(_TCConfig) ->
+    put_auth_header(create_superuser()),
+    {200, _} = create_authenticator(emqx_authn_test_lib:built_in_database_example()),
+    Ns = ?OTHER_NS,
+    User = #{<<"user_id">> => <<"u1">>, <<"password">> => <<"p1">>, <<"namespace">> => Ns},
+    ?assertMatch({201, _}, add_user(User)),
+    ?assertMatch(
+        {200, _},
+        update_user(<<"u1">>, #{<<"password">> => <<"p2">>, <<"namespace">> => Ns}, #{})
+    ),
+    %% A body namespace pointing at a different namespace (where the user does
+    %% not exist) is honored and yields 404 rather than touching another record.
+    ?assertMatch(
+        {404, _},
+        update_user(
+            <<"u1">>, #{<<"password">> => <<"p2">>, <<"namespace">> => <<"another_ns">>}, #{}
+        )
+    ),
+    %% A conflicting `ns' query parameter and `namespace' body field is rejected.
+    ?assertMatch(
+        {400, _},
+        update_user(
+            <<"u1">>,
+            #{<<"password">> => <<"p3">>, <<"namespace">> => <<"another_ns">>},
+            #{<<"ns">> => Ns}
+        )
+    ),
+    ?assertMatch({204, _}, delete_user(<<"u1">>, #{<<"ns">> => Ns})),
+    ok.
+
+%% Creating a built-in user that targets a namespace which is not a known
+%% managed namespace must be rejected, whether the namespace is given in the
+%% request body or in the `ns' query parameter.
+t_create_user_unknown_namespace_rejected(_TCConfig) ->
+    put_auth_header(create_superuser()),
+    {200, _} = create_authenticator(emqx_authn_test_lib:built_in_database_example()),
+    Ns = ?OTHER_NS,
+    %% Mark the namespace as not managed (never created / already deleted).
+    mark_namespace_deleted(Ns),
+    ?assertMatch(
+        {400, #{<<"message">> := <<"Managed namespace not found">>}},
+        add_user(#{<<"user_id">> => <<"u1">>, <<"password">> => <<"p1">>, <<"namespace">> => Ns})
+    ),
+    ?assertMatch(
+        {400, #{<<"message">> := <<"Managed namespace not found">>}},
+        add_user(#{<<"user_id">> => <<"u2">>, <<"password">> => <<"p2">>}, #{<<"ns">> => Ns})
+    ),
+    ok.
+
+%% Checks generated-password user lifecycle behavior through the management API.
+t_generated_password_api() ->
+    [{matrix, true}].
+t_generated_password_api(matrix) ->
+    [[?global], [?ns]];
+t_generated_password_api(TCConfig) ->
+    {200, _} = create_authenticator(emqx_authn_test_lib:built_in_database_generated_example()),
+    put_auth_header(proplists:get_value(auth_header, TCConfig, create_superuser())),
+    Namespace = ns_of(TCConfig),
+    QueryParams = maybe_add_ns_qs(#{}, TCConfig),
+    UserInfo = maybe_add_ns_user_info(#{user_id => <<"generated">>}, TCConfig),
+
+    {400, #{<<"message">> := PasswordNotAllowed}} =
+        add_user(UserInfo#{password => <<"must-not-be-supplied">>}),
+    ?assertNotEqual(nomatch, binary:match(PasswordNotAllowed, <<"must be omitted">>)),
+
+    {201, Created} = add_user(UserInfo),
+    #{<<"password">> := Password1, <<"user_id">> := <<"generated">>} = Created,
+    ?assert(byte_size(Password1) > 32),
+    {409, _} = add_user(UserInfo),
+
+    {200, Fetched} = get_user(<<"generated">>, QueryParams),
+    ?assertNot(maps:is_key(<<"password">>, Fetched)),
+    {200, #{<<"data">> := [Listed]}} = list_users(QueryParams),
+    ?assertNot(maps:is_key(<<"password">>, Listed)),
+
+    IsSuperuser = Namespace =:= ?global_ns,
+    {400, #{<<"message">> := UpdatePasswordNotAllowed}} =
+        update_user(<<"generated">>, #{password => <<"explicit">>}, QueryParams),
+    ?assertNotEqual(nomatch, binary:match(UpdatePasswordNotAllowed, <<"must be omitted">>)),
+    assert_password(<<"generated">>, Password1, Namespace, true),
+    {200, Updated} = update_user(
+        <<"generated">>, #{is_superuser => IsSuperuser}, QueryParams
+    ),
+    ?assertNot(maps:is_key(<<"password">>, Updated)),
+    assert_password(<<"generated">>, Password1, Namespace, true),
+
+    {200, Rotated1} = rotate_password(<<"generated">>, QueryParams),
+    #{<<"password">> := Password2} = Rotated1,
+    ?assertNotEqual(Password1, Password2),
+    assert_password(<<"generated">>, Password1, Namespace, false),
+    assert_password(<<"generated">>, Password2, Namespace, true),
+
+    {200, Rotated2} = rotate_password(<<"generated">>, QueryParams),
+    #{<<"password">> := Password3} = Rotated2,
+    ?assertNotEqual(Password2, Password3),
+    assert_password(<<"generated">>, Password2, Namespace, false),
+    assert_password(<<"generated">>, Password3, Namespace, true),
+    {404, _} = rotate_password(<<"missing">>, QueryParams),
+
+    maybe
+        true ?= Namespace =/= ?global_ns,
+        ?assertMatch({403, _}, rotate_password(<<"generated">>, #{<<"ns">> => ?OTHER_NS})),
+        ok
+    end,
+    ok.
+
+%% Checks manual-password requirements and disabled rotation through the management API.
+t_manual_password_api() ->
+    [{matrix, true}].
+t_manual_password_api(matrix) ->
+    [[?global], [?ns]];
+t_manual_password_api(TCConfig) ->
+    Authenticator =
+        (emqx_authn_test_lib:built_in_database_example())#{autogenerate_password => false},
+    {200, _} = create_authenticator(Authenticator),
+    put_auth_header(proplists:get_value(auth_header, TCConfig, create_superuser())),
+    QueryParams = maybe_add_ns_qs(#{}, TCConfig),
+    UserInfo = maybe_add_ns_user_info(#{user_id => <<"manual">>}, TCConfig),
+
+    {400, #{<<"message">> := PasswordRequired}} = add_user(UserInfo),
+    ?assertNotEqual(nomatch, binary:match(PasswordRequired, <<"Password is required">>)),
+    {201, Created} = add_user(UserInfo#{password => <<"manual-password">>}),
+    ?assertNot(maps:is_key(<<"password">>, Created)),
+    {400, #{<<"message">> := RotationDisabled}} =
+        rotate_password(<<"manual">>, QueryParams),
+    ?assertNotEqual(nomatch, binary:match(RotationDisabled, <<"requires automatic">>)),
+    ok.
+
+assert_password(UserId, Password, Namespace, ShouldSucceed) ->
+    process_flag(trap_exit, true),
+    ClientOpts0 = #{
+        username => UserId,
+        password => Password,
+        clientid => emqx_base62:encode(crypto:strong_rand_bytes(8)),
+        proto_ver => v5
+    },
+    ClientOpts =
+        case Namespace of
+            ?global_ns ->
+                ClientOpts0;
+            _ ->
+                emqx_utils_maps:deep_put(
+                    [properties, 'User-Property'], ClientOpts0, [{<<"ns">>, Namespace}]
+                )
+        end,
+    {ok, Client} = emqtt:start_link(ClientOpts),
+    Result = emqtt:connect(Client),
+    _ = catch emqtt:stop(Client),
+    case ShouldSucceed of
+        true -> ?assertMatch({ok, _}, Result);
+        false -> ?assertMatch({error, _}, Result)
+    end.
+
+t_authenticator_import_users_global() ->
+    [{matrix, true}].
+t_authenticator_import_users_global(matrix) ->
+    [[?global]];
+t_authenticator_import_users_global(TCConfig) ->
+    {200, _} = create_authenticator(emqx_authn_test_lib:built_in_database_example()),
+
+    put_auth_header(?config(auth_header, TCConfig)),
+
+    {400, _} = import_users_multipart(#{files => []}),
+    {400, _} = import_users_multipart(#{
+        files => [
+            %% problem is either bad parameter name or empty file?
+            {<<"filenam">>, <<"user-credentials.json">>, <<>>}
+        ]
+    }),
+
+    Dir = code:lib_dir(emqx_auth),
+    JSONFileName = filename:join([Dir, <<"test/data/user-credentials.json">>]),
+    CSVFileName = filename:join([Dir, <<"test/data/user-credentials.csv">>]),
+
+    {ok, JSONData} = file:read_file(JSONFileName),
+    {200, Result1} = import_users_multipart(#{
+        files => [
+            {<<"filename">>, <<"user-credentials.json">>, JSONData}
+        ]
+    }),
+    ?assertMatch(#{<<"total">> := 2, <<"success">> := 2}, Result1),
+
+    {ok, CSVData} = file:read_file(CSVFileName),
+    {200, Result2} = import_users_multipart(#{
+        files => [
+            {<<"filename">>, <<"user-credentials.csv">>, CSVData}
+        ]
+    }),
+    ?assertMatch(#{<<"total">> := 2, <<"success">> := 2}, Result2),
+
+    %% test application/json
+    {200, _} = import_users(emqx_utils_json:decode(JSONData), #{<<"type">> => <<"hash">>}),
+    {ok, JSONData1} = file:read_file(
+        filename:join([Dir, <<"test/data/user-credentials-plain.json">>])
+    ),
+    {200, _} = import_users(emqx_utils_json:decode(JSONData1), #{<<"type">> => <<"plain">>}),
+
+    %% test application/json; charset=utf-8
+    {200, _} = import_users({raw, JSONData1}, #{<<"type">> => <<"plain">>}, #{
+        content_type => "application/json; charset=utf-8"
+    }),
+    ok.
+
+%% Each imported user contains its namespace.  So, we leave importing multiple users to a
+%% global admin only.
+t_authenticator_import_users_ns() ->
+    [{matrix, true}].
+t_authenticator_import_users_ns(matrix) ->
+    [[?ns]];
+t_authenticator_import_users_ns(TCConfig) ->
+    {200, _} = create_authenticator(emqx_authn_test_lib:built_in_database_example()),
+    put_auth_header(?config(auth_header, TCConfig)),
+    put_auth_header(?config(auth_header, TCConfig)),
+
+    Dir = code:lib_dir(emqx_auth),
+    JSONFileName = filename:join([Dir, <<"test/data/user-credentials.json">>]),
+    {ok, JSONData} = file:read_file(JSONFileName),
+    {403, _} = import_users_multipart(#{
+        files => [
+            {<<"filename">>, <<"user-credentials.json">>, JSONData}
+        ]
+    }),
+    {403, _} = import_users(emqx_utils_json:decode(JSONData), #{<<"type">> => <<"hash">>}),
+
+    ok.
+
+-doc """
+Regression test for CVE-style bypass where a namespaced admin could:
+  (1) list authentication users in the global namespace by omitting the `ns`
+      query parameter; and
+  (2) create users (including superusers) in the global namespace by omitting
+      the `namespace` body field.
+The handlers must now ignore user-controlled input for the namespace and use
+the actor's resolved namespace instead.
+""".
+t_ns_admin_bypass_global() ->
+    [{matrix, true}].
+t_ns_admin_bypass_global(matrix) ->
+    [[?ns]];
+t_ns_admin_bypass_global(TCConfig) ->
+    {200, _} = create_authenticator(emqx_authn_test_lib:built_in_database_example()),
+
+    %% Seed a user in the global namespace directly via the chain API, so we
+    %% do not need a second HTTP admin session.
+    {ok, _} = emqx_authn_chains:add_user(
+        ?GLOBAL,
+        <<"password_based:built_in_database">>,
+        #{
+            namespace => ?global_ns,
+            user_id => <<"global_user">>,
+            password => <<"p">>,
+            is_superuser => false
+        }
+    ),
+
+    put_auth_header(?config(auth_header, TCConfig)),
+
+    %% Bug 1 — GET without `ns` must only return the caller's namespace.
+    {200, ListData} = list_users(#{<<"page">> => <<"1">>, <<"limit">> => <<"50">>}),
+    #{<<"data">> := Rows} = ListData,
+    UserIds = [UserId || #{<<"user_id">> := UserId} <- Rows],
+    ?assertEqual(
+        [],
+        UserIds,
+        #{reason => <<"namespaced admin must not see global users">>}
+    ),
+
+    %% Bug 2 — POST without `namespace` must land in the caller's namespace,
+    %% not global. Creating a superuser via this bypass must also be rejected
+    %% by the new invariant.
+    NsBody = #{
+        <<"user_id">> => <<"ns_created">>,
+        <<"password">> => <<"p">>
+    },
+    {201, Created} = add_user(NsBody),
+    ?assertMatch(#{<<"namespace">> := <<"ns1">>}, Created),
+
+    %% The global table must remain unchanged.
+    {ok, #{user_id := <<"global_user">>}} =
+        emqx_authn_chains:lookup_user(
+            ?GLOBAL, <<"password_based:built_in_database">>, ?global_ns, <<"global_user">>
+        ),
+    ?assertMatch(
+        {error, not_found},
+        emqx_authn_chains:lookup_user(
+            ?GLOBAL, <<"password_based:built_in_database">>, ?global_ns, <<"ns_created">>
+        )
+    ),
+
+    %% Bug 3 — superuser creation as a namespaced admin must be rejected.
+    SuperBody = #{
+        <<"user_id">> => <<"ns_super">>,
+        <<"password">> => <<"p">>,
+        <<"is_superuser">> => true
+    },
+    ?assertMatch({400, _}, add_user(SuperBody)),
+
+    ok.

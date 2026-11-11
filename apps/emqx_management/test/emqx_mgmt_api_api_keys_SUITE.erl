@@ -1,0 +1,2337 @@
+%%--------------------------------------------------------------------
+%% Copyright (c) 2020-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
+%%--------------------------------------------------------------------
+-module(emqx_mgmt_api_api_keys_SUITE).
+
+-compile(export_all).
+-compile(nowarn_export_all).
+
+-include_lib("eunit/include/eunit.hrl").
+-include_lib("common_test/include/ct.hrl").
+-include_lib("emqx_dashboard/include/emqx_dashboard_rbac.hrl").
+-include_lib("emqx/include/emqx_config.hrl").
+-include_lib("emqx_utils/include/emqx_api_key_scopes.hrl").
+
+-define(EE_CASES, [
+    t_ee_create,
+    t_ee_update,
+    %% A partial update that does not carry `role' must keep the stored one.
+    t_update_partial_without_role,
+    t_ee_authorize_viewer,
+    t_ee_authorize_admin,
+    t_ee_authorize_admin_cannot_manage_mfa,
+    t_ee_authorize_admin_cannot_manage_mfa_module_level,
+    t_is_api_key_allowed,
+    t_ee_authorize_publisher,
+    %% Schema validation: publisher role can only hold publish scope
+    t_ee_publisher_only_publish_scope,
+    t_ee_publisher_with_undefined_scopes,
+    t_ee_publisher_with_empty_scopes,
+    t_ee_publisher_rejects_connections_scope,
+    t_ee_publisher_rejects_login_only_scope,
+    t_ee_publisher_rejects_publish_plus_other,
+    %% Schema validation: API keys cannot hold login-only scopes
+    t_ee_api_key_rejects_login_only_via_post,
+    t_ee_api_key_rejects_login_only_via_put,
+    t_ee_admin_role_with_publish_scope_allowed,
+    t_ee_viewer_role_with_publish_scope_allowed,
+    %% Schema validation: privilege scopes must stand alone
+    t_ee_api_key_privilege_only_allowed,
+    t_ee_api_key_nonprivilege_only_allowed,
+    t_ee_api_key_rejects_mixed_privilege_via_post,
+    t_ee_api_key_rejects_mixed_privilege_via_put,
+    t_ee_api_key_privilege_mutex_message,
+    %% Unset-equivalent scopes on create/update (#18195)
+    t_ee_scopes_update_unchanged_roundtrip,
+    t_ee_scopes_create_unset_sentinel,
+    t_ee_scopes_update_explicit_list,
+    t_ee_publisher_update_rejects_explicit_non_publish,
+    %% Regression: API key auth must not leak into dashboard
+    %% login-user scope check when ApiKey name == dashboard username.
+    t_ee_api_key_unaffected_by_colliding_username_scopes,
+    %% Namespaced-key scope defaults and create-time publish rejection (#18220)
+    t_ee_ns_admin_default_scopes_exclude_publish,
+    t_ee_ns_viewer_default_scopes,
+    t_ee_ns_key_create_rejects_publish_scope,
+    t_ee_ns_key_update_rejects_publish_in_changed_scopes,
+    t_ee_ns_admin_legacy_publish_scopes_roundtrip,
+    t_ee_ns_admin_legacy_publish_only_scopes_stay_set,
+    %% Namespaced-key scope allowlist parity with the dashboard user rule (#412)
+    t_ee_ns_key_create_rejects_out_of_allowlist_scopes,
+    t_ee_ns_key_update_rejects_out_of_allowlist_scopes,
+    %% Role change to publisher validates against the persisted scopes
+    %% when the body omits `scopes' (H7)
+    t_ee_publisher_role_change_with_persisted_admin_scopes_is_rejected,
+    t_ee_publisher_role_change_with_compatible_persisted_scopes_succeeds
+]).
+
+-define(APP, emqx_app).
+
+-record(?APP, {
+    name = <<>> :: binary() | '_',
+    api_key = <<>> :: binary() | '_',
+    api_secret_hash = <<>> :: binary() | '_',
+    enable = true :: boolean() | '_',
+    desc = <<>> :: binary() | '_',
+    expired_at = 0 :: integer() | undefined | infinity | '_',
+    created_at = 0 :: integer() | '_'
+}).
+
+all() -> [{group, legacy}, {group, hardened}, {group, sequence}].
+suite() -> [{timetrap, {minutes, 1}}].
+groups() ->
+    [
+        {legacy, [], [{group, parallel}]},
+        {hardened, [], [{group, parallel}]},
+        {parallel, [parallel], [
+            t_create,
+            t_update,
+            t_update_legacy_undefined_expiry,
+            t_delete,
+            t_authorize,
+            t_create_unexpired_app,
+            t_create_optional_fields,
+            t_update_optional_fields
+        ]},
+        {parallel, [parallel], ?EE_CASES},
+        {sequence, [], [
+            t_bootstrap_file,
+            t_bootstrap_file_override,
+            t_bootstrap_file_dup_override,
+            t_bootstrap_file_with_role,
+            t_bootstrap_file_with_scopes,
+            t_bootstrap_file_with_scopes_invalid,
+            t_bootstrap_file_with_empty_scopes,
+            t_bootstrap_file_with_mixed_case_scopes,
+            t_bootstrap_file_with_whitespace_scopes,
+            t_bootstrap_file_with_duplicate_scopes,
+            t_bootstrap_file_drops_mixed_privilege_scopes,
+            t_bootstrap_file_lenient_order_independence,
+            t_bootstrap_file_scope_runtime_check,
+            t_bootstrap_file_publisher_only_publish_scope,
+            t_bootstrap_file_2_segment_seeds_default_scopes,
+            t_bootstrap_file_3_segment_publisher_seeds_publish_scope,
+            t_bootstrap_file_ns_admin_seeds_ns_default_scopes,
+            t_bootstrap_file_ns_admin_drops_out_of_allowlist_scopes,
+            t_bootstrap_file_override,
+            t_bootstrap_file_dup_override,
+            t_bootstrap_file_same_secret_keeps_hash,
+            t_bootstrap_file_rotated_secret_rehashes,
+            t_bootstrap_file_same_secret_updates_metadata,
+            t_create_failed
+        ]}
+    ].
+
+init_per_suite(Config) ->
+    application:ensure_all_started(hackney),
+    Apps = emqx_cth_suite:start(
+        [
+            emqx_conf,
+            emqx_management,
+            emqx_mgmt_api_test_util:emqx_dashboard()
+        ],
+        #{work_dir => emqx_cth_suite:work_dir(Config)}
+    ),
+    [{suite_apps, Apps} | Config].
+
+end_per_suite(Config) ->
+    ok = emqx_cth_suite:stop(?config(suite_apps, Config)),
+    application:stop(hackney).
+
+init_per_group(Profile, Config) when Profile =:= legacy; Profile =:= hardened ->
+    ok = reset_api_key_state(),
+    ok = emqx_common_test_helpers:set_security_profile(Profile),
+    [{security_profile, Profile} | Config];
+init_per_group(_Group, Config) ->
+    Config.
+
+end_per_group(Profile, _Config) when Profile =:= legacy; Profile =:= hardened ->
+    ok = reset_api_key_state(),
+    emqx_common_test_helpers:clear_security_profile();
+end_per_group(_Group, Config) ->
+    Config.
+
+%% Bootstrap-file tests insert records into the api_key Mnesia table
+%% without cleanup; the historical sequence group relies on disjoint key
+%% prefixes to avoid leaks. Wipe every `from_bootstrap_file_*' record and
+%% reset the configured `bootstrap_file' before and after each
+%% `t_bootstrap_*' case so a future testcase rename or reorder cannot
+%% silently inherit state from the previous one.
+init_per_testcase(Case, Config) ->
+    case is_bootstrap_case(Case) of
+        true -> reset_bootstrap_state();
+        false -> ok
+    end,
+    Config.
+
+end_per_testcase(Case, _Config) ->
+    case is_bootstrap_case(Case) of
+        true -> reset_bootstrap_state();
+        false -> ok
+    end,
+    ok.
+
+is_bootstrap_case(Case) ->
+    case atom_to_list(Case) of
+        "t_bootstrap_" ++ _ -> true;
+        _ -> false
+    end.
+
+reset_bootstrap_state() ->
+    %% Drop the configured bootstrap path so we are not racing a stale
+    %% post_config_update reload during cleanup.
+    _ = emqx:update_config([<<"api_key">>], #{<<"bootstrap_file">> => <<>>}),
+    %% Delete every key that was bootstrap-loaded; HTTP-API-created keys
+    %% (used by t_create / t_authorize / t_ee_*) live under different
+    %% names and stay untouched.
+    Apps = emqx_mgmt_auth:list(),
+    lists:foreach(
+        fun(#{name := Name}) ->
+            case Name of
+                <<"from_bootstrap_file_", _/binary>> ->
+                    _ = emqx_mgmt_auth:delete(Name);
+                _ ->
+                    ok
+            end
+        end,
+        Apps
+    ),
+    ok.
+
+reset_api_key_state() ->
+    lists:foreach(
+        fun(#{name := Name}) ->
+            {ok, ok} = emqx_mgmt_auth:delete(Name)
+        end,
+        emqx_mgmt_auth:list()
+    ),
+    ok.
+
+t_bootstrap_file(_) ->
+    TestPath = <<"/api/v5/status">>,
+    Bin = <<"test-1:secret-1\ntest-2:secret-2">>,
+    File = "./bootstrap_api_keys.txt",
+    ok = file:write_file(File, Bin),
+    update_file(File),
+    ?assertMatch({ok, _}, auth_authorize(TestPath, <<"test-1">>, <<"secret-1">>)),
+    ?assertMatch({ok, _}, auth_authorize(TestPath, <<"test-2">>, <<"secret-2">>)),
+    ?assertMatch({error, _}, auth_authorize(TestPath, <<"test-2">>, <<"secret-1">>)),
+
+    %% relaunch to check if the table is changed.
+    Bin1 = <<"test-1:new-secret-1\ntest-2:new-secret-2">>,
+    ok = file:write_file(File, Bin1),
+    update_file(File),
+    ?assertMatch({error, _}, auth_authorize(TestPath, <<"test-1">>, <<"secret-1">>)),
+    ?assertMatch({error, _}, auth_authorize(TestPath, <<"test-2">>, <<"secret-2">>)),
+    ?assertMatch({ok, _}, auth_authorize(TestPath, <<"test-1">>, <<"new-secret-1">>)),
+    ?assertMatch({ok, _}, auth_authorize(TestPath, <<"test-2">>, <<"new-secret-2">>)),
+
+    %% not error when bootstrap_file is empty
+    update_file(<<>>),
+    update_file("./bootstrap_apps_not_exist.txt"),
+    ?assertMatch({error, _}, auth_authorize(TestPath, <<"test-1">>, <<"secret-1">>)),
+    ?assertMatch({error, _}, auth_authorize(TestPath, <<"test-2">>, <<"secret-2">>)),
+    ?assertMatch({ok, _}, auth_authorize(TestPath, <<"test-1">>, <<"new-secret-1">>)),
+    ?assertMatch({ok, _}, auth_authorize(TestPath, <<"test-2">>, <<"new-secret-2">>)),
+
+    %% bad format
+    BadBin = <<"test-1:secret-11\ntest-2 secret-12">>,
+    ok = file:write_file(File, BadBin),
+    update_file(File),
+    ?assertMatch({error, #{reason := "invalid_format"}}, emqx_mgmt_auth:init_bootstrap_file(File)),
+    ?assertMatch({ok, _}, auth_authorize(TestPath, <<"test-1">>, <<"secret-11">>)),
+    ?assertMatch({error, _}, auth_authorize(TestPath, <<"test-2">>, <<"secret-12">>)),
+    update_file(<<>>),
+
+    %% skip the empty line
+    Bin2 = <<"test-3:new-secret-1\n\n\n   \ntest-4:new-secret-2">>,
+    ok = file:write_file(File, Bin2),
+    update_file(File),
+    ?assertMatch({error, _}, auth_authorize(TestPath, <<"test-3">>, <<"secret-1">>)),
+    ?assertMatch({error, _}, auth_authorize(TestPath, <<"test-4">>, <<"secret-2">>)),
+    ?assertMatch({ok, _}, auth_authorize(TestPath, <<"test-3">>, <<"new-secret-1">>)),
+    ?assertMatch({ok, _}, auth_authorize(TestPath, <<"test-4">>, <<"new-secret-2">>)),
+    ok.
+
+t_bootstrap_file_override(_) ->
+    TestPath = <<"/api/v5/status">>,
+    Bin =
+        <<"test-1:secret-1\ntest-1:duplicated-secret-1\ntest-2:secret-2\ntest-2:duplicated-secret-2">>,
+    File = "./bootstrap_api_keys.txt",
+    ok = file:write_file(File, Bin),
+    update_file(File),
+
+    ?assertEqual(ok, emqx_mgmt_auth:init_bootstrap_file(File)),
+
+    MatchFun = fun(ApiKey) -> mnesia:match_object(#?APP{api_key = ApiKey, _ = '_'}) end,
+    ?assertMatch(
+        {ok, [
+            #?APP{
+                name = <<"from_bootstrap_file_18926f94712af04e">>,
+                api_key = <<"test-1">>
+            }
+        ]},
+        emqx_mgmt_auth:trans(MatchFun, [<<"test-1">>])
+    ),
+    ?assertMatch({ok, _}, auth_authorize(TestPath, <<"test-1">>, <<"duplicated-secret-1">>)),
+
+    ?assertMatch(
+        {ok, [
+            #?APP{
+                name = <<"from_bootstrap_file_de1c28a2e610e734">>,
+                api_key = <<"test-2">>
+            }
+        ]},
+        emqx_mgmt_auth:trans(MatchFun, [<<"test-2">>])
+    ),
+    ?assertMatch({ok, _}, auth_authorize(TestPath, <<"test-2">>, <<"duplicated-secret-2">>)),
+    ok.
+
+t_bootstrap_file_dup_override(_) ->
+    TestPath = <<"/api/v5/status">>,
+    TestApiKey = <<"test-1">>,
+    Bin = <<"test-1:secret-1">>,
+    File = "./bootstrap_api_keys.txt",
+    ok = file:write_file(File, Bin),
+    update_file(File),
+    ?assertEqual(ok, emqx_mgmt_auth:init_bootstrap_file(File)),
+
+    SameAppWithDiffName = #?APP{
+        name = <<"name-1">>,
+        api_key = <<"test-1">>,
+        api_secret_hash = emqx_dashboard_admin:hash_api_secret(<<"duplicated-secret-1">>),
+        enable = true,
+        desc = <<"dup api key">>,
+        created_at = erlang:system_time(second),
+        expired_at = infinity
+    },
+    WriteFun = fun(App) -> mnesia:write(App) end,
+    MatchFun = fun(ApiKey) -> mnesia:match_object(#?APP{api_key = ApiKey, _ = '_'}) end,
+
+    ?assertEqual({ok, ok}, emqx_mgmt_auth:trans(WriteFun, [SameAppWithDiffName])),
+    %% `match_object' does not order its result, so compare the names as a set.
+    ?assertEqual(
+        [<<"from_bootstrap_file_18926f94712af04e">>, <<"name-1">>],
+        app_names(emqx_mgmt_auth:trans(MatchFun, [TestApiKey]))
+    ),
+
+    update_file(File),
+
+    %% Similar to loading bootstrap file at node startup
+    %% the duplicated apikey in mnesia will be cleaned up
+    ?assertEqual(ok, emqx_mgmt_auth:init_bootstrap_file(File)),
+    ?assertEqual(
+        [<<"from_bootstrap_file_18926f94712af04e">>],
+        app_names(emqx_mgmt_auth:trans(MatchFun, [<<"test-1">>]))
+    ),
+
+    %% the last apikey in bootstrap file will override the all in mnesia and the previous one(s) in bootstrap file
+    ?assertMatch({ok, _}, auth_authorize(TestPath, <<"test-1">>, <<"secret-1">>)),
+
+    ok.
+
+-doc """
+A bootstrap file re-read with an unchanged secret keeps the stored hash
+byte-identical, so a node joining a mixed-version cluster does not rewrite the
+shared record in a format the older nodes cannot verify.
+""".
+t_bootstrap_file_same_secret_keeps_hash(_) ->
+    TestPath = <<"/api/v5/status">>,
+    ApiKey = <<"keep-hash-1">>,
+    Secret = <<"secret-1">>,
+    File = "./bootstrap_api_keys.txt",
+    ok = file:write_file(File, <<ApiKey/binary, ":", Secret/binary>>),
+    update_file(File),
+    ?assertEqual(ok, emqx_mgmt_auth:init_bootstrap_file(File)),
+
+    %% Replace the hash with the pre-6.3 layout an older node writes.
+    LegacyHash = legacy_hash(<<"abcd">>, Secret),
+    ok = set_secret_hash(ApiKey, LegacyHash),
+    ?assertMatch({ok, _}, auth_authorize(TestPath, ApiKey, Secret)),
+
+    ?assertEqual(ok, emqx_mgmt_auth:init_bootstrap_file(File)),
+    ?assertEqual(LegacyHash, read_secret_hash(ApiKey)),
+    ?assertMatch({ok, _}, auth_authorize(TestPath, ApiKey, Secret)),
+    ok.
+
+-doc """
+A bootstrap file re-read with a rotated secret replaces the stored hash with the
+current format, the old secret stops working and the new one works.
+""".
+t_bootstrap_file_rotated_secret_rehashes(_) ->
+    TestPath = <<"/api/v5/status">>,
+    ApiKey = <<"rotate-hash-1">>,
+    Secret = <<"secret-1">>,
+    NewSecret = <<"secret-2">>,
+    File = "./bootstrap_api_keys.txt",
+    ok = file:write_file(File, <<ApiKey/binary, ":", Secret/binary>>),
+    update_file(File),
+    ?assertEqual(ok, emqx_mgmt_auth:init_bootstrap_file(File)),
+    ok = set_secret_hash(ApiKey, legacy_hash(<<"abcd">>, Secret)),
+
+    ok = file:write_file(File, <<ApiKey/binary, ":", NewSecret/binary>>),
+    ?assertEqual(ok, emqx_mgmt_auth:init_bootstrap_file(File)),
+
+    ?assertMatch(<<"$1$", _/binary>>, read_secret_hash(ApiKey)),
+    ?assertMatch({error, _}, auth_authorize(TestPath, ApiKey, Secret)),
+    ?assertMatch({ok, _}, auth_authorize(TestPath, ApiKey, NewSecret)),
+    ok.
+
+-doc """
+A role change in the bootstrap file takes effect on a re-read even though the
+secret is unchanged and the stored hash is kept.
+""".
+t_bootstrap_file_same_secret_updates_metadata(_) ->
+    ApiKey = <<"keep-hash-meta-1">>,
+    Secret = <<"secret-1">>,
+    File = "./bootstrap_api_keys.txt",
+    ok = file:write_file(File, <<ApiKey/binary, ":", Secret/binary, ":viewer">>),
+    update_file(File),
+    ?assertEqual(ok, emqx_mgmt_auth:init_bootstrap_file(File)),
+    ?assertEqual(<<"viewer">>, read_bootstrap_role(ApiKey)),
+    Hash = read_secret_hash(ApiKey),
+
+    ok = file:write_file(File, <<ApiKey/binary, ":", Secret/binary, ":administrator">>),
+    ?assertEqual(ok, emqx_mgmt_auth:init_bootstrap_file(File)),
+
+    ?assertEqual(Hash, read_secret_hash(ApiKey)),
+    ?assertEqual(<<"administrator">>, read_bootstrap_role(ApiKey)),
+    ok.
+
+app_names({ok, Apps}) ->
+    lists:sort([Name || #?APP{name = Name} <- Apps]).
+
+%% The pre-6.3 hash layout: 4 salt characters followed by sha256(Salt ++ Secret).
+legacy_hash(Salt, Secret) ->
+    <<Salt/binary, (crypto:hash(sha256, <<Salt/binary, Secret/binary>>))/binary>>.
+
+read_app_by_api_key(ApiKey) ->
+    MatchFun = fun(Key) -> mnesia:match_object(#?APP{api_key = Key, _ = '_'}) end,
+    {ok, [App]} = emqx_mgmt_auth:trans(MatchFun, [ApiKey]),
+    App.
+
+read_secret_hash(ApiKey) ->
+    (read_app_by_api_key(ApiKey))#?APP.api_secret_hash.
+
+set_secret_hash(ApiKey, Hash) ->
+    App = read_app_by_api_key(ApiKey),
+    WriteFun = fun(A) -> mnesia:write(A) end,
+    {ok, ok} = emqx_mgmt_auth:trans(WriteFun, [App#?APP{api_secret_hash = Hash}]),
+    ok.
+
+read_bootstrap_role(ApiKey) ->
+    {value, #{role := Role}} = lists:search(
+        fun(#{api_key := Key}) -> Key =:= ApiKey end,
+        emqx_mgmt_auth:list()
+    ),
+    Role.
+
+t_bootstrap_file_with_role(_) ->
+    Search = fun(Name) ->
+        lists:search(
+            fun(#{api_key := AppName}) ->
+                AppName =:= Name
+            end,
+            emqx_mgmt_auth:list()
+        )
+    end,
+
+    Bin = iolist_to_binary(
+        lists:join($\n, [
+            <<"role-1:role-1:viewer">>,
+            <<"role-2:role-2:administrator">>,
+            <<"role-3:role-3">>,
+            <<"role-4:role-4:ns:ns1::administrator">>,
+            <<"role-5:role-5:ns:ns1::viewer">>,
+            <<"role-6:role-6:ns:ns1::blobber">>
+        ])
+    ),
+    File = "./bootstrap_api_keys.txt",
+    ok = file:write_file(File, Bin),
+    update_file(File),
+
+    ?assertMatch(
+        {value, #{api_key := <<"role-1">>, role := <<"viewer">>, namespace := ?global_ns}},
+        Search(<<"role-1">>)
+    ),
+    ?assertMatch(
+        {value, #{api_key := <<"role-2">>, role := <<"administrator">>, namespace := ?global_ns}},
+        Search(<<"role-2">>)
+    ),
+    ?assertMatch(
+        {value, #{api_key := <<"role-3">>, role := <<"administrator">>, namespace := ?global_ns}},
+        Search(<<"role-3">>)
+    ),
+    ?assertMatch(
+        {value, #{api_key := <<"role-4">>, role := <<"administrator">>, namespace := <<"ns1">>}},
+        Search(<<"role-4">>)
+    ),
+    ?assertMatch(
+        {value, #{api_key := <<"role-5">>, role := <<"viewer">>, namespace := <<"ns1">>}},
+        Search(<<"role-5">>)
+    ),
+    ?assertMatch(false, Search(<<"role-6">>)),
+
+    %% bad role
+    BadBin = <<"role-7:secret-11:bad\n">>,
+    ok = file:write_file(File, BadBin),
+    update_file(File),
+    ?assertEqual(
+        false,
+        Search(<<"role-7">>)
+    ),
+    ok.
+
+%%--------------------------------------------------------------------
+%% Bootstrap file: 4-segment scope format `key:secret:role:scope1,scope2`
+%%--------------------------------------------------------------------
+
+%% Read the `scopes` value stored on a bootstrapped api key.
+%% Returns:
+%%   `not_found' — no record for this api key
+%%   `not_set'   — record exists but `scopes' is absent (back-compat:
+%%                  behaves as "all non-denied paths allowed")
+%%   `[binary()]' — explicit scope list
+read_bootstrap_scopes(ApiKey) ->
+    case
+        lists:search(
+            fun(#{api_key := K}) -> K =:= ApiKey end,
+            emqx_mgmt_auth:list()
+        )
+    of
+        false ->
+            not_found;
+        {value, #{scopes := Scopes}} when is_list(Scopes) ->
+            Scopes;
+        {value, #{scopes := <<"unset">>}} ->
+            %% Legacy upgrade artefact - extra map has no `scopes' key.
+            %% Fresh records (any segment count) materialise role-default
+            %% scopes at parse time, so this branch is only reachable in
+            %% upgrade scenarios.
+            unset;
+        {value, _AppMap} ->
+            not_set
+    end.
+
+t_bootstrap_file_with_scopes(_) ->
+    File = "./bootstrap_api_keys.txt",
+    %% Single scope, multiple scopes, and the special "all-allow" 3-segment
+    %% baseline mixed in to ensure they coexist.
+    Bin = iolist_to_binary([
+        "scope-single:secret-1:administrator:",
+        ?SCOPE_CONNECTIONS,
+        "\n",
+        "scope-multi:secret-2:administrator:",
+        ?SCOPE_CONNECTIONS,
+        ",",
+        ?SCOPE_PUBLISH,
+        ",",
+        ?SCOPE_MONITORING,
+        "\n",
+        "scope-no-field:secret-3:administrator\n"
+    ]),
+    ok = file:write_file(File, Bin),
+    update_file(File),
+
+    ?assertEqual([?SCOPE_CONNECTIONS], read_bootstrap_scopes(<<"scope-single">>)),
+    ?assertEqual(
+        [?SCOPE_CONNECTIONS, ?SCOPE_PUBLISH, ?SCOPE_MONITORING],
+        read_bootstrap_scopes(<<"scope-multi">>)
+    ),
+    %% 3-segment line: parser materialises role-default scopes (administrator
+    %% → GENERIC_SCOPES). The persisted extra map now carries an explicit
+    %% scope list, never the `<<"unset">>' sentinel.
+    ?assertEqual(?GENERIC_SCOPES, read_bootstrap_scopes(<<"scope-no-field">>)),
+    ok.
+
+t_bootstrap_file_with_scopes_invalid(_) ->
+    File = "./bootstrap_api_keys.txt",
+
+    %% Lenient policy: an unknown scope name is dropped with a warning log,
+    %% but the entry IS created (with whatever valid scopes remain). This
+    %% lets ops fix typos via the UI later instead of bouncing the whole
+    %% bootstrap load.
+
+    %% Mix of one unknown and two valid scopes — only the valid pair should
+    %% remain on the api_key record.
+    MixedBin = iolist_to_binary([
+        "scope-mixed:secret-1:administrator:bogus_scope,",
+        ?SCOPE_CONNECTIONS,
+        ",",
+        ?SCOPE_PUBLISH,
+        "\n"
+    ]),
+    ok = file:write_file(File, MixedBin),
+    update_file(File),
+    ?assertEqual(
+        [?SCOPE_CONNECTIONS, ?SCOPE_PUBLISH],
+        read_bootstrap_scopes(<<"scope-mixed">>)
+    ),
+
+    %% The internal `$denied` scope is NOT in scope_catalog/0; if a user
+    %% writes it the loader must drop it like any other unknown name.
+    DeniedBin = iolist_to_binary([
+        "scope-denied:secret-2:administrator:$denied,", ?SCOPE_AUDIT, "\n"
+    ]),
+    ok = file:write_file(File, DeniedBin),
+    update_file(File),
+    ?assertEqual([?SCOPE_AUDIT], read_bootstrap_scopes(<<"scope-denied">>)),
+
+    %% Bad line followed by a good line — both must be loaded. The bad line
+    %% becomes a deny-all key (scopes=[]), the good line stays intact.
+    GoodAfterBadBin = iolist_to_binary([
+        "scope-all-bad:secret-3:administrator:bogus_scope,foo\n",
+        "scope-good-after:secret-4:administrator:",
+        ?SCOPE_CONNECTIONS,
+        "\n"
+    ]),
+    ok = file:write_file(File, GoodAfterBadBin),
+    update_file(File),
+    ?assertEqual([], read_bootstrap_scopes(<<"scope-all-bad">>)),
+    ?assertEqual(
+        [?SCOPE_CONNECTIONS],
+        read_bootstrap_scopes(<<"scope-good-after">>)
+    ),
+    ok.
+
+%% A privilege scope combined with a non-privilege scope cannot restrict
+%% the key, so the lenient bootstrap loader drops the privilege scope
+%% (keeping the more restricted subset) rather than aborting the load.
+%% Among the four privilege scopes only `system' reaches this loader
+%% (the others are not in scope_catalog/0), so `system,connections'
+%% becomes `[connections]'.
+t_bootstrap_file_drops_mixed_privilege_scopes(_) ->
+    File = "./bootstrap_api_keys.txt",
+    Bin = iolist_to_binary([
+        "scope-mixed-priv:secret-1:administrator:",
+        ?SCOPE_SYSTEM,
+        ",",
+        ?SCOPE_CONNECTIONS,
+        "\n",
+        %% A privilege-only line is left untouched.
+        "scope-priv-only:secret-2:administrator:",
+        ?SCOPE_SYSTEM,
+        "\n"
+    ]),
+    ok = file:write_file(File, Bin),
+    update_file(File),
+    ?assertEqual(
+        [?SCOPE_CONNECTIONS],
+        read_bootstrap_scopes(<<"scope-mixed-priv">>)
+    ),
+    ?assertEqual([?SCOPE_SYSTEM], read_bootstrap_scopes(<<"scope-priv-only">>)),
+    ok.
+
+t_bootstrap_file_with_empty_scopes(_) ->
+    File = "./bootstrap_api_keys.txt",
+    %% Trailing colon with empty/whitespace-only 4th field is the explicit
+    %% "no scopes" form: the loader stores `scopes => []' on the record.
+    %% At runtime this denies every mapped path but still allows unmapped
+    %% public endpoints, so ops can reach the node and reconfigure the key
+    %% via the UI.
+    Bin = iolist_to_binary([
+        "scope-trailing:secret-1:administrator:\n",
+        %% Whitespace-only payload — the line-level `string:trim/1' inside
+        %% `read_line/1' strips the trailing spaces before the regex sees
+        %% the line, so this is equivalent to the trailing-colon form.
+        "scope-spaces:secret-2:administrator:   \n"
+    ]),
+    ok = file:write_file(File, Bin),
+    update_file(File),
+
+    ?assertEqual([], read_bootstrap_scopes(<<"scope-trailing">>)),
+    ?assertEqual([], read_bootstrap_scopes(<<"scope-spaces">>)),
+    ok.
+
+%% Users will write capitalised scope names ("Connections") because typed
+%% lists tend to look "more proper". `parse_scopes_str/1' lowercases each
+%% token so the catalog lookup matches; without this normalization the
+%% scope would be silently dropped by `filter_valid_scopes/1' (the entry
+%% would still be created with no usable scopes — the worst kind of
+%% confusion). Pin the lowercase contract here so it cannot regress.
+t_bootstrap_file_with_mixed_case_scopes(_) ->
+    File = "./bootstrap_api_keys.txt",
+    Bin = iolist_to_binary([
+        %% Mixed case + leading capital + ALL CAPS — every variant must
+        %% normalise to the lowercase catalog name.
+        "scope-mixed-case:secret-1:administrator:Connections,PUBLISH,Monitoring\n"
+    ]),
+    ok = file:write_file(File, Bin),
+    update_file(File),
+    ?assertEqual(
+        [?SCOPE_CONNECTIONS, ?SCOPE_PUBLISH, ?SCOPE_MONITORING],
+        read_bootstrap_scopes(<<"scope-mixed-case">>)
+    ),
+    ok.
+
+%% Tokens are split on `,' with `trim_all', and each surviving element is
+%% then `string:trim/1'-ed individually. Heredocs and copy-pasted YAML
+%% routinely sneak whitespace into the scopes column; verify it lands
+%% cleanly in the stored list.
+t_bootstrap_file_with_whitespace_scopes(_) ->
+    File = "./bootstrap_api_keys.txt",
+    Bin = iolist_to_binary([
+        "scope-ws:secret-1:administrator:  ",
+        ?SCOPE_CONNECTIONS,
+        "  ,   ",
+        ?SCOPE_PUBLISH,
+        "   \n"
+    ]),
+    ok = file:write_file(File, Bin),
+    update_file(File),
+    ?assertEqual(
+        [?SCOPE_CONNECTIONS, ?SCOPE_PUBLISH],
+        read_bootstrap_scopes(<<"scope-ws">>)
+    ),
+    ok.
+
+%% Duplicate scope tokens are NOT collapsed by the loader. `lists:member'
+%% in `check_path_in_scopes/2' tolerates duplicates at runtime, so the
+%% loader keeps the user-supplied list verbatim (matching the HTTP API
+%% contract). Pin this so a future "helpful" dedup does not silently
+%% change list ordering or stored shape.
+t_bootstrap_file_with_duplicate_scopes(_) ->
+    File = "./bootstrap_api_keys.txt",
+    Bin = iolist_to_binary([
+        "scope-dup:secret-1:administrator:",
+        ?SCOPE_CONNECTIONS,
+        ",",
+        ?SCOPE_CONNECTIONS,
+        ",",
+        ?SCOPE_PUBLISH,
+        "\n"
+    ]),
+    ok = file:write_file(File, Bin),
+    update_file(File),
+    ?assertEqual(
+        [?SCOPE_CONNECTIONS, ?SCOPE_CONNECTIONS, ?SCOPE_PUBLISH],
+        read_bootstrap_scopes(<<"scope-dup">>)
+    ),
+    ok.
+
+%% Lenient loading is order-independent: a line with bad-and-good scopes
+%% before a fully-valid line, OR a fully-valid line before a bad line,
+%% MUST both result in every entry being stored. The pre-lenient
+%% implementation aborted the whole file on the first bad line, leaving
+%% any subsequent good lines unloaded. Cover both orderings explicitly.
+t_bootstrap_file_lenient_order_independence(_) ->
+    File = "./bootstrap_api_keys.txt",
+
+    BadFirst = iolist_to_binary([
+        "scope-bad-1:secret-1:administrator:bogus,",
+        ?SCOPE_CONNECTIONS,
+        "\n",
+        "scope-good-1:secret-2:administrator:",
+        ?SCOPE_PUBLISH,
+        "\n"
+    ]),
+    ok = file:write_file(File, BadFirst),
+    update_file(File),
+    ?assertEqual(
+        [?SCOPE_CONNECTIONS],
+        read_bootstrap_scopes(<<"scope-bad-1">>)
+    ),
+    ?assertEqual(
+        [?SCOPE_PUBLISH],
+        read_bootstrap_scopes(<<"scope-good-1">>)
+    ),
+
+    %% Reset between sub-cases so the second mixed-file write is its own
+    %% fresh load (init_per_testcase only fires between cases, not
+    %% sub-blocks).
+    update_file(<<>>),
+
+    GoodFirst = iolist_to_binary([
+        "scope-good-2:secret-3:administrator:",
+        ?SCOPE_AUDIT,
+        "\n",
+        "scope-bad-2:secret-4:administrator:bogus,",
+        ?SCOPE_MONITORING,
+        "\n"
+    ]),
+    ok = file:write_file(File, GoodFirst),
+    update_file(File),
+    ?assertEqual(
+        [?SCOPE_AUDIT],
+        read_bootstrap_scopes(<<"scope-good-2">>)
+    ),
+    ?assertEqual(
+        [?SCOPE_MONITORING],
+        read_bootstrap_scopes(<<"scope-bad-2">>)
+    ),
+    ok.
+
+t_bootstrap_file_scope_runtime_check(_) ->
+    File = "./bootstrap_api_keys.txt",
+    %% Sanity-check that the scope cache is populated for the handlers
+    %% we exercise below — otherwise `handler_scopes/1' returns
+    %% `undefined' and `check_scopes/2' would silently allow access
+    %% regardless of the scope list, turning this test green for the
+    %% wrong reason.
+    ?assertEqual(
+        [?SCOPE_CONNECTIONS],
+        emqx_mgmt_api_key_scopes:handler_scopes({emqx_mgmt_api_banned, banned})
+    ),
+    ?assertEqual(
+        [?SCOPE_PUBLISH],
+        emqx_mgmt_api_key_scopes:handler_scopes({emqx_mgmt_api_publish, publish})
+    ),
+    ?assertEqual(
+        [?SCOPE_SYSTEM],
+        emqx_mgmt_api_key_scopes:handler_scopes({emqx_mgmt_api_status, get_status})
+    ),
+
+    %% A single key scoped to `connections`. Endpoints that map to OTHER scopes
+    %% (publish, monitoring, ...) must be denied for this key, while
+    %% `connections` endpoints stay allowed.
+    Bin = iolist_to_binary([
+        "scope-conn-only:secret-1:administrator:", ?SCOPE_CONNECTIONS, "\n"
+    ]),
+    ok = file:write_file(File, Bin),
+    update_file(File),
+
+    %% connections
+    BannedPath = <<"/api/v5/banned">>,
+    %% publish
+    PublishPath = <<"/api/v5/publish">>,
+    %% system
+    StatusPath = <<"/api/v5/status">>,
+
+    ?assertMatch(
+        {ok, _},
+        auth_authorize(BannedPath, <<"scope-conn-only">>, <<"secret-1">>)
+    ),
+    ?assertMatch(
+        {error, {unauthorized_role, _}},
+        auth_authorize(PublishPath, <<"scope-conn-only">>, <<"secret-1">>)
+    ),
+    ?assertMatch(
+        {error, {unauthorized_role, _}},
+        auth_authorize(StatusPath, <<"scope-conn-only">>, <<"secret-1">>)
+    ),
+
+    %% A key with no scopes field (3-segment entry) should reach all the
+    %% non-denied paths, confirming the back-compat path.
+    Bin2 = <<"scope-allow-all:secret-2:administrator\n">>,
+    ok = file:write_file(File, Bin2),
+    update_file(File),
+
+    ?assertMatch(
+        {ok, _},
+        auth_authorize(BannedPath, <<"scope-allow-all">>, <<"secret-2">>)
+    ),
+    ?assertMatch(
+        {ok, _},
+        auth_authorize(PublishPath, <<"scope-allow-all">>, <<"secret-2">>)
+    ),
+    ?assertMatch(
+        {ok, _},
+        auth_authorize(StatusPath, <<"scope-allow-all">>, <<"secret-2">>)
+    ),
+
+    %% A 4-segment entry with empty scopes (`scopes=[]'): mapped paths
+    %% must be denied, but unmapped paths should still be reachable so an
+    %% operator can fix the key via the UI.
+    Bin3 = <<"scope-empty:secret-3:administrator:\n">>,
+    ok = file:write_file(File, Bin3),
+    update_file(File),
+
+    %% Mapped paths under `connections' / `publish' scopes — denied.
+    ?assertMatch(
+        {error, {unauthorized_role, _}},
+        auth_authorize(BannedPath, <<"scope-empty">>, <<"secret-3">>)
+    ),
+    ?assertMatch(
+        {error, {unauthorized_role, _}},
+        auth_authorize(PublishPath, <<"scope-empty">>, <<"secret-3">>)
+    ),
+    %% `/status' is mapped to `system' scope — also denied.
+    ?assertMatch(
+        {error, {unauthorized_role, _}},
+        auth_authorize(StatusPath, <<"scope-empty">>, <<"secret-3">>)
+    ),
+    %% Unmapped handler: there should not be any in the management app
+    %% at the time this suite starts, but if `handler_scopes/1' returns
+    %% `undefined' for a handler the key with `scopes=[]' is allowed to
+    %% reach it. We test that contract directly:
+    ?assertEqual(
+        ok,
+        emqx_mgmt_auth:check_scopes(
+            #{role => ?ROLE_API_SUPERUSER, scopes => []},
+            #{method => get, module => no_such_api_module, function => no_such_function}
+        )
+    ),
+    ok.
+
+auth_authorize(Path, Key, Secret) ->
+    FakePath = erlang:list_to_binary(emqx_dashboard_swagger:relative_uri("/fake")),
+    FakeReq = #{method => <<"GET">>, path => FakePath},
+    %% minirest provides HandlerInfo as a map with path/method/module/function.
+    %% The scope check keys on `module' and `function', the handler
+    %% cowboy dispatched to; `path' is the route template minirest
+    %% would carry for it.
+    RelPath =
+        case emqx_dashboard_swagger:get_relative_uri(Path) of
+            {ok, Rel} -> binary_to_list(Rel);
+            _ -> binary_to_list(Path)
+        end,
+    {Module, Function} = handler_for(RelPath),
+    HandlerInfo = #{
+        method => get,
+        module => Module,
+        function => Function,
+        path => RelPath
+    },
+    emqx_mgmt_auth:authorize(HandlerInfo, FakeReq, Key, Secret).
+
+handler_for("/status") -> {emqx_mgmt_api_status, get_status};
+handler_for("/banned") -> {emqx_mgmt_api_banned, banned};
+handler_for("/publish") -> {emqx_mgmt_api_publish, publish}.
+
+update_file(File) ->
+    ?assertMatch({ok, _}, emqx:update_config([<<"api_key">>], #{<<"bootstrap_file">> => File})).
+
+t_create(_Config) ->
+    Name = <<"EMQX-API-KEY-1">>,
+    {ok, Create} = create_app(Name),
+    ?assertMatch(
+        #{
+            <<"api_key">> := _,
+            <<"api_secret">> := _,
+            <<"created_at">> := _,
+            <<"desc">> := _,
+            <<"enable">> := true,
+            <<"expired_at">> := _,
+            <<"name">> := Name
+        },
+        Create
+    ),
+    {ok, List} = list_app(),
+    [App] = lists:filter(fun(#{<<"name">> := NameA}) -> NameA =:= Name end, List),
+    ?assertEqual(false, maps:is_key(<<"api_secret">>, App)),
+    {ok, App1} = read_app(Name),
+    ?assertEqual(Name, maps:get(<<"name">>, App1)),
+    ?assertEqual(true, maps:get(<<"enable">>, App1)),
+    ?assertEqual(false, maps:is_key(<<"api_secret">>, App1)),
+    ?assertEqual({error, {"HTTP/1.1", 404, "Not Found"}}, read_app(<<"EMQX-API-KEY-NO-EXIST">>)),
+    ok.
+
+%% Creating a key without the optional `desc'/`enable' fields must not crash
+%% the handler into HTTP 500 (#18713): the note defaults to an empty string
+%% and the key is created enabled. The Dashboard always sends both
+%% (`desc => ""', `enable => true'), but the REST API and the documented
+%% examples may omit them.
+t_create_optional_fields(_Config) ->
+    Name = <<"EMQX-API-KEY-OPTIONAL">>,
+    {ok, Create} = post_app(#{name => Name}),
+    ?assertMatch(
+        #{
+            <<"name">> := Name,
+            <<"desc">> := <<>>,
+            <<"enable">> := true,
+            <<"expired_at">> := <<"infinity">>
+        },
+        Create
+    ),
+    {ok, Read} = read_app(Name),
+    ?assertEqual(<<>>, maps:get(<<"desc">>, Read)),
+    ?assertEqual(true, maps:get(<<"enable">>, Read)),
+    {ok, _} = delete_app(Name),
+
+    %% `enable' may be omitted on its own: the note is kept as sent and the
+    %% key is still created enabled.
+    HalfName = <<"EMQX-API-KEY-NO-ENABLE">>,
+    {ok, Half} = post_app(#{name => HalfName, desc => <<"Kept"/utf8>>}),
+    ?assertMatch(
+        #{<<"name">> := HalfName, <<"desc">> := <<"Kept"/utf8>>, <<"enable">> := true},
+        Half
+    ),
+    {ok, _} = delete_app(HalfName),
+
+    %% The exact request from the issue: the note was spelled `description'
+    %% (the name users read off the Dashboard form's validation prop), which is
+    %% not part of the API key schema and is silently ignored by request
+    %% validation. It must not 500; the key is created with an empty note.
+    TypoName = <<"EMQX-API-KEY-DESCRIPTION">>,
+    {ok, Typo} = post_app(#{
+        name => TypoName,
+        description => <<"test"/utf8>>,
+        role => ?ROLE_API_VIEWER,
+        enable => true
+    }),
+    ?assertMatch(#{<<"name">> := TypoName, <<"desc">> := <<>>}, Typo),
+    {ok, _} = delete_app(TypoName),
+
+    %% JSON `null' is the other common way clients express "field omitted":
+    %% the schema drops nulls, so both fields must fall back to the same
+    %% defaults as when they are absent.
+    NullName = <<"EMQX-API-KEY-NULL">>,
+    {ok, Null} = post_app(#{name => NullName, desc => null, enable => null}),
+    ?assertMatch(
+        #{<<"name">> := NullName, <<"desc">> := <<>>, <<"enable">> := true},
+        Null
+    ),
+    {ok, _} = delete_app(NullName),
+
+    %% `name' is still mandatory — a missing one is rejected by the schema
+    %% (400) and never reaches the handler.
+    ok = assert_400(post_app(#{desc => <<"no name">>, enable => true})),
+    ok.
+
+%% PUT is a partial update for `desc'/`enable': an absent `desc' must not
+%% clear the note and an absent `enable' must not re-enable a disabled key.
+%% `expired_at' behaves the same way: an absent one keeps the stored expiry
+%% instead of re-applying a default (pinned by t_update).
+t_update_optional_fields(_Config) ->
+    Name = <<"EMQX-API-UPDATE-OPTIONAL">>,
+    {ok, _} = create_app(Name),
+    {ok, Disabled} = update_app(Name, #{enable => false}),
+    ?assertEqual(false, maps:get(<<"enable">>, Disabled)),
+    ?assertEqual(<<"Note"/utf8>>, maps:get(<<"desc">>, Disabled)),
+    %% Neither field supplied: the note and the disabled state survive.
+    {ok, Untouched} = update_app(Name, #{}),
+    ?assertEqual(false, maps:get(<<"enable">>, Untouched)),
+    ?assertEqual(<<"Note"/utf8>>, maps:get(<<"desc">>, Untouched)),
+    {ok, _} = delete_app(Name),
+    ok.
+
+%% Bootstrap file: publisher role lenient policy — non-publish
+%% scopes are dropped with a warning log; the entry IS created with
+%% only the publish scope retained (or empty if no publish present).
+%% This mirrors the API-layer schema validation but is non-fatal for
+%% the whole bootstrap load.
+t_bootstrap_file_publisher_only_publish_scope(_) ->
+    File = "./bootstrap_api_keys.txt",
+    Bin = iolist_to_binary([
+        %% publisher with mixed scopes — only publish should survive.
+        "from_bootstrap_file_pub_mixed:secret-1:publisher:",
+        ?SCOPE_CONNECTIONS,
+        ",",
+        ?SCOPE_PUBLISH,
+        ",",
+        ?SCOPE_MONITORING,
+        "\n",
+        %% publisher with only non-publish scope — all dropped, ends
+        %% up with empty scopes (which the runtime treats like the
+        %% absent case for publisher: RBAC restricts to /publish).
+        "from_bootstrap_file_pub_drop_all:secret-2:publisher:",
+        ?SCOPE_CONNECTIONS,
+        ",",
+        ?SCOPE_AUDIT,
+        "\n",
+        %% publisher with publish only — passes through unchanged.
+        "from_bootstrap_file_pub_publish_only:secret-3:publisher:",
+        ?SCOPE_PUBLISH,
+        "\n",
+        %% Non-publisher (administrator) is NOT subject to the
+        %% publisher restriction — all valid scopes retained.
+        "from_bootstrap_file_admin_full:secret-4:administrator:",
+        ?SCOPE_CONNECTIONS,
+        ",",
+        ?SCOPE_PUBLISH,
+        ",",
+        ?SCOPE_MONITORING,
+        "\n"
+    ]),
+    ok = file:write_file(File, Bin),
+    update_file(File),
+
+    ?assertEqual(
+        [?SCOPE_PUBLISH],
+        read_bootstrap_scopes(<<"from_bootstrap_file_pub_mixed">>)
+    ),
+    ?assertEqual(
+        [],
+        read_bootstrap_scopes(<<"from_bootstrap_file_pub_drop_all">>)
+    ),
+    ?assertEqual(
+        [?SCOPE_PUBLISH],
+        read_bootstrap_scopes(<<"from_bootstrap_file_pub_publish_only">>)
+    ),
+    ?assertEqual(
+        [?SCOPE_CONNECTIONS, ?SCOPE_PUBLISH, ?SCOPE_MONITORING],
+        read_bootstrap_scopes(<<"from_bootstrap_file_admin_full">>)
+    ),
+    ok.
+
+%% 2-segment `key:secret' bootstrap lines have no role and no scope column.
+%% The parser defaults the role to `?ROLE_API_DEFAULT' (administrator) and
+%% materialises that role's default scope list at parse time. The persisted
+%% record carries an explicit scope list — never the legacy `<<"unset">>'
+%% sentinel — so a fresh `key:secret' bootstrap key behaves identically to
+%% a POST that omits the `scopes' field.
+t_bootstrap_file_2_segment_seeds_default_scopes(_) ->
+    File = "./bootstrap_api_keys.txt",
+    Bin = <<"from_bootstrap_file_2seg:secret-2seg\n">>,
+    ok = file:write_file(File, Bin),
+    update_file(File),
+    ?assertEqual(
+        ?GENERIC_SCOPES,
+        read_bootstrap_scopes(<<"from_bootstrap_file_2seg">>)
+    ),
+    ok.
+
+%% 3-segment `key:secret:publisher' lines materialise the publisher
+%% role default — a single `publish' scope — so the record can be served
+%% via the management API without falling back to the `<<"unset">>'
+%% sentinel and without exposing the publisher to non-publish endpoints.
+t_bootstrap_file_3_segment_publisher_seeds_publish_scope(_) ->
+    File = "./bootstrap_api_keys.txt",
+    Bin = <<"from_bootstrap_file_3seg_pub:secret-3seg:publisher\n">>,
+    ok = file:write_file(File, Bin),
+    update_file(File),
+    ?assertEqual(
+        [?SCOPE_PUBLISH],
+        read_bootstrap_scopes(<<"from_bootstrap_file_3seg_pub">>)
+    ),
+    ok.
+
+-doc """
+Namespaced `role`-only bootstrap lines materialise the namespace-aware
+administrator default: the namespaced-admin subset without `publish`.
+""".
+t_bootstrap_file_ns_admin_seeds_ns_default_scopes(_) ->
+    File = "./bootstrap_api_keys.txt",
+    Bin = <<"from_bootstrap_file_ns_admin:secret-ns-admin:ns:nsboot::administrator\n">>,
+    ok = file:write_file(File, Bin),
+    update_file(File),
+    ?assertEqual(
+        ?NS_ADMIN_COMMON_SCOPES,
+        read_bootstrap_scopes(<<"from_bootstrap_file_ns_admin">>)
+    ),
+    ok.
+
+-doc """
+A namespaced bootstrap line granting scopes outside `?NS_ADMIN_ALLOWED_SCOPES'
+(`audit`, `gateways`, `publish`) has those scopes dropped; an allowlisted
+scope in the same line is kept (emqx-dev-team-tasks#412).
+""".
+t_bootstrap_file_ns_admin_drops_out_of_allowlist_scopes(_) ->
+    File = "./bootstrap_api_keys.txt",
+    Bin = iolist_to_binary([
+        "from_bootstrap_file_ns_over_grant:secret-ns-over-grant:ns:nsboot2::administrator:",
+        ?SCOPE_AUDIT,
+        ",",
+        ?SCOPE_GATEWAYS,
+        ",",
+        ?SCOPE_PUBLISH,
+        ",",
+        ?SCOPE_CONNECTIONS,
+        "\n"
+    ]),
+    ok = file:write_file(File, Bin),
+    update_file(File),
+    ?assertEqual(
+        [?SCOPE_CONNECTIONS],
+        read_bootstrap_scopes(<<"from_bootstrap_file_ns_over_grant">>)
+    ),
+    ok.
+
+t_create_failed(_Config) ->
+    BadRequest = {error, {"HTTP/1.1", 400, "Bad Request"}},
+
+    ?assertEqual(BadRequest, create_app(<<" error format name">>)),
+    LongName = iolist_to_binary(lists:duplicate(257, "A")),
+    ?assertEqual(BadRequest, create_app(<<" error format name">>)),
+    ?assertEqual(BadRequest, create_app(LongName)),
+
+    {ok, List} = list_app(),
+    CreateNum = 100 - erlang:length(List),
+    Names = lists:map(
+        fun(Seq) ->
+            <<"EMQX-API-FAILED-KEY-", (integer_to_binary(Seq))/binary>>
+        end,
+        lists:seq(1, CreateNum)
+    ),
+    lists:foreach(fun(N) -> {ok, _} = create_app(N) end, Names),
+    ?assertEqual(BadRequest, create_app(<<"EMQX-API-KEY-MAXIMUM">>)),
+
+    lists:foreach(fun(N) -> {ok, _} = delete_app(N) end, Names),
+    Name = <<"EMQX-API-FAILED-KEY-1">>,
+    ?assertMatch({ok, _}, create_app(Name)),
+    ?assertEqual(BadRequest, create_app(Name)),
+    {ok, _} = delete_app(Name),
+    ?assertMatch({ok, #{<<"name">> := Name}}, create_app(Name)),
+    {ok, _} = delete_app(Name),
+    ok.
+
+t_update(_Config) ->
+    Name = <<"EMQX-API-UPDATE-KEY">>,
+    {ok, _} = create_app(Name),
+
+    ExpiredAt = to_rfc3339(erlang:system_time(second) + 10000),
+    Change = #{
+        expired_at => ExpiredAt,
+        desc => <<"NoteVersion1"/utf8>>,
+        enable => false
+    },
+    {ok, Update1} = update_app(Name, Change),
+    ?assertEqual(Name, maps:get(<<"name">>, Update1)),
+    ?assertEqual(false, maps:get(<<"enable">>, Update1)),
+    ?assertEqual(<<"NoteVersion1"/utf8>>, maps:get(<<"desc">>, Update1)),
+    ?assertEqual(
+        calendar:rfc3339_to_system_time(binary_to_list(ExpiredAt)),
+        calendar:rfc3339_to_system_time(binary_to_list(maps:get(<<"expired_at">>, Update1)))
+    ),
+    Unexpired1 = maps:without([expired_at], Change),
+    {ok, Update2} = update_app(Name, Unexpired1),
+    %% omitting `expired_at' keeps the stored expiry, it must not make the key immortal
+    ?assertEqual(
+        calendar:rfc3339_to_system_time(binary_to_list(ExpiredAt)),
+        calendar:rfc3339_to_system_time(binary_to_list(maps:get(<<"expired_at">>, Update2)))
+    ),
+    Unexpired2 = Change#{expired_at => <<"infinity">>},
+    {ok, Update3} = update_app(Name, Unexpired2),
+    ?assertEqual(<<"infinity">>, maps:get(<<"expired_at">>, Update3)),
+
+    ?assertEqual({error, {"HTTP/1.1", 404, "Not Found"}}, update_app(<<"Not-Exist">>, Change)),
+    ok.
+
+%% Releases before 5.0.0 stored `expired_at = undefined' to mean "never expires", and
+%% such records survive an upgrade (and a backup restore) unchanged. They must not take
+%% the API down: both reading and a partial update have to keep working.
+t_update_legacy_undefined_expiry(_Config) ->
+    Name = <<"EMQX-API-LEGACY-EXPIRY-KEY">>,
+    {ok, _} = create_app(Name),
+    ok = set_stored_expired_at(Name, undefined),
+
+    {ok, #{<<"expired_at">> := <<"infinity">>}} = read_app(Name),
+    {ok, #{<<"expired_at">> := <<"infinity">>}} = update_app(Name, #{enable => false}),
+    {ok, #{<<"expired_at">> := <<"infinity">>}} = read_app(Name),
+    {ok, _} = delete_app(Name),
+    ok.
+
+%% Overwrite the stored expiry directly to emulate a record written by an old release.
+%% Only the `expired_at' slot is touched, so the stored `extra' payload survives as-is.
+set_stored_expired_at(Name, ExpiredAt) ->
+    {ok, ok} = emqx_mgmt_auth:trans(
+        fun() ->
+            [App0] = mnesia:read(?APP, Name, write),
+            mnesia:write(App0#?APP{expired_at = ExpiredAt})
+        end,
+        []
+    ),
+    ok.
+
+t_delete(_Config) ->
+    Name = <<"EMQX-API-DELETE-KEY">>,
+    {ok, _Create} = create_app(Name),
+    {ok, Delete} = delete_app(Name),
+    ?assertEqual([], Delete),
+    ?assertEqual({error, {"HTTP/1.1", 404, "Not Found"}}, delete_app(Name)),
+    ok.
+
+t_authorize(_Config) ->
+    Name = <<"EMQX-API-AUTHORIZE-KEY">>,
+    {ok, #{<<"api_key">> := ApiKey, <<"api_secret">> := ApiSecret}} = create_app(Name),
+    BasicHeader = emqx_common_test_http:auth_header(
+        binary_to_list(ApiKey),
+        binary_to_list(ApiSecret)
+    ),
+    SecretError = emqx_common_test_http:auth_header(
+        binary_to_list(ApiKey),
+        binary_to_list(ApiKey)
+    ),
+    KeyError = emqx_common_test_http:auth_header("not_found_key", binary_to_list(ApiSecret)),
+    Unauthorized = {error, {"HTTP/1.1", 401, "Unauthorized"}},
+
+    BanPath = emqx_mgmt_api_test_util:api_path(["banned"]),
+    ApiKeyPath = emqx_mgmt_api_test_util:api_path(["api_key"]),
+    UserPath = emqx_mgmt_api_test_util:api_path(["users"]),
+    DeleteUserPath1 = emqx_mgmt_api_test_util:api_path(["users", "some_user"]),
+    DeleteUserPath2 = [emqx_mgmt_api_test_util:api_path([""]), "./users/some_user"],
+
+    {ok, _Status} = emqx_mgmt_api_test_util:request_api(get, BanPath, BasicHeader),
+    ?assertEqual(Unauthorized, emqx_mgmt_api_test_util:request_api(get, BanPath, KeyError)),
+    ?assertEqual(Unauthorized, emqx_mgmt_api_test_util:request_api(get, BanPath, SecretError)),
+    ?assertEqual(Unauthorized, emqx_mgmt_api_test_util:request_api(get, UserPath, BasicHeader)),
+
+    ?assertEqual(
+        Unauthorized, emqx_mgmt_api_test_util:request_api(delete, DeleteUserPath1, BasicHeader)
+    ),
+    %% We make request with hackney to avoid path normalization made by httpc.
+    {ok, Code, _Headers0, _Body0} = hackney:request(delete, DeleteUserPath2, [BasicHeader], <<>>),
+    ?assertEqual(401, Code),
+
+    {error, {{"HTTP/1.1", 401, "Unauthorized"}, _Headers1, Body1}} =
+        emqx_mgmt_api_test_util:request_api(
+            get,
+            ApiKeyPath,
+            [],
+            BasicHeader,
+            [],
+            #{return_all => true}
+        ),
+    ?assertMatch(
+        #{
+            <<"code">> := <<"API_KEY_NOT_ALLOW">>,
+            <<"message">> := _
+        },
+        emqx_utils_json:decode(Body1, [return_maps])
+    ),
+
+    ?assertMatch(
+        {ok, #{<<"api_key">> := _, <<"enable">> := false}},
+        update_app(Name, #{enable => false})
+    ),
+    ?assertEqual(Unauthorized, emqx_mgmt_api_test_util:request_api(get, BanPath, BasicHeader)),
+
+    Expired = #{
+        expired_at => to_rfc3339(erlang:system_time(second) - 1),
+        enable => true
+    },
+    ?assertMatch({ok, #{<<"api_key">> := _, <<"enable">> := true}}, update_app(Name, Expired)),
+    ?assertEqual(Unauthorized, emqx_mgmt_api_test_util:request_api(get, BanPath, BasicHeader)),
+    UnExpired = #{expired_at => infinity},
+    ?assertMatch(
+        {ok, #{<<"api_key">> := _, <<"expired_at">> := <<"infinity">>}},
+        update_app(Name, UnExpired)
+    ),
+    {ok, _Status1} = emqx_mgmt_api_test_util:request_api(get, BanPath, BasicHeader),
+    ok.
+
+t_create_unexpired_app(_Config) ->
+    Name1 = <<"EMQX-UNEXPIRED-API-KEY-1">>,
+    Name2 = <<"EMQX-UNEXPIRED-API-KEY-2">>,
+    {ok, Create1} = create_unexpired_app(Name1, #{}),
+    ?assertMatch(#{<<"expired_at">> := <<"infinity">>}, Create1),
+    {ok, Create2} = create_unexpired_app(Name2, #{expired_at => <<"infinity">>}),
+    ?assertMatch(#{<<"expired_at">> := <<"infinity">>}, Create2),
+    ok.
+
+t_ee_create(_Config) ->
+    Name = <<"EMQX-EE-API-KEY-1">>,
+    {ok, Create} = create_app(Name, #{role => ?ROLE_API_VIEWER}),
+    ?assertMatch(
+        #{
+            <<"api_key">> := _,
+            <<"api_secret">> := _,
+            <<"created_at">> := _,
+            <<"desc">> := _,
+            <<"enable">> := true,
+            <<"expired_at">> := _,
+            <<"name">> := Name,
+            <<"role">> := ?ROLE_API_VIEWER
+        },
+        Create
+    ),
+
+    {ok, App} = read_app(Name),
+    ?assertMatch(#{<<"name">> := Name, <<"role">> := ?ROLE_API_VIEWER}, App).
+
+t_ee_update(_Config) ->
+    Name = <<"EMQX-EE-API-UPDATE-KEY">>,
+    {ok, _} = create_app(Name, #{role => ?ROLE_API_VIEWER}),
+
+    Change = #{
+        desc => <<"NoteVersion1"/utf8>>,
+        enable => false,
+        role => ?ROLE_API_SUPERUSER
+    },
+    {ok, Update1} = update_app(Name, Change),
+    ?assertEqual(?ROLE_API_SUPERUSER, maps:get(<<"role">>, Update1)),
+
+    {ok, App} = read_app(Name),
+    ?assertMatch(#{<<"name">> := Name, <<"role">> := ?ROLE_API_SUPERUSER}, App).
+
+%% A partial update must only touch the fields it carries: omitting `role' keeps the
+%% stored role instead of escalating the key to the default (administrator) role, while
+%% an explicitly supplied role must still be able to change it.
+t_update_partial_without_role(_Config) ->
+    Name = <<"EMQX-API-PARTIAL-UPDATE-KEY">>,
+    %% an expiry given at creation time must be honoured, not silently dropped.
+    %% `create_app/2' overwrites `expired_at', so use the pass-through helper here.
+    SentExpiry = to_rfc3339(erlang:system_time(second) + 30000),
+    {ok, Created} = create_unexpired_app(Name, #{
+        role => ?ROLE_API_VIEWER, expired_at => SentExpiry
+    }),
+    {ok, #{<<"role">> := Role0, <<"expired_at">> := ExpiredAt0}} = read_app(Name),
+    ?assertEqual(?ROLE_API_VIEWER, Role0),
+    ?assertEqual(
+        calendar:rfc3339_to_system_time(binary_to_list(SentExpiry)),
+        calendar:rfc3339_to_system_time(binary_to_list(ExpiredAt0))
+    ),
+    ?assertEqual(maps:get(<<"expired_at">>, Created), ExpiredAt0),
+
+    Partial = #{enable => false},
+    {ok, Update1} = update_app(Name, Partial),
+    ?assertEqual(Role0, maps:get(<<"role">>, Update1)),
+    ?assertEqual(false, maps:get(<<"enable">>, Update1)),
+    %% the response must not merely echo the old values, the stored ones must be intact
+    ?assertEqual(ExpiredAt0, maps:get(<<"expired_at">>, Update1)),
+    {ok, Update1Read} = read_app(Name),
+    ?assertEqual(Role0, maps:get(<<"role">>, Update1Read)),
+    ?assertEqual(ExpiredAt0, maps:get(<<"expired_at">>, Update1Read)),
+
+    {ok, Update2} = update_app(Name, Partial#{desc => <<"NoteVersion2"/utf8>>}),
+    ?assertEqual(Role0, maps:get(<<"role">>, Update2)),
+    ?assertEqual(<<"NoteVersion2"/utf8>>, maps:get(<<"desc">>, Update2)),
+    ?assertEqual(ExpiredAt0, maps:get(<<"expired_at">>, Update2)),
+
+    %% `expired_at' is absent from `Partial', so the key must not be made immortal by
+    %% this update; asking for a new expiry explicitly must still work.
+    {ok, Update3} = update_app(Name, Partial#{expired_at => <<"infinity">>}),
+    ?assertEqual(<<"infinity">>, maps:get(<<"expired_at">>, Update3)),
+    NewExpiry = to_rfc3339(erlang:system_time(second) + 20000),
+    {ok, Update4} = update_app(Name, #{expired_at => NewExpiry}),
+    ?assertEqual(
+        calendar:rfc3339_to_system_time(binary_to_list(NewExpiry)),
+        calendar:rfc3339_to_system_time(binary_to_list(maps:get(<<"expired_at">>, Update4)))
+    ),
+
+    %% omitting `role' must not escalate, but asking for one explicitly must still work
+    {ok, Update5} = update_app(Name, #{role => ?ROLE_API_SUPERUSER}),
+    ?assertEqual(?ROLE_API_SUPERUSER, maps:get(<<"role">>, Update5)),
+    {ok, #{<<"role">> := ?ROLE_API_SUPERUSER}} = read_app(Name),
+
+    %% an unknown role is still rejected by the schema validator ...
+    ?assertMatch({error, {"HTTP/1.1", 400, _}}, update_app(Name, #{role => <<"bad_role">>})),
+    {ok, #{<<"role">> := ?ROLE_API_SUPERUSER}} = read_app(Name),
+
+    %% ... and by `emqx_mgmt_auth:update/5' itself, which is the function this change
+    %% touches; also check the "no role asked for" case at the storage layer.
+    ?assertEqual(
+        {error, <<"Role does not exist">>},
+        emqx_mgmt_auth:update(Name, true, infinity, undefined, <<"bad_role">>)
+    ),
+    {ok, ViaApi} = emqx_mgmt_auth:update(Name, undefined, undefined, undefined, undefined),
+    ?assertEqual(?ROLE_API_SUPERUSER, maps:get(role, ViaApi)),
+    ?assertEqual(<<"NoteVersion2"/utf8>>, maps:get(desc, ViaApi)),
+
+    %% A namespaced key: an omitted `role' keeps the namespaced role, and the
+    %% namespaced-role scope allowlist still applies to the update. This needs the
+    %% handler to resolve the stored role for its validation instead of handing
+    %% `undefined' to it, which would look like a global role.
+    NsName = <<"EMQX-API-PARTIAL-UPDATE-NS-KEY">>,
+    NsRole = <<"ns:partial_ns::administrator">>,
+    {ok, _} = create_app(NsName, #{role => NsRole, scopes => [?SCOPE_CONNECTIONS]}),
+    %% the response reports the bare role plus the namespace it is scoped to
+    {ok, NsCreated} = read_app(NsName),
+    ?assertMatch(
+        #{<<"role">> := <<"administrator">>, <<"namespace">> := <<"partial_ns">>},
+        NsCreated
+    ),
+    {ok, NsUpdate1} = update_app(NsName, #{enable => false}),
+    ?assertEqual(maps:get(<<"role">>, NsCreated), maps:get(<<"role">>, NsUpdate1)),
+    ?assertEqual(maps:get(<<"namespace">>, NsCreated), maps:get(<<"namespace">>, NsUpdate1)),
+    ?assertEqual(false, maps:get(<<"enable">>, NsUpdate1)),
+    ok = assert_400(update_app(NsName, #{scopes => [?SCOPE_CONNECTIONS, ?SCOPE_AUDIT]})),
+    ?assertMatch(
+        {ok, #{
+            <<"role">> := <<"administrator">>,
+            <<"namespace">> := <<"partial_ns">>,
+            <<"scopes">> := [?SCOPE_CONNECTIONS]
+        }},
+        read_app(NsName)
+    ),
+    {ok, _} = delete_app(NsName),
+
+    %% a key that does not exist is still reported as missing
+    ?assertEqual({error, {"HTTP/1.1", 404, "Not Found"}}, update_app(<<"Not-Exist">>, Partial)),
+    {ok, _} = delete_app(Name),
+    ok.
+
+t_ee_authorize_viewer(_Config) ->
+    Name = <<"EMQX-EE-API-AUTHORIZE-KEY-VIEWER">>,
+    {ok, #{<<"api_key">> := ApiKey, <<"api_secret">> := ApiSecret}} = create_app(Name, #{
+        role => ?ROLE_API_VIEWER
+    }),
+    BasicHeader = emqx_common_test_http:auth_header(
+        binary_to_list(ApiKey),
+        binary_to_list(ApiSecret)
+    ),
+
+    BanPath = emqx_mgmt_api_test_util:api_path(["banned"]),
+    ?assertMatch({ok, _}, emqx_mgmt_api_test_util:request_api(get, BanPath, BasicHeader)),
+    ?assertMatch(
+        {error, {_, 403, _}}, emqx_mgmt_api_test_util:request_api(delete, BanPath, BasicHeader)
+    ).
+
+t_ee_authorize_admin(_Config) ->
+    Name = <<"EMQX-EE-API-AUTHORIZE-KEY-ADMIN">>,
+    {ok, #{<<"api_key">> := ApiKey, <<"api_secret">> := ApiSecret}} = create_app(Name, #{
+        role => ?ROLE_API_SUPERUSER
+    }),
+    BasicHeader = emqx_common_test_http:auth_header(
+        binary_to_list(ApiKey),
+        binary_to_list(ApiSecret)
+    ),
+
+    BanPath = emqx_mgmt_api_test_util:api_path(["banned"]),
+    ?assertMatch({ok, _}, emqx_mgmt_api_test_util:request_api(get, BanPath, BasicHeader)),
+    ?assertMatch(
+        {ok, _}, emqx_mgmt_api_test_util:request_api(delete, BanPath, BasicHeader)
+    ).
+
+-doc """
+An admin-role API key must NOT be able to reach the dashboard user-account
+endpoints via HTTP Basic auth -- neither the administrator MFA route nor
+any of the self-service `/current_user/*' routes. These endpoints belong
+to the human-facing dashboard surface and are intended only for
+bearer-token (JWT) callers.
+
+DELETE and POST /api/v5/users/:username/mfa via API key Basic auth must
+return HTTP 401 with body code API_KEY_NOT_ALLOW, matching the policy
+already enforced on /users and /users/:username.
+
+The `/current_user/*' routes need the same guard for a different reason:
+they are declared ?SCOPE_PUBLIC (self-service is authorized by identity,
+not by scope), so the scope layer would let an API key through. An API
+key has no dashboard account to be the subject of a self-service call.
+""".
+t_ee_authorize_admin_cannot_manage_mfa(_Config) ->
+    Name = <<"EMQX-EE-API-AUTHORIZE-KEY-ADMIN-MFA">>,
+    {ok, #{<<"api_key">> := ApiKey, <<"api_secret">> := ApiSecret}} = create_app(Name, #{
+        role => ?ROLE_API_SUPERUSER
+    }),
+    BasicHeader = emqx_common_test_http:auth_header(
+        binary_to_list(ApiKey),
+        binary_to_list(ApiSecret)
+    ),
+    Victim = <<"mfa_victim_user">>,
+    ok = ensure_victim_user(Victim),
+    DeleteMfa = emqx_mgmt_api_test_util:api_path(["users", Victim, "mfa"]),
+    PostMfa = DeleteMfa,
+    ShimPwd = emqx_mgmt_api_test_util:api_path(["users", Victim, "change_pwd"]),
+    CurrentUser = emqx_mgmt_api_test_util:api_path(["current_user"]),
+    CurrentUserMfa = emqx_mgmt_api_test_util:api_path(["current_user", "mfa"]),
+    CurrentUserPwd = emqx_mgmt_api_test_util:api_path(["current_user", "change_pwd"]),
+
+    ok = assert_api_key_not_allow(
+        delete, DeleteMfa, [], BasicHeader, []
+    ),
+    ok = assert_api_key_not_allow(
+        post, PostMfa, [], BasicHeader, #{mechanism => totp}
+    ),
+    %% The deprecated self-only shim is a self operation too, and it
+    %% carries no scope, so only the handler-name denial stops an API key.
+    ok = assert_api_key_not_allow(
+        post,
+        ShimPwd,
+        [],
+        BasicHeader,
+        #{old_pwd => <<"mfa_victim_pass">>, new_pwd => <<"new_pass_123">>}
+    ),
+    %% Self-service routes are equally out of reach for an API key.
+    ok = assert_api_key_not_allow(get, CurrentUser, [], BasicHeader, []),
+    ok = assert_api_key_not_allow(delete, CurrentUserMfa, [], BasicHeader, []),
+    ok = assert_api_key_not_allow(
+        post, CurrentUserMfa, [], BasicHeader, #{mechanism => totp}
+    ),
+    ok = assert_api_key_not_allow(
+        post,
+        CurrentUserPwd,
+        [],
+        BasicHeader,
+        #{old_pwd => <<"mfa_victim_pass">>, new_pwd => <<"new_pass_123">>}
+    ),
+
+    %% Even the generic /users and /users/:username stay blocked — baseline
+    %% sanity that this test is not special-casing change_mfa alone.
+    UsersPath = emqx_mgmt_api_test_util:api_path(["users"]),
+    UserPath = emqx_mgmt_api_test_util:api_path(["users", Victim]),
+    ok = assert_api_key_not_allow(get, UsersPath, [], BasicHeader, []),
+    ok = assert_api_key_not_allow(delete, UserPath, [], BasicHeader, []),
+    ok.
+
+-doc """
+Lower-level companion to t_ee_authorize_admin_cannot_manage_mfa:
+call emqx_mgmt_auth:authorize/4 directly with a HandlerInfo map that
+names the dashboard change_mfa and current_user_* handlers. It checks
+the rule directly in emqx_mgmt_auth, independent of any HTTP / minirest
+plumbing. The denial matches on the handler function name, so a
+dashboard route is covered only once it appears in this list.
+""".
+t_ee_authorize_admin_cannot_manage_mfa_module_level(_Config) ->
+    Name = <<"EMQX-EE-API-AUTH-MFA-MODULE">>,
+    {ok, #{<<"api_key">> := ApiKey, <<"api_secret">> := ApiSecret}} = create_app(Name, #{
+        role => ?ROLE_API_SUPERUSER
+    }),
+    %% FakeReq is only consulted by check_rbac — the denylist clauses we
+    %% add return before check_rbac runs, so it just needs to be a map
+    %% with method/path keys to satisfy cowboy_req helpers if called.
+    FakeReq = #{method => <<"DELETE">>, path => <<"/api/v5/users/someuser/mfa">>},
+    DeleteMfaHandler = #{
+        method => delete,
+        module => emqx_dashboard_api,
+        function => change_mfa,
+        path => "/users/:username/mfa"
+    },
+    PostMfaHandler = DeleteMfaHandler#{method => post},
+    SelfHandlers = [
+        #{
+            method => post,
+            function => change_pwd,
+            path => "/users/:username/change_pwd"
+        },
+        #{method => get, function => current_user, path => "/current_user"},
+        #{
+            method => post,
+            function => current_user_change_pwd,
+            path => "/current_user/change_pwd"
+        },
+        #{method => post, function => current_user_mfa, path => "/current_user/mfa"},
+        #{method => delete, function => current_user_mfa, path => "/current_user/mfa"}
+    ],
+    lists:foreach(
+        fun(Handler) ->
+            ?assertEqual(
+                {error, <<"not_allowed">>, <<"users">>},
+                emqx_mgmt_auth:authorize(
+                    Handler#{module => emqx_dashboard_api}, FakeReq, ApiKey, ApiSecret
+                ),
+                Handler
+            )
+        end,
+        [DeleteMfaHandler, PostMfaHandler | SelfHandlers]
+    ),
+    ok.
+
+-doc """
+`emqx_mgmt_auth:is_api_key_allowed/1` is the single predicate the auth-error
+message code (emqx_dashboard.erl) consults to decide whether to hint at API
+keys. It must agree with authorize/4's own denylist for every handler shape
+on the list, and allow anything else.
+""".
+t_is_api_key_allowed(_Config) ->
+    NotAllowed = [
+        #{module => emqx_dashboard_api, function => user},
+        #{module => emqx_dashboard_api, function => users},
+        #{module => emqx_dashboard_api, function => logout},
+        #{module => emqx_dashboard_api, function => change_pwd},
+        #{module => emqx_dashboard_api, function => change_mfa},
+        #{module => emqx_mgmt_api_api_keys, function => list}
+    ],
+    lists:foreach(
+        fun(HandlerInfo) ->
+            ?assertNot(emqx_mgmt_auth:is_api_key_allowed(HandlerInfo), HandlerInfo)
+        end,
+        NotAllowed
+    ),
+    ?assert(
+        emqx_mgmt_auth:is_api_key_allowed(#{module => emqx_mgmt_api_nodes, function => nodes})
+    ),
+    ok.
+
+ensure_victim_user(Username) ->
+    case emqx_dashboard_admin:add_user(Username, <<"mfa_victim_pass">>, ?ROLE_SUPERUSER, <<>>) of
+        {ok, _} -> ok;
+        {error, _AlreadyExists} -> ok
+    end.
+
+assert_api_key_not_allow(Method, Path, QueryParams, AuthHeader, Body) ->
+    Result = emqx_mgmt_api_test_util:request_api(
+        Method, Path, QueryParams, AuthHeader, Body, #{return_all => true}
+    ),
+    ?assertMatch(
+        {error, {{"HTTP/1.1", 401, _}, _Headers, _Body}},
+        Result
+    ),
+    {error, {_, _, ResponseBody}} = Result,
+    ?assertMatch(
+        #{<<"code">> := <<"API_KEY_NOT_ALLOW">>, <<"message">> := _},
+        emqx_utils_json:decode(ResponseBody, [return_maps])
+    ),
+    ok.
+
+t_ee_authorize_publisher(_Config) ->
+    Name = <<"EMQX-EE-API-AUTHORIZE-KEY-PUBLISHER">>,
+    {ok, #{<<"api_key">> := ApiKey, <<"api_secret">> := ApiSecret}} = create_app(Name, #{
+        role => ?ROLE_API_PUBLISHER
+    }),
+    BasicHeader = emqx_common_test_http:auth_header(
+        binary_to_list(ApiKey),
+        binary_to_list(ApiSecret)
+    ),
+
+    BanPath = emqx_mgmt_api_test_util:api_path(["banned"]),
+    Publish = emqx_mgmt_api_test_util:api_path(["publish"]),
+    ?assertMatch(
+        {error, {_, 403, _}}, emqx_mgmt_api_test_util:request_api(get, BanPath, BasicHeader)
+    ),
+    ?assertMatch(
+        {error, {_, 403, _}}, emqx_mgmt_api_test_util:request_api(delete, BanPath, BasicHeader)
+    ),
+    ?assertMatch(
+        {ok, _},
+        emqx_mgmt_api_test_util:request_api(
+            post,
+            Publish,
+            [],
+            BasicHeader,
+            #{topic => <<"t/t_ee_authorize_publisher">>, payload => <<"hello">>}
+        )
+    ).
+
+%%--------------------------------------------------------------------
+%% Schema validation tests for API key scopes:
+%%   * publisher role is restricted to the publish scope only;
+%%   * API keys reject any login-only scope regardless of role.
+%%--------------------------------------------------------------------
+
+%% publisher role + scopes=[<<"publish">>] — accepted (the only
+%% non-empty list a publisher can hold).
+t_ee_publisher_only_publish_scope(_Config) ->
+    Name = <<"EE-PUB-PUBLISH-ONLY">>,
+    ?assertMatch(
+        {ok, #{<<"name">> := Name}},
+        create_app(Name, #{role => ?ROLE_API_PUBLISHER, scopes => [?SCOPE_PUBLISH]})
+    ),
+    delete_app(Name).
+
+%% publisher role + scopes absent — accepted (falls back to RBAC
+%% hardcoded path matching at runtime).
+t_ee_publisher_with_undefined_scopes(_Config) ->
+    Name = <<"EE-PUB-UNDEFINED-SCOPES">>,
+    ?assertMatch(
+        {ok, #{<<"name">> := Name}},
+        create_app(Name, #{role => ?ROLE_API_PUBLISHER})
+    ),
+    delete_app(Name).
+
+%% publisher role + scopes=[] — accepted (empty list is equivalent
+%% to absent; runtime path check still applies).
+t_ee_publisher_with_empty_scopes(_Config) ->
+    Name = <<"EE-PUB-EMPTY-SCOPES">>,
+    ?assertMatch(
+        {ok, #{<<"name">> := Name}},
+        create_app(Name, #{role => ?ROLE_API_PUBLISHER, scopes => []})
+    ),
+    delete_app(Name).
+
+%% publisher role + scopes containing a non-publish scope — rejected
+%% by validate_publisher_scopes/2 with HTTP 400.
+t_ee_publisher_rejects_connections_scope(_Config) ->
+    Name = <<"EE-PUB-CONN-REJECT">>,
+    Result = create_app(Name, #{
+        role => ?ROLE_API_PUBLISHER,
+        scopes => [?SCOPE_CONNECTIONS]
+    }),
+    assert_400_publisher_only(Result).
+
+%% publisher role + scopes containing a login-only scope — rejected.
+%% This case exercises BOTH the publisher restriction (layer A) and
+%% the login-only rejection (layer B); validate_scopes/2 returns the
+%% first matching error, which is layer A here.
+t_ee_publisher_rejects_login_only_scope(_Config) ->
+    Name = <<"EE-PUB-LOGIN-ONLY-REJECT">>,
+    Result = create_app(Name, #{
+        role => ?ROLE_API_PUBLISHER,
+        scopes => [?SCOPE_USER_MGMT]
+    }),
+    assert_400_publisher_only(Result).
+
+%% publisher role + [publish, connections] — rejected. The publisher
+%% scope check requires scopes to be exactly [<<"publish">>] or
+%% empty/absent.
+t_ee_publisher_rejects_publish_plus_other(_Config) ->
+    Name = <<"EE-PUB-PUBLISH-PLUS-OTHER">>,
+    Result = create_app(Name, #{
+        role => ?ROLE_API_PUBLISHER,
+        scopes => [?SCOPE_PUBLISH, ?SCOPE_CONNECTIONS]
+    }),
+    assert_400_publisher_only(Result).
+
+%% Non-publisher API key (administrator) creation with login-only
+%% scope — rejected with HTTP 400 from validate_no_login_only_scopes/1.
+t_ee_api_key_rejects_login_only_via_post(_Config) ->
+    Name = <<"EE-API-KEY-LOGIN-ONLY-POST">>,
+    Result = create_app(Name, #{
+        role => ?ROLE_API_SUPERUSER,
+        scopes => [?SCOPE_CONNECTIONS, ?SCOPE_MFA_MGMT]
+    }),
+    assert_400_login_only(Result).
+
+%% PUT /api_key/:name with login-only scope on an existing key —
+%% rejected by the same validator.
+t_ee_api_key_rejects_login_only_via_put(_Config) ->
+    Name = <<"EE-API-KEY-LOGIN-ONLY-PUT">>,
+    {ok, _} = create_app(Name, #{
+        role => ?ROLE_API_SUPERUSER,
+        scopes => [?SCOPE_CONNECTIONS]
+    }),
+    Result = update_app(Name, #{
+        scopes => [?SCOPE_CONNECTIONS, ?SCOPE_USER_MGMT]
+    }),
+    assert_400_login_only(Result),
+    delete_app(Name).
+
+%% Administrator API key + scopes containing publish — accepted.
+%% Administrator and viewer roles are NOT restricted on the publish
+%% scope; only the publisher role is.
+t_ee_admin_role_with_publish_scope_allowed(_Config) ->
+    Name = <<"EE-ADMIN-WITH-PUBLISH">>,
+    ?assertMatch(
+        {ok, #{<<"name">> := Name}},
+        create_app(Name, #{
+            role => ?ROLE_API_SUPERUSER,
+            scopes => [?SCOPE_PUBLISH, ?SCOPE_CONNECTIONS, ?SCOPE_MONITORING]
+        })
+    ),
+    delete_app(Name).
+
+%% Viewer role + publish scope — accepted at schema layer (RBAC will
+%% reject the actual POST /publish at runtime, but the scope is
+%% formally legal).
+t_ee_viewer_role_with_publish_scope_allowed(_Config) ->
+    Name = <<"EE-VIEWER-WITH-PUBLISH">>,
+    ?assertMatch(
+        {ok, #{<<"name">> := Name}},
+        create_app(Name, #{
+            role => ?ROLE_API_VIEWER,
+            scopes => [?SCOPE_PUBLISH, ?SCOPE_MONITORING]
+        })
+    ),
+    delete_app(Name).
+
+%% H7: A partial-update PUT that changes the role to `publisher'
+%% without supplying a `scopes' field must validate against the
+%% persisted scopes, not against `undefined'. Otherwise an admin key
+%% with non-`publish' scopes could be silently demoted to publisher
+%% while keeping forbidden scopes — RBAC blocks the runtime path, but
+%% the stored config and the API response would violate the
+%% publisher-only-`publish' invariant.
+t_ee_publisher_role_change_with_persisted_admin_scopes_is_rejected(_Config) ->
+    Name = <<"EE-PUBLISHER-PERSISTED">>,
+    {ok, _} = create_app(Name, #{
+        role => ?ROLE_API_SUPERUSER,
+        scopes => [?SCOPE_CONNECTIONS, ?SCOPE_MONITORING]
+    }),
+    %% Partial update: drop to publisher; omit `scopes' on the wire.
+    Change = #{role => ?ROLE_API_PUBLISHER},
+    ok = assert_400_publisher_only(update_app(Name, Change)),
+    %% The persisted state must remain unchanged after the rejection.
+    {ok, App} = read_app(Name),
+    ?assertEqual(?ROLE_API_SUPERUSER, maps:get(<<"role">>, App)),
+    ?assertEqual(
+        [?SCOPE_CONNECTIONS, ?SCOPE_MONITORING], maps:get(<<"scopes">>, App)
+    ),
+    delete_app(Name).
+
+%% Counterpart of H7 rejection: when persisted scopes are already
+%% publisher-compatible (`[publish]'), a role change to publisher
+%% without a body `scopes' field must succeed.
+t_ee_publisher_role_change_with_compatible_persisted_scopes_succeeds(_Config) ->
+    Name = <<"EE-PUBLISHER-COMPATIBLE">>,
+    {ok, _} = create_app(Name, #{
+        role => ?ROLE_API_SUPERUSER,
+        scopes => [?SCOPE_PUBLISH]
+    }),
+    Change = #{role => ?ROLE_API_PUBLISHER},
+    {ok, Updated} = update_app(Name, Change),
+    ?assertEqual(?ROLE_API_PUBLISHER, maps:get(<<"role">>, Updated)),
+    ?assertEqual([?SCOPE_PUBLISH], maps:get(<<"scopes">>, Updated)),
+    delete_app(Name).
+
+%% Among the four privilege scopes only `system' is holdable by an API
+%% key (the other three are login-only and rejected earlier), so a
+%% privilege-only list here means `[system]'.
+t_ee_api_key_privilege_only_allowed(_Config) ->
+    Name = <<"EE-APIKEY-PRIV-ONLY">>,
+    ?assertMatch(
+        {ok, #{<<"name">> := Name}},
+        create_app(Name, #{
+            role => ?ROLE_API_SUPERUSER,
+            scopes => [?SCOPE_SYSTEM]
+        })
+    ),
+    delete_app(Name).
+
+t_ee_api_key_nonprivilege_only_allowed(_Config) ->
+    Name = <<"EE-APIKEY-NONPRIV-ONLY">>,
+    ?assertMatch(
+        {ok, #{<<"name">> := Name}},
+        create_app(Name, #{
+            role => ?ROLE_API_SUPERUSER,
+            scopes => [?SCOPE_CONNECTIONS, ?SCOPE_PUBLISH, ?SCOPE_MONITORING]
+        })
+    ),
+    delete_app(Name),
+    %% Empty list is deny-all, not mixed — accepted.
+    Name2 = <<"EE-APIKEY-EMPTY">>,
+    ?assertMatch(
+        {ok, #{<<"name">> := Name2}},
+        create_app(Name2, #{role => ?ROLE_API_SUPERUSER, scopes => []})
+    ),
+    delete_app(Name2).
+
+%% Mixing a privilege scope with a non-privilege scope is rejected.
+t_ee_api_key_rejects_mixed_privilege_via_post(_Config) ->
+    Name = <<"EE-APIKEY-MIXED-POST">>,
+    Result = create_app(Name, #{
+        role => ?ROLE_API_SUPERUSER,
+        scopes => [?SCOPE_SYSTEM, ?SCOPE_CONNECTIONS]
+    }),
+    assert_400(Result).
+
+%% Same on the update path.
+t_ee_api_key_rejects_mixed_privilege_via_put(_Config) ->
+    Name = <<"EE-APIKEY-MIXED-PUT">>,
+    {ok, _} = create_app(Name, #{
+        role => ?ROLE_API_SUPERUSER,
+        scopes => [?SCOPE_CONNECTIONS]
+    }),
+    Result = update_app(Name, #{scopes => [?SCOPE_SYSTEM, ?SCOPE_CONNECTIONS]}),
+    assert_400(Result),
+    %% Splitting the list succeeds.
+    ?assertMatch({ok, _}, update_app(Name, #{scopes => [?SCOPE_SYSTEM]})),
+    delete_app(Name).
+
+%% The mutex validator returns the expected message (the HTTP layer
+%% drops the 400 body, so assert on the validator directly).
+t_ee_api_key_privilege_mutex_message(_Config) ->
+    ?assertEqual(ok, emqx_scope_catalog:check_privilege_scope_mutex(undefined)),
+    ?assertEqual(ok, emqx_scope_catalog:check_privilege_scope_mutex([])),
+    ?assertEqual(ok, emqx_scope_catalog:check_privilege_scope_mutex([?SCOPE_SYSTEM])),
+    ?assertEqual(
+        ok, emqx_scope_catalog:check_privilege_scope_mutex([?SCOPE_CONNECTIONS])
+    ),
+    {error, Msg} =
+        emqx_scope_catalog:check_privilege_scope_mutex([?SCOPE_SYSTEM, ?SCOPE_CONNECTIONS]),
+    ?assertMatch(
+        {_, _},
+        binary:match(Msg, <<"Privilege scopes cannot be combined with other scopes">>)
+    ).
+
+-doc """
+The #18195 repro: create a key with the scope left blank, then update it
+re-submitting exactly what GET returned (the materialized role-default
+list, in any order, later the `unset` sentinel) — the update must
+succeed and clear the stored scope list.
+""".
+t_ee_scopes_update_unchanged_roundtrip(_Config) ->
+    Name = <<"EE-SCOPES-ROUNDTRIP">>,
+    {ok, _} = create_app(Name),
+    {ok, #{<<"scopes">> := Default}} = read_app(Name),
+    ?assert(is_list(Default)),
+    ?assertMatch({ok, _}, update_app(Name, #{scopes => Default})),
+    %% The role-default list is stored as "no explicit scopes".
+    ?assertMatch({ok, #{<<"scopes">> := <<"unset">>}}, read_app(Name)),
+    %% Round-trip once more with the `unset` sentinel GET now returns.
+    ?assertMatch({ok, _}, update_app(Name, #{scopes => <<"unset">>})),
+    ?assertMatch({ok, #{<<"scopes">> := <<"unset">>}}, read_app(Name)),
+    %% Order-insensitive: a permuted role-default list is also unset-equivalent.
+    ?assertMatch({ok, _}, update_app(Name, #{scopes => lists:reverse(Default)})),
+    ?assertMatch({ok, #{<<"scopes">> := <<"unset">>}}, read_app(Name)),
+    %% From the unset state, an explicit non-default list still takes effect.
+    Explicit = [?SCOPE_CONNECTIONS, ?SCOPE_MONITORING],
+    ?assertMatch({ok, _}, update_app(Name, #{scopes => Explicit})),
+    ?assertMatch({ok, #{<<"scopes">> := Explicit}}, read_app(Name)),
+    delete_app(Name).
+
+-doc """
+POST accepts the `unset` sentinel: the key is created without an explicit
+scope list and GET surfaces the sentinel.
+""".
+t_ee_scopes_create_unset_sentinel(_Config) ->
+    Name = <<"EE-SCOPES-CREATE-UNSET">>,
+    {ok, _} = create_app(Name, #{scopes => <<"unset">>}),
+    ?assertMatch({ok, #{<<"scopes">> := <<"unset">>}}, read_app(Name)),
+    delete_app(Name).
+
+-doc """
+A genuinely explicit scope list (different from the role default) is
+still validated and stored verbatim; GET reflects it.
+""".
+t_ee_scopes_update_explicit_list(_Config) ->
+    Name = <<"EE-SCOPES-EXPLICIT">>,
+    {ok, _} = create_app(Name),
+    Scopes = [?SCOPE_CONNECTIONS, ?SCOPE_MONITORING],
+    ?assertMatch({ok, _}, update_app(Name, #{scopes => Scopes})),
+    ?assertMatch({ok, #{<<"scopes">> := Scopes}}, read_app(Name)),
+    delete_app(Name).
+
+-doc """
+The publisher-only-`publish` invariant survives the unset-equivalent
+handling: an explicit non-publish list on a publisher key is still
+rejected on PUT, while the publisher role default (`[publish]`) is
+accepted as unset-equivalent.
+""".
+t_ee_publisher_update_rejects_explicit_non_publish(_Config) ->
+    Name = <<"EE-PUB-UPDATE-REJECT">>,
+    {ok, _} = create_app(Name, #{role => ?ROLE_API_PUBLISHER}),
+    assert_400_publisher_only(
+        update_app(Name, #{role => ?ROLE_API_PUBLISHER, scopes => [?SCOPE_CONNECTIONS]})
+    ),
+    ?assertMatch(
+        {ok, _},
+        update_app(Name, #{role => ?ROLE_API_PUBLISHER, scopes => [?SCOPE_PUBLISH]})
+    ),
+    ?assertMatch({ok, #{<<"scopes">> := <<"unset">>}}, read_app(Name)),
+    delete_app(Name).
+
+%% Regression: API key auth must NOT consult dashboard login-user
+%% scopes, even when the API key's generated `api_key' string happens
+%% to collide with a dashboard username. Prior to the fix,
+%% emqx_dashboard_rbac:check_rbac/3 unconditionally invoked
+%% check_login_user_scopes/3 after the role check, so a colliding
+%% admin record's empty extra.scopes would falsely deny the API key.
+%%
+%% Construction: create the API key first, then back-add a dashboard
+%% user whose username equals the generated api_key string. (Going
+%% the other way is harder because api_key is server-generated.)
+t_ee_api_key_unaffected_by_colliding_username_scopes(_Config) ->
+    Name = <<"EE-APIKEY-COLLIDE">>,
+    {ok, #{<<"api_key">> := ApiKey, <<"api_secret">> := ApiSecret}} =
+        create_app(Name, #{
+            role => ?ROLE_API_VIEWER,
+            scopes => [?SCOPE_CONNECTIONS]
+        }),
+    %% Now create a dashboard user whose username equals the
+    %% generated ApiKey string and assign it explicit empty scopes
+    %% (which, if leaked into the API key auth path, would deny every
+    %% mapped endpoint).
+    {ok, _} = emqx_dashboard_admin:add_user(
+        ApiKey, <<"P@ssw0rd">>, ?ROLE_VIEWER, <<>>
+    ),
+    {ok, ok} = emqx_dashboard_admin:set_user_scopes(ApiKey, []),
+    %% The API key request must succeed: /clients maps to the
+    %% connections scope, which the key holds. With the pre-fix bug,
+    %% check_login_user_scopes(ApiKey, <<"/clients">>) would have
+    %% resolved against the dashboard user's [] and returned false.
+    Basic = emqx_common_test_http:auth_header(
+        binary_to_list(ApiKey), binary_to_list(ApiSecret)
+    ),
+    Path = emqx_mgmt_api_test_util:api_path(["clients"]),
+    ?assertMatch({ok, _}, emqx_mgmt_api_test_util:request_api(get, Path, Basic)),
+    %% Cleanup
+    delete_app(Name),
+    _ = emqx_dashboard_admin:remove_user(ApiKey),
+    ok.
+
+-doc """
+A newly created namespaced administrator API key defaults to the
+namespaced-admin scope subset: no `publish` (the publish APIs are
+global-only) and no login-only scopes, matching the namespaced
+dashboard-user default minus the login-only scopes. The global
+administrator default still includes `publish`.
+""".
+t_ee_ns_admin_default_scopes_exclude_publish(_Config) ->
+    Name = <<"EE-NS-ADMIN-DEFAULT-SCOPES">>,
+    NsRole = <<"ns:scopes_ns1::administrator">>,
+    {ok, #{<<"scopes">> := NsScopes}} = create_app(Name, #{role => NsRole}),
+    ?assertEqual(lists:usort(?NS_ADMIN_COMMON_SCOPES), lists:usort(NsScopes)),
+    ?assertNot(lists:member(?SCOPE_PUBLISH, NsScopes)),
+    %% Parity with the namespaced dashboard-user default, minus the
+    %% login-only scopes (which API keys never hold).
+    UserDefault = emqx_dashboard_admin:role_default_scopes(NsRole),
+    ?assertEqual(
+        lists:usort(UserDefault -- ?LOGIN_ONLY_SCOPES),
+        lists:usort(NsScopes)
+    ),
+    %% Global administrator keys keep the generic default with `publish`.
+    GlobalName = <<"EE-GLOBAL-ADMIN-DEFAULT-SCOPES">>,
+    {ok, #{<<"scopes">> := GlobalScopes}} =
+        create_app(GlobalName, #{role => ?ROLE_API_SUPERUSER}),
+    ?assertEqual(lists:usort(?GENERIC_SCOPES), lists:usort(GlobalScopes)),
+    ?assert(lists:member(?SCOPE_PUBLISH, GlobalScopes)),
+    delete_app(Name),
+    delete_app(GlobalName).
+
+-doc """
+A newly created namespaced viewer API key defaults to the namespaced
+viewer scopes. It holds no scope that the namespaced administrator key
+default lacks. The global viewer default is unchanged.
+""".
+t_ee_ns_viewer_default_scopes(_Config) ->
+    Name = <<"EE-NS-VIEWER-DEFAULT-SCOPES">>,
+    {ok, #{<<"scopes">> := NsScopes}} =
+        create_app(Name, #{role => <<"ns:scopes_ns1::viewer">>}),
+    ?assertEqual(lists:usort(?NS_VIEWER_ALLOWED_SCOPES), lists:usort(NsScopes)),
+    ?assertEqual([], NsScopes -- ?NS_ADMIN_COMMON_SCOPES),
+    ?assertNot(lists:member(?SCOPE_GATEWAYS, NsScopes)),
+    GlobalName = <<"EE-GLOBAL-VIEWER-DEFAULT-SCOPES">>,
+    {ok, #{<<"scopes">> := GlobalScopes}} =
+        create_app(GlobalName, #{role => ?ROLE_API_VIEWER}),
+    ?assertEqual(lists:usort(?GENERIC_SCOPES), lists:usort(GlobalScopes)),
+    delete_app(Name),
+    delete_app(GlobalName).
+
+-doc """
+POST with an explicit scope list containing `publish` for a namespaced
+role (administrator or viewer) is rejected with 400; a namespaced
+explicit list without `publish` is still accepted.
+""".
+t_ee_ns_key_create_rejects_publish_scope(_Config) ->
+    NsAdmin = <<"ns:scopes_ns2::administrator">>,
+    NsViewer = <<"ns:scopes_ns2::viewer">>,
+    assert_400(
+        create_app(<<"EE-NS-PUBLISH-REJECT-1">>, #{role => NsAdmin, scopes => [?SCOPE_PUBLISH]})
+    ),
+    assert_400(
+        create_app(<<"EE-NS-PUBLISH-REJECT-2">>, #{
+            role => NsAdmin, scopes => [?SCOPE_PUBLISH, ?SCOPE_CONNECTIONS]
+        })
+    ),
+    assert_400(
+        create_app(<<"EE-NS-PUBLISH-REJECT-3">>, #{role => NsViewer, scopes => [?SCOPE_PUBLISH]})
+    ),
+    Name = <<"EE-NS-NO-PUBLISH-OK">>,
+    ?assertMatch(
+        {ok, _},
+        create_app(Name, #{role => NsAdmin, scopes => [?SCOPE_CONNECTIONS]})
+    ),
+    delete_app(Name).
+
+-doc """
+PUT with a changed scope list containing `publish` on a namespaced key is
+rejected with 400 and leaves the record unchanged — even when the
+persisted list already carries `publish` (changing the list is the
+opportunity to shed the unusable scope). Dropping `publish` in the same
+change is accepted.
+""".
+t_ee_ns_key_update_rejects_publish_in_changed_scopes(_Config) ->
+    Name = <<"EE-NS-UPDATE-NEW-PUBLISH">>,
+    NsRole = <<"ns:scopes_ns5::administrator">>,
+    {ok, _} = create_app(Name, #{role => NsRole, scopes => [?SCOPE_CONNECTIONS]}),
+    assert_400(
+        update_app(Name, #{role => NsRole, scopes => [?SCOPE_CONNECTIONS, ?SCOPE_PUBLISH]})
+    ),
+    ?assertMatch({ok, #{<<"scopes">> := [?SCOPE_CONNECTIONS]}}, read_app(Name)),
+    %% A legacy key whose persisted list already carries `publish` must
+    %% shed it when changing the list.
+    Legacy = <<"EE-NS-UPDATE-KEEP-PUBLISH">>,
+    LegacyScopes = [?SCOPE_PUBLISH, ?SCOPE_CONNECTIONS, ?SCOPE_MONITORING],
+    {ok, _} = emqx_mgmt_auth:create(Legacy, true, infinity, <<"legacy">>, NsRole, LegacyScopes),
+    assert_400(
+        update_app(Legacy, #{role => NsRole, scopes => [?SCOPE_PUBLISH, ?SCOPE_CONNECTIONS]})
+    ),
+    ?assertMatch({ok, #{<<"scopes">> := LegacyScopes}}, read_app(Legacy)),
+    {ok, Updated} = update_app(Legacy, #{
+        role => NsRole, scopes => [?SCOPE_CONNECTIONS, ?SCOPE_MONITORING]
+    }),
+    ?assertEqual([?SCOPE_CONNECTIONS, ?SCOPE_MONITORING], maps:get(<<"scopes">>, Updated)),
+    delete_app(Name),
+    delete_app(Legacy).
+
+-doc """
+Backward compatibility: a legacy namespaced administrator key stored with
+an explicit scope list containing `publish` (the pre-fix materialized
+default) is untouched — GET returns it verbatim, a read-modify-write that
+re-submits it succeeds and keeps it verbatim (neither stripped nor
+collapsed to the `unset` sentinel), and POST /publish with the key is
+still denied (403, by design).
+""".
+t_ee_ns_admin_legacy_publish_scopes_roundtrip(_Config) ->
+    Name = <<"EE-NS-LEGACY-GENERIC">>,
+    NsRole = <<"ns:scopes_ns3::administrator">>,
+    %% Write the legacy record directly, bypassing API validation, as an
+    %% upgraded cluster would have it stored.
+    {ok, #{api_key := ApiKey, api_secret := ApiSecret}} =
+        emqx_mgmt_auth:create(Name, true, infinity, <<"legacy">>, NsRole, ?GENERIC_SCOPES),
+    %% Not unset-equivalent for the namespaced role: stays an explicit list.
+    ?assertEqual(
+        {set, ?GENERIC_SCOPES}, emqx_mgmt_auth:write_scope_intent(NsRole, ?GENERIC_SCOPES)
+    ),
+    {ok, #{<<"scopes">> := Stored}} = read_app(Name),
+    ?assertEqual(?GENERIC_SCOPES, Stored),
+    %% Read-modify-write: re-submit exactly what GET returned.
+    {ok, Updated} = update_app(Name, #{role => NsRole, scopes => Stored}),
+    ?assertEqual(Stored, maps:get(<<"scopes">>, Updated)),
+    ?assertMatch({ok, #{<<"scopes">> := Stored}}, read_app(Name)),
+    %% Runtime publish denial for namespaced actors is unchanged.
+    Basic = emqx_common_test_http:auth_header(
+        binary_to_list(ApiKey), binary_to_list(ApiSecret)
+    ),
+    Publish = emqx_mgmt_api_test_util:api_path(["publish"]),
+    ?assertMatch(
+        {error, {_, 403, _}},
+        emqx_mgmt_api_test_util:request_api(
+            post, Publish, [], Basic, #{topic => <<"t/legacy">>, payload => <<"hello">>}
+        )
+    ),
+    delete_app(Name).
+
+-doc """
+A legacy namespaced administrator key stored with a `publish`-only
+explicit list is served verbatim and never becomes unset-equivalent
+(which would broaden the key to the role default), but any PUT that
+requests the `[publish]`-only list — even a verbatim round-trip — is
+rejected with a hint that the key is useless and should be re-created
+without a namespace. The rejection leaves the stored record untouched,
+and updates that omit `scopes` still work.
+""".
+t_ee_ns_admin_legacy_publish_only_scopes_stay_set(_Config) ->
+    Name = <<"EE-NS-LEGACY-PUBLISH-ONLY">>,
+    NsRole = <<"ns:scopes_ns4::administrator">>,
+    {ok, _} =
+        emqx_mgmt_auth:create(Name, true, infinity, <<"legacy">>, NsRole, [?SCOPE_PUBLISH]),
+    ?assertEqual(
+        {set, [?SCOPE_PUBLISH]}, emqx_mgmt_auth:write_scope_intent(NsRole, [?SCOPE_PUBLISH])
+    ),
+    ?assertMatch({ok, #{<<"scopes">> := [?SCOPE_PUBLISH]}}, read_app(Name)),
+    %% Requesting the publish-only list is rejected with the remedy hint.
+    Auth = emqx_common_test_http:default_user_auth_header(),
+    Path = emqx_mgmt_api_test_util:api_path(["api_key", Name]),
+    {error, {{_, 400, _}, _, RespBody}} =
+        emqx_mgmt_api_test_util:request_api(
+            put,
+            Path,
+            "",
+            Auth,
+            #{role => NsRole, scopes => [?SCOPE_PUBLISH]},
+            #{return_all => true}
+        ),
+    ?assertMatch(
+        {_, _},
+        binary:match(
+            iolist_to_binary(RespBody), <<"re-create it without a namespace">>
+        )
+    ),
+    %% The rejection left the stored record untouched.
+    ?assertMatch({ok, #{<<"scopes">> := [?SCOPE_PUBLISH]}}, read_app(Name)),
+    %% Updates that omit `scopes` still work and keep the list verbatim.
+    {ok, _} = update_app(Name, #{role => NsRole, desc => <<"still works">>}),
+    ?assertMatch({ok, #{<<"scopes">> := [?SCOPE_PUBLISH]}}, read_app(Name)),
+    ?assertEqual(unset, emqx_mgmt_auth:write_scope_intent(NsRole, ?NS_ADMIN_COMMON_SCOPES)),
+    delete_app(Name).
+
+-doc """
+POST with an explicit scope list containing `gateways` or `audit` for a
+namespaced role is rejected with 400, mirroring the dashboard login-user
+rule (`?NS_ADMIN_ALLOWED_SCOPES`, emqx-dev-team-tasks#412). An allowlisted
+scope is still accepted.
+""".
+t_ee_ns_key_create_rejects_out_of_allowlist_scopes(_Config) ->
+    NsAdmin = <<"ns:scopes_ns6::administrator">>,
+    assert_400(
+        create_app(<<"EE-NS-GATEWAYS-REJECT">>, #{role => NsAdmin, scopes => [?SCOPE_GATEWAYS]})
+    ),
+    assert_400(
+        create_app(<<"EE-NS-AUDIT-REJECT">>, #{role => NsAdmin, scopes => [?SCOPE_AUDIT]})
+    ),
+    assert_400(
+        create_app(<<"EE-NS-MIXED-REJECT">>, #{
+            role => NsAdmin, scopes => [?SCOPE_CONNECTIONS, ?SCOPE_AUDIT]
+        })
+    ),
+    Name = <<"EE-NS-ALLOWLISTED-OK">>,
+    ?assertMatch(
+        {ok, _},
+        create_app(Name, #{role => NsAdmin, scopes => [?SCOPE_CONNECTIONS]})
+    ),
+    delete_app(Name).
+
+-doc """
+PUT with a changed scope list adding `gateways` or `audit` on a namespaced
+key is rejected with 400 and leaves the record unchanged, even when the
+persisted list already carries the disallowed scope from before this
+allowlist existed (grandfathered legacy record) — changing the list is
+the opportunity to shed the disallowed scopes. A verbatim round-trip of
+the legacy list is still accepted (backward compat).
+""".
+t_ee_ns_key_update_rejects_out_of_allowlist_scopes(_Config) ->
+    Name = <<"EE-NS-UPDATE-NEW-AUDIT">>,
+    NsRole = <<"ns:scopes_ns7::administrator">>,
+    {ok, _} = create_app(Name, #{role => NsRole, scopes => [?SCOPE_CONNECTIONS]}),
+    assert_400(
+        update_app(Name, #{role => NsRole, scopes => [?SCOPE_CONNECTIONS, ?SCOPE_AUDIT]})
+    ),
+    ?assertMatch({ok, #{<<"scopes">> := [?SCOPE_CONNECTIONS]}}, read_app(Name)),
+    %% A legacy key whose persisted list already carries `audit`/`gateways`
+    %% (minted before this allowlist existed) must shed them when changing
+    %% the list, but a verbatim round-trip is grandfathered.
+    Legacy = <<"EE-NS-UPDATE-LEGACY-AUDIT">>,
+    LegacyScopes = [?SCOPE_AUDIT, ?SCOPE_GATEWAYS, ?SCOPE_CONNECTIONS],
+    {ok, _} = emqx_mgmt_auth:create(Legacy, true, infinity, <<"legacy">>, NsRole, LegacyScopes),
+    ?assertMatch({ok, #{<<"scopes">> := LegacyScopes}}, read_app(Legacy)),
+    {ok, RoundTripped} = update_app(Legacy, #{role => NsRole, scopes => LegacyScopes}),
+    ?assertEqual(LegacyScopes, maps:get(<<"scopes">>, RoundTripped)),
+    assert_400(
+        update_app(Legacy, #{
+            role => NsRole, scopes => [?SCOPE_AUDIT, ?SCOPE_GATEWAYS, ?SCOPE_MONITORING]
+        })
+    ),
+    ?assertMatch({ok, #{<<"scopes">> := LegacyScopes}}, read_app(Legacy)),
+    {ok, Updated} = update_app(Legacy, #{role => NsRole, scopes => [?SCOPE_CONNECTIONS]}),
+    ?assertEqual([?SCOPE_CONNECTIONS], maps:get(<<"scopes">>, Updated)),
+    delete_app(Name),
+    delete_app(Legacy).
+
+assert_400_publisher_only(Result) ->
+    %% request_api/5 returns {error, {"HTTP/1.1", 400, "Bad Request"}}
+    %% on 4xx responses; the body is dropped unless return_all=true is
+    %% set in opts. We only assert the status code here — the precise
+    %% error message is covered by unit tests of validate_publisher_scopes.
+    case Result of
+        {error, {"HTTP/1.1", 400, _}} ->
+            ok;
+        Other ->
+            ct:fail("expected 400 BAD_REQUEST publisher-only error, got: ~p", [Other])
+    end.
+
+assert_400_login_only(Result) ->
+    %% Same shape — the body assertion is covered by the unit test
+    %% of validate_no_login_only_scopes.
+    case Result of
+        {error, {"HTTP/1.1", 400, _}} ->
+            ok;
+        Other ->
+            ct:fail("expected 400 BAD_REQUEST login-only error, got: ~p", [Other])
+    end.
+
+assert_400(Result) ->
+    case Result of
+        {error, {"HTTP/1.1", 400, _}} ->
+            ok;
+        Other ->
+            ct:fail("expected 400 BAD_REQUEST, got: ~p", [Other])
+    end.
+
+list_app() ->
+    AuthHeader = emqx_common_test_http:default_user_auth_header(),
+    Path = emqx_mgmt_api_test_util:api_path(["api_key"]),
+    case emqx_mgmt_api_test_util:request_api(get, Path, AuthHeader) of
+        {ok, Apps} -> {ok, emqx_utils_json:decode(Apps)};
+        Error -> Error
+    end.
+
+read_app(Name) ->
+    AuthHeader = emqx_common_test_http:default_user_auth_header(),
+    Path = emqx_mgmt_api_test_util:api_path(["api_key", Name]),
+    case emqx_mgmt_api_test_util:request_api(get, Path, AuthHeader) of
+        {ok, Res} -> {ok, emqx_utils_json:decode(Res)};
+        Error -> Error
+    end.
+
+create_app(Name) ->
+    create_app(Name, #{}).
+
+create_app(Name, Extra) ->
+    ExpiredAt = to_rfc3339(erlang:system_time(second) + 1000),
+    App = Extra#{
+        name => Name,
+        expired_at => ExpiredAt,
+        desc => <<"Note"/utf8>>,
+        enable => true
+    },
+    post_app(App).
+
+create_unexpired_app(Name, Params) ->
+    post_app(maps:merge(#{name => Name, desc => <<"Note"/utf8>>, enable => true}, Params)).
+
+%% POST a body verbatim, without filling in the optional `desc'/`enable'
+%% defaults, so tests can exercise the "field omitted" paths.
+post_app(App) ->
+    AuthHeader = emqx_common_test_http:default_user_auth_header(),
+    Path = emqx_mgmt_api_test_util:api_path(["api_key"]),
+    case emqx_mgmt_api_test_util:request_api(post, Path, "", AuthHeader, App) of
+        {ok, Res} -> {ok, emqx_utils_json:decode(Res)};
+        Error -> Error
+    end.
+
+delete_app(Name) ->
+    AuthHeader = emqx_common_test_http:default_user_auth_header(),
+    DeletePath = emqx_mgmt_api_test_util:api_path(["api_key", Name]),
+    emqx_mgmt_api_test_util:request_api(delete, DeletePath, AuthHeader).
+
+update_app(Name, Change) ->
+    AuthHeader = emqx_common_test_http:default_user_auth_header(),
+    UpdatePath = emqx_mgmt_api_test_util:api_path(["api_key", Name]),
+    case emqx_mgmt_api_test_util:request_api(put, UpdatePath, "", AuthHeader, Change) of
+        {ok, Update} -> {ok, emqx_utils_json:decode(Update)};
+        Error -> Error
+    end.
+
+to_rfc3339(Sec) ->
+    list_to_binary(calendar:system_time_to_rfc3339(Sec)).

@@ -1,0 +1,1634 @@
+%%--------------------------------------------------------------------
+%% Copyright (c) 2018-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
+%%--------------------------------------------------------------------
+
+%% @doc Start/Stop MQTT listeners.
+-module(emqx_listeners).
+
+-include("emqx_schema.hrl").
+-include("logger.hrl").
+-include_lib("snabbkaffe/include/snabbkaffe.hrl").
+-include_lib("esockd/include/esockd.hrl").
+
+%% Listener names come from checked config, so the atoms exist.
+-elvis([{elvis_style, no_common_caveats_call, disable}]).
+
+%% APIs
+-export([
+    list_raw/0,
+    list/0,
+    start/0,
+    restart/0,
+    stop/0,
+    is_running/1,
+    current_conns/2,
+    max_conns/2,
+    id_example/0,
+    default_max_conn/0,
+    shutdown_count/2,
+    accept_stats/2,
+    tcp_opts/1,
+    ip_port/1,
+    clamp_active_n/1
+]).
+
+-export([
+    start_listener/1,
+    start_listener/3,
+    stop_listener/1,
+    stop_listener/3,
+    restart_listener/1,
+    restart_listener/3,
+    has_enabled_listener_conf_by_type/1,
+    wait_cowboy_listener_stopped/1
+]).
+
+-export([
+    listener_id/2,
+    validate_listener_name/1,
+    parse_listener_id/1,
+    parse_listener_id_without_atom/1,
+    esockd_access_rules/1
+]).
+
+-export([is_packet_parser_available/1]).
+
+-export([pre_config_update/3, post_config_update/5]).
+-export([post_zone_config_update/2, update_listener_for_zone_changes/3]).
+
+-export([format_bind/1, format_bind_ip/1]).
+
+-ifdef(TEST).
+-export([certs_dir/2, do_log_bind_portability/4]).
+-endif.
+
+-export_type([
+    listener_id/0,
+    listener_type/0
+]).
+
+-if(OTP_RELEASE >= 26).
+-dialyzer(
+    {no_unknown, [
+        is_running/3,
+        current_conns/3,
+        do_stop_listener/3,
+        do_start_listener/4,
+        do_update_listener/4,
+        quic_listener_conf_rollback/4
+    ]}
+).
+-endif.
+
+-type listener_id() :: atom() | binary().
+-type listener_type() :: tcp | ssl | ws | wss | quic | dtls.
+
+%% MQTT SockOpts
+-define(MQTT_SOCKOPTS, [
+    binary,
+    {reuseaddr, true},
+    {backlog, 512},
+    {nodelay, true}
+]).
+
+-define(ESOCKD_LISTENER(T), (T == tcp orelse T == ssl)).
+-define(COWBOY_LISTENER(T), (T == ws orelse T == wss)).
+
+%% `tcp_options.active_n' and `tcp_options.buffer' are clamped at the point of
+%% use. Out-of-range values are not rejected, so existing configs keep working.
+%%
+%% `active_n': `emqx_connection' passes it as `{active, N}', and N = 0 leaves
+%% the socket passive forever. `emqx_socket_connection' uses it only as the
+%% `#deliver{}' batch size and as the number of sent packets between OOM checks.
+%% The cap bounds how many packets either backend handles between OOM checks.
+-define(MIN_ACTIVE_N, 1).
+-define(MAX_ACTIVE_N, 1000).
+%% `buffer': the inet driver floors it at 1 byte (INET_BUFFER_MIN), while the
+%% `socket' module rejects `{otp, rcvbuf}' = 0 and esockd then drops the
+%% accepted connection. Floor it at the largest MQTT fixed header (1 type byte
+%% + up to 4 remaining-length bytes) on both backends, so a single read can
+%% hold a complete fixed header.
+-define(MIN_TCP_BUFFER, 5).
+%% `low_watermark': the inet driver default (INET_LOW_WATERMARK).
+-define(DEFAULT_TCP_LOW_WATERMARK, 4096).
+
+-define(ROOT_KEY, listeners).
+-define(MAX_LISTENER_NAME_BYTES, 64).
+-define(CONF_KEY_PATH, [?ROOT_KEY, '?', '?']).
+-define(TYPES_STRING, ["tcp", "ssl", "ws", "wss", "quic"]).
+-define(MARK_DEL, ?TOMBSTONE_CONFIG_CHANGE_REQ).
+
+-spec id_example() -> atom().
+id_example() -> 'tcp:default'.
+
+%% @doc List configured listeners.
+-spec list_raw() -> [{ListenerId :: atom(), Type :: binary(), ListenerConf :: map()}].
+list_raw() ->
+    [
+        {listener_id(Type, LName), Type, LConf}
+     || {Type, LName, LConf} <- do_list_raw()
+    ].
+
+list() ->
+    Listeners = maps:to_list(emqx:get_config([listeners], #{})),
+    lists:flatmap(fun format_list/1, Listeners).
+
+format_list(Listener) ->
+    {Type, Conf} = Listener,
+    [
+        begin
+            Id = listener_id(Type, LName),
+            Bind = maps:get(bind, LConf),
+            Running = is_running(Type, Id, LConf),
+            ResolvedAddress = format_bind_ip(listen_on(Id, Bind)),
+            ResolvedAddressFrom = emqx_default_address:listen_on_from(mqtt, Bind),
+            {Id,
+                maps:merge(LConf, #{
+                    running => Running,
+                    resolved_address => ResolvedAddress,
+                    resolved_address_from => ResolvedAddressFrom
+                })}
+        end
+     || {LName, LConf} <- maps:to_list(Conf), is_map(LConf)
+    ].
+
+do_list_raw() ->
+    %% GET /listeners from other nodes returns [] when init config is not loaded.
+    %% FIXME This is a workaround for the issue:
+    %% mria:running_nodes() sometime return node which not ready to accept rpc call.
+    case emqx_app:init_load_done() of
+        true ->
+            Key = <<"listeners">>,
+            Raw = emqx_config:get_raw([Key], #{}),
+            SchemaMod = emqx_config:get_schema_mod(Key),
+            #{Key := RawWithDefault} = emqx_config:fill_defaults(SchemaMod, #{Key => Raw}, #{
+                obfuscate_sensitive_values => true
+            }),
+            Listeners = maps:to_list(RawWithDefault),
+            lists:flatmap(fun format_raw_listeners/1, Listeners);
+        false ->
+            []
+    end.
+
+format_raw_listeners({Type0, Conf}) ->
+    Type = binary_to_atom(Type0),
+    lists:filtermap(
+        fun
+            ({LName, LConf0}) when is_map(LConf0) ->
+                Bind = parse_bind(LConf0),
+                Id = listener_id(Type, LName),
+                MaxConn = maps:get(<<"max_connections">>, LConf0, default_max_conn()),
+                Running = is_running(Type, Id, LConf0#{bind => Bind}),
+                ResolvedAddress = format_bind_ip(listen_on(Id, Bind)),
+                ResolvedAddressFrom = emqx_default_address:listen_on_from(mqtt, Bind),
+                LConf1 = maps:without([<<"authentication">>], LConf0),
+                LConf2 = maps:put(<<"running">>, Running, LConf1),
+                CurrConn =
+                    case Running of
+                        true -> current_conns(Type, LName, Bind);
+                        false -> 0
+                    end,
+                LConf = maps:merge(LConf2, #{
+                    <<"current_connections">> => CurrConn,
+                    <<"max_connections">> => ensure_max_conns(MaxConn),
+                    <<"resolved_address">> => ResolvedAddress,
+                    <<"resolved_address_from">> => ResolvedAddressFrom
+                }),
+                {true, {Type0, LName, LConf}};
+            ({_LName, _MarkDel}) ->
+                false
+        end,
+        maps:to_list(Conf)
+    ).
+
+-spec is_running(ListenerId :: atom()) -> boolean() | {error, not_found}.
+is_running(ListenerId) ->
+    case lists:keyfind(ListenerId, 1, list()) of
+        {_Id, #{running := Running}} -> Running;
+        false -> {error, not_found}
+    end.
+
+is_running(Type, ListenerId, _Conf) when Type =:= tcp; Type =:= ssl ->
+    find_listen_on(ListenerId) =/= error;
+is_running(Type, ListenerId, _Conf) when Type =:= ws; Type =:= wss ->
+    try
+        ranch:get_status(ListenerId) =:= running
+    catch
+        _:_ ->
+            false
+    end;
+is_running(quic, ListenerId, _Conf) ->
+    case quicer:listener(ListenerId) of
+        {ok, Pid} when is_pid(Pid) ->
+            true;
+        _ ->
+            false
+    end.
+
+current_conns(Id, ListenOn) ->
+    {ok, #{type := Type, name := Name}} = parse_listener_id(Id),
+    current_conns(Type, Name, ListenOn).
+
+current_conns(Type, Name, Bind) when Type == tcp; Type == ssl ->
+    ListenOn = emqx_default_address:listen_on(mqtt, Bind),
+    esockd:get_current_connections({listener_id(Type, Name), ListenOn});
+current_conns(Type, Name, _ListenOn) when Type =:= ws; Type =:= wss ->
+    maps:get(all_connections, ranch:info(listener_id(Type, Name)));
+current_conns(quic, Name, _ListenOn) ->
+    {ok, LPid} = quicer:listener(listener_id(quic, Name)),
+    quicer_listener:count_conns(LPid);
+current_conns(_, _, _) ->
+    {error, not_support}.
+
+max_conns(Id, ListenOn) ->
+    {ok, #{type := Type, name := Name}} = parse_listener_id(Id),
+    max_conns(Type, Name, ListenOn).
+
+max_conns(Type, Name, Bind) when Type == tcp; Type == ssl ->
+    ListenOn = emqx_default_address:listen_on(mqtt, Bind),
+    esockd:get_max_connections({listener_id(Type, Name), ListenOn});
+max_conns(Type, Name, _ListenOn) when Type =:= ws; Type =:= wss ->
+    maps:get(max_connections, ranch:info(listener_id(Type, Name)));
+max_conns(_, _, _) ->
+    {error, not_support}.
+
+shutdown_count(Id, ListenOn) ->
+    {ok, #{type := Type, name := Name}} = parse_listener_id(Id),
+    shutdown_count(Type, Name, ListenOn).
+
+shutdown_count(Type, Name, Bind) when Type == tcp; Type == ssl ->
+    ListenOn = emqx_default_address:listen_on(mqtt, Bind),
+    esockd:get_shutdown_count({listener_id(Type, Name), ListenOn});
+shutdown_count(Type, _Name, _ListenOn) when Type =:= ws; Type =:= wss ->
+    [];
+shutdown_count(_, _, _) ->
+    {error, not_support}.
+
+-doc """
+Return the esockd accept-result counters of a listener.
+The counters follow the esockd `?ACCEPT_RESULT_GROUPS` order.
+
+A running listener is looked up by the address it runs on. esockd returns
+no stats for an unknown address instead of raising `not_found`, so a
+derived address that does not match would silently report zeros.
+""".
+accept_stats(Id, Bind) ->
+    {ok, #{type := Type, name := Name}} = parse_listener_id(Id),
+    accept_stats(Type, Name, Bind).
+
+accept_stats(Type, Name, Bind) when Type == tcp; Type == ssl ->
+    Id = listener_id(Type, Name),
+    Stats = esockd:get_stats({Id, listen_on(Id, Bind)}),
+    [{Key, proplists:get_value(Key, Stats, 0)} || Key <- ?ACCEPT_RESULT_GROUPS];
+accept_stats(Type, _Name, _ListenOn) when Type =:= ws; Type =:= wss ->
+    [];
+accept_stats(_, _, _) ->
+    {error, not_support}.
+
+%% @doc Start all listeners.
+-spec start() -> ok.
+start() ->
+    %% Resolve node.default_listener_address eagerly, so an unresolvable
+    %% host stops the boot with a clear reason.
+    _ = emqx_default_address:resolve(mqtt),
+    ok = warn_loopback_by_profile(),
+    %% The ?MODULE:start/0 will be called by emqx_app when emqx get started,
+    %% so we install the config handler here.
+    %% callback when http api request
+    ok = emqx_config_handler:add_handler(?CONF_KEY_PATH, ?MODULE),
+    %% callback when reload from config file
+    ok = emqx_config_handler:add_handler([?ROOT_KEY], ?MODULE),
+    foreach_listeners(fun start_listener/3).
+
+warn_loopback_by_profile() ->
+    case emqx_default_address:loopback_by_profile() of
+        true ->
+            ?SLOG(warning, #{
+                msg => "listeners_bind_loopback",
+                reason =>
+                    "the hardened security profile binds a listener that has no "
+                    "explicit bind address to loopback",
+                hint =>
+                    "Clients on other hosts cannot connect. Set "
+                    "node.default_listener_address to the address to bind, or "
+                    "set an address in the bind of each listener."
+            });
+        false ->
+            ok
+    end.
+
+-spec start_listener(listener_id()) -> ok | {error, term()}.
+start_listener(ListenerId) ->
+    apply_on_listener(ListenerId, fun ?MODULE:start_listener/3).
+
+-spec start_listener(listener_type(), atom(), map()) -> ok | {error, term()}.
+start_listener(Type, Name, #{bind := Bind0, enable := true} = Conf0) ->
+    %% A bare-port bind gets the resolved default address here, so every
+    %% later use of this listener's bind sees the same listen-on value.
+    Bind = emqx_default_address:listen_on(mqtt, Bind0),
+    Conf = Conf0#{bind := Bind},
+    ListenerId = listener_id(Type, Name),
+    ok = emqx_limiter:create_listener_limiters(ListenerId, Conf),
+    case start_listener_with_certs(Type, Name, ListenerId, Conf) of
+        {ok, {skipped, Reason}} when
+            Reason =:= quic_app_missing
+        ->
+            ?tp(listener_not_started, #{type => Type, bind => Bind, status => {skipped, Reason}}),
+            console_print(
+                "Listener ~ts is NOT started due to: ~p.~n",
+                [ListenerId, Reason]
+            ),
+            ok;
+        {ok, _} ->
+            ?tp(listener_started, #{type => Type, bind => Bind, conf => Conf}),
+            console_print(
+                "Listener ~ts on ~ts started.~n",
+                [ListenerId, format_bind(Bind)]
+            ),
+            ok;
+        {error, {already_started, Pid}} ->
+            ?tp(listener_not_started, #{
+                type => Type, bind => Bind, status => {already_started, Pid}
+            }),
+            {error, {already_started, Pid}};
+        {error, Reason} ->
+            ?tp(listener_not_started, #{type => Type, bind => Bind, status => {error, Reason}}),
+            ok = emqx_limiter:delete_listener_limiters(ListenerId),
+            BindStr = format_bind(Bind),
+            ?ELOG(
+                "Failed to start listener ~ts on ~ts: ~0p.~n",
+                [ListenerId, BindStr, Reason]
+            ),
+            Msg = lists:flatten(
+                io_lib:format(
+                    "~ts(~ts) : ~0p",
+                    [ListenerId, BindStr, filter_stacktrace(Reason)]
+                )
+            ),
+            {error, {failed_to_start, Msg}}
+    end;
+start_listener(Type, Name, #{enable := false}) ->
+    console_print(
+        "Listener ~ts is NOT started due to: disabled.~n",
+        [listener_id(Type, Name)]
+    ),
+    ok.
+
+%% A listener that needs the node's own certificate and cannot be given one does
+%% not start: the failure is reported the way every other start failure is.
+start_listener_with_certs(Type, Name, ListenerId, Conf) ->
+    case ensure_default_certs(Conf) of
+        {ok, ConfWithCerts} -> do_start_listener(Type, Name, ListenerId, ConfWithCerts);
+        {error, _} = Error -> Error
+    end.
+
+%% @doc Restart all listeners
+-spec restart() -> ok.
+restart() ->
+    foreach_listeners(fun restart_listener/3).
+
+-spec restart_listener(listener_id()) -> ok | {error, term()}.
+restart_listener(ListenerId) ->
+    apply_on_listener(ListenerId, fun ?MODULE:restart_listener/3).
+
+-spec restart_listener(listener_type(), atom(), map()) -> ok | {error, term()}.
+restart_listener(Type, ListenerName, Conf) ->
+    restart_listener(Type, ListenerName, Conf, Conf).
+
+update_listener_for_zone_changes(Type, Name, Conf) ->
+    %% Listener config is not changed, so pass the current Conf as olad AND new
+    Res = update_listener(Type, Name, _Old = Conf, _New = Conf),
+    ?SLOG(info, #{msg => ?FUNCTION_NAME, result => Res, listener => listener_id(Type, Name)}),
+    ok.
+
+update_listener(_Type, _Name, #{enable := false}, #{enable := false}) ->
+    ok;
+update_listener(Type, Name, Conf = #{enable := true}, #{enable := false}) ->
+    stop_listener(Type, Name, Conf);
+update_listener(Type, Name, #{enable := false}, Conf = #{enable := true}) ->
+    start_listener(Type, Name, Conf);
+update_listener(Type, Name, OldConf, NewConf) ->
+    ListenerId = listener_id(Type, Name),
+    %% It's possible for the updated listener to not be running.  e.g., a previous failed
+    %% update could have led it to have its limiters deleted.
+    case is_running(Type, ListenerId, NewConf) of
+        true ->
+            ok = emqx_limiter:update_listener_limiters(ListenerId, NewConf),
+            do_update_running_listener(Type, Name, OldConf, NewConf);
+        false ->
+            ok = maybe_unregister_ocsp_stapling_refresh(Type, Name, NewConf),
+            restart_listener(Type, Name, OldConf, NewConf)
+    end.
+
+do_update_running_listener(Type, Name, OldConf, NewConf) ->
+    maybe
+        {ok, NewConfWithCerts} ?= ensure_default_certs(NewConf),
+        OldConfWithCerts = default_certs_if_present(OldConf),
+        case do_update_listener(Type, Name, OldConfWithCerts, NewConfWithCerts) of
+            ok ->
+                ok = maybe_unregister_ocsp_stapling_refresh(Type, Name, NewConf),
+                ok;
+            {skip, Error} when Type =:= quic ->
+                {error, {rollbacked, Error}};
+            {error, _Reason} ->
+                restart_listener(Type, Name, OldConf, NewConf)
+        end
+    end.
+
+restart_listener(Type, Name, OldConf, NewConf) ->
+    case stop_listener(Type, Name, OldConf) of
+        ok ->
+            start_listener(Type, Name, NewConf);
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+%% @doc Stop all listeners.
+-spec stop() -> ok.
+stop() ->
+    %% The ?MODULE:stop/0 will be called by emqx_app when emqx is going to shutdown,
+    %% so we uninstall the config handler here.
+    ok = emqx_config_handler:remove_handler(?CONF_KEY_PATH),
+    ok = emqx_config_handler:remove_handler([?ROOT_KEY]),
+    ok = foreach_listeners(fun stop_listener/3),
+    ?tp(emqx_listeners_stopped, #{}),
+    ok.
+
+-spec stop_listener(listener_id()) -> ok | {error, term()}.
+stop_listener(ListenerId) ->
+    apply_on_listener(ListenerId, fun stop_listener/3).
+
+stop_listener(Type, Name, #{bind := Bind0} = Conf0) ->
+    Id = listener_id(Type, Name),
+    Bind = listen_on(Id, Bind0),
+    Conf = Conf0#{bind := Bind},
+    ok = unregister_ocsp_stapling_refresh(Type, Name),
+    case do_stop_listener(Type, Id, Conf) of
+        ok ->
+            ok = emqx_limiter:delete_listener_limiters(Id),
+            console_print(
+                "Listener ~ts on ~ts stopped.~n",
+                [Id, format_bind(Bind)]
+            ),
+            ok;
+        {error, not_found} ->
+            ok;
+        {error, Reason} ->
+            ?ELOG(
+                "Failed to stop listener ~ts on ~ts: ~0p~n",
+                [Id, format_bind(Bind), Reason]
+            ),
+            {error, Reason}
+    end.
+
+-spec do_stop_listener(listener_type(), atom(), map()) -> ok | {error, term()}.
+do_stop_listener(Type, Id, #{bind := ListenOn}) when ?ESOCKD_LISTENER(Type) ->
+    esockd:close(Id, ListenOn);
+do_stop_listener(Type, Id, #{bind := ListenOn}) when ?COWBOY_LISTENER(Type) ->
+    case cowboy:stop_listener(Id) of
+        ok ->
+            _ = wait_cowboy_listener_stopped(ListenOn),
+            ok;
+        Error ->
+            Error
+    end;
+do_stop_listener(quic, Id, _Conf) ->
+    quicer:terminate_listener(Id).
+
+wait_cowboy_listener_stopped(ListenOn) ->
+    wait_cowboy_listener_stopped(ListenOn, 0).
+
+wait_cowboy_listener_stopped(ListenOn, 3) ->
+    Log = #{
+        msg => "port_not_released_after_listener_stopped",
+        explain => "Expecting the operating system to release the port soon.",
+        listener => ListenOn,
+        wait_seconds => 9
+    },
+    ?SLOG(warning, Log),
+    timeout;
+wait_cowboy_listener_stopped(ListenOn, RetryCount) ->
+    % NOTE
+    % `cowboy:stop_listener/1` will not close the listening socket explicitly,
+    % it will be closed by the runtime system **only after** the process exits.
+    Endpoint = maps:from_list(ip_port(ListenOn)),
+    case
+        gen_tcp:connect(
+            maps:get(ip, Endpoint, "127.0.0.1"),
+            maps:get(port, Endpoint),
+            [{active, false}]
+        )
+    of
+        {error, _EConnrefused} ->
+            %% NOTE
+            %% We should get `econnrefused` here because acceptors are already dead
+            %% but don't want to crash if not, because this doesn't make any difference.
+            ok;
+        {ok, Socket} ->
+            %% cowboy(ws/wss) will close the socket if we don't send packet in 5 seconds.
+            %% so we only wait 3 second here.
+            case gen_tcp:recv(Socket, 0, 3000) of
+                {ok, _} ->
+                    _ = gen_tcp:close(Socket),
+                    wait_cowboy_listener_stopped(ListenOn, RetryCount + 1);
+                {error, timeout} ->
+                    _ = gen_tcp:close(Socket),
+                    wait_cowboy_listener_stopped(ListenOn, RetryCount + 1);
+                {error, _} ->
+                    _ = gen_tcp:close(Socket),
+                    ok
+            end
+    end.
+
+-ifndef(TEST).
+console_print(Fmt, Args) -> ?ULOG(Fmt, Args).
+-else.
+console_print(_Fmt, _Args) -> ok.
+-endif.
+
+-spec do_start_listener(listener_type(), atom(), listener_id(), map()) ->
+    {ok, pid() | {skipped, atom()}} | {error, term()}.
+%% Start MQTT/TCP listener
+do_start_listener(Type = tcp, Name, Id, #{bind := ListenOn, tcp_backend := socket} = Conf) ->
+    esockd:open_tcpsocket(
+        Id,
+        ListenOn,
+        esockd_opts(Id, Type, Name, emqx_socket_connection, Conf)
+    );
+do_start_listener(Type, Name, Id, #{bind := ListenOn} = Opts) when ?ESOCKD_LISTENER(Type) ->
+    esockd:open(
+        Id,
+        ListenOn,
+        esockd_opts(Id, Type, Name, emqx_connection, Opts)
+    );
+%% Start MQTT/WS listener
+do_start_listener(Type, Name, Id, Opts) when ?COWBOY_LISTENER(Type) ->
+    RanchOpts = ranch_opts(Id, Type, Opts),
+    WsOpts = ws_opts(Type, Name, Opts),
+    case Type of
+        ws -> cowboy:start_clear(Id, RanchOpts, WsOpts);
+        wss -> cowboy:start_tls(Id, RanchOpts, WsOpts)
+    end;
+%% Start MQTT/QUIC listener
+do_start_listener(quic, Name, Id, #{bind := Bind} = Opts) ->
+    ListenOn = quic_listen_on(Bind),
+    case [A || {quicer, _, _} = A <- application:which_applications()] of
+        [_] ->
+            quicer:spawn_listener(
+                Id,
+                ListenOn,
+                to_quicer_listener_opts(Name, Opts)
+            );
+        [] ->
+            {ok, {skipped, quic_app_missing}}
+    end.
+
+do_update_listener(
+    Type = tcp, Name, OldConf, NewConf = #{bind := Bind, tcp_backend := Backend}
+) ->
+    Id = listener_id(tcp, Name),
+    %% Update in place only the address the listener actually runs on, and
+    %% only when the new config resolves to that same address. The configured
+    %% bind does not tell which address a running listener uses, because a
+    %% bare port gets the default address. A listener that stopped in the
+    %% meantime takes the restart path below.
+    case {find_listen_on(Id), OldConf, emqx_default_address:listen_on(mqtt, Bind)} of
+        {{ok, ListenOn}, #{tcp_backend := Backend}, ListenOn} ->
+            case Backend of
+                gen_tcp -> ConnMod = emqx_connection;
+                socket -> ConnMod = emqx_socket_connection
+            end,
+            esockd:reset_options(
+                {Id, ListenOn},
+                esockd_opts(Id, Type, Name, ConnMod, NewConf)
+            );
+        _Different ->
+            %% TODO
+            %% Again, we're not strictly required to drop live connections in this case.
+            {error, not_supported}
+    end;
+do_update_listener(Type, Name, _OldConf, NewConf = #{bind := Bind}) when
+    ?ESOCKD_LISTENER(Type)
+->
+    Id = listener_id(Type, Name),
+    case {find_listen_on(Id), emqx_default_address:listen_on(mqtt, Bind)} of
+        {{ok, ListenOn}, ListenOn} ->
+            esockd:reset_options(
+                {Id, ListenOn},
+                esockd_opts(Id, Type, Name, emqx_connection, NewConf)
+            );
+        _Different ->
+            %% TODO
+            %% Again, we're not strictly required to drop live connections in this case.
+            {error, not_supported}
+    end;
+do_update_listener(Type, Name, OldConf, NewConf) when
+    ?COWBOY_LISTENER(Type)
+->
+    Id = listener_id(Type, Name),
+    RanchOpts = ranch_opts(Id, Type, NewConf),
+    WsOpts = ws_opts(Type, Name, NewConf),
+    case ranch_opts(Id, Type, OldConf) of
+        RanchOpts ->
+            %% Transport options did not change, no need to touch the listener.
+            ok;
+        _Different ->
+            %% Transport options changed, we need to tear down the listener.
+            ok = ranch:suspend_listener(Id),
+            ok = ranch:set_transport_options(Id, RanchOpts)
+    end,
+    ok = ranch:set_protocol_options(Id, WsOpts),
+    %% No-op if the listener was not suspended.
+    resume_cowboy_listener(Id);
+do_update_listener(quic = Type, Name, OldConf, NewConf) ->
+    case quicer:listener(listener_id(Type, Name)) of
+        {ok, ListenerPid} ->
+            ListenOn = quic_listen_on(NewConf),
+            case
+                quicer_listener:reload(
+                    ListenerPid, ListenOn, to_quicer_listener_opts(Name, NewConf)
+                )
+            of
+                ok ->
+                    ok;
+                Error ->
+                    case
+                        quic_listener_conf_rollback(
+                            ListenerPid,
+                            quic_listen_on(OldConf),
+                            to_quicer_listener_opts(Name, OldConf),
+                            Error
+                        )
+                    of
+                        ok ->
+                            {skip, Error};
+                        E ->
+                            E
+                    end
+            end;
+        E ->
+            E
+    end;
+do_update_listener(_Type, _Name, _OldConf, _NewConf) ->
+    {error, not_supported}.
+
+%% Resuming a ws/wss listener after a transport-options change rebinds the same
+%% port (`ranch:suspend_listener' closes the old listen socket, `resume' reopens
+%% it). The OS may not have released the port yet when we rebind, which surfaces
+%% as a transient `eaddrinuse'. Retry a few times with a short backoff before
+%% giving up. The proper fix (avoid rebinding when the bind address is unchanged)
+%% is tracked separately.
+resume_cowboy_listener(Id) ->
+    resume_cowboy_listener(Id, 10).
+
+resume_cowboy_listener(Id, Retries) ->
+    case ranch:resume_listener(Id) of
+        {error, eaddrinuse} when Retries > 0 ->
+            timer:sleep(100),
+            resume_cowboy_listener(Id, Retries - 1);
+        Res ->
+            Res
+    end.
+
+%% Update the listeners at runtime
+pre_config_update([?ROOT_KEY, Type, Name], {create, NewConf}, V) when
+    V =:= undefined orelse V =:= ?TOMBSTONE_VALUE
+->
+    case validate_listener_name(Name) of
+        ok ->
+            {ok, convert_certs(Type, Name, NewConf)};
+        {error, _} = Error ->
+            Error
+    end;
+pre_config_update([?ROOT_KEY, _Type, _Name], {create, _NewConf}, _RawConf) ->
+    {error, already_exist};
+pre_config_update([?ROOT_KEY, _Type, _Name], {update, _Request}, undefined) ->
+    {error, not_found};
+pre_config_update([?ROOT_KEY, Type, Name], {update, Request}, RawConf) ->
+    RawConf1 = emqx_utils_maps:deep_merge(RawConf, Request),
+    ok = assert_zone_exists(RawConf1),
+    {ok, convert_certs(Type, Name, RawConf1)};
+pre_config_update([?ROOT_KEY, _Type, _Name], {action, _Action, Updated}, RawConf) ->
+    {ok, emqx_utils_maps:deep_merge(RawConf, Updated)};
+pre_config_update([?ROOT_KEY, _Type, _Name], ?MARK_DEL, _RawConf) ->
+    {ok, ?TOMBSTONE_VALUE};
+pre_config_update([?ROOT_KEY], RawConf, RawConf) ->
+    {ok, RawConf};
+pre_config_update([?ROOT_KEY], NewConf, OldConf) ->
+    case validate_new_listener_ids(NewConf, OldConf) of
+        ok ->
+            {ok, convert_certs(NewConf)};
+        {error, _} = Error ->
+            Error
+    end.
+
+post_config_update(Path, Request, NewConf, OldConf, AppEnvs) ->
+    Result = do_post_config_update(Path, Request, NewConf, OldConf, AppEnvs),
+    ok = emqx_connection_conf:listeners_changed(changed_listeners(Path, Request, NewConf, OldConf)),
+    Result.
+
+%% The updated listeners with their new config, and the deleted ones with `undefined'.
+changed_listeners([?ROOT_KEY, Type, Name], ?MARK_DEL, _NewConf, _OldConf) ->
+    [{{Type, Name}, undefined}];
+changed_listeners([?ROOT_KEY, Type, Name], {update, _Request}, NewConf, _OldConf) ->
+    [{{Type, Name}, NewConf}];
+changed_listeners([?ROOT_KEY], _Request, NewConf, OldConf) ->
+    #{removed := Removed, changed := Changed} = diff_confs(NewConf, OldConf),
+    [{{Type, Name}, undefined} || {Type, Name, _} <- Removed] ++
+        [{{Type, Name}, New} || {_Old, {Type, Name, New}} <- Changed];
+changed_listeners(_Path, _Request, _NewConf, _OldConf) ->
+    [].
+
+do_post_config_update([?ROOT_KEY, Type, Name], {create, _Request}, NewConf, OldConf, _AppEnvs) when
+    OldConf =:= undefined orelse OldConf =:= ?TOMBSTONE_TYPE
+->
+    ok = check_bind_portability(Type, Name, undefined, NewConf),
+    start_listener(Type, Name, NewConf);
+do_post_config_update([?ROOT_KEY, Type, Name], {update, _Request}, NewConf, OldConf, _AppEnvs) ->
+    ok = check_bind_portability(Type, Name, OldConf, NewConf),
+    update_listener(Type, Name, OldConf, NewConf);
+do_post_config_update([?ROOT_KEY, Type, Name], ?MARK_DEL, _, OldConf = #{}, _AppEnvs) ->
+    stop_listener(Type, Name, OldConf);
+do_post_config_update([?ROOT_KEY, Type, Name], {action, _Action, _}, NewConf, OldConf, _AppEnvs) ->
+    ok = check_bind_portability(Type, Name, OldConf, NewConf),
+    update_listener(Type, Name, OldConf, NewConf);
+do_post_config_update([?ROOT_KEY], _Request, OldConf, OldConf, _AppEnvs) ->
+    ok;
+do_post_config_update([?ROOT_KEY], _Request, NewConf, OldConf, _AppEnvs) ->
+    #{added := Added, removed := Removed, changed := Changed} = diff_confs(NewConf, OldConf),
+    %% TODO
+    %% This currently lacks transactional semantics. If one of the changes fails,
+    %% previous changes will not be rolled back.
+    perform_listener_changes(
+        [{update, L} || L <- Changed] ++
+            [{stop, L} || L <- Removed] ++
+            [{start, L} || L <- Added]
+    );
+do_post_config_update(_Path, _Request, _NewConf, _OldConf, _AppEnvs) ->
+    ok.
+
+post_zone_config_update(OldZones, NewZones) ->
+    %% Cluster config may update zones before listener dependencies start; skip runtime refreshes.
+    case emqx:is_running() andalso emqx_boot:is_enabled(listeners) of
+        false ->
+            ok;
+        true ->
+            do_post_zone_config_update(true, OldZones, NewZones)
+    end.
+
+do_post_zone_config_update(true, OldZones, NewZones) ->
+    Zones0 = maps:keys(OldZones),
+    case find_zones_with_relevant_changes(Zones0, OldZones, NewZones, []) of
+        [] ->
+            ok;
+        Zones ->
+            Listeners = emqx_config:get([listeners], #{}),
+            maps:foreach(
+                fun(Type, NameConfig) ->
+                    update_listeners_in_zones(Type, NameConfig, Zones)
+                end,
+                Listeners
+            )
+    end.
+
+%% Zone settings that `choose_packet_opts/1' bakes into the listener socket
+%% options, and so require the listener to be updated when they change.
+-define(PACKET_OPT_KEYS, [max_packet_size, max_connect_packet_size]).
+
+find_zones_with_relevant_changes([], _OldZones, _NewZones, Acc) ->
+    Acc;
+find_zones_with_relevant_changes([Zone | Zones], OldZones, NewZones, Acc) ->
+    Read = fun(Config, Key) -> emqx_utils_maps:deep_get([Zone, mqtt, Key], Config, none) end,
+    Changed = lists:any(
+        fun(Key) -> Read(OldZones, Key) =/= Read(NewZones, Key) end,
+        ?PACKET_OPT_KEYS
+    ),
+    case Changed of
+        false ->
+            find_zones_with_relevant_changes(Zones, OldZones, NewZones, Acc);
+        true ->
+            find_zones_with_relevant_changes(Zones, OldZones, NewZones, [Zone | Acc])
+    end.
+
+%% So far zone config change only impacts tcp and ssl listeners
+update_listeners_in_zones(Type, NameConfig, Zones) when Type =:= tcp orelse Type =:= ssl ->
+    maps:foreach(
+        fun(Name, Config) ->
+            Zone = maps:get(zone, Config),
+            case lists:member(Zone, Zones) of
+                true ->
+                    ListenerId = listener_id(Type, Name),
+                    apply_on_listener(ListenerId, fun ?MODULE:update_listener_for_zone_changes/3);
+                false ->
+                    ok
+            end
+        end,
+        NameConfig
+    );
+update_listeners_in_zones(_Type, _NameConfig, _Zones) ->
+    ok.
+
+perform_listener_changes([]) ->
+    ok;
+perform_listener_changes([{Action, Listener} | Rest]) ->
+    case perform_listener_change(Action, Listener) of
+        ok -> perform_listener_changes(Rest);
+        {error, Reason} -> {error, Reason}
+    end.
+
+perform_listener_change(start, {Type, Name, Conf}) ->
+    ok = check_bind_portability(Type, Name, undefined, Conf),
+    start_listener(Type, Name, Conf);
+perform_listener_change(update, {{Type, Name, ConfOld}, {_, _, ConfNew}}) ->
+    ok = check_bind_portability(Type, Name, ConfOld, ConfNew),
+    update_listener(Type, Name, ConfOld, ConfNew);
+perform_listener_change(stop, {Type, Name, Conf}) ->
+    stop_listener(Type, Name, Conf).
+
+%% Log a notice when a config change sets a listener bind to a host-specific
+%% IP address. Logging only: this runs from `post_config_update/5', which every
+%% node executes when it applies a replicated config change. Returning an error
+%% here would block config replication, a much worse failure than one listener
+%% that cannot bind. Each node checks the address against its own network
+%% interfaces, so exactly the nodes that cannot bind the address log an error.
+check_bind_portability(Type, Name, OldConf, NewConf) ->
+    OldBind = bind_of(OldConf),
+    case bind_of(NewConf) of
+        {Ip, _Port} = Bind when Bind =/= OldBind ->
+            case is_generic_address(Ip) of
+                true -> ok;
+                false -> log_bind_portability(listener_id(Type, Name), Ip, Bind)
+            end;
+        _ ->
+            %% A bare-port bind has no address part. An unchanged bind was
+            %% already checked by the change that set it.
+            ok
+    end.
+
+bind_of(#{bind := Bind}) -> Bind;
+bind_of(undefined) -> undefined.
+
+log_bind_portability(Id, Ip, Bind) ->
+    IsLocal = is_local_address(Ip),
+    %% Count stopped nodes too: a stopped node applies the replicated config
+    %% when it comes back, and then cannot bind the address either.
+    IsSingleNode =
+        case emqx:cluster_nodes(all) of
+            [_] -> true;
+            _ -> false
+        end,
+    do_log_bind_portability(Id, Bind, IsLocal, IsSingleNode).
+
+do_log_bind_portability(Id, Bind, true = _IsLocal, true = _IsSingleNode) ->
+    BindStr = format_bind_str(Bind),
+    ?tp(listener_bind_portability_log, #{listener => Id, level => warning, bind => BindStr}),
+    ?SLOG(warning, #{
+        msg => "listener_bind_address_not_portable",
+        listener => Id,
+        bind => BindStr,
+        hint =>
+            "The bind address is specific to this host. "
+            "The config will not work when copied or migrated to another host."
+    });
+do_log_bind_portability(Id, Bind, IsLocal, _IsSingleNode) ->
+    Reason =
+        case IsLocal of
+            true ->
+                "The bind address is specific to one host. "
+                "Other nodes in the cluster cannot bind it.";
+            false ->
+                "The bind address is not found on this node's network interfaces. "
+                "The listener cannot bind it on this node."
+        end,
+    BindStr = format_bind_str(Bind),
+    ?tp(listener_bind_portability_log, #{listener => Id, level => error, bind => BindStr}),
+    ?SLOG(error, #{
+        msg => "listener_bind_address_not_local",
+        listener => Id,
+        bind => BindStr,
+        reason => Reason
+    }).
+
+%% Addresses that bind the same way on any host: the IPv4/IPv6 wildcard and
+%% loopback. All of 127.0.0.0/8 is loopback on every host, not just 127.0.0.1,
+%% so the whole block counts as generic.
+is_generic_address({0, 0, 0, 0}) -> true;
+is_generic_address({127, _, _, _}) -> true;
+is_generic_address({0, 0, 0, 0, 0, 0, 0, 0}) -> true;
+is_generic_address({0, 0, 0, 0, 0, 0, 0, 1}) -> true;
+is_generic_address(_) -> false.
+
+is_local_address(Ip) ->
+    case inet:getifaddrs() of
+        {ok, IfAddrs} ->
+            lists:any(fun({_Name, Opts}) -> lists:member({addr, Ip}, Opts) end, IfAddrs);
+        {error, _} ->
+            %% Cannot inspect the interfaces; assume the address is local
+            %% rather than log a false alarm.
+            true
+    end.
+
+format_bind_str(Bind) ->
+    iolist_to_binary(format_bind(Bind)).
+
+esockd_opts(ListenerId, Type, Name, ConnMod, Opts0) ->
+    Zone = zone(Opts0),
+    PacketTcpOpts = choose_packet_opts(Opts0),
+    Limiter = emqx_limiter:create_esockd_limiter_client(Zone, ListenerId),
+    Opts1 = maps:with([acceptors, max_connections, proxy_protocol, proxy_protocol_timeout], Opts0),
+    Opts2 = Opts1#{
+        limiter => Limiter,
+        access_rules => esockd_access_rules(maps:get(access_rules, Opts0, [])),
+        tune_fun => {emqx_olp, backoff_new_conn, [Zone]},
+        connection_mfargs =>
+            {ConnMod, start_link, [
+                #{
+                    listener => {Type, Name},
+                    zone => Zone,
+                    enable_authn => enable_authn(Opts0)
+                }
+            ]}
+    },
+    TcpOpts0 =
+        case ConnMod of
+            emqx_socket_connection -> socket_tcp_opts(Opts0);
+            emqx_connection -> tcp_opts(Opts0)
+        end,
+    TcpOpts = emqx_utils:merge_opts(?MQTT_SOCKOPTS, PacketTcpOpts ++ TcpOpts0),
+    maps:to_list(
+        case Type of
+            tcp ->
+                Opts2#{
+                    tcp_options => TcpOpts
+                };
+            ssl ->
+                SSLOpts0 = ssl_opts(Opts0),
+                SSLOpts = inject_sni_fun(ListenerId, Opts0, SSLOpts0),
+                Opts2#{
+                    ssl_options => SSLOpts,
+                    tcp_options => TcpOpts
+                }
+        end
+    ).
+
+socket_tcp_opts(#{tcp_options := #{buffer_retention_strategy := packet}} = Opts) ->
+    TcpOpts = tcp_opts(Opts),
+    Buffer = proplists:get_value(buffer, TcpOpts),
+    lists:keyreplace(buffer, 1, TcpOpts, {buffer, {false, Buffer}});
+socket_tcp_opts(Opts) ->
+    tcp_opts(Opts).
+
+ws_opts(Type, ListenerName, Opts) ->
+    WsPath = emqx_utils_maps:deep_get([websocket, mqtt_path], Opts, "/mqtt"),
+    WsRoutes = [
+        {WsPath, emqx_ws_connection, #{
+            zone => zone(Opts),
+            listener => {Type, ListenerName},
+            enable_authn => enable_authn(Opts)
+        }}
+    ],
+    Dispatch = cowboy_router:compile([{'_', WsRoutes}]),
+    ProxyProto = maps:get(proxy_protocol, Opts, false),
+    #{env => #{dispatch => Dispatch}, proxy_header => ProxyProto}.
+
+ranch_opts(ListenerId, Type, Opts = #{bind := ListenOn}) ->
+    Zone = zone(Opts),
+    NumAcceptors = maps:get(acceptors, Opts, 4),
+    MaxConnections = maps:get(max_connections, Opts, 1024),
+    LimiterClient = emqx_limiter:create_listener_limiter_client(Zone, ListenerId),
+    Limiter =
+        {emqx_ranch_limiter, #{
+            listener => ListenerId,
+            rate_limiter => LimiterClient,
+            max_connections => MaxConnections
+        }},
+    SocketOpts =
+        case Type of
+            wss ->
+                tcp_opts(Opts) ++
+                    lists:filter(
+                        fun
+                            ({partial_chain, _}) -> false;
+                            ({handshake_timeout, _}) -> false;
+                            (_) -> true
+                        end,
+                        ssl_opts(Opts)
+                    );
+            ws ->
+                tcp_opts(Opts)
+        end,
+    #{
+        num_acceptors => NumAcceptors,
+        %% Controls both connection rate and max connections limit:
+        limiter => Limiter,
+        %% Same as number of acceptors, for predictable limiter behavior:
+        num_conns_sups => NumAcceptors,
+        %% Essentially only for `max_conns/1` now:
+        max_connections => MaxConnections,
+        handshake_timeout => ranch_handshake_timeout(Opts),
+        socket_opts => ip_port(ListenOn) ++
+            %% cowboy don't allow us to set 'reuseaddr'
+            proplists:delete(reuseaddr, SocketOpts)
+    }.
+
+%% The TLS handshake timeout of a WSS listener. A WS listener has no
+%% `ssl_options` and keeps the ranch default.
+ranch_handshake_timeout(#{ssl_options := #{handshake_timeout := Timeout}}) ->
+    Timeout;
+ranch_handshake_timeout(_Opts) ->
+    15000.
+
+choose_packet_opts(Opts) ->
+    ParseUnit = maps:get(parse_unit, Opts, frame),
+    HasPacketParser = is_packet_parser_available(mqtt),
+    case ParseUnit of
+        frame when HasPacketParser ->
+            %% Accept with the CONNECT limit, so the kernel does not buffer a
+            %% whole `max_packet_size' frame for a client that has not connected
+            %% yet. `emqx_connection' raises it once the client is connected.
+            Zone = zone(Opts),
+            PacketSize = min(
+                emqx_config:get_zone_conf(Zone, [mqtt, max_packet_size]),
+                emqx_config:get_zone_conf(Zone, [mqtt, max_connect_packet_size])
+            ),
+            [{packet, mqtt}, {packet_size, PacketSize}, {mode, binary}];
+        frame ->
+            %% NOTE: Silently ignoring the setting if BEAM does not provide `mqtt` parser.
+            [{packet, raw}];
+        chunk ->
+            [{packet, raw}]
+    end.
+
+-spec is_packet_parser_available(atom()) -> boolean().
+is_packet_parser_available(Type) ->
+    try erlang:decode_packet(Type, <<>>, []) of
+        _ -> true
+    catch
+        error:badarg -> false
+    end.
+
+ip_port(Port) when is_integer(Port) ->
+    [{port, Port}];
+ip_port({Addr, Port}) ->
+    [{ip, Addr}, {port, Port}].
+
+-doc """
+Returns the address an esockd listener is registered under.
+
+A running listener is the source of truth: it keeps the address it was
+started with, which is what every esockd call must be keyed by. Falls back
+to the configured bind with the default address applied, for a listener
+that is not running yet.
+""".
+listen_on(Id, Bind) ->
+    case find_listen_on(Id) of
+        {ok, ListenOn} -> ListenOn;
+        error -> emqx_default_address:listen_on(mqtt, Bind)
+    end.
+
+find_listen_on(Id) ->
+    Found = lists:filtermap(
+        fun({{ListenerId, ListenOn}, _Pid}) ->
+            ListenerId =:= Id andalso {true, ListenOn}
+        end,
+        esockd:listeners()
+    ),
+    case Found of
+        [ListenOn | _] -> {ok, ListenOn};
+        [] -> error
+    end.
+
+esockd_access_rules(StrRules) ->
+    Access = fun(S, Acc) ->
+        [A, CIDR] = string:tokens(S, " "),
+        %% esockd rules only use words 'allow' and 'deny', both are existing
+        %% comparison of strings may be better, but there is a loss of backward compatibility
+        case emqx_utils:safe_to_existing_atom(A) of
+            {ok, Action} ->
+                [
+                    {
+                        Action,
+                        case CIDR of
+                            "all" -> all;
+                            _ -> CIDR
+                        end
+                    }
+                    | Acc
+                ];
+            _ ->
+                ?SLOG(warning, #{msg => "invalid_esockd_access_rule", rule => S}),
+                Acc
+        end
+    end,
+    lists:foldr(Access, [], StrRules).
+
+-spec format_bind(
+    integer() | {tuple(), integer()} | string() | binary()
+) -> io_lib:chars().
+format_bind(Port) when is_integer(Port) ->
+    %% **Note**:
+    %% 'For TCP, UDP and IP networks, if the host is empty or a literal
+    %% unspecified IP address, as in ":80", "0.0.0.0:80" or "[::]:80" for
+    %% TCP and UDP, "", "0.0.0.0" or "::" for IP, the local system is
+    %% assumed.'
+    %%
+    %% Quoted from: https://pkg.go.dev/net
+    %% Decided to use this format to display the bind for all interfaces and
+    %% IPv4/IPv6 support
+    io_lib:format(":~w", [Port]);
+format_bind({Addr, Port}) when is_list(Addr) ->
+    io_lib:format("~ts:~w", [Addr, Port]);
+format_bind({Addr, Port}) when is_tuple(Addr), tuple_size(Addr) == 4 ->
+    io_lib:format("~ts:~w", [inet:ntoa(Addr), Port]);
+format_bind({Addr, Port}) when is_tuple(Addr), tuple_size(Addr) == 8 ->
+    io_lib:format("[~ts]:~w", [inet:ntoa(Addr), Port]);
+%% Support string, binary type for Port or IP:Port
+format_bind(Str) when is_list(Str) ->
+    case emqx_schema:to_ip_port(Str) of
+        {ok, {Ip, Port}} ->
+            format_bind({Ip, Port});
+        {ok, Port} ->
+            format_bind(Port);
+        {error, _} ->
+            format_bind(list_to_integer(Str))
+    end;
+format_bind(Bin) when is_binary(Bin) ->
+    format_bind(binary_to_list(Bin)).
+
+-doc """
+Same input as `format_bind/1`, but returns only the IP address, without the
+port, as a binary. Empty binary for a bind with no explicit address (bind
+all interfaces), the same convention `format_bind/1` uses for the host
+part.
+""".
+-spec format_bind_ip(
+    integer() | {tuple(), integer()} | string() | binary()
+) -> binary().
+format_bind_ip(Bind) ->
+    iolist_to_binary(do_format_bind_ip(Bind)).
+
+do_format_bind_ip(Port) when is_integer(Port) ->
+    "";
+do_format_bind_ip({Addr, _Port}) when is_list(Addr) ->
+    Addr;
+do_format_bind_ip({Addr, _Port}) when is_tuple(Addr), tuple_size(Addr) == 4 ->
+    inet:ntoa(Addr);
+do_format_bind_ip({Addr, _Port}) when is_tuple(Addr), tuple_size(Addr) == 8 ->
+    inet:ntoa(Addr);
+do_format_bind_ip(Str) when is_list(Str) ->
+    case emqx_schema:to_ip_port(Str) of
+        {ok, {Ip, Port}} ->
+            do_format_bind_ip({Ip, Port});
+        {ok, Port} ->
+            do_format_bind_ip(Port);
+        {error, _} ->
+            do_format_bind_ip(list_to_integer(Str))
+    end;
+do_format_bind_ip(Bin) when is_binary(Bin) ->
+    do_format_bind_ip(binary_to_list(Bin)).
+
+listener_id(Type, ListenerName) ->
+    list_to_atom(lists:append([str(Type), ":", str(ListenerName)])).
+
+-spec validate_listener_name(unicode:chardata() | atom()) ->
+    ok
+    | {error, {listener_name_invalid_chars | listener_name_too_long, binary()}}.
+validate_listener_name(Name) ->
+    NameBin = listener_id_part_to_binary(Name),
+    case byte_size(NameBin) =< ?MAX_LISTENER_NAME_BYTES of
+        false ->
+            Message = iolist_to_binary(
+                io_lib:format(
+                    "Listener name must not exceed ~B bytes", [?MAX_LISTENER_NAME_BYTES]
+                )
+            ),
+            {error, {listener_name_too_long, Message}};
+        true ->
+            case emqx_utils:is_restricted_str(NameBin) of
+                true ->
+                    ok;
+                false ->
+                    ErrMsg = <<
+                        "Listener name must start with a letter or digit "
+                        "and contain only letters, digits, '-' and '_'"
+                    >>,
+                    {error, {listener_name_invalid_chars, ErrMsg}}
+            end
+    end.
+
+listener_id_part_to_binary(Value) when is_binary(Value) ->
+    Value;
+listener_id_part_to_binary(Value) when is_atom(Value) ->
+    atom_to_binary(Value, utf8);
+listener_id_part_to_binary(Value) when is_list(Value) ->
+    unicode:characters_to_binary(Value).
+
+-spec parse_listener_id(listener_id()) -> {ok, #{type => atom(), name => atom()}} | {error, term()}.
+parse_listener_id(Id) ->
+    case parse_listener_id_without_atom(Id) of
+        {ok, #{type := Type, name := Name}} ->
+            {ok, #{type => binary_to_existing_atom(Type), name => binary_to_atom(Name)}};
+        {error, _} = Error ->
+            Error
+    end.
+
+-spec parse_listener_id_without_atom(listener_id() | unicode:chardata()) ->
+    {ok, #{type => binary(), name => binary()}} | {error, {invalid_listener_id, binary()}}.
+parse_listener_id_without_atom(Id) ->
+    IdBin = listener_id_part_to_binary(Id),
+    case binary:split(IdBin, <<":">>) of
+        [Type, Name] ->
+            case lists:member(binary_to_list(Type), ?TYPES_STRING) of
+                true -> {ok, #{type => Type, name => Name}};
+                false -> {error, {invalid_listener_id, <<"Unsupported listener type">>}}
+            end;
+        _ ->
+            {error, {invalid_listener_id, <<"Invalid listener ID format, expected type:name">>}}
+    end.
+
+zone(Opts) ->
+    maps:get(zone, Opts, undefined).
+
+diff_confs(NewConfs, OldConfs) ->
+    emqx_utils:diff_lists(
+        flatten_confs(NewConfs),
+        flatten_confs(OldConfs),
+        fun({Type, Name, _}) -> {Type, Name} end
+    ).
+
+validate_new_listener_ids(NewConf, OldConf) ->
+    #{added := Added} = diff_confs(NewConf, OldConf),
+    validate_listener_ids(Added).
+
+validate_listener_ids([]) ->
+    ok;
+validate_listener_ids([{_Type, Name, _Conf} | Rest]) ->
+    case validate_listener_name(Name) of
+        ok ->
+            validate_listener_ids(Rest);
+        {error, _} = Error ->
+            Error
+    end.
+
+flatten_confs(Confs) ->
+    lists:flatmap(
+        fun({Type, Listeners}) ->
+            do_flatten_confs(Type, Listeners)
+        end,
+        maps:to_list(Confs)
+    ).
+
+do_flatten_confs(Type, Listeners) ->
+    FilterFun =
+        fun
+            ({_Name, ?TOMBSTONE_TYPE}) -> false;
+            ({Name, Conf}) -> {true, {Type, Name, Conf}}
+        end,
+    lists:filtermap(FilterFun, maps:to_list(Listeners)).
+
+enable_authn(Opts) ->
+    maps:get(enable_authn, Opts, true).
+
+ssl_opts(Opts) ->
+    emqx_tls_lib:to_server_opts(tls, maps:get(ssl_options, Opts, #{})).
+
+-doc """
+Points a listener with no certificate of its own at the node's default bundle,
+generating it if this node has none.
+
+Done here, where a listener is actually started or updated, rather than in
+`ssl_opts/1': that is also called to compare two configurations, and
+`to_server_opts/2' is called by other applications to read a listener's
+certificate. Neither of those should mint one as a side effect.
+
+Applied to both sides of an update so the comparison that decides whether the
+transport has to be torn down stays symmetric.
+""".
+ensure_default_certs(#{ssl_options := SSLOpts} = Conf) ->
+    case emqx_tls_lib:ensure_default_certs(SSLOpts) of
+        {ok, SSLOpts1} -> {ok, Conf#{ssl_options => SSLOpts1}};
+        {error, _} = Error -> Error
+    end;
+ensure_default_certs(Conf) ->
+    {ok, Conf}.
+
+%% The config a listener is being updated away from is only compared against and
+%% rolled back to, never served.  Resolving it must not generate a certificate.
+default_certs_if_present(#{ssl_options := SSLOpts} = Conf) ->
+    Conf#{ssl_options => emqx_tls_lib:default_certs_if_present(SSLOpts)};
+default_certs_if_present(Conf) ->
+    Conf.
+
+tcp_opts(Opts) ->
+    TcpOpts0 = maps:get(tcp_options, Opts, #{}),
+    TcpOpts = maps:to_list(ensure_low_watermark(TcpOpts0)),
+    lists:flatten(lists:map(fun tcp_opt/1, TcpOpts)).
+
+%% `low_watermark' defaults to a quarter of `high_watermark', the same
+%% ratio `emqx_socket_connection' uses to clear congestion, floored at
+%% the inet driver default. Without it, a socket that went busy at a 1MB
+%% `high_watermark' would stay busy until its buffer drained below 4KB.
+%% The value never exceeds `high_watermark': the inet driver would raise
+%% `high_watermark' to match a higher `low_watermark'.
+ensure_low_watermark(#{high_watermark := High} = TcpOpts) ->
+    Default = max(?DEFAULT_TCP_LOW_WATERMARK, High div 4),
+    Low = maps:get(low_watermark, TcpOpts, Default),
+    TcpOpts#{low_watermark => min(Low, High)};
+ensure_low_watermark(TcpOpts) ->
+    TcpOpts.
+
+tcp_opt({active_n, _}) ->
+    %% The `active_n' option is ignored for listener socket.
+    %% For accepted sockets, `active_n' is set by socket owner processes.
+    [];
+tcp_opt({keepalive, _String}) ->
+    %% emqx_schema:tcp_keepalive_opts(String);
+    %% esockd only supports key-value paris, NOT options like [{raw, 6, 4, ...}]
+    %% so we ignore it here but set it in emqx_connection process like `active_n'
+    [];
+tcp_opt({buffer_retention_strategy, _Strategy}) ->
+    %% Relevant for `socket` backend only, see `socket_tcp_opts/1`.
+    [];
+tcp_opt({nolinger, Bool}) ->
+    case Bool of
+        true ->
+            {linger, {true, 0}};
+        false ->
+            %% cannot return [] here
+            %% because we need to be able to set {true, 0}
+            %% but also be able to revert it on the fly
+            {linger, {false, 0}}
+    end;
+tcp_opt({buffer, Bytes}) when is_integer(Bytes) andalso Bytes < ?MIN_TCP_BUFFER ->
+    {buffer, ?MIN_TCP_BUFFER};
+tcp_opt(Opt) ->
+    Opt.
+
+%% Used by emqx_connection, emqx_socket_connection and emqx_ws_connection.
+-spec clamp_active_n(integer()) -> pos_integer().
+clamp_active_n(N) when is_integer(N) ->
+    max(?MIN_ACTIVE_N, min(?MAX_ACTIVE_N, N)).
+
+foreach_listeners(Do) ->
+    lists:foreach(
+        fun({Id, LConf}) ->
+            {ok, #{type := Type, name := Name}} = parse_listener_id(Id),
+            case Do(Type, Name, LConf) of
+                {error, {failed_to_start, _} = Reason} -> error(Reason);
+                {error, {already_started, _}} -> ok;
+                ok -> ok
+            end
+        end,
+        list()
+    ).
+
+has_enabled_listener_conf_by_type(Type) ->
+    lists:any(
+        fun({Id, LConf}) when is_map(LConf) ->
+            {ok, #{type := Type0}} = parse_listener_id(Id),
+            Type =:= Type0 andalso maps:get(enable, LConf, true)
+        end,
+        list()
+    ).
+
+apply_on_listener(ListenerId, Do) ->
+    {ok, #{type := Type, name := Name}} = parse_listener_id(ListenerId),
+    case emqx_config:find_listener_conf(Type, Name, []) of
+        {not_found, _, _} -> error({listener_config_not_found, Type, Name});
+        {ok, Conf} -> Do(Type, Name, Conf)
+    end.
+
+str(A) when is_atom(A) ->
+    atom_to_list(A);
+str(B) when is_binary(B) ->
+    binary_to_list(B);
+str(S) when is_list(S) ->
+    S.
+
+parse_bind(#{<<"bind">> := Bind}) when is_integer(Bind) -> Bind;
+parse_bind(#{<<"bind">> := Bind}) ->
+    case emqx_schema:to_ip_port(binary_to_list(Bind)) of
+        {ok, L} -> L;
+        {error, _} -> binary_to_integer(Bind)
+    end.
+
+%% The relative dir for ssl files.
+certs_dir(Type, Name) ->
+    TypePath = binary_to_list(listener_id_part_to_binary(Type)),
+    NamePath = binary_to_list(listener_id_part_to_binary(Name)),
+    iolist_to_binary(filename:join(["listeners", TypePath, NamePath])).
+
+convert_certs(ListenerConf) ->
+    maps:fold(
+        fun(Type, Listeners0, Acc) ->
+            Listeners1 =
+                maps:fold(
+                    fun(Name, Conf0, Acc1) ->
+                        Conf1 = convert_certs(Type, Name, Conf0),
+                        Acc1#{Name => Conf1}
+                    end,
+                    #{},
+                    Listeners0
+                ),
+            Acc#{Type => Listeners1}
+        end,
+        #{},
+        ListenerConf
+    ).
+
+convert_certs(Type, Name, Conf) ->
+    CertsDir = certs_dir(Type, Name),
+    case emqx_tls_lib:ensure_ssl_files_in_mutable_certs_dir(CertsDir, get_ssl_options(Conf)) of
+        {ok, undefined} ->
+            Conf;
+        {ok, SSL} ->
+            Conf#{<<"ssl_options">> => SSL};
+        {error, Reason} ->
+            ?SLOG(error, Reason#{msg => "bad_ssl_config", type => Type, name => Name}),
+            throw({bad_ssl_config, Reason})
+    end.
+
+filter_stacktrace({Reason, _Stacktrace}) -> Reason;
+filter_stacktrace(Reason) -> Reason.
+
+assert_zone_exists(#{<<"zone">> := Zone}) ->
+    emqx_config_zones:assert_zone_exists(Zone);
+assert_zone_exists(_) ->
+    ok.
+
+get_ssl_options(Conf = #{}) ->
+    case maps:find(ssl_options, Conf) of
+        {ok, SSL} ->
+            SSL;
+        error ->
+            maps:get(<<"ssl_options">>, Conf, undefined)
+    end;
+get_ssl_options(_) ->
+    undefined.
+
+%% @doc Get QUIC optional settings for low level tunings.
+%% @see quicer:quic_settings()
+-spec optional_quic_listener_opts(map()) -> map().
+optional_quic_listener_opts(Conf) when is_map(Conf) ->
+    maps:filter(
+        fun(Name, _V) ->
+            lists:member(
+                Name,
+                quic_listener_optional_settings()
+            )
+        end,
+        Conf
+    ).
+
+-spec quic_listener_optional_settings() -> [atom()].
+quic_listener_optional_settings() ->
+    [
+        max_bytes_per_key,
+        %% In conf schema we use handshake_idle_timeout
+        handshake_idle_timeout_ms,
+        %% In conf schema we use idle_timeout
+        idle_timeout_ms,
+        %% not use since we are server
+        %% tls_client_max_send_buffer,
+        tls_server_max_send_buffer,
+        stream_recv_window_default,
+        stream_recv_buffer_default,
+        conn_flow_control_window,
+        max_stateless_operations,
+        initial_window_packets,
+        send_idle_timeout_ms,
+        initial_rtt_ms,
+        max_ack_delay_ms,
+        disconnect_timeout_ms,
+        %% In conf schema,  we use keep_alive_interval
+        keep_alive_interval_ms,
+        %% over written by conn opts
+        peer_bidi_stream_count,
+        %% over written by conn opts
+        peer_unidi_stream_count,
+        retry_memory_limit,
+        load_balancing_mode,
+        max_operations_per_drain,
+        send_buffering_enabled,
+        pacing_enabled,
+        migration_enabled,
+        datagram_receive_enabled,
+        server_resumption_level,
+        minimum_mtu,
+        maximum_mtu,
+        mtu_discovery_search_complete_timeout_us,
+        mtu_discovery_missing_probe_count,
+        max_binding_stateless_operations,
+        stateless_operation_expiration_ms
+    ].
+
+inject_sni_fun(
+    ListenerId,
+    Conf = #{ssl_options := #{ocsp := #{enable_ocsp_stapling := true}}},
+    SSLOpts
+) ->
+    emqx_ocsp_cache:opt_sni_fun(ListenerId, Conf) ++ SSLOpts;
+inject_sni_fun(_ListenerId, _Conf = #{}, SSLOpts) ->
+    SSLOpts.
+
+maybe_unregister_ocsp_stapling_refresh(
+    ssl = Type, Name, #{ssl_options := #{ocsp := #{enable_ocsp_stapling := false}}} = _Conf
+) ->
+    unregister_ocsp_stapling_refresh(Type, Name),
+    ok;
+maybe_unregister_ocsp_stapling_refresh(_Type, _Name, _Conf) ->
+    ok.
+
+unregister_ocsp_stapling_refresh(Type, Name) ->
+    ListenerId = listener_id(Type, Name),
+    emqx_ocsp_cache:unregister_listener(ListenerId),
+    ok.
+
+default_max_conn() ->
+    <<"infinity">>.
+
+ensure_max_conns(<<"infinity">>) -> <<"infinity">>;
+ensure_max_conns(MaxConn) when is_binary(MaxConn) -> binary_to_integer(MaxConn);
+ensure_max_conns(MaxConn) -> MaxConn.
+
+quic_listen_on(#{bind := Bind}) ->
+    quic_listen_on(Bind);
+quic_listen_on(Bind) ->
+    case Bind of
+        {Addr, Port} when tuple_size(Addr) == 4 ->
+            %% IPv4
+            lists:flatten(io_lib:format("~ts:~w", [inet:ntoa(Addr), Port]));
+        {Addr, Port} when tuple_size(Addr) == 8 ->
+            %% IPv6
+            lists:flatten(io_lib:format("[~ts]:~w", [inet:ntoa(Addr), Port]));
+        Port ->
+            Port
+    end.
+
+-spec to_quicer_listener_opts(atom(), map()) -> quicer_listener:listener_opts().
+to_quicer_listener_opts(Name, Opts) ->
+    DefAcceptors = erlang:system_info(schedulers_online) * 8,
+    SSLOpts = maps:from_list(ssl_opts(Opts)),
+    Opts1 = maps:filter(
+        fun
+            (cacertfile, undefined) -> false;
+            (password, undefined) -> false;
+            (_, _) -> true
+        end,
+        Opts
+    ),
+    Opts2 = maps:merge(
+        Opts#{
+            alpn => ["mqtt"],
+            conn_acceptors => max(DefAcceptors, maps:get(acceptors, Opts1, 0)),
+            %% @NOTE: Backward compatibility START
+            server_resumption_level => maps:get(server_resumption_level, Opts, 2),
+            idle_timeout_ms => maps:get(idle_timeout, Opts, 0),
+            keep_alive_interval_ms => maps:get(keep_alive_interval, Opts, 0),
+            handshake_idle_timeout_ms => maps:get(handshake_idle_timeout, Opts, 10000)
+            %% @NOTE: Backward compatibility END
+        },
+        SSLOpts
+    ),
+    %% @NOTE: Optional options take precedence over required options
+    ListenOpts = maps:merge(Opts2, optional_quic_listener_opts(Opts)),
+
+    %% Conn Opts
+    ConnectionOpts = #{
+        alpn => ["mqtt"],
+        conn_callback => emqx_quic_connection,
+        peer_unidi_stream_count => maps:get(peer_unidi_stream_count, Opts, 1),
+        peer_bidi_stream_count => maps:get(peer_bidi_stream_count, Opts, 10),
+        zone => zone(Opts),
+        listener => {quic, Name}
+    },
+    StreamOpts = #{
+        stream_callback => emqx_quic_stream,
+        active => 1
+    },
+    ?tp("quic_listener_opts", #{listen_opts => ListenOpts}),
+    {ListenOpts, ConnectionOpts, StreamOpts}.
+
+-spec quic_listener_conf_rollback(
+    pid(),
+    quicer:listen_on(),
+    quicer_listener:listener_opts(),
+    Error :: {error, _, _} | {error, _}
+) -> ok | {error, any()}.
+quic_listener_conf_rollback(ListenerPid, ListenOn, Conf, Error) ->
+    case quicer_listener:reload(ListenerPid, ListenOn, Conf) of
+        ok ->
+            ?ELOG(
+                "Failed to reload QUIC listener ~p, but Rollback success\n",
+                [
+                    Error
+                ]
+            ),
+            ok;
+        RestoreErr ->
+            ?ELOG(
+                "Failed to reload QUIC listener ~p, and Rollback failed as well\n",
+                [Error]
+            ),
+            {error, {rollback_fail, RestoreErr}}
+    end.

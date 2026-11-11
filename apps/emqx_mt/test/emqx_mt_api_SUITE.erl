@@ -1,0 +1,2527 @@
+%%--------------------------------------------------------------------
+%% Copyright (c) 2024-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
+%%--------------------------------------------------------------------
+
+-module(emqx_mt_api_SUITE).
+
+-compile(nowarn_export_all).
+-compile(export_all).
+
+-include_lib("eunit/include/eunit.hrl").
+-include_lib("common_test/include/ct.hrl").
+-include_lib("snabbkaffe/include/snabbkaffe.hrl").
+-include_lib("emqx/include/asserts.hrl").
+-include_lib("emqx/include/emqx_mqtt.hrl").
+-include_lib("emqx/include/emqx_hooks.hrl").
+-include("emqx_mt.hrl").
+-include("emqx_mt_internal.hrl").
+-include_lib("emqx/include/emqx_managed_certs.hrl").
+
+-define(NEW_CLIENTID(I),
+    iolist_to_binary("c-" ++ atom_to_list(?FUNCTION_NAME) ++ "-" ++ integer_to_list(I))
+).
+
+-define(NEW_USERNAME(), iolist_to_binary("u-" ++ atom_to_list(?FUNCTION_NAME))).
+
+-define(ON(NODE, BODY), erpc:call(NODE, fun() -> BODY end)).
+-define(ON_ALL(NODES, BODY), erpc:multicall(NODES, fun() -> BODY end)).
+
+-define(MAX_NUM_TNS_CONFIGS, 1_000).
+-define(AUTH_HEADER_PD_KEY, {?MODULE, auth_header}).
+
+-define(FILE_KIND_CA_BIN, atom_to_binary(?FILE_KIND_CA)).
+
+-import(emqx_common_test_helpers, [on_exit/1]).
+
+%%------------------------------------------------------------------------------
+%% CT Boilerplate
+%%------------------------------------------------------------------------------
+
+all() ->
+    ProfileCases = profile_cases(),
+    (emqx_common_test_helpers:all(?MODULE) -- ProfileCases) ++
+        [{group, legacy}, {group, hardened}].
+
+groups() ->
+    ProfileCases = profile_cases(),
+    [{legacy, [], ProfileCases}, {hardened, [], ProfileCases}].
+
+init_per_suite(Config) ->
+    Config.
+
+end_per_suite(_Config) ->
+    ok.
+
+init_per_group(Profile, Config) when Profile =:= legacy; Profile =:= hardened ->
+    ok = emqx_common_test_helpers:set_security_profile(Profile),
+    [{security_profile, Profile} | Config].
+
+end_per_group(Profile, _Config) when Profile =:= legacy; Profile =:= hardened ->
+    emqx_common_test_helpers:clear_security_profile().
+
+init_per_testcase(TestCase, Config) when
+    TestCase == t_adjust_limiters;
+    TestCase == t_delivery_rate_limit;
+    TestCase == t_subscribe_rate_limit
+->
+    Apps = [
+        emqx,
+        {emqx_conf, "mqtt.client_attrs_init = [{expression = username, set_as_attr = tns}]"},
+        emqx_mt,
+        emqx_management
+    ],
+    Cluster =
+        [N1, _N2] = emqx_cth_cluster:start(
+            [
+                {node_name(TestCase, 1), #{
+                    apps => Apps ++
+                        [emqx_mgmt_api_test_util:emqx_dashboard()]
+                }},
+                {node_name(TestCase, 2), #{apps => Apps, role => replicant}}
+            ],
+            #{work_dir => emqx_cth_suite:work_dir(TestCase, Config)}
+        ),
+    AuthHeader = ?ON(N1, emqx_mgmt_api_test_util:auth_header_()),
+    put(?AUTH_HEADER_PD_KEY, AuthHeader),
+    [{cluster, Cluster} | Config];
+init_per_testcase(TestCase, Config) when
+    TestCase == t_namespaced_metrics;
+    TestCase == t_delete_ns_purges_builtin_auth_data;
+    TestCase == t_purge_ns_cli
+->
+    Apps = emqx_cth_suite:start(
+        [
+            emqx,
+            {emqx_conf,
+                "mqtt.client_attrs_init = [{expression = username, set_as_attr = tns}]\n"
+                "authentication = [{mechanism = password_based, backend = built_in_database, "
+                "autogenerate_password = false}]\n"
+                "authorization.no_match = allow\n"
+                "authorization.sources = [{type = built_in_database, max_rules = 7}]"},
+            {emqx_mt, "multi_tenancy.default_max_sessions = 10"},
+            emqx_auth_mnesia,
+            emqx_auth,
+            emqx_management,
+            emqx_mgmt_api_test_util:emqx_dashboard()
+        ],
+        #{work_dir => emqx_cth_suite:work_dir(TestCase, Config)}
+    ),
+    snabbkaffe:start_trace(),
+    [{apps, Apps} | Config];
+init_per_testcase(TestCase, Config) ->
+    Apps = emqx_cth_suite:start(
+        [
+            emqx,
+            {emqx_conf,
+                "mqtt.client_attrs_init = [{expression = username, set_as_attr = tns}]\n"
+                "authorization.cache { enable = false }\n"
+                "authorization.no_match = deny\n"
+                "authorization.sources = [{type = built_in_database, max_rules = 7}]"},
+            {emqx_mt, "multi_tenancy.default_max_sessions = 10"},
+            emqx_auth_mnesia,
+            emqx_auth,
+            emqx_management,
+            emqx_mgmt_api_test_util:emqx_dashboard()
+        ],
+        #{work_dir => emqx_cth_suite:work_dir(TestCase, Config)}
+    ),
+    snabbkaffe:start_trace(),
+    maybe_enable_authn(TestCase),
+    [{apps, Apps} | Config].
+
+end_per_testcase(TestCase, Config) when
+    TestCase == t_adjust_limiters;
+    TestCase == t_delivery_rate_limit;
+    TestCase == t_subscribe_rate_limit
+->
+    Cluster = ?config(cluster, Config),
+    snabbkaffe:stop(),
+    emqx_common_test_helpers:call_janitor(),
+    ok = emqx_cth_cluster:stop(Cluster),
+    ok;
+end_per_testcase(_TestCase, Config) ->
+    Apps = ?config(apps, Config),
+    snabbkaffe:stop(),
+    emqx_common_test_helpers:call_janitor(),
+    ok = emqx_cth_suite:stop(Apps),
+    ok.
+
+%%------------------------------------------------------------------------------
+%% Helper fns
+%%------------------------------------------------------------------------------
+
+-define(assertIntersectionEqual(EXPECTED_MAP, MAP),
+    ?assertEqual(
+        EXPECTED_MAP,
+        deep_intersect(EXPECTED_MAP, MAP),
+        #{expected => EXPECTED_MAP, got => MAP}
+    )
+).
+
+node_name(TestCase, N) ->
+    NameBin = <<(atom_to_binary(TestCase))/binary, "_", (integer_to_binary(N))/binary>>,
+    binary_to_atom(NameBin).
+
+get_mqtt_tcp_port(Node) ->
+    {_, Port} = erpc:call(Node, emqx_config, get, [[listeners, tcp, default, bind]]),
+    Port.
+
+connect(ClientId, Username) ->
+    connect(#{
+        clientid => ClientId,
+        username => Username,
+        password => "123456"
+    }).
+
+connect(Overrides) ->
+    Opts0 = #{
+        proto_ver => v5
+    },
+    Opts = emqx_utils_maps:deep_merge(Opts0, Overrides),
+    {ok, Pid} = emqtt:start_link(Opts),
+    monitor(process, Pid),
+    unlink(Pid),
+    case emqtt:connect(Pid) of
+        {ok, _} ->
+            Pid;
+        {error, _Reason} = E ->
+            stop_client(Pid),
+            erlang:error(E)
+    end.
+
+stop_client(Pid) ->
+    catch emqtt:stop(Pid),
+    receive
+        {'DOWN', _, process, Pid, _, _} -> ok
+    after 3000 ->
+        exit(Pid, kill)
+    end.
+
+maybe_enable_authn(TestCase) when
+    TestCase == t_allow_only_managed_namespaces;
+    TestCase == t_session_limit_exceeded
+->
+    emqx_common_test_helpers:listeners_enable_authn_scoped(),
+    ok = emqx_hooks:add('client.authenticate', {?MODULE, allow_authentication, []}, ?HP_LOWEST),
+    on_exit(fun() ->
+        emqx_hooks:del('client.authenticate', {?MODULE, allow_authentication})
+    end);
+maybe_enable_authn(_TestCase) ->
+    ok.
+
+allow_authentication(_ClientInfo, _DefaultResult) ->
+    {stop, ok}.
+
+profile_cases() ->
+    [t_allow_only_managed_namespaces, t_session_limit_exceeded].
+
+url(Path) ->
+    emqx_mgmt_api_test_util:api_path(["mt", Path]).
+
+ns_url(Ns, Path) ->
+    emqx_mgmt_api_test_util:api_path(["mt", "ns", Ns, Path]).
+
+count_clients(Ns) ->
+    URL = ns_url(Ns, "client_count"),
+    simple_request(#{method => get, url => URL}).
+
+list_clients(Ns, QueryParams) ->
+    URL = ns_url(Ns, "client_list"),
+    simple_request(#{method => get, url => URL, query_params => QueryParams}).
+
+list_clients_headers(Ns, QueryParams) ->
+    URL = ns_url(Ns, "client_list"),
+    simple_request(#{
+        method => get, url => URL, query_params => QueryParams, return_headers => true
+    }).
+
+list_nss(QueryParams) ->
+    URL = url("ns_list"),
+    simple_request(#{method => get, url => URL, query_params => QueryParams}).
+
+list_nss_headers(QueryParams) ->
+    URL = url("ns_list"),
+    simple_request(#{
+        method => get, url => URL, query_params => QueryParams, return_headers => true
+    }).
+
+list_nss_details(QueryParams) ->
+    URL = url("ns_list_details"),
+    simple_request(#{method => get, url => URL, query_params => QueryParams}).
+
+list_nss_details_headers(QueryParams) ->
+    URL = url("ns_list_details"),
+    simple_request(#{
+        method => get, url => URL, query_params => QueryParams, return_headers => true
+    }).
+
+maybe_json_decode(X) ->
+    case emqx_utils_json:safe_decode(X) of
+        {ok, Decoded} -> Decoded;
+        {error, _} -> X
+    end.
+
+simplify_result(Res) ->
+    case Res of
+        {error, {{_, StatusCode, _}, Body}} ->
+            {StatusCode, Body};
+        {ok, {{_, StatusCode, _}, Body}} ->
+            {StatusCode, Body}
+    end.
+
+put_auth_header(Header) ->
+    put(?AUTH_HEADER_PD_KEY, Header).
+
+simple_request(Params) ->
+    AuthHeader =
+        case get(?AUTH_HEADER_PD_KEY) of
+            undefined -> emqx_mgmt_api_test_util:auth_header_();
+            Header -> Header
+        end,
+    emqx_mgmt_api_test_util:simple_request(Params#{auth_header => AuthHeader}).
+
+simple_request(Method, Path, Body, QueryParams) ->
+    simple_request(#{method => Method, url => Path, body => Body, query_params => QueryParams}).
+
+simple_request(Method, Path, Body) ->
+    simple_request(#{method => Method, url => Path, body => Body}).
+
+list_managed_nss(QueryParams) ->
+    URL = emqx_mgmt_api_test_util:api_path(["mt", "managed_ns_list"]),
+    simple_request(#{method => get, url => URL, query_params => QueryParams}).
+
+list_managed_nss_headers(QueryParams) ->
+    URL = emqx_mgmt_api_test_util:api_path(["mt", "managed_ns_list"]),
+    simple_request(#{
+        method => get, url => URL, query_params => QueryParams, return_headers => true
+    }).
+
+list_managed_nss_details(QueryParams) ->
+    URL = emqx_mgmt_api_test_util:api_path(["mt", "managed_ns_list_details"]),
+    simple_request(#{method => get, url => URL, query_params => QueryParams}).
+
+list_managed_nss_details_headers(QueryParams) ->
+    URL = emqx_mgmt_api_test_util:api_path(["mt", "managed_ns_list_details"]),
+    simple_request(#{
+        method => get, url => URL, query_params => QueryParams, return_headers => true
+    }).
+
+create_managed_ns(Ns) ->
+    Path = emqx_mgmt_api_test_util:api_path(["mt", "ns", Ns]),
+    Res = simple_request(post, Path, ""),
+    ct:pal("create managed ns result:\n  ~p", [Res]),
+    Res.
+
+%% Same as `create_managed_ns/1', but with every byte of the name
+%% percent-encoded, so that names containing characters special to URLs
+%% (`/', `#', `%', ...) reach the handler verbatim.
+create_managed_ns_encoded(Ns) ->
+    Path = emqx_mgmt_api_test_util:api_path(["mt", "ns", percent_encode_all(Ns)]),
+    Res = simple_request(post, Path, ""),
+    ct:pal("create managed ns ~p result:\n  ~p", [Ns, Res]),
+    Res.
+
+percent_encode_all(Bin) ->
+    iolist_to_binary([io_lib:format("%~2.16.0B", [C]) || <<C>> <= Bin]).
+
+delete_ns(Ns) ->
+    delete_managed_ns(Ns).
+
+delete_managed_ns(Ns) ->
+    Path = emqx_mgmt_api_test_util:api_path(["mt", "ns", Ns]),
+    Res = simple_request(delete, Path, ""),
+    ct:pal("delete managed ns result:\n  ~p", [Res]),
+    Res.
+
+bulk_delete_ns(Nss) ->
+    Path = emqx_mgmt_api_test_util:api_path(["mt", "bulk_delete_ns"]),
+    Body = #{<<"nss">> => Nss},
+    Res = simple_request(delete, Path, Body),
+    ct:pal("bulk delete nss result:\n  ~p", [Res]),
+    Res.
+
+get_managed_ns_config(Ns) ->
+    Path = emqx_mgmt_api_test_util:api_path(["mt", "ns", Ns, "config"]),
+    Res = simple_request(get, Path, ""),
+    ct:pal("get managed ns config result:\n  ~p", [Res]),
+    Res.
+
+update_managed_ns_config(Ns, Body) ->
+    Path = emqx_mgmt_api_test_util:api_path(["mt", "ns", Ns, "config"]),
+    Res = simple_request(put, Path, Body),
+    ct:pal("update managed ns config result:\n  ~p", [Res]),
+    Res.
+
+bulk_import_configs(Body) ->
+    Path = emqx_mgmt_api_test_util:api_path(["mt", "bulk_import_configs"]),
+    Res = simple_request(post, Path, Body),
+    ct:pal("bulk import configs result:\n  ~p", [Res]),
+    Res.
+
+bulk_export_ns_configs(Body) ->
+    Path = emqx_mgmt_api_test_util:api_path(["mt", "bulk_export_ns_configs"]),
+    Res = simple_request(post, Path, Body),
+    ct:pal("bulk export ns configs result:\n  ~p", [Res]),
+    Res.
+
+bulk_import_ns_configs(Body) ->
+    Path = emqx_mgmt_api_test_util:api_path(["mt", "bulk_import_ns_configs"]),
+    Res = simple_request(post, Path, Body),
+    ct:pal("bulk import ns configs result:\n  ~p", [Res]),
+    Res.
+
+kick_all_clients(Ns) ->
+    Path = emqx_mgmt_api_test_util:api_path(["mt", "ns", Ns, "kick_all_clients"]),
+    Res = simple_request(post, Path, ""),
+    ct:pal("kick all ns clients result:\n  ~p", [Res]),
+    Res.
+
+disable_tenant_limiter(Ns) ->
+    Body = #{<<"limiter">> => #{<<"tenant">> => <<"disabled">>}},
+    update_managed_ns_config(Ns, Body).
+
+disable_client_limiter(Ns) ->
+    Body = #{<<"limiter">> => #{<<"client">> => <<"disabled">>}},
+    update_managed_ns_config(Ns, Body).
+
+export_backup() ->
+    URL = emqx_mgmt_api_test_util:api_path(["data", "export"]),
+    simple_request(#{method => post, url => URL, body => {raw, <<"">>}}).
+
+import_backup(BackupName) ->
+    URL = emqx_mgmt_api_test_util:api_path(["data", "import"]),
+    Body = #{<<"filename">> => unicode:characters_to_binary(BackupName)},
+    simple_request(#{method => post, url => URL, body => Body}).
+
+get_metrics(Ns) ->
+    Path = emqx_mgmt_api_test_util:api_path(["mt", "ns", Ns, "metrics"]),
+    Res = simple_request(get, Path, ""),
+    ct:pal("get ns metrics result:\n  ~p", [Res]),
+    Res.
+
+tenant_limiter_params() ->
+    tenant_limiter_params(_Overrides = #{}).
+
+tenant_limiter_params(Overrides) ->
+    Defaults = #{
+        <<"bytes">> => #{
+            <<"rate">> => <<"10MB/10s">>,
+            <<"burst">> => <<"200MB/1m">>
+        },
+        <<"messages">> => #{
+            <<"rate">> => <<"3000/1s">>,
+            <<"burst">> => <<"40/1m">>
+        }
+    },
+    Merged = emqx_utils_maps:deep_merge(Defaults, Overrides),
+    #{<<"limiter">> => #{<<"tenant">> => Merged}}.
+
+client_limiter_params() ->
+    client_limiter_params(_Overrides = #{}).
+
+client_limiter_params(Overrides) ->
+    Defaults = #{
+        <<"bytes">> => #{
+            <<"rate">> => <<"10MB/10s">>,
+            <<"burst">> => <<"200MB/1m">>
+        },
+        <<"messages">> => #{
+            <<"rate">> => <<"3000/1s">>,
+            <<"burst">> => <<"40/1m">>
+        }
+    },
+    Merged = emqx_utils_maps:deep_merge(Defaults, Overrides),
+    #{<<"limiter">> => #{<<"client">> => Merged}}.
+
+session_params() ->
+    session_params(_Overrides = #{}).
+
+session_params(Overrides) ->
+    Defaults = #{
+        <<"max_sessions">> => <<"infinity">>
+    },
+    Merged = emqx_utils_maps:deep_merge(Defaults, Overrides),
+    #{<<"session">> => Merged}.
+
+bulk_import_configs_params(Entries) when is_list(Entries) ->
+    lists:map(
+        fun({Ns, Cfg}) -> #{<<"ns">> => Ns, <<"config">> => Cfg} end,
+        Entries
+    ).
+
+set_limiter_for_zone(Key, Value) ->
+    KeyBin = atom_to_binary(Key, utf8),
+    MqttConf0 = emqx_config:fill_defaults(#{<<"mqtt">> => emqx:get_raw_config([<<"mqtt">>])}),
+    MqttConf1 = emqx_utils_maps:deep_put([<<"mqtt">>, <<"limiter">>, KeyBin], MqttConf0, Value),
+    {ok, _} = emqx:update_config([mqtt], maps:get(<<"mqtt">>, MqttConf1)).
+
+set_limiter_for_listener(Key, Value) ->
+    KeyBin = atom_to_binary(Key, utf8),
+    emqx:update_config(
+        [listeners, tcp, default],
+        {update, #{
+            KeyBin => Value
+        }}
+    ),
+    ok.
+
+spawn_publisher(Opts) ->
+    #{
+        clientid := ClientId,
+        username := Username,
+        qos := QoS,
+        payload_size := PayloadSize
+    } = Opts,
+    Port = maps:get(port, Opts, 1883),
+    TestPid = self(),
+    LoopPid = spawn_link(fun() ->
+        C = connect(#{
+            clientid => ClientId,
+            username => Username,
+            password => "123456",
+            port => Port
+        }),
+        TestPid ! {client, C},
+        receive
+            go -> run_publisher(C, PayloadSize, QoS)
+        end
+    end),
+    receive
+        {client, C} ->
+            {LoopPid, C}
+    after 1_000 ->
+        ct:fail("client didn't start properly")
+    end.
+
+run_publisher(C, PayloadSize, QoS) ->
+    _ = emqtt:publish(C, <<"test">>, binary:copy(<<"a">>, PayloadSize), QoS),
+    receive
+        die ->
+            ok
+    after 10 ->
+        run_publisher(C, PayloadSize, QoS)
+    end.
+
+assert_limited(Opts) ->
+    #{
+        event_matcher := EventMatcher,
+        timeout := Timeout
+    } = Opts,
+    {LoopPid, _C} = spawn_publisher(Opts),
+    {_, {ok, _}} =
+        snabbkaffe:wait_async_action(
+            fun() -> LoopPid ! go end,
+            EventMatcher,
+            Timeout
+        ),
+    MRef = monitor(process, LoopPid),
+    LoopPid ! die,
+    receive
+        {'DOWN', MRef, process, LoopPid, _} ->
+            ok
+    after 1_000 ->
+        ct:fail("loop pid didn't die")
+    end.
+
+deep_intersect(#{} = RefMap, #{} = Map) ->
+    lists:foldl(
+        fun({K, RefV}, Acc) ->
+            case maps:find(K, Map) of
+                {ok, #{} = V} when is_map(RefV) ->
+                    Acc#{K => deep_intersect(RefV, V)};
+                {ok, V} ->
+                    Acc#{K => V};
+                error ->
+                    Acc
+            end
+        end,
+        #{},
+        maps:to_list(RefMap)
+    ).
+
+wait_downs(Refs, _Timeout) when map_size(Refs) =:= 0 ->
+    ok;
+wait_downs(Refs0, Timeout) ->
+    receive
+        {'DOWN', Ref, process, _Pid, _Reason} when is_map_key(Ref, Refs0) ->
+            Refs = maps:remove(Ref, Refs0),
+            wait_downs(Refs, Timeout)
+    after Timeout ->
+        ct:fail("processes didn't die; remaining: ~b", [map_size(Refs0)])
+    end.
+
+gen_cert(Opts) ->
+    #{
+        cert := Cert,
+        key := Key,
+        cert_pem := CertPEM,
+        key_pem := KeyPEM
+    } = emqx_cth_tls:gen_cert_pem(Opts),
+    #{
+        cert_key => {Cert, Key},
+        cert_pem => CertPEM,
+        key_pem => KeyPEM
+    }.
+
+upload_file_ns(Ns, BundleName, Kind, Contents) ->
+    URL = emqx_mgmt_api_test_util:api_path(["certs", "ns", Ns, "name", BundleName]),
+    Body = #{Kind => Contents},
+    simple_request(#{
+        method => post,
+        url => URL,
+        body => Body
+    }).
+
+delete_bundle_ns(Ns, BundleName) ->
+    URL = emqx_mgmt_api_test_util:api_path(["certs", "ns", Ns, "name", BundleName]),
+    simple_request(#{
+        method => delete,
+        url => URL
+    }).
+
+delete_file_ns(Ns, BundleName, Kind) ->
+    URL = emqx_mgmt_api_test_util:api_path(["certs", "ns", Ns, "name", BundleName]),
+    simple_request(#{
+        method => delete,
+        url => URL,
+        query_params => #{<<"kind">> => Kind}
+    }).
+
+limiter_group_exists(Group) ->
+    emqx_limiter_registry:find_group(Group) =/= undefined.
+
+limiter_group_absent(Group) ->
+    emqx_limiter_registry:find_group(Group) =:= undefined.
+
+%%------------------------------------------------------------------------------
+%% Test cases
+%%------------------------------------------------------------------------------
+
+t_list_apis(_Config) ->
+    N = 9,
+    ClientIds = [?NEW_CLIENTID(I) || I <- lists:seq(1, N)],
+    Ns = ?NEW_USERNAME(),
+    Clients = [connect(ClientId, Ns) || ClientId <- ClientIds],
+    ?retry(200, 50, ?assertEqual({ok, N}, emqx_mt:count_clients(Ns))),
+    ?assertMatch({200, #{<<"count">> := N}}, count_clients(Ns)),
+    {200, ClientIds0} = list_clients(Ns, #{<<"limit">> => integer_to_binary(N div 2)}),
+    LastClientId = lists:last(ClientIds0),
+    {200, ClientIds1} =
+        list_clients(Ns, #{
+            <<"last_clientid">> => LastClientId,
+            <<"limit">> => integer_to_binary(N)
+        }),
+    ?assertEqual(ClientIds, ClientIds0 ++ ClientIds1),
+    ok = lists:foreach(fun stop_client/1, Clients),
+    ?retry(
+        200,
+        50,
+        ?assertMatch(
+            {200, #{<<"count">> := 0}},
+            count_clients(Ns)
+        )
+    ),
+    ?assertMatch(
+        {200, []},
+        list_clients(Ns, #{})
+    ),
+    ?assertMatch(
+        {200, [Ns]},
+        list_nss(#{})
+    ),
+    ?assertMatch(
+        {200, [Ns]},
+        list_nss(#{<<"limit">> => <<"2">>})
+    ),
+    ?assertMatch(
+        {200, []},
+        list_nss(#{<<"last_ns">> => Ns, <<"limit">> => <<"1">>})
+    ),
+    ok.
+
+%% Smoke CRUD operations test for managed namespaces.
+%% Configuration management is tested in separate, specific test cases.
+t_managed_namespaces_crud(_Config) ->
+    ?assertMatch({200, []}, list_managed_nss(#{})),
+
+    Ns1 = <<"tns1">>,
+    Ns2 = <<"tns2">>,
+    ?assertMatch({204, _}, delete_managed_ns(Ns1)),
+    ?assertMatch({204, _}, delete_managed_ns(Ns2)),
+    ?assertMatch({404, _}, get_managed_ns_config(Ns1)),
+    ?assertMatch({404, _}, get_managed_ns_config(Ns2)),
+    ?assertMatch({200, []}, list_managed_nss(#{})),
+
+    ?assertMatch({204, _}, create_managed_ns(Ns1)),
+    ?assertMatch({204, _}, delete_managed_ns(Ns2)),
+    ?assertMatch({200, _}, get_managed_ns_config(Ns1)),
+    ?assertMatch({404, _}, get_managed_ns_config(Ns2)),
+    ?assertMatch({200, [Ns1]}, list_managed_nss(#{})),
+
+    ?assertMatch({204, _}, create_managed_ns(Ns2)),
+    ?assertMatch({200, [Ns1, Ns2]}, list_managed_nss(#{})),
+    ?assertMatch({200, _}, get_managed_ns_config(Ns1)),
+    ?assertMatch({200, _}, get_managed_ns_config(Ns2)),
+
+    ?assertMatch({200, [Ns1]}, list_managed_nss(#{<<"limit">> => <<"1">>})),
+    ?assertMatch({200, [Ns2]}, list_managed_nss(#{<<"last_ns">> => Ns1})),
+    ?assertMatch({200, []}, list_managed_nss(#{<<"last_ns">> => Ns2})),
+
+    ?assertMatch({204, _}, delete_managed_ns(Ns1)),
+    %% Idempotency
+    ?assertMatch({204, _}, delete_managed_ns(Ns1)),
+    ?assertMatch({200, [Ns2]}, list_managed_nss(#{})),
+    ?assertMatch({404, _}, get_managed_ns_config(Ns1)),
+    ?assertMatch({200, _}, get_managed_ns_config(Ns2)),
+    ?assertMatch({204, _}, delete_managed_ns(Ns2)),
+    ?assertMatch({200, []}, list_managed_nss(#{})),
+    ?assertMatch({404, _}, get_managed_ns_config(Ns1)),
+    ?assertMatch({404, _}, get_managed_ns_config(Ns2)),
+
+    ok.
+
+-doc """
+Reserved namespace names (`global`, `undefined`, `null`, `none`) are rejected
+with HTTP 400 at the creation and bulk-import boundaries, while a non-reserved
+name still works.
+""".
+t_reserved_namespaces(_Config) ->
+    Reserved = [<<"global">>, <<"undefined">>, <<"null">>, <<"none">>],
+    lists:foreach(
+        fun(Ns) ->
+            ?assertMatch({400, _}, create_managed_ns(Ns), #{ns => Ns})
+        end,
+        Reserved
+    ),
+    %% Regression guard: a non-reserved name still works.
+    ?assertMatch({204, _}, create_managed_ns(<<"tns-ok">>)),
+    ?assertMatch({200, [<<"tns-ok">>]}, list_managed_nss(#{})),
+
+    %% Bulk upsert path rejects reserved names.
+    ReservedEntries = bulk_import_configs_params([{<<"global">>, #{}}]),
+    ?assertMatch({400, _}, bulk_import_configs(ReservedEntries)),
+
+    %% Bulk namespaced-config import path rejects reserved names.
+    ?assertMatch(
+        {400, _},
+        bulk_import_ns_configs(#{
+            <<"configs">> => #{<<"null">> => #{}},
+            <<"dry_run">> => true
+        })
+    ),
+
+    ?assertMatch({204, _}, delete_managed_ns(<<"tns-ok">>)),
+    ok.
+
+%% Managed namespace names accept only URL- and filesystem-safe characters:
+%% ASCII letters, digits, `.', `-' and `_'. Dotted names such as `my.ns'
+%% are legal; the special path components `.' and `..', path separators and
+%% other special characters are rejected with a 400.
+t_managed_ns_name_validation(_Config) ->
+    ValidNames = [<<"my.ns">>, <<"...">>, <<"nS-1_2">>],
+    lists:foreach(
+        fun(Ns) ->
+            ?assertMatch({204, _}, create_managed_ns_encoded(Ns), #{ns => Ns})
+        end,
+        ValidNames
+    ),
+    {200, Listed} = list_managed_nss(#{}),
+    ?assertEqual(lists:sort(ValidNames), lists:sort(Listed)),
+    %% `.' and `..' are not listed here: HTTP path normalization keeps them
+    %% from ever reaching the handler as one path segment (404). Their
+    %% rejection is covered through the body-based bulk import endpoint in
+    %% `t_bulk_import_configs_ns_name_validation'.
+    InvalidNames = [
+        <<"a/b">>,
+        <<"../a">>,
+        <<"a\\b">>,
+        <<"a#b">>,
+        <<"a%b">>,
+        <<"a&b">>,
+        <<"a~b">>,
+        <<"~">>,
+        <<"a b">>,
+        <<"a?b">>,
+        <<"a\nb">>,
+        <<"ns🐣"/utf8>>,
+        binary:copy(<<"a">>, 256)
+    ],
+    lists:foreach(
+        fun(Ns) ->
+            ?assertMatch(
+                {400, #{<<"message">> := <<"Invalid namespace name", _/binary>>}},
+                create_managed_ns_encoded(Ns),
+                #{ns => Ns}
+            )
+        end,
+        InvalidNames
+    ),
+    ?assertMatch({200, Listed}, list_managed_nss(#{})),
+    %% A name that already exists as an implicit namespace is still rejected
+    %% when promoting it to a managed namespace.
+    ImplicitNs = <<"implicit/ns">>,
+    ok = emqx_mt_state:ensure_ns_added(ImplicitNs),
+    ?assertMatch(
+        {400, #{<<"message">> := <<"Invalid namespace name", _/binary>>}},
+        create_managed_ns_encoded(ImplicitNs)
+    ),
+    ok.
+
+%% Bulk import creates namespaces from the request body, so it validates names
+%% the same way; namespaces that already exist are exempt so that names
+%% created before validation existed keep working.
+t_bulk_import_configs_ns_name_validation(_Config) ->
+    GoodNs = <<"good.ns">>,
+    ImportParams1 = bulk_import_configs_params([
+        {GoodNs, session_params()},
+        {<<"bad/ns">>, session_params()},
+        {<<".">>, session_params()},
+        {<<"..">>, session_params()},
+        {<<>>, session_params()}
+    ]),
+    ?assertMatch(
+        {400, #{<<"message">> := <<"Invalid namespace name", _/binary>>}},
+        bulk_import_configs(ImportParams1)
+    ),
+    %% Nothing was created by the rejected request.
+    ?assertMatch({200, []}, list_managed_nss(#{})),
+    %% Valid names import fine.
+    ImportParams2 = bulk_import_configs_params([{GoodNs, session_params()}]),
+    ?assertMatch({204, _}, bulk_import_configs(ImportParams2)),
+    ?assertMatch({200, [GoodNs]}, list_managed_nss(#{})),
+    %% A pre-existing managed namespace with a name that would be rejected
+    %% today can still have its config imported.
+    LegacyNs = <<"legacy/ns">>,
+    ok = emqx_mt_state:create_managed_ns(LegacyNs),
+    ImportParams3 = bulk_import_configs_params([{LegacyNs, session_params()}]),
+    ?assertMatch({204, _}, bulk_import_configs(ImportParams3)),
+    ok.
+
+t_bulk_delete_ns(_Config) ->
+    ?assertMatch({200, []}, list_managed_nss(#{})),
+
+    Ns1 = <<"tns1">>,
+    Ns2 = <<"tns2">>,
+    Ns3 = <<"tns3">>,
+
+    lists:foreach(
+        fun(Ns) ->
+            {204, _} = create_managed_ns(Ns)
+        end,
+        [Ns1, Ns2, Ns3]
+    ),
+    {200, [Ns1, Ns2, Ns3]} = list_managed_nss(#{}),
+
+    ?assertMatch({204, _}, bulk_delete_ns([Ns3, Ns1])),
+    ?assertMatch({200, [Ns2]}, list_managed_nss(#{})),
+
+    %% Idempotency
+    ?assertMatch({204, _}, bulk_delete_ns([Ns3, Ns1])),
+    ?assertMatch({200, [Ns2]}, list_managed_nss(#{})),
+
+    ?assertMatch({204, _}, bulk_delete_ns([Ns2])),
+    ?assertMatch({200, []}, list_managed_nss(#{})),
+
+    %% Simulate failure during side-effect execution.
+    ct:pal("waiting for tombstones to be cleared"),
+    lists:foreach(
+        fun(Ns) ->
+            ?retry(250, 10, ?assertNot(emqx_mt_state:is_tombstoned(Ns), #{ns => Ns}))
+        end,
+        [Ns1, Ns2, Ns3]
+    ),
+    lists:foreach(
+        fun(Ns) ->
+            {204, _} = create_managed_ns(Ns)
+        end,
+        [Ns1, Ns2, Ns3]
+    ),
+
+    emqx_common_test_helpers:with_mock(
+        emqx_mt_state,
+        delete_managed_ns,
+        fun(Ns) ->
+            case Ns of
+                Ns2 ->
+                    %% actually impossible to have an aborted txn here?
+                    {error, {aborted, mocked_error}};
+                _ ->
+                    meck:passthrough([Ns])
+            end
+        end,
+        fun() ->
+            ?assertMatch(
+                {500, #{
+                    <<"hint">> := _,
+                    <<"errors">> := #{Ns2 := <<"{aborted,mocked_error}">>}
+                }},
+                bulk_delete_ns([Ns1, Ns2, Ns3])
+            ),
+            ?assertMatch({200, [Ns2]}, list_managed_nss(#{}))
+        end
+    ),
+
+    ok.
+
+%% Checks that we can delete implicit namespace (`?NS_TAB`) entries when calling the
+%% endpoint for deleting managed namespaces (originally meant only for them).
+t_delete_implicit_namespaces(_Config) ->
+    %% Sanity checks
+    ?assertMatch({200, []}, list_managed_nss(#{})),
+    ?assertMatch({200, []}, list_nss(#{})),
+
+    Ns1 = <<"ns1">>,
+    ?assertMatch({204, _}, delete_managed_ns(Ns1)),
+
+    %% Create implicit NS
+    ClientId1 = ?NEW_CLIENTID(1),
+    {Pid1, {ok, _}} =
+        ?wait_async_action(
+            connect(ClientId1, Ns1),
+            #{?snk_kind := multi_tenant_client_added}
+        ),
+    ?assertMatch({200, []}, list_managed_nss(#{})),
+    ?assertMatch({200, [_]}, list_nss(#{})),
+
+    %% Delete implicit NS.  Should kick client as a side-effect.
+    ?assertMatch({204, _}, delete_managed_ns(Ns1)),
+    receive
+        {'DOWN', _, process, Pid1, _} ->
+            ok
+    after 1_000 -> ct:fail("~b: client ~p didn't get kicked", [?LINE, Pid1])
+    end,
+    ?assertMatch({200, []}, list_managed_nss(#{})),
+    ?assertMatch({200, []}, list_nss(#{})),
+
+    %% Create managed NS
+    ct:pal("waiting for kicker to shut down"),
+    ?retry(250, 10, ?assertMatch({error, not_found}, emqx_mt_client_kicker:whereis_kicker(Ns1))),
+    ?assertMatch({204, _}, create_managed_ns(Ns1)),
+
+    ClientId2 = ?NEW_CLIENTID(2),
+    {Pid2, {ok, _}} =
+        ?wait_async_action(
+            connect(ClientId2, Ns1),
+            #{?snk_kind := multi_tenant_client_added}
+        ),
+    ?assertMatch({200, [_]}, list_managed_nss(#{})),
+    ?assertMatch({200, [_]}, list_nss(#{})),
+
+    %% Delete implicit NS.  Should kick client as a side-effect.
+    ?assertMatch({204, _}, delete_managed_ns(Ns1)),
+    receive
+        {'DOWN', _, process, Pid2, _} ->
+            ok
+    after 1_000 -> ct:fail("~b: client ~p didn't get kicked", [?LINE, Pid1])
+    end,
+    ?assertMatch({200, []}, list_managed_nss(#{})),
+    ?assertMatch({200, []}, list_nss(#{})),
+
+    ok.
+
+%% Checks that managedly declared namespaces use their own maximum session count instead
+%% of global defaults.
+t_session_limit_exceeded(_Config) ->
+    emqx_mt_config:tmp_set_default_max_sessions(1),
+    Ns = ?NEW_USERNAME(),
+    ClientId1 = ?NEW_CLIENTID(1),
+    ClientId2 = ?NEW_CLIENTID(2),
+    ClientId3 = ?NEW_CLIENTID(3),
+
+    Params = session_params(#{<<"max_sessions">> => 2}),
+    {204, _} = create_managed_ns(Ns),
+    ?assertMatch({200, _}, update_managed_ns_config(Ns, Params)),
+
+    %% First client is always fine.
+    {Pid1, {ok, _}} =
+        ?wait_async_action(
+            connect(ClientId1, Ns),
+            #{?snk_kind := multi_tenant_client_added}
+        ),
+    ?assertEqual(1, emqx_mt_state:update_ccache(Ns)),
+    %% Second would fail with quota exceeded reason, if it were to use global default
+    {Pid2, {ok, _}} =
+        ?wait_async_action(
+            connect(ClientId2, Ns),
+            #{?snk_kind := multi_tenant_client_added}
+        ),
+    ?assertEqual(2, emqx_mt_state:update_ccache(Ns)),
+    %% Now we hit the maximum session count
+    try
+        _Pid3 = connect(ClientId3, Ns),
+        ct:fail("should have not connected successfully!")
+    catch
+        error:{error, {quota_exceeded, _}} ->
+            ok;
+        exit:{shutdown, quota_exceeded} ->
+            ok
+    end,
+    emqtt:stop(Pid1),
+    emqtt:stop(Pid2),
+    ok.
+
+%% When `multi_tenancy.allow_only_managed_namespaces = true', we don't allow clients from
+%% non-managed namespaces to connect.
+t_allow_only_managed_namespaces(_Config) ->
+    ok = emqx_mt_config:set_allow_only_managed_namespaces(true),
+    UnknownNs = <<"implicit-ns">>,
+    ClientId = ?NEW_CLIENTID(1),
+    ?assertError({error, {not_authorized, _}}, connect(ClientId, UnknownNs)),
+    %% Clients without extracted namespace are also forbidden from connecting.
+    {ok, Pid} = emqtt:start_link(#{proto_ver => v5}),
+    unlink(Pid),
+    ?assertMatch({error, {not_authorized, _}}, emqtt:connect(Pid)),
+    ok.
+
+t_deny_tombstoned_namespace(_Config) ->
+    Ns = <<"ns-being-deleted">>,
+    {204, _} = create_managed_ns(Ns),
+    Janitor = whereis(emqx_mt_config_janitor),
+    ok = sys:suspend(Janitor),
+    on_exit(fun() -> catch sys:resume(Janitor) end),
+
+    {204, _} = delete_ns(Ns),
+    ?assert(emqx_mt_state:is_tombstoned(Ns)),
+    ?assertError(
+        {error, {server_unavailable, _}},
+        connect(?NEW_CLIENTID(1), Ns)
+    ),
+    ?assertMatch({200, []}, list_nss(#{})),
+
+    ok = sys:resume(Janitor),
+    ok.
+
+%% Verifies bulk import config endpoint
+t_bulk_import_configs(_Config) ->
+    %% Seed config with some preexisting configs and namespaces
+    ExistingNs1 = <<"ens1">>,
+    {204, _} = create_managed_ns(ExistingNs1),
+
+    %% Will receive new config keys and leave existing one untouched
+    ExistingNs2 = <<"ens2">>,
+    {204, _} = create_managed_ns(ExistingNs2),
+    ExistingConfig2 = tenant_limiter_params(),
+    {200, _} = update_managed_ns_config(ExistingNs2, ExistingConfig2),
+
+    %% Will receive both new config keys and update existing one
+    ExistingNs3 = <<"ens3">>,
+    {204, _} = create_managed_ns(ExistingNs3),
+    ExistingConfig3 = tenant_limiter_params(),
+    {200, _} = update_managed_ns_config(ExistingNs3, ExistingConfig3),
+
+    %% Untouched
+    ExistingNs4 = <<"ens4">>,
+    {204, _} = create_managed_ns(ExistingNs4),
+
+    NewConfig1 = tenant_limiter_params(),
+    NewConfig2 = client_limiter_params(),
+    NewConfig3 = emqx_utils_maps:deep_merge(
+        #{<<"limiter">> => #{<<"tenant">> => <<"disabled">>}},
+        client_limiter_params()
+    ),
+    NewNs5 = <<"new-ns5">>,
+    NewConfig5 = client_limiter_params(),
+    ImportParams1 = bulk_import_configs_params([
+        {ExistingNs1, NewConfig1},
+        {ExistingNs2, NewConfig2},
+        {ExistingNs3, NewConfig3},
+        {NewNs5, NewConfig5}
+    ]),
+    ?assertMatch({204, _}, bulk_import_configs(ImportParams1)),
+
+    {200, Config1} = get_managed_ns_config(ExistingNs1),
+    ?assertIntersectionEqual(NewConfig1, Config1),
+    {200, Config2} = get_managed_ns_config(ExistingNs2),
+    ?assertIntersectionEqual(NewConfig2, Config2),
+    {200, Config3} = get_managed_ns_config(ExistingNs3),
+    ?assertIntersectionEqual(NewConfig3, Config3),
+    {200, Config4} = get_managed_ns_config(ExistingNs4),
+    ?assertEqual(#{}, Config4),
+    {200, Config5} = get_managed_ns_config(NewNs5),
+    ?assertIntersectionEqual(NewConfig5, Config5),
+
+    ok.
+
+%% Checks that we validate for duplicate namespaces when bulk importing.
+t_bulk_import_configs_duplicated_nss(_Config) ->
+    Ns1 = <<"ns1">>,
+    Ns2 = <<"ns2">>,
+    ImportParams1 = bulk_import_configs_params([
+        {Ns1, #{}},
+        {Ns1, #{}},
+        {<<"not-duplicated">>, #{}},
+        {Ns2, #{}},
+        {Ns2, #{}}
+    ]),
+    ?assertMatch(
+        {400, #{
+            <<"message">> := <<"Duplicated namespaces in input: ns1, ns2">>
+        }},
+        bulk_import_configs(ImportParams1)
+    ),
+    ok.
+
+%% Checks that we validate the maximum allowed number of configs.
+t_bulk_import_configs_max_configs(_Config) ->
+    TooManyConfigs0 =
+        lists:map(
+            fun(N) -> {<<"ns", (integer_to_binary(N))/binary>>, #{}} end,
+            lists:seq(1, ?MAX_NUM_TNS_CONFIGS + 1)
+        ),
+    TooManyConfigs = bulk_import_configs_params(TooManyConfigs0),
+    ?assertMatch(
+        {400, #{
+            <<"message">> := <<"Maximum number of managed namespaces reached">>
+        }},
+        bulk_import_configs(TooManyConfigs)
+    ),
+    MaxConfigs = lists:sublist(TooManyConfigs, ?MAX_NUM_TNS_CONFIGS),
+    ?assertMatch({204, _}, bulk_import_configs(MaxConfigs)),
+    %% Should be fine to bulk import again if only updating existing configs
+    ?assertMatch({204, _}, bulk_import_configs(MaxConfigs)),
+    ?assertMatch(
+        {400, #{
+            <<"message">> := <<"Maximum number of managed namespaces reached">>
+        }},
+        bulk_import_configs(TooManyConfigs)
+    ),
+    ok.
+
+%% Smoke CRUD operations test for tenant limiter.
+t_tenant_limiter(_Config) ->
+    Ns1 = <<"tns">>,
+    Params1 = tenant_limiter_params(),
+
+    %% Must create the managed namespace first
+    ?assertMatch({404, _}, get_managed_ns_config(Ns1)),
+    ?assertMatch({404, _}, update_managed_ns_config(Ns1, Params1)),
+    ?assertMatch({404, _}, disable_tenant_limiter(Ns1)),
+
+    ?assertMatch({204, _}, create_managed_ns(Ns1)),
+
+    ?assertMatch(
+        {200, #{
+            <<"limiter">> := #{
+                <<"tenant">> := #{
+                    <<"bytes">> := #{<<"rate">> := <<"10MB/10s">>, <<"burst">> := <<"200MB/1m">>},
+                    <<"messages">> := #{<<"rate">> := <<"3000/1s">>, <<"burst">> := <<"40/1m">>}
+                }
+            }
+        }},
+        update_managed_ns_config(Ns1, Params1)
+    ),
+    %% Idempotency
+    ?assertMatch(
+        {200, #{
+            <<"limiter">> := #{
+                <<"tenant">> := #{
+                    <<"bytes">> := #{<<"rate">> := <<"10MB/10s">>, <<"burst">> := <<"200MB/1m">>},
+                    <<"messages">> := #{<<"rate">> := <<"3000/1s">>, <<"burst">> := <<"40/1m">>}
+                }
+            }
+        }},
+        update_managed_ns_config(Ns1, Params1)
+    ),
+    ?assertMatch(
+        {200, #{
+            <<"limiter">> := #{
+                <<"tenant">> := #{
+                    <<"bytes">> := #{<<"rate">> := <<"10MB/10s">>, <<"burst">> := <<"200MB/1m">>},
+                    <<"messages">> := #{<<"rate">> := <<"3000/1s">>, <<"burst">> := <<"40/1m">>}
+                }
+            }
+        }},
+        get_managed_ns_config(Ns1)
+    ),
+    Params2 = tenant_limiter_params(#{
+        <<"bytes">> => #{
+            <<"rate">> => <<"infinity">>,
+            <<"burst">> => <<"0/1d">>
+        },
+        <<"messages">> => #{
+            <<"burst">> => <<"60/60s">>
+        }
+    }),
+    ?assertMatch(
+        {200, #{
+            <<"limiter">> := #{
+                <<"tenant">> := #{
+                    <<"bytes">> := #{<<"rate">> := <<"infinity">>, <<"burst">> := <<"0/1d">>},
+                    <<"messages">> := #{<<"rate">> := <<"3000/1s">>, <<"burst">> := <<"60/1m">>}
+                }
+            }
+        }},
+        update_managed_ns_config(Ns1, Params2)
+    ),
+    ?assertMatch(
+        {200, #{
+            <<"limiter">> := #{
+                <<"tenant">> := #{
+                    <<"bytes">> := #{<<"rate">> := <<"infinity">>, <<"burst">> := <<"0/1d">>},
+                    <<"messages">> := #{<<"rate">> := <<"3000/1s">>, <<"burst">> := <<"60/1m">>}
+                }
+            }
+        }},
+        get_managed_ns_config(Ns1)
+    ),
+
+    ?assertMatch(
+        {200, #{<<"limiter">> := #{<<"tenant">> := <<"disabled">>}}},
+        disable_tenant_limiter(Ns1)
+    ),
+    ?assertMatch(
+        {200, #{<<"limiter">> := #{<<"tenant">> := <<"disabled">>}}},
+        get_managed_ns_config(Ns1)
+    ),
+
+    ok.
+
+%% Smoke CRUD operations test for client limiter.
+t_client_limiter(_Config) ->
+    Ns1 = <<"tns">>,
+    Params1 = client_limiter_params(),
+
+    %% Must create the managed namespace first
+    ?assertMatch({404, _}, get_managed_ns_config(Ns1)),
+    ?assertMatch({404, _}, update_managed_ns_config(Ns1, Params1)),
+    ?assertMatch({404, _}, disable_client_limiter(Ns1)),
+
+    ?assertMatch({204, _}, create_managed_ns(Ns1)),
+
+    ?assertMatch(
+        {200, #{
+            <<"limiter">> := #{
+                <<"client">> := #{
+                    <<"bytes">> := #{<<"rate">> := <<"10MB/10s">>, <<"burst">> := <<"200MB/1m">>},
+                    <<"messages">> := #{<<"rate">> := <<"3000/1s">>, <<"burst">> := <<"40/1m">>}
+                }
+            }
+        }},
+        update_managed_ns_config(Ns1, Params1)
+    ),
+    %% Idempotency
+    ?assertMatch(
+        {200, #{
+            <<"limiter">> := #{
+                <<"client">> := #{
+                    <<"bytes">> := #{<<"rate">> := <<"10MB/10s">>, <<"burst">> := <<"200MB/1m">>},
+                    <<"messages">> := #{<<"rate">> := <<"3000/1s">>, <<"burst">> := <<"40/1m">>}
+                }
+            }
+        }},
+        update_managed_ns_config(Ns1, Params1)
+    ),
+    ?assertMatch(
+        {200, #{
+            <<"limiter">> := #{
+                <<"client">> := #{
+                    <<"bytes">> := #{<<"rate">> := <<"10MB/10s">>, <<"burst">> := <<"200MB/1m">>},
+                    <<"messages">> := #{<<"rate">> := <<"3000/1s">>, <<"burst">> := <<"40/1m">>}
+                }
+            }
+        }},
+        get_managed_ns_config(Ns1)
+    ),
+    Params2 = client_limiter_params(#{
+        <<"bytes">> => #{
+            <<"rate">> => <<"infinity">>,
+            <<"burst">> => <<"0/1d">>
+        },
+        <<"messages">> => #{
+            <<"burst">> => <<"60/60s">>
+        }
+    }),
+    ?assertMatch(
+        {200, #{
+            <<"limiter">> := #{
+                <<"client">> := #{
+                    <<"bytes">> := #{<<"rate">> := <<"infinity">>, <<"burst">> := <<"0/1d">>},
+                    <<"messages">> := #{<<"rate">> := <<"3000/1s">>, <<"burst">> := <<"60/1m">>}
+                }
+            }
+        }},
+        update_managed_ns_config(Ns1, Params2)
+    ),
+    ?assertMatch(
+        {200, #{
+            <<"limiter">> := #{
+                <<"client">> := #{
+                    <<"bytes">> := #{<<"rate">> := <<"infinity">>, <<"burst">> := <<"0/1d">>},
+                    <<"messages">> := #{<<"rate">> := <<"3000/1s">>, <<"burst">> := <<"60/1m">>}
+                }
+            }
+        }},
+        get_managed_ns_config(Ns1)
+    ),
+
+    ?assertMatch(
+        {200, #{<<"limiter">> := #{<<"client">> := <<"disabled">>}}},
+        disable_client_limiter(Ns1)
+    ),
+    ?assertMatch(
+        {200, #{<<"limiter">> := #{<<"client">> := <<"disabled">>}}},
+        get_managed_ns_config(Ns1)
+    ),
+
+    ok.
+
+%% Verifies that the channel limiters are adjusted when client and/or tenant limiters are
+%% configured.
+%% We create the configs via HTTP API on one node, and connect MQTT clients to the other,
+%% so we verify that limiter groups are changed on all nodes.
+t_adjust_limiters(Config) when is_list(Config) ->
+    Nodes = [_N1, N2] = ?config(cluster, Config),
+    Port2 = get_mqtt_tcp_port(N2),
+    Ns = atom_to_binary(?FUNCTION_NAME),
+    ?check_trace(
+        begin
+            ?assertMatch({204, _}, create_managed_ns(Ns)),
+
+            %% 1) Client limiter completely replaces listener limiter.
+            ?ON_ALL(Nodes, set_limiter_for_listener(messages_rate, <<"infinity">>)),
+            ?ON_ALL(Nodes, set_limiter_for_listener(bytes_rate, <<"infinity">>)),
+            ClientParams1 = client_limiter_params(#{
+                <<"bytes">> => #{<<"rate">> => <<"1/500ms">>, <<"burst">> => <<"0/1s">>},
+                <<"messages">> => #{<<"rate">> => <<"1/500ms">>, <<"burst">> => <<"0/1s">>}
+            }),
+            ?assertMatch({200, _}, update_managed_ns_config(Ns, ClientParams1)),
+            Username = Ns,
+            ClientId1 = ?NEW_CLIENTID(1),
+            assert_limited(#{
+                clientid => ClientId1,
+                username => Username,
+                qos => 1,
+                payload_size => 100,
+                port => Port2,
+                event_matcher => ?match_event(#{
+                    ?snk_kind := limiter_exclusive_try_consume, success := false
+                }),
+                timeout => 1_000
+            }),
+            {200, _} = disable_client_limiter(Ns),
+            %% Tenant limiter composes with zone limiter.
+            ?ON_ALL(Nodes, set_limiter_for_zone(messages_rate, <<"infinity">>)),
+            ?ON_ALL(Nodes, set_limiter_for_zone(bytes_rate, <<"infinity">>)),
+            TenantParams1 = tenant_limiter_params(#{
+                <<"bytes">> => #{<<"rate">> => <<"1/500ms">>, <<"burst">> => <<"0/1s">>},
+                <<"messages">> => #{<<"rate">> => <<"1/500ms">>, <<"burst">> => <<"0/1s">>}
+            }),
+            ?assertMatch({200, _}, update_managed_ns_config(Ns, TenantParams1)),
+            ClientId2 = ?NEW_CLIENTID(2),
+            assert_limited(#{
+                clientid => ClientId2,
+                username => Username,
+                qos => 1,
+                payload_size => 100,
+                port => Port2,
+                event_matcher => ?match_event(#{
+                    ?snk_kind := limiter_shared_try_consume, success := false
+                }),
+                timeout => 1_000
+            }),
+            %% Other way around
+            ?ON_ALL(Nodes, set_limiter_for_zone(messages_rate, <<"1/500ms">>)),
+            ?ON_ALL(Nodes, set_limiter_for_zone(bytes_rate, <<"1/500ms">>)),
+            TenantParams2 = tenant_limiter_params(#{
+                <<"bytes">> => #{<<"rate">> => <<"infinity">>, <<"burst">> => <<"0/1s">>},
+                <<"messages">> => #{<<"rate">> => <<"infinity">>, <<"burst">> => <<"0/1s">>}
+            }),
+            ?assertMatch({200, _}, update_managed_ns_config(Ns, TenantParams2)),
+            ClientId3 = ?NEW_CLIENTID(3),
+            assert_limited(#{
+                clientid => ClientId3,
+                username => Username,
+                qos => 1,
+                payload_size => 100,
+                port => Port2,
+                event_matcher => ?match_event(#{
+                    ?snk_kind := limiter_shared_try_consume, success := false
+                }),
+                timeout => 1_000
+            }),
+            {200, _} = disable_tenant_limiter(Ns),
+
+            ok
+        end,
+        fun(Trace) ->
+            Events = ?of_kind("mt_limiter_adjusted", Trace),
+            ?assertMatch([_, _, _], [E || E = #{level := channel} <- Events]),
+            ?assertMatch([_, _, _], [E || E = #{level := session} <- Events])
+        end
+    ),
+    ok.
+
+%% Checks that we kick clients of a managed namespace when we delete it.
+t_kick_clients_when_deleting(_Config) ->
+    Ns1 = <<"ns1">>,
+    Ns2 = <<"ns2">>,
+    Ns3 = <<"ns3">>,
+    {204, _} = create_managed_ns(Ns1),
+    {204, _} = create_managed_ns(Ns2),
+    {204, _} = create_managed_ns(Ns3),
+
+    N = 9,
+    ClientIds1 = [?NEW_CLIENTID(I) || I <- lists:seq(1, N)],
+    Clients1 = [connect(ClientId, Ns1) || ClientId <- ClientIds1],
+    ClientIds2 = [?NEW_CLIENTID(I) || I <- lists:seq(10, 10 + N)],
+    Clients2 = [connect(ClientId, Ns2) || ClientId <- ClientIds2],
+    %% These should be left alone
+    ClientIds3 = [?NEW_CLIENTID(I) || I <- lists:seq(20, 10 + N)],
+    Clients3 = [connect(ClientId, Ns3) || ClientId <- ClientIds3],
+
+    MRefs0 = lists:map(fun(Pid) -> monitor(process, Pid) end, Clients1 ++ Clients2),
+    MRefs = maps:from_keys(MRefs0, true),
+
+    %% Delete 2 NSs (almost) at the same time
+    ct:pal("deleting namespaces"),
+    ?assertMatch({204, _}, delete_managed_ns(Ns1)),
+    ?assertMatch({204, _}, delete_managed_ns(Ns2)),
+    %% Cannot re-create namespace while clients are being kicked
+    ?assertMatch(
+        {409, #{
+            <<"message">> := <<
+                "Clients from this namespace are still being kicked;",
+                _/binary
+            >>
+        }},
+        create_managed_ns(Ns2)
+    ),
+
+    ct:pal("waiting for clients to be kicked"),
+    wait_downs(MRefs, _Timeout = 5_000),
+    ct:pal("clients kicked"),
+
+    %% Clients from 3rd namespace should not be kicked
+    ?assert(lists:all(fun is_process_alive/1, Clients3)),
+
+    %% Create one of the NSs again
+    ct:pal("waiting for kicker to shut down"),
+    ?retry(250, 10, ?assertMatch({error, not_found}, emqx_mt_client_kicker:whereis_kicker(Ns1))),
+    ct:pal("waiting for tombstone to be cleared"),
+    ?retry(250, 10, ?assertNot(emqx_mt_state:is_tombstoned(Ns1))),
+    ct:pal("recreating namespace"),
+    {204, _} = create_managed_ns(Ns1),
+    Clients1B = [connect(ClientId, Ns1) || ClientId <- ClientIds1],
+    ct:sleep(500),
+
+    ct:pal("checking new clients are not kicked"),
+    ?assert(lists:all(fun is_process_alive/1, Clients1B)),
+
+    lists:foreach(fun emqtt:stop/1, Clients1B ++ Clients3),
+
+    ok.
+
+t_fail_closed_while_deleting(_Config) ->
+    Ns = <<"ns1">>,
+    {204, _} = create_managed_ns(Ns),
+    Params = emqx_utils_maps:deep_merge(tenant_limiter_params(), client_limiter_params()),
+    {200, _} = update_managed_ns_config(Ns, Params),
+    Client = connect(?NEW_CLIENTID(1), Ns),
+    MRef = monitor(process, Client),
+    LimiterGroups = [{mt_tenant, Ns}, {mt_client, Ns}],
+    ?assert(lists:all(fun limiter_group_exists/1, LimiterGroups)),
+
+    TestPid = self(),
+    ok = meck:new(emqx_mgmt, [passthrough, no_history]),
+    ok = meck:expect(emqx_mgmt, kickout_clients, fun(ClientIds) ->
+        TestPid ! {kicking, self()},
+        receive
+            continue -> meck:passthrough([ClientIds])
+        end
+    end),
+    on_exit(fun() -> meck:unload(emqx_mgmt) end),
+
+    ?assertMatch({204, _}, delete_managed_ns(Ns)),
+    Kicker =
+        receive
+            {kicking, Pid} -> Pid
+        after 1_000 ->
+            ct:fail("client kicker did not start")
+        end,
+    ?assert(lists:all(fun limiter_group_absent/1, LimiterGroups)),
+    ?assertMatch(
+        {ok, #{reason_code := ?RC_QUOTA_EXCEEDED}},
+        emqtt:publish(Client, <<"topic">>, <<"payload">>, qos1)
+    ),
+
+    Kicker ! continue,
+    receive
+        {'DOWN', MRef, process, Client, _} -> ok
+    after 1_000 ->
+        ct:fail("client was not kicked")
+    end,
+    ok.
+
+%% Smoke test for "kick all NS clients" API.
+t_kick_all_ns_clients(_Config) ->
+    Ns = <<"ns1">>,
+    {204, _} = create_managed_ns(Ns),
+
+    N = 9,
+    ClientIds = [?NEW_CLIENTID(I) || I <- lists:seq(1, N)],
+    Clients1 = [connect(ClientId, Ns) || ClientId <- ClientIds],
+
+    MRefs1A = lists:map(fun(Pid) -> monitor(process, Pid) end, Clients1),
+    MRefs1 = maps:from_keys(MRefs1A, true),
+
+    ?assertMatch({202, _}, kick_all_clients(Ns)),
+
+    ct:pal("waiting for clients to be kicked"),
+    Timeout = 5_000,
+    wait_downs(MRefs1, Timeout),
+    ct:pal("clients kicked"),
+
+    ?retry(250, 10, ?assertMatch({error, not_found}, emqx_mt_client_kicker:whereis_kicker(Ns))),
+
+    %% Check consecutive calls to this async API.
+    Clients2 = [connect(ClientId, Ns) || ClientId <- ClientIds],
+
+    MRefs2A = lists:map(fun(Pid) -> monitor(process, Pid) end, Clients2),
+    MRefs2 = maps:from_keys(MRefs2A, true),
+
+    ?assertMatch({202, _}, kick_all_clients(Ns)),
+    %% Already started
+    ?assertMatch({409, _}, kick_all_clients(Ns)),
+
+    ct:pal("waiting for clients to be kicked (again)"),
+    wait_downs(MRefs2, Timeout),
+    ct:pal("clients kicked"),
+
+    ok.
+
+%% Simple test to check we are able to export and import MT config.
+t_backup_export_and_import(_Config) ->
+    ClientParams = client_limiter_params(),
+    TenantParams = tenant_limiter_params(),
+    SessionParams = session_params(),
+    MTConfig0 = emqx_utils_maps:deep_merge(ClientParams, TenantParams),
+    MTConfig = emqx_utils_maps:deep_merge(MTConfig0, SessionParams),
+    Ns = <<"ns1">>,
+    LimiterGroupsBefore = emqx_limiter_registry:list_groups(),
+    ?assertMatch({204, _}, create_managed_ns(Ns)),
+    ?assertMatch({200, _}, update_managed_ns_config(Ns, MTConfig)),
+    LimiterGroupsAfter = emqx_limiter_registry:list_groups(),
+    ?assertNotEqual(LimiterGroupsBefore, LimiterGroupsAfter),
+
+    ok = emqx_mt_config:set_allow_only_managed_namespaces(true),
+    {ok, _} = emqx_conf:update([?CONF_ROOT_KEY, default_max_sessions], 13, #{override_to => cluster}),
+
+    {200, #{<<"filename">> := BackupName}} = export_backup(),
+
+    ?assertMatch({204, _}, delete_managed_ns(Ns)),
+    ok = emqx_mt_config:set_allow_only_managed_namespaces(false),
+    {ok, _} = emqx_conf:update([?CONF_ROOT_KEY, default_max_sessions], 10, #{override_to => cluster}),
+
+    ?assertEqual(LimiterGroupsBefore, emqx_limiter_registry:list_groups()),
+
+    ?assertMatch({204, _}, import_backup(BackupName)),
+
+    ?assertMatch(
+        {200, #{
+            <<"limiter">> := #{
+                <<"client">> := #{},
+                <<"tenant">> := #{}
+            },
+            <<"session">> := #{}
+        }},
+        get_managed_ns_config(Ns)
+    ),
+    %% Must have created limiters as side-effect of importing config.
+    ?assertEqual(LimiterGroupsAfter, emqx_limiter_registry:list_groups()),
+
+    ?assertMatch({200, [Ns]}, list_managed_nss(#{})),
+    ?assertMatch({200, [Ns]}, list_nss(#{})),
+
+    ?assertMatch(
+        #{
+            default_max_sessions := 13,
+            allow_only_managed_namespaces := true
+        },
+        emqx_config:get([multi_tenancy])
+    ),
+
+    %% Idempotency
+    ?assertMatch({204, _}, import_backup(BackupName)),
+    ?assertMatch(
+        {200, #{
+            <<"limiter">> := #{
+                <<"client">> := #{},
+                <<"tenant">> := #{}
+            },
+            <<"session">> := #{}
+        }},
+        get_managed_ns_config(Ns)
+    ),
+    ?assertEqual(LimiterGroupsAfter, emqx_limiter_registry:list_groups()),
+    ?assertMatch({200, [Ns]}, list_managed_nss(#{})),
+    ?assertMatch({200, [Ns]}, list_nss(#{})),
+
+    %% Simulate errors when executing side-effects.
+    on_exit(fun meck:unload/0),
+    ok = meck:new(emqx_mt_config_proto_v1, [passthrough, no_history]),
+    ok = meck:expect(emqx_mt_config_proto_v1, execute_side_effects, fun(_) ->
+        {ok, [
+            #{path => [sessions], op => {mocked, error}, error => {throw, <<"mocked_error">>}}
+        ]}
+    end),
+    {400, #{<<"message">> := #{<<"global">> := Msg}}} = import_backup(BackupName),
+    ?assertEqual(match, re:run(Msg, <<"mocked_error">>, [global, {capture, none}])),
+
+    ok.
+
+-doc """
+Verifies https://github.com/emqx/emqx/issues/19025 is fixed.
+
+Older EMQX versions don't have the newer `subscribes` limiter nor `delivery`, so they
+export mnesia records for `emqx_mt_config` lacking those sub-keys.
+
+We should use the defaults for those lacking keys: disable the limiter.
+""".
+t_import_backup_lacking_limiter_config(_TCConfig) ->
+    ClientParams = client_limiter_params(),
+    TenantParams = tenant_limiter_params(),
+    SessionParams = session_params(),
+    MTConfig0 = emqx_utils_maps:deep_merge(ClientParams, TenantParams),
+    MTConfig = emqx_utils_maps:deep_merge(MTConfig0, SessionParams),
+    Ns = <<"ns1">>,
+    ?assertMatch({204, _}, create_managed_ns(Ns)),
+    %% sanity check: we have the expected limiter in this version
+    ?assertMatch(
+        {200, #{
+            ~"limiter" := #{
+                ~"client" := #{
+                    ~"delivery_bytes" := _,
+                    ~"delivery_messages" := _
+                }
+            }
+        }},
+        update_managed_ns_config(Ns, MTConfig)
+    ),
+    %% manually edit the row to simulate an older backup version
+    [#?CONFIG_TAB{configs = Cfgs0} = Rec0] = mnesia:dirty_read(?CONFIG_TAB, Ns),
+    #{limiter := #{client := #{delivery_messages := _}}} = Cfgs0,
+    Cfgs = emqx_utils_maps:deep_remove([limiter, client, delivery_messages], Cfgs0),
+    Rec = Rec0#?CONFIG_TAB{configs = Cfgs},
+    ok = mnesia:dirty_write(Rec),
+
+    {200, #{~"filename" := BackupName}} = export_backup(),
+
+    %% original problem: would crash with 400 because `subscribes` was a required key.
+    ?assertMatch({204, _}, import_backup(BackupName)),
+    ?assertMatch(
+        {200, #{
+            ~"limiter" := #{~"client" := #{} = ClientLimiter}
+        }} when not is_map_key(~"delivery_messages", ClientLimiter),
+        get_managed_ns_config(Ns)
+    ),
+
+    ok.
+
+%% Smoke tests for checking that we assign creation times for namespaces.
+t_creation_date(_Config) ->
+    ct:pal("implicit namespace"),
+    Ns1 = <<"ins1">>,
+    ClientId1 = ?NEW_CLIENTID(1),
+    {Pid1, {ok, _}} =
+        ?wait_async_action(
+            connect(ClientId1, Ns1),
+            #{?snk_kind := multi_tenant_client_added}
+        ),
+    stop_client(Pid1),
+    ?assertMatch(
+        {200, [
+            #{
+                <<"name">> := Ns1,
+                <<"created_at">> := I
+            }
+        ]} when is_integer(I),
+        list_nss_details(#{})
+    ),
+    {204, _} = delete_ns(Ns1),
+
+    ct:pal("managed namespace"),
+    Ns2 = <<"mns1">>,
+    {204, _} = create_managed_ns(Ns2),
+    ClientId2 = ?NEW_CLIENTID(2),
+    {Pid2, {ok, _}} =
+        ?wait_async_action(
+            connect(ClientId2, Ns2),
+            #{?snk_kind := multi_tenant_client_added}
+        ),
+    stop_client(Pid2),
+    ?assertMatch(
+        {200, [
+            #{
+                <<"name">> := Ns2,
+                <<"created_at">> := I
+            }
+        ]} when is_integer(I),
+        list_nss_details(#{})
+    ),
+    ?assertMatch(
+        {200, [
+            #{
+                <<"name">> := Ns2,
+                <<"created_at">> := I,
+                <<"config">> := #{}
+            }
+        ]} when is_integer(I),
+        list_managed_nss_details(#{})
+    ),
+    {204, _} = delete_managed_ns(Ns2),
+
+    ok.
+
+-doc """
+Verifies that `/mt/managed_ns_list_details` inlines each namespace's configuration,
+so the UI doesn't need an N+1 round trip to fetch per-namespace configs.
+""".
+t_managed_ns_list_details_includes_config(_Config) ->
+    Ns1 = <<"mns-cfg-1">>,
+    Ns2 = <<"mns-cfg-2">>,
+    {204, _} = create_managed_ns(Ns1),
+    {204, _} = create_managed_ns(Ns2),
+    {200, _} = update_managed_ns_config(Ns1, tenant_limiter_params()),
+    ?assertMatch(
+        {200, [
+            #{
+                <<"name">> := Ns1,
+                <<"config">> := #{
+                    <<"limiter">> := #{
+                        <<"tenant">> := #{
+                            <<"bytes">> := #{<<"rate">> := <<"10MB/10s">>},
+                            <<"messages">> := #{<<"rate">> := <<"3000/1s">>}
+                        }
+                    }
+                }
+            },
+            #{
+                <<"name">> := Ns2,
+                <<"config">> := #{}
+            }
+        ]},
+        list_managed_nss_details(#{})
+    ),
+    {204, _} = delete_managed_ns(Ns1),
+    {204, _} = delete_managed_ns(Ns2),
+    ok.
+
+-doc """
+Verifies that managed/explicit namespaces have their existence checked before attempting
+to create a namespaced user or API key.
+""".
+t_namespaced_user_api_checks(_TCConfig) ->
+    GlobalAdminHeader = emqx_dashboard_admin_SUITE:create_superuser(),
+    Namespace = <<"ns1">>,
+    AdminRole = iolist_to_binary(["ns:", Namespace, "::administrator"]),
+    %% Pre-conditions
+    {200, []} = list_managed_nss_details(#{}),
+
+    Username = <<"iminans">>,
+    Password = <<"superSecureP@ss">>,
+    ?assertMatch(
+        {400, #{
+            <<"message">> := #{<<"reason">> := <<"unknown_namespace">>}
+        }},
+        emqx_dashboard_admin_SUITE:create_user_api(
+            #{
+                <<"username">> => Username,
+                <<"password">> => Password,
+                <<"role">> => AdminRole,
+                <<"description">> => <<"???">>
+            },
+            GlobalAdminHeader
+        )
+    ),
+
+    APIKeyName = <<"someapikey">>,
+    ExpiresAt = emqx_dashboard_admin_SUITE:to_rfc3339(erlang:system_time(second) + 1_000),
+    ?assertMatch(
+        {400, #{
+            <<"message">> := #{<<"reason">> := <<"unknown_namespace">>}
+        }},
+        emqx_dashboard_admin_SUITE:create_api_key_api(
+            #{
+                <<"name">> => APIKeyName,
+                <<"expired_at">> => ExpiresAt,
+                <<"desc">> => <<"namespaced api 1">>,
+                <<"enable">> => true,
+                <<"role">> => AdminRole
+            },
+            GlobalAdminHeader
+        )
+    ),
+
+    %% Now we create the namespace
+    {204, _} = create_managed_ns(Namespace),
+    ?assertMatch(
+        {200, _},
+        emqx_dashboard_admin_SUITE:create_user_api(
+            #{
+                <<"username">> => Username,
+                <<"password">> => Password,
+                <<"role">> => AdminRole,
+                <<"description">> => <<"???">>
+            },
+            GlobalAdminHeader
+        )
+    ),
+    ?assertMatch(
+        {200, _},
+        emqx_dashboard_admin_SUITE:create_api_key_api(
+            #{
+                <<"name">> => APIKeyName,
+                <<"expired_at">> => ExpiresAt,
+                <<"desc">> => <<"namespaced api 1">>,
+                <<"enable">> => true,
+                <<"role">> => AdminRole
+            },
+            GlobalAdminHeader
+        )
+    ),
+
+    ok.
+
+-doc """
+Smoke tests for using namespaced authorization.
+
+- Namespaced clients check their namespaced rules instead of global ones.
+""".
+t_namespaced_authz(_TCConfig) ->
+    GlobalAdminHeader = emqx_dashboard_admin_SUITE:create_superuser(),
+    emqx_authz_api_mnesia_SUITE:put_auth_header(GlobalAdminHeader),
+    Namespace1 = <<"ns01">>,
+    {204, _} = create_managed_ns(Namespace1),
+
+    TopicPub0 = <<"t/pub/0">>,
+    TopicSub0 = <<"t/sub/0">>,
+    TopicPub1 = <<"t/pub/1">>,
+    TopicSub1 = <<"t/sub/1">>,
+    TopicPub2 = <<"t/pub/2">>,
+    TopicSub2 = <<"t/sub/2">>,
+    {204, _} = emqx_authz_api_mnesia_SUITE:create_all_rules(
+        #{
+            <<"rules">> => [
+                #{
+                    topic => TopicPub1,
+                    permission => <<"allow">>,
+                    action => <<"publish">>
+                },
+                #{
+                    topic => TopicSub1,
+                    permission => <<"allow">>,
+                    action => <<"subscribe">>
+                }
+            ]
+        },
+        #{<<"ns">> => Namespace1}
+    ),
+    Namespace2 = <<"another_ns">>,
+    %% Must first create managed namespace
+    ?assertMatch(
+        {400, #{<<"message">> := <<"Managed namespace not found">>}},
+        emqx_authz_api_mnesia_SUITE:create_all_rules(
+            #{
+                <<"rules">> => [
+                    #{
+                        topic => TopicPub2,
+                        permission => <<"allow">>,
+                        action => <<"publish">>
+                    },
+                    #{
+                        topic => TopicSub2,
+                        permission => <<"allow">>,
+                        action => <<"subscribe">>
+                    }
+                ]
+            },
+            #{<<"ns">> => Namespace2}
+        )
+    ),
+    {204, _} = create_managed_ns(Namespace2),
+    {204, _} = emqx_authz_api_mnesia_SUITE:create_all_rules(
+        #{
+            <<"rules">> => [
+                #{
+                    topic => TopicPub2,
+                    permission => <<"allow">>,
+                    action => <<"publish">>
+                },
+                #{
+                    topic => TopicSub2,
+                    permission => <<"allow">>,
+                    action => <<"subscribe">>
+                }
+            ]
+        },
+        #{<<"ns">> => Namespace2}
+    ),
+    %% global
+    {204, _} = emqx_authz_api_mnesia_SUITE:create_all_rules(
+        #{
+            <<"rules">> => [
+                #{
+                    topic => TopicPub0,
+                    permission => <<"allow">>,
+                    action => <<"publish">>
+                },
+                #{
+                    topic => TopicSub0,
+                    permission => <<"allow">>,
+                    action => <<"subscribe">>
+                }
+            ]
+        }
+    ),
+    ClientId1 = <<"ns_c1">>,
+    C1 = connect(ClientId1, Namespace1),
+
+    ?assertMatch({ok, _, [?RC_NOT_AUTHORIZED]}, emqtt:subscribe(C1, TopicPub1, [{qos, 1}])),
+    ?assertMatch(
+        {ok, #{reason_code := ?RC_NOT_AUTHORIZED}},
+        emqtt:publish(C1, TopicSub1, <<"hi">>, [{qos, 1}])
+    ),
+    %% Different ns
+    ?assertMatch({ok, _, [?RC_NOT_AUTHORIZED]}, emqtt:subscribe(C1, TopicSub2, [{qos, 1}])),
+    ?assertMatch(
+        {ok, #{reason_code := ?RC_NOT_AUTHORIZED}},
+        emqtt:publish(C1, TopicPub2, <<"hi">>, [{qos, 1}])
+    ),
+    ?assertMatch({ok, _, [?RC_NOT_AUTHORIZED]}, emqtt:subscribe(C1, TopicSub0, [{qos, 1}])),
+    ?assertMatch(
+        {ok, #{reason_code := ?RC_NOT_AUTHORIZED}},
+        emqtt:publish(C1, TopicPub0, <<"hi">>, [{qos, 1}])
+    ),
+
+    ?assertMatch({ok, _, [?RC_GRANTED_QOS_1]}, emqtt:subscribe(C1, TopicSub1, [{qos, 1}])),
+    ?assertMatch(
+        {ok, #{reason_code := ?RC_NO_MATCHING_SUBSCRIBERS}},
+        emqtt:publish(C1, TopicPub1, <<"hi">>, [{qos, 1}])
+    ),
+
+    ok.
+
+-doc """
+Tests that deleting a namespace also purges its built-in database authentication users
+and authorization rules, so a later namespace with the same name starts empty.
+
+See https://github.com/emqx/emqx/issues/17816.
+""".
+t_delete_ns_purges_builtin_auth_data(_TCConfig) ->
+    GlobalAdminHeader = emqx_dashboard_admin_SUITE:create_superuser(),
+    emqx_authn_api_mnesia_SUITE:put_auth_header(GlobalAdminHeader),
+    emqx_authz_api_mnesia_SUITE:put_auth_header(GlobalAdminHeader),
+    Ns = <<"tns">>,
+    {204, _} = create_managed_ns(Ns),
+
+    {201, _} = emqx_authn_api_mnesia_SUITE:add_user(
+        #{<<"user_id">> => <<"u1">>, <<"password">> => <<"passwd">>},
+        #{<<"ns">> => Ns}
+    ),
+    {204, _} = emqx_authz_api_mnesia_SUITE:create_all_rules(
+        #{
+            <<"rules">> => [
+                #{
+                    <<"topic">> => <<"t">>,
+                    <<"permission">> => <<"allow">>,
+                    <<"action">> => <<"publish">>
+                }
+            ]
+        },
+        #{<<"ns">> => Ns}
+    ),
+    ?assertMatch(
+        {200, #{<<"data">> := [_]}},
+        emqx_authn_api_mnesia_SUITE:list_users(#{<<"ns">> => Ns})
+    ),
+    ?assertMatch(
+        {200, #{<<"rules">> := [_]}},
+        emqx_authz_api_mnesia_SUITE:get_all_rules(#{<<"ns">> => Ns})
+    ),
+
+    {204, _} = delete_ns(Ns),
+    ?retry(250, 10, ?assertNot(emqx_mt_state:is_tombstoned(Ns))),
+    {204, _} = create_managed_ns(Ns),
+
+    ?assertMatch(
+        {200, #{<<"data">> := []}},
+        emqx_authn_api_mnesia_SUITE:list_users(#{<<"ns">> => Ns})
+    ),
+    ?assertMatch(
+        {200, #{<<"rules">> := []}},
+        emqx_authz_api_mnesia_SUITE:get_all_rules(#{<<"ns">> => Ns})
+    ),
+    ok.
+
+-doc """
+Tests the `emqx ctl mt purge_ns` command: it deletes the namespace and purges all of its
+data regardless of the namespace's current state, and is idempotent.
+""".
+t_purge_ns_cli(_TCConfig) ->
+    GlobalAdminHeader = emqx_dashboard_admin_SUITE:create_superuser(),
+    emqx_authn_api_mnesia_SUITE:put_auth_header(GlobalAdminHeader),
+    emqx_authz_api_mnesia_SUITE:put_auth_header(GlobalAdminHeader),
+    Ns = <<"tns">>,
+    {204, _} = create_managed_ns(Ns),
+
+    {201, _} = emqx_authn_api_mnesia_SUITE:add_user(
+        #{<<"user_id">> => <<"u1">>, <<"password">> => <<"passwd">>},
+        #{<<"ns">> => Ns}
+    ),
+    {204, _} = emqx_authz_api_mnesia_SUITE:create_all_rules(
+        #{
+            <<"rules">> => [
+                #{
+                    <<"topic">> => <<"t">>,
+                    <<"permission">> => <<"allow">>,
+                    <<"action">> => <<"publish">>
+                }
+            ]
+        },
+        #{<<"ns">> => Ns}
+    ),
+
+    %% Purge without deleting the namespace first.
+    ok = emqx_mt_cli:mt(["purge_ns", binary_to_list(Ns)]),
+    ?assertMatch({404, _}, get_managed_ns_config(Ns)),
+
+    %% Cleanup is synchronous: the namespace can be recreated immediately, and starts
+    %% empty.
+    {204, _} = create_managed_ns(Ns),
+    ?assertMatch(
+        {200, #{<<"data">> := []}},
+        emqx_authn_api_mnesia_SUITE:list_users(#{<<"ns">> => Ns})
+    ),
+    ?assertMatch(
+        {200, #{<<"rules">> := []}},
+        emqx_authz_api_mnesia_SUITE:get_all_rules(#{<<"ns">> => Ns})
+    ),
+
+    %% Idempotent: purging repeatedly, including a nonexistent namespace, succeeds.
+    ok = emqx_mt_cli:mt(["purge_ns", binary_to_list(Ns)]),
+    ok = emqx_mt_cli:mt(["purge_ns", binary_to_list(Ns)]),
+    ok.
+
+-doc """
+Smoke tests for consulting namespaced metrics.
+""".
+t_namespaced_metrics(_TCConfig) ->
+    Namespace = <<"ns02">>,
+
+    ?assertMatch({404, _}, get_metrics(Namespace)),
+
+    {204, _} = create_managed_ns(Namespace),
+
+    %% Generate some values
+    {ok, _} = emqx_authn_chains:add_user(
+        'mqtt:global',
+        <<"password_based:built_in_database">>,
+        #{
+            user_id => Namespace,
+            namespace => Namespace,
+            password => <<"123456">>
+        }
+    ),
+    emqx_authz_mnesia:store_rules(Namespace, all, [
+        #{
+            <<"permission">> => <<"allow">>,
+            <<"action">> => <<"publish">>,
+            <<"topic">> => <<"t/ns02">>
+        },
+        #{
+            <<"permission">> => <<"allow">>,
+            <<"action">> => <<"subscribe">>,
+            <<"topic">> => <<"t/ns02">>
+        }
+    ]),
+
+    ClientId1 = ?NEW_CLIENTID(1),
+    C1 = connect(ClientId1, Namespace),
+    Topic = <<"t/ns02">>,
+    {ok, _, _} = emqtt:subscribe(C1, Topic, [{qos, 1}]),
+    emqtt:publish(C1, Topic, <<"hey1">>, [{qos, 1}]),
+    emqtt:publish(C1, Topic, <<"hey2">>, [{qos, 1}]),
+
+    ?assertMatch(
+        {200, #{
+            %% Only a sample of all namespaced metrics are matched below.
+            <<"messaging_stats">> := #{
+                <<"messages.sent">> := 2,
+                <<"messages.received">> := 2,
+                <<"bytes.sent">> := _,
+                <<"bytes.received">> := _
+            },
+            <<"session_count">> := 1,
+            <<"builtin_authz_record_count">> := 1,
+            <<"builtin_authn_record_count">> := 1
+        }},
+        get_metrics(Namespace)
+    ),
+
+    ok.
+
+-doc """
+Verifies that we check whether a namespace exists before uploading managed certs.
+""".
+t_managed_certs_inexistent_ns(_TCConfig) ->
+    on_exit(fun emqx_managed_certs:clean_certs_dir/0),
+    Ns = <<"i_dont_exist">>,
+    Bundle = <<"some_bundle">>,
+
+    #{
+        cert_pem := CA
+    } = gen_cert(#{key => ec, issuer => root}),
+
+    %% Can delete even if ns is absent (potentially to cleanup)
+    ?assertMatch({204, _}, delete_file_ns(Ns, Bundle, ?FILE_KIND_CA_BIN)),
+    ?assertMatch({204, _}, delete_bundle_ns(Ns, Bundle)),
+
+    ?assertMatch(
+        {400, #{<<"message">> := <<"Managed namespace not found">>}},
+        upload_file_ns(Ns, Bundle, ?FILE_KIND_CA, CA)
+    ),
+
+    {204, _} = create_managed_ns(Ns),
+    ?assertMatch({204, _}, upload_file_ns(Ns, Bundle, ?FILE_KIND_CA, CA)),
+
+    ok.
+
+-doc """
+"Integration" test for using per-ns delivery rate limiting options.
+
+While the global config has no delivery rate limiting (the default), the namespace in this
+case does and uses it.
+
+This assumes in-memory sessions are in use.
+""".
+t_delivery_rate_limit(Config) when is_list(Config) ->
+    [N | _] = ?config(cluster, Config),
+    %% Setup namespace with limiters
+    Params1 = client_limiter_params(#{
+        <<"delivery_bytes">> => #{
+            <<"rate">> => <<"10MB/s">>,
+            <<"burst">> => <<"0MB/s">>
+        },
+        <<"delivery_messages">> => #{
+            %% This shall be the bottleneck.
+            <<"rate">> => <<"3/s">>,
+            <<"burst">> => <<"0/s">>
+        }
+    }),
+    Ns = atom_to_binary(?FUNCTION_NAME),
+    {204, _} = create_managed_ns(Ns),
+    ?assertMatch({200, _}, update_managed_ns_config(Ns, Params1)),
+    ?check_trace(
+        begin
+            C1 = ?NEW_CLIENTID(1),
+            {ok, Pid1} = emqtt:start_link(#{
+                username => Ns,
+                clientid => C1,
+                proto_ver => v5,
+                port => emqx_mt_api_SUITE:get_mqtt_tcp_port(N)
+            }),
+            {ok, _} = emqtt:connect(Pid1),
+            Topic = <<"rate/limit">>,
+            {ok, _, _} = emqtt:subscribe(Pid1, Topic, 2),
+            %% Publish a few messages in quick succession; most will get enqueued (except
+            %% for QoS 0 ones arriving while the limiter is exhausted).
+            ct:pal("publishing"),
+            lists:foreach(
+                fun({QoS, Payload}) ->
+                    emqtt:publish(Pid1, Topic, Payload, [{qos, QoS}])
+                end,
+                [
+                    {?QOS_0, <<"0a">>},
+                    {?QOS_1, <<"1a">>},
+                    {?QOS_2, <<"2a">>},
+                    {?QOS_0, <<"0b">>},
+                    {?QOS_1, <<"1b">>},
+                    {?QOS_2, <<"2b">>}
+                ]
+            ),
+            ct:pal("published"),
+            %% Eventually, must receive all messages (except a QoS 0 one) at the
+            %% configured rate, hence in ~ 2 s.  We wait for one more than the expected
+            %% count to check we don't actually receive that QoS 0 message with payload
+            %% `0b`.
+            ExpectedCount = 5,
+            Timeout = 3_000,
+            T0 = erlang:monotonic_time(millisecond),
+            Received = emqx_common_test_helpers:wait_publishes(ExpectedCount + 1, Timeout),
+            T1 = erlang:monotonic_time(millisecond),
+            ct:pal("received:\n  ~p", [Received]),
+            ct:pal("took: ~b ms", [T1 - T0]),
+            ?assertEqual(ExpectedCount, length(Received)),
+            ?assertMatch(
+                [
+                    #{qos := ?QOS_0, payload := <<"0a">>},
+                    #{qos := ?QOS_1, payload := <<"1a">>},
+                    #{qos := ?QOS_2, payload := <<"2a">>},
+                    %% `0b` is dropped due to rate limiting.
+                    %%
+                    %% N.B.: `0b` _could_ appear here depending on the rate limit.  If it
+                    %% happens to arrive when the limiter has tokens (e.g. if one sets
+                    %% `delivery_messages.rate` to `2/s`), it'll be published as usual, though
+                    %% the ordering might be different, since different QoS's are different
+                    %% ordering tracks (`[MQTT-4.6.0-5]`).
+                    #{qos := ?QOS_1, payload := <<"1b">>},
+                    #{qos := ?QOS_2, payload := <<"2b">>}
+                ],
+                Received
+            ),
+            emqtt:stop(Pid1)
+        end,
+        fun(Trace) ->
+            ?assertEqual(
+                [], ?of_kind(["hook_callback_exception", "session_mem_limiter_not_found"], Trace)
+            ),
+            ?assertMatch(
+                [
+                    #{
+                        reason :=
+                            {failed_to_consume_from_limiter, {{mt_client, _}, delivery_messages}}
+                    }
+                    | _
+                ],
+                ?of_kind(["mem_delivery_rate_limit"], Trace)
+            ),
+            ok
+        end
+    ),
+    ok.
+
+-doc """
+"Integration" test for using per-ns subscribe rate limiting options.
+
+While the global config has no subscribe rate limiting (the default), the namespace in this
+case does and uses it.
+""".
+t_subscribe_rate_limit(Config) when is_list(Config) ->
+    [N | _] = ?config(cluster, Config),
+    %% Setup namespace with limiters
+    Params1 = client_limiter_params(#{
+        <<"subscribes">> => #{
+            %% This shall be the bottleneck.
+            <<"rate">> => <<"3/s">>,
+            <<"burst">> => <<"0/s">>
+        }
+    }),
+    Ns = atom_to_binary(?FUNCTION_NAME),
+    {204, _} = create_managed_ns(Ns),
+    ?assertMatch({200, _}, update_managed_ns_config(Ns, Params1)),
+    ?check_trace(
+        begin
+            C1 = ?NEW_CLIENTID(1),
+            {ok, Pid1} = emqtt:start_link(#{
+                username => Ns,
+                clientid => C1,
+                proto_ver => v5,
+                port => emqx_mt_api_SUITE:get_mqtt_tcp_port(N)
+            }),
+            {ok, _} = emqtt:connect(Pid1),
+            Topic = <<"rate/limit">>,
+            %% Subscribe in quick succession; should hit limit
+            ct:pal("subscribing"),
+            ?ON(N, emqx_logger:set_log_level(debug)),
+            process_flag(trap_exit, true),
+            Subacks = lists:map(
+                fun(_) ->
+                    emqtt:subscribe(Pid1, Topic, [{qos, 0}])
+                end,
+                lists:seq(1, 5)
+            ),
+            ct:pal("subscribed"),
+            ct:pal("subacks:\n  ~p", [Subacks]),
+            emqtt:stop(Pid1),
+            ?assertMatch(
+                {ok, _, [?RC_QUOTA_EXCEEDED]},
+                lists:last(Subacks)
+            ),
+            ok
+        end,
+        fun(Trace) ->
+            ?assertEqual(
+                [], ?of_kind(["hook_callback_exception", "session_mem_limiter_not_found"], Trace)
+            ),
+            ?assertMatch(
+                [
+                    #{
+                        reason :=
+                            {failed_to_consume_from_limiter, {{mt_client, _}, subscribes}}
+                    }
+                    | _
+                ],
+                ?of_kind(["subscribe_rate_limit"], Trace)
+            ),
+            ok
+        end
+    ),
+    ok.
+
+-doc """
+Verifies that the paginated list endpoints emit an RFC 8288
+`Link: <?...>; rel="next"` response header when more pages are available,
+and no such header when the current page is the last one. The query-only
+URI-reference in the Link header, once resolved against the request URL,
+must carry the caller back to the next page of results.
+""".
+t_list_pagination_link_header(_Config) ->
+    Ns1 = <<"pagns1">>,
+    Ns2 = <<"pagns2">>,
+    %% Populate `?CONFIG_TAB` (managed_ns_list*) with two entries.
+    ?assertMatch({204, _}, create_managed_ns(Ns1)),
+    ?assertMatch({204, _}, create_managed_ns(Ns2)),
+    %% Populate `?NS_TAB` (ns_list*) with two entries by connecting clients.
+    %% Also create 2 clients under Ns1 to exercise the client_list endpoint.
+    ClientId1 = <<"pag-c-1">>,
+    ClientId2 = <<"pag-c-2">>,
+    ClientId3 = <<"pag-c-3">>,
+    C1 = connect(ClientId1, Ns1),
+    C2 = connect(ClientId2, Ns1),
+    C3 = connect(ClientId3, Ns2),
+    ?retry(200, 50, ?assertMatch({200, [Ns1, Ns2]}, list_nss(#{}))),
+
+    %% Exact-one-page: limit == total items => no Link header.
+    assert_no_link(list_managed_nss_headers(#{<<"limit">> => <<"2">>})),
+    assert_no_link(list_managed_nss_details_headers(#{<<"limit">> => <<"2">>})),
+    assert_no_link(list_nss_headers(#{<<"limit">> => <<"2">>})),
+    assert_no_link(list_nss_details_headers(#{<<"limit">> => <<"2">>})),
+    assert_no_link(list_clients_headers(Ns1, #{<<"limit">> => <<"2">>})),
+
+    %% More-pages: limit < total items => Link header present with cursor
+    %% pointing at the last item of the returned page. Following the cursor
+    %% must yield the next item(s).
+    assert_next_link_roundtrip(
+        fun(QS) -> list_managed_nss_headers(QS) end,
+        #{<<"limit">> => <<"1">>},
+        <<"last_ns">>,
+        Ns1,
+        1
+    ),
+    assert_next_link_roundtrip(
+        fun(QS) -> list_nss_headers(QS) end,
+        #{<<"limit">> => <<"1">>},
+        <<"last_ns">>,
+        Ns1,
+        1
+    ),
+    assert_next_link_roundtrip(
+        fun(QS) -> list_managed_nss_details_headers(QS) end,
+        #{<<"limit">> => <<"1">>},
+        <<"last_ns">>,
+        Ns1,
+        1
+    ),
+    assert_next_link_roundtrip(
+        fun(QS) -> list_nss_details_headers(QS) end,
+        #{<<"limit">> => <<"1">>},
+        <<"last_ns">>,
+        Ns1,
+        1
+    ),
+    assert_next_link_roundtrip(
+        fun(QS) -> list_clients_headers(Ns1, QS) end,
+        #{<<"limit">> => <<"1">>},
+        <<"last_clientid">>,
+        ClientId1,
+        1
+    ),
+
+    lists:foreach(fun stop_client/1, [C1, C2, C3]),
+    ok.
+
+assert_no_link({200, Headers, _Body}) ->
+    ?assertEqual(false, lists:keyfind("link", 1, Headers), #{headers => Headers}).
+
+assert_next_link_roundtrip(Fun, QS, CursorKey, ExpectedCursor, ExpectedNextPageSize) ->
+    {200, Headers, Body} = Fun(QS),
+    ?assertEqual(1, length(Body), #{headers => Headers, body => Body}),
+    {"link", LinkVal} = lists:keyfind("link", 1, Headers),
+    NextQS = parse_next_link(LinkVal),
+    ?assertMatch(
+        #{CursorKey := ExpectedCursor, <<"limit">> := <<"1">>},
+        NextQS,
+        #{link => LinkVal}
+    ),
+    {200, NextHeaders, NextBody} = Fun(NextQS),
+    ?assertEqual(
+        ExpectedNextPageSize,
+        length(NextBody),
+        #{headers => NextHeaders, body => NextBody}
+    ),
+    ok.
+
+%% Parse `<?k=v&...>; rel="next"` into a #{binary() => binary()} query map.
+parse_next_link(LinkVal) ->
+    LinkBin = iolist_to_binary(LinkVal),
+    [URIPart | _] = binary:split(LinkBin, <<";">>),
+    Trimmed = string:trim(URIPart),
+    <<"<?", Rest/binary>> = Trimmed,
+    Size = byte_size(Rest) - 1,
+    <<Query:Size/binary, ">">> = Rest,
+    maps:from_list(uri_string:dissect_query(Query)).
+
+-doc """
+Verifies the inclusive keyset cursor parameters (`first_ns`, `first_clientid`).
+Covers exact-match lookup, paginated continuation where the Link header
+preserves the inclusive cursor mode, and the mutex rule that rejects requests
+providing both an inclusive and an exclusive cursor on the same endpoint.
+""".
+t_list_pagination_first_cursor(_Config) ->
+    Ns1 = <<"pfns1">>,
+    Ns2 = <<"pfns2">>,
+    Ns3 = <<"pfns3">>,
+    ?assertMatch({204, _}, create_managed_ns(Ns1)),
+    ?assertMatch({204, _}, create_managed_ns(Ns2)),
+    ?assertMatch({204, _}, create_managed_ns(Ns3)),
+    ClientId1 = <<"pf-c-1">>,
+    ClientId2 = <<"pf-c-2">>,
+    ClientId3 = <<"pf-c-3">>,
+    C1 = connect(ClientId1, Ns1),
+    C2 = connect(ClientId2, Ns1),
+    C3 = connect(ClientId3, Ns1),
+    C4 = connect(<<"pf-other">>, Ns2),
+    C5 = connect(<<"pf-other">>, Ns3),
+    ?retry(200, 50, ?assertMatch({200, [Ns1, Ns2, Ns3]}, list_nss(#{}))),
+
+    %% --- Exact-match lookup: first_ns equal to an existing key returns that
+    %% key as the first element (up to limit=1 => one-item response).
+    ?assertMatch(
+        {200, [Ns2]},
+        list_managed_nss(#{<<"first_ns">> => Ns2, <<"limit">> => <<"1">>})
+    ),
+    ?assertMatch(
+        {200, [Ns2]},
+        list_nss(#{<<"first_ns">> => Ns2, <<"limit">> => <<"1">>})
+    ),
+    ?assertMatch(
+        {200, [ClientId2]},
+        list_clients(Ns1, #{<<"first_clientid">> => ClientId2, <<"limit">> => <<"1">>})
+    ),
+
+    %% --- first_ns with a value that isn't present advances to the next key
+    %% that exists (like an inclusive lower bound).
+    ?assertMatch(
+        {200, [Ns2, Ns3]},
+        list_managed_nss(#{<<"first_ns">> => <<"pfns15">>, <<"limit">> => <<"5">>})
+    ),
+
+    %% --- Pagination: limit < total with first_ns => Link preserves first_ns
+    %% and points at the next-inclusive cursor.
+    assert_first_mode_roundtrip(
+        fun(QS) -> list_managed_nss_headers(QS) end,
+        #{<<"first_ns">> => Ns1, <<"limit">> => <<"1">>},
+        <<"first_ns">>,
+        Ns2,
+        [Ns1],
+        1
+    ),
+    assert_first_mode_roundtrip(
+        fun(QS) -> list_nss_headers(QS) end,
+        #{<<"first_ns">> => Ns1, <<"limit">> => <<"1">>},
+        <<"first_ns">>,
+        Ns2,
+        [Ns1],
+        1
+    ),
+    assert_first_mode_roundtrip(
+        fun(QS) -> list_managed_nss_details_headers(QS) end,
+        #{<<"first_ns">> => Ns1, <<"limit">> => <<"1">>},
+        <<"first_ns">>,
+        Ns2,
+        1,
+        1
+    ),
+    assert_first_mode_roundtrip(
+        fun(QS) -> list_nss_details_headers(QS) end,
+        #{<<"first_ns">> => Ns1, <<"limit">> => <<"1">>},
+        <<"first_ns">>,
+        Ns2,
+        1,
+        1
+    ),
+    assert_first_mode_roundtrip(
+        fun(QS) -> list_clients_headers(Ns1, QS) end,
+        #{<<"first_clientid">> => ClientId1, <<"limit">> => <<"1">>},
+        <<"first_clientid">>,
+        ClientId2,
+        [ClientId1],
+        1
+    ),
+
+    %% --- Mutex: providing both cursors rejects with 400.
+    ?assertMatch(
+        {400, #{<<"code">> := <<"BAD_REQUEST">>}},
+        list_managed_nss(#{
+            <<"first_ns">> => Ns1,
+            <<"last_ns">> => Ns1,
+            <<"limit">> => <<"1">>
+        })
+    ),
+    ?assertMatch(
+        {400, #{<<"code">> := <<"BAD_REQUEST">>}},
+        list_nss(#{
+            <<"first_ns">> => Ns1,
+            <<"last_ns">> => Ns1,
+            <<"limit">> => <<"1">>
+        })
+    ),
+    ?assertMatch(
+        {400, #{<<"code">> := <<"BAD_REQUEST">>}},
+        list_managed_nss_details(#{
+            <<"first_ns">> => Ns1,
+            <<"last_ns">> => Ns1,
+            <<"limit">> => <<"1">>
+        })
+    ),
+    ?assertMatch(
+        {400, #{<<"code">> := <<"BAD_REQUEST">>}},
+        list_nss_details(#{
+            <<"first_ns">> => Ns1,
+            <<"last_ns">> => Ns1,
+            <<"limit">> => <<"1">>
+        })
+    ),
+    ?assertMatch(
+        {400, #{<<"code">> := <<"BAD_REQUEST">>}},
+        list_clients(Ns1, #{
+            <<"first_clientid">> => ClientId1,
+            <<"last_clientid">> => ClientId1,
+            <<"limit">> => <<"1">>
+        })
+    ),
+
+    lists:foreach(fun stop_client/1, [C1, C2, C3, C4, C5]),
+    ok.
+
+%% Checks that a request using `first_*` cursor returns the expected first
+%% page, that the Link header preserves the `first_*` param name, that the
+%% cursor value points at the next inclusive item, and that following the
+%% Link yields the expected continuation.
+assert_first_mode_roundtrip(
+    Fun, QS, CursorKey, ExpectedCursor, ExpectedFirstPage, ExpectedNextPageSize
+) ->
+    {200, Headers, Body} = Fun(QS),
+    %% First-page content check: if caller gave a list, match it; otherwise
+    %% use it as a length expectation (details endpoints return maps with
+    %% keys beyond just `name`).
+    case is_list(ExpectedFirstPage) of
+        true ->
+            ?assertEqual(ExpectedFirstPage, Body, #{headers => Headers});
+        false ->
+            ?assertEqual(ExpectedFirstPage, length(Body), #{headers => Headers, body => Body})
+    end,
+    {"link", LinkVal} = lists:keyfind("link", 1, Headers),
+    NextQS = parse_next_link(LinkVal),
+    ?assertMatch(
+        #{CursorKey := ExpectedCursor, <<"limit">> := <<"1">>},
+        NextQS,
+        #{link => LinkVal}
+    ),
+    {200, NextHeaders, NextBody} = Fun(NextQS),
+    ?assertEqual(
+        ExpectedNextPageSize,
+        length(NextBody),
+        #{headers => NextHeaders, body => NextBody}
+    ),
+    ok.

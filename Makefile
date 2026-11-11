@@ -1,149 +1,375 @@
-$(shell $(CURDIR)/scripts/git-hooks-init.sh)
-REBAR_VERSION = 3.14.3-emqx-6
+ifeq ($(DEBUG),1)
+DEBUG_INFO = $(info $1)
+else
+DEBUG_INFO = @:
+endif
 REBAR = $(CURDIR)/rebar3
+MIX = $(CURDIR)/mix
 BUILD = $(CURDIR)/build
 SCRIPTS = $(CURDIR)/scripts
-export PKG_VSN ?= $(shell $(CURDIR)/pkg-vsn.sh)
-export EMQX_DESC ?= EMQ X
-export EMQX_CE_DASHBOARD_VERSION ?= v4.3.0-rc.1
-ifeq ($(OS),Windows_NT)
-	export REBAR_COLOR=none
-endif
+include env.sh
 
-PROFILE ?= emqx
-REL_PROFILES := emqx emqx-edge
-PKG_PROFILES := emqx-pkg emqx-edge-pkg
+.DEFAULT_GOAL := default
+
+# Dashboard version
+# from https://github.com/emqx/emqx-dashboard5
+export EMQX_DASHBOARD_VERSION ?= 3.0.0-alpha.1
+
+.PHONY: print-dashboard-version
+print-dashboard-version:
+	@echo $(EMQX_DASHBOARD_VERSION)
+
+export EMQX_REL_FORM ?= tgz
+# 'auto' resolves to 'sys' (link system libcrypto) when the build host has
+# OpenSSL >= 3.0, and to quicer's bundled quictls otherwise.
+export QUICER_TLS_VER ?= auto
+
+-include default-profile.mk
+PROFILE ?= emqx-enterprise
+export PROFILE
+REL_PROFILES := emqx-enterprise
+PKG_PROFILES := emqx-enterprise-pkg
 PROFILES := $(REL_PROFILES) $(PKG_PROFILES) default
 
+CT_NODE_NAME ?= 'test@127.0.0.1'
+CT_READABLE ?= true
+CT_COVER_EXPORT_PREFIX ?= $(PROFILE)
+
 export REBAR_GIT_CLONE_OPTIONS += --depth=1
+export MIX_REBAR3 = $(CURDIR)/rebar3
+
+ELIXIR_COMMON_DEPS := ensure-hex ensure-mix-rebar3 ensure-mix-rebar
 
 .PHONY: default
 default: $(REBAR) $(PROFILE)
+
+.prepare:
+	@$(SCRIPTS)/git-hooks-init.sh # this is no longer needed since 5.0 but we keep it anyway
+	@$(SCRIPTS)/prepare-build-deps.sh
+	@touch .prepare
 
 .PHONY: all
 all: $(REBAR) $(PROFILES)
 
 .PHONY: ensure-rebar3
 ensure-rebar3:
-	@$(SCRIPTS)/fail-on-old-otp-version.escript
-	@$(SCRIPTS)/ensure-rebar3.sh $(REBAR_VERSION)
+	@$(SCRIPTS)/ensure-rebar3.sh
 
-$(REBAR): ensure-rebar3
+$(REBAR): .prepare ensure-rebar3
 
-.PHONY: get-dashboard
-get-dashboard:
-	@$(SCRIPTS)/get-dashboard.sh
+.PHONY: ensure-hex
+ensure-hex:
+	@mix local.hex --if-missing --force
+
+.PHONY: ensure-mix-rebar3
+ensure-mix-rebar3: $(REBAR)
+	@mix local.rebar rebar3 $(CURDIR)/rebar3 --if-missing --force
+
+.PHONY: ensure-mix-rebar
+ensure-mix-rebar: $(REBAR)
+	@mix local.rebar --if-missing --force
+
+.PHONY: elixir-common-deps
+elixir-common-deps: $(ELIXIR_COMMON_DEPS)
+
+.PHONY: mix-deps-get
+mix-deps-get: elixir-common-deps
+	@$(SCRIPTS)/mix-deps-quiet.sh mix deps.get
 
 .PHONY: eunit
-eunit: $(REBAR)
-	@ENABLE_COVER_COMPILE=1 $(REBAR) eunit -v -c
+eunit: $(ELIXIR_COMMON_DEPS) merge-config
+	@env PROFILE=$(PROFILE)-test $(MIX) eunit --cover-export-name $(CT_COVER_EXPORT_PREFIX)-eunit
 
 .PHONY: proper
-proper: $(REBAR)
-	@ENABLE_COVER_COMPILE=1 $(REBAR) proper -d test/props -c
+proper: $(ELIXIR_COMMON_DEPS)
+	@env PROFILE=$(PROFILE)-test $(MIX) proper
+
+.PHONY: test-compile
+test-compile: $(REBAR) merge-config
+	env PROFILE=$(PROFILE)-test $(SCRIPTS)/mix-deps-quiet.sh $(MIX) deps.get
+	env PROFILE=$(PROFILE)-test $(MIX) deps.compile cth_readable
+	env PROFILE=$(PROFILE)-test $(MIX) compile
+
+.PHONY: test-compile-plugins
+test-compile-plugins: $(REBAR) merge-config
+	env TEST=1 PROFILE=$(PROFILE)-test $(SCRIPTS)/build-plugins.sh --compile-only
+
+.PHONY: $(REL_PROFILES:%=%-compile)
+$(REL_PROFILES:%=%-compile): $(REBAR) merge-config
+	env PROFILE=$(@:%-compile=%) $(SCRIPTS)/mix-deps-quiet.sh $(MIX) deps.get
+	env PROFILE=$(@:%-compile=%) $(MIX) compile
+
+.PHONY: render-test-env
+render-test-env:
+	@./scripts/ct/render-env.sh
 
 .PHONY: ct
-ct: $(REBAR)
-	@ENABLE_COVER_COMPILE=1 $(REBAR) ct --name 'test@127.0.0.1' -c -v
+ct: $(REBAR) merge-config render-test-env
+	@env ERL_FLAGS="-kernel prevent_overlapping_partitions false" $(MIX) ct --cover-export-name $(CT_COVER_EXPORT_PREFIX)-ct
 
-APPS=$(shell $(CURDIR)/scripts/find-apps.sh)
+## only check bpapi for enterprise profile because it's a super-set.
+## Compares each committed BPAPI baseline against the newest released tag on its
+## line. Needs git tags, not a build; CI runs it in the sanity-checks job.
+.PHONY: check-bpapi-baselines
+check-bpapi-baselines:
+	./scripts/check-bpapi-baselines.exs
 
-## app/name-ct targets are intended for local tests hence cover is not enabled
-.PHONY: $(APPS:%=%-ct)
+.PHONY: static_checks
+static_checks: $(ELIXIR_COMMON_DEPS)
+	@# the cluster-rpc check reads plugin beams from the shared build tree
+	@env PROFILE=$(PROFILE:%-test=%) $(SCRIPTS)/build-plugins.sh --compile-only
+	@env BPAPI_BUILD_PROFILE=$(PROFILE:%-test=%) \
+	    $(MIX) do \
+	    emqx.xref + dialyzer --mode classic + \
+	    emqx.static_checks + \
+	    emqx.check_cluster_rpc
+	./scripts/check-i18n-style.sh
+	./scripts/check_missing_reboot_apps.exs
+
+# Allow user-set CASES environment variable
+ifneq ($(CASES),)
+CASES_ARG := --cases $(CASES)
+endif
+
+# Allow user-set GROUPS environment variable
+ifneq ($(GROUPS),)
+GROUPS_ARG := --group-paths $(GROUPS)
+endif
+
+CT_MIX_ENV := $(PROFILE)-test
+
+ifeq ($(ENABLE_COVER_COMPILE),1)
+cover_args = --cover-export-name $(CT_COVER_EXPORT_PREFIX)-$(subst /,-,$1)
+else
+cover_args =
+endif
+
+## example:
+## env SUITES=apps/appname/test/test_SUITE.erl CASES=t_foo make apps/appname-ct
 define gen-app-ct-target
-$1-ct:
-	$(REBAR) ct --name 'test@127.0.0.1' -v --suite $(shell $(CURDIR)/scripts/find-suites.sh $1)
+$1-ct: $(REBAR) $(ELIXIR_COMMON_DEPS) merge-config clean-test-cluster-config render-test-env
+	$(eval RESOLVED_SUITES := $(shell $(SCRIPTS)/find-suites.sh $1))
+ifneq ($(RESOLVED_SUITES),)
+	env ERL_FLAGS="-kernel prevent_overlapping_partitions false" \
+	    PROFILE=$(PROFILE)-test \
+	        $(MIX) ct \
+		$(call cover_args,$1) \
+		--suites $(RESOLVED_SUITES) \
+		$(GROUPS_ARG) \
+		$(CASES_ARG)
+else
+	@echo 'No suites found for $1'
+endif
 endef
-$(foreach app,$(APPS),$(eval $(call gen-app-ct-target,$(app))))
+
+define gen-plugin-ct-target
+$1-ct: $(REBAR) $(ELIXIR_COMMON_DEPS) merge-config clean-test-cluster-config render-test-env
+	$(eval RESOLVED_SUITES := $(shell $(SCRIPTS)/find-suites.sh --relative $1))
+ifneq ($(RESOLVED_SUITES),)
+	cd $1 && env ERL_FLAGS="-kernel prevent_overlapping_partitions false" \
+	    TEST=1 \
+	    MIX_ENV=$(CT_MIX_ENV) \
+	    PROFILE=$(PROFILE)-test \
+	        $(MIX) do deps.get + compile --force + emqx.ct \
+		$(call cover_args,$1) \
+		--suites $(RESOLVED_SUITES) \
+		$(GROUPS_ARG) \
+		$(CASES_ARG)
+else
+	@echo 'No suites found for $1'
+endif
+endef
+
+ifneq ($(filter-out plugins-ct plugin-ct,$(filter %-ct,$(MAKECMDGOALS))),)
+app_to_test := $(patsubst %-ct,%,$(filter-out plugins-ct plugin-ct,$(filter %-ct,$(MAKECMDGOALS))))
+$(call DEBUG_INFO,app_to_test $(app_to_test))
+ifneq ($(filter plugins/%,$(app_to_test)),)
+$(eval $(call gen-plugin-ct-target,$(app_to_test)))
+else
+$(eval $(call gen-app-ct-target,$(app_to_test)))
+endif
+endif
 
 ## apps/name-prop targets
-.PHONY: $(APPS:%=%-prop)
 define gen-app-prop-target
 $1-prop:
-	$(REBAR) proper -d test/props -v -m $(shell $(CURDIR)/scripts/find-props.sh $1)
+	$(REBAR) proper -d test/props -v -m $(shell $(SCRIPTS)/find-props.sh $1)
 endef
-$(foreach app,$(APPS),$(eval $(call gen-app-prop-target,$(app))))
+ifneq ($(filter %-prop,$(MAKECMDGOALS)),)
+app_to_test := $(patsubst %-prop,%,$(filter %-prop,$(MAKECMDGOALS)))
+$(call DEBUG_INFO,app_to_test $(app_to_test))
+$(eval $(call gen-app-prop-target,$(app_to_test)))
+endif
+
+.PHONY: ct-suite
+ct-suite: $(REBAR) merge-config clean-test-cluster-config render-test-env
+ifneq ($(TESTCASE),)
+ifneq ($(GROUP),)
+	env PROFILE=$(PROFILE)-test $(MIX) do deps.get + ct --suites $(SUITE) --cases $(TESTCASE) --group-paths $(GROUP)
+else
+	env PROFILE=$(PROFILE)-test $(MIX) do deps.get + ct --suites $(SUITE) --cases $(TESTCASE)
+endif
+else ifneq ($(GROUP),)
+	env PROFILE=$(PROFILE)-test $(MIX) do deps.get + ct --suites $(SUITE) --group-paths $(GROUP)
+else
+	env PROFILE=$(PROFILE)-test $(MIX) do deps.get + ct --suites $(SUITE)
+endif
 
 .PHONY: cover
-cover: $(REBAR)
-	@ENABLE_COVER_COMPILE=1 $(REBAR) cover
+cover:
+	@env PROFILE=$(PROFILE)-test mix cover
 
-.PHONY: coveralls
-coveralls: $(REBAR)
-	@ENABLE_COVER_COMPILE=1 $(REBAR) as test coveralls send
+.PHONY: plugin-%
+plugin-%: PLUGIN_APP_DIR = plugins/$*
+plugin-%:
+	@test -d $(PLUGIN_APP_DIR) || { echo "Error: No such plugin app: $(PLUGIN_APP_DIR)"; exit 1; }
+	@test -f $(PLUGIN_APP_DIR)/mix.exs || { \
+		echo "Error: $(PLUGIN_APP_DIR) does not define mix.exs."; \
+		echo "Ensure it is a monorepo plugin app with Mix support."; \
+		exit 1; \
+	}
+	@grep -q "emqx_plugin:" $(PLUGIN_APP_DIR)/mix.exs || { \
+		echo "Error: $(PLUGIN_APP_DIR) is not an EMQX plugin app (missing :emqx_plugin)."; \
+		exit 1; \
+	}
+	cd "$(PLUGIN_APP_DIR)" && MIX_ENV="$(PROFILE)" PROFILE="$(PROFILE)" $(MIX) do deps.get + emqx.plugin
+
+.PHONY: plugins
+plugins: $(REBAR)
+	@$(SCRIPTS)/build-plugins.sh
+
+.PHONY: plugins-ct
+plugins-ct: $(REBAR) $(ELIXIR_COMMON_DEPS) merge-config clean-test-cluster-config
+	@$(SCRIPTS)/run-plugins-ct.sh
+
+COMMON_DEPS := $(REBAR)
 
 .PHONY: $(REL_PROFILES)
-$(REL_PROFILES:%=%): $(REBAR) get-dashboard
-	@$(REBAR) as $(@) do compile,release
+$(REL_PROFILES:%=%): $(COMMON_DEPS) $(ELIXIR_COMMON_DEPS) mix-deps-get
+	@$(BUILD) $(@) rel
 
-## Not calling rebar3 clean because
-## 1. rebar3 clean relies on rebar3, meaning it reads config, fetches dependencies etc.
-## 2. it's slow
-## NOTE: this does not force rebar3 to fetch new version dependencies
-## make clean-all to delete all fetched dependencies for a fresh start-over
 .PHONY: clean $(PROFILES:%=clean-%)
 clean: $(PROFILES:%=clean-%)
 $(PROFILES:%=clean-%):
-	@if [ -d _build/$(@:clean-%=%) ]; then \
-		rm -rf _build/$(@:clean-%=%)/rel; \
-		find _build/$(@:clean-%=%) -name '*.beam' -o -name '*.so' -o -name '*.app' -o -name '*.appup' -o -name '*.o' -o -name '*.d' -type f | xargs rm -f; \
-	fi
+	@rm -rf _build/$(@:clean-%=%)
 
 .PHONY: clean-all
 clean-all:
+	@rm -f rebar.lock
+	@rm -f mix.lock
+	@rm -rf deps
 	@rm -rf _build
+	@rm -f emqx_dialyzer_*_plt*
+	@rm -rf apps/emqx_dashboard/priv/{www,*.hocon}
+	@rm -rf apps/*/gen_src/*.{erl,hrl,asn1db}
 
 .PHONY: deps-all
 deps-all: $(REBAR) $(PROFILES:%=deps-%)
-
-## deps-<profile> is used in CI scripts to download deps and the
-## share downloads between CI steps and/or copied into containers
-## which may not have the right credentials
-.PHONY: $(PROFILES:%=deps-%)
-$(PROFILES:%=deps-%): $(REBAR) get-dashboard
-	@$(REBAR) as $(@:deps-%=%) get-deps
+	@make clean # ensure clean at the end
 
 .PHONY: xref
-xref: $(REBAR)
-	@$(REBAR) as check xref
+xref:
+	@$(MIX) emqx.xref
 
 .PHONY: dialyzer
-dialyzer: $(REBAR)
-	@$(REBAR) as check dialyzer
+dialyzer:
+	@$(MIX) dialyzer --mode incremental
 
-.PHONY: $(REL_PROFILES:%=relup-%)
-$(REL_PROFILES:%=relup-%): $(REBAR)
-ifneq ($(OS),Windows_NT)
-	@$(BUILD) $(@:relup-%=%) relup
-endif
+## rel target is to create release package
+.PHONY: $(REL_PROFILES:%=%-rel) $(PKG_PROFILES:%=%-rel)
+$(REL_PROFILES:%=%-rel) $(PKG_PROFILES:%=%-rel): $(COMMON_DEPS) $(ELIXIR_COMMON_DEPS)
+	@env ELIXIR_MAKE_TAR=yes PROFILE=$(subst -rel,,$(@)) $(BUILD) $(subst -rel,,$(@)) rel
 
-.PHONY: $(REL_PROFILES:%=%-tar) $(PKG_PROFILES:%=%-tar)
-$(REL_PROFILES:%=%-tar) $(PKG_PROFILES:%=%-tar): $(REBAR) get-dashboard $(CONF_SEGS)
-	@$(BUILD) $(subst -tar,,$(@)) tar
-
-## zip targets depend on the corresponding relup and tar artifacts
-.PHONY: $(REL_PROFILES:%=%-zip)
-define gen-zip-target
-$1-zip: relup-$1 $1-tar
-	@$(BUILD) $1 zip
+## tgz target is to create a release package .tar.gz
+.PHONY: $(REL_PROFILES:%=%-tgz)
+define gen-tgz-target
+$1-tgz: $(COMMON_DEPS) $(ELIXIR_COMMON_DEPS) mix-deps-get merge-config
+	@env $(BUILD) $1 tgz
 endef
-ALL_ZIPS = $(REL_PROFILES) $(PKG_PROFILES)
-$(foreach zt,$(ALL_ZIPS),$(eval $(call gen-zip-target,$(zt))))
+ALL_TGZS = $(REL_PROFILES)
+$(foreach zt,$(ALL_TGZS),$(eval $(call gen-tgz-target,$(zt))))
 
-## A pkg target depend on a regular release profile zip to include relup,
-## and also a -pkg suffixed profile tar (without relup) for making deb/rpm package
+## A pkg target depend on a regular release
 .PHONY: $(PKG_PROFILES)
 define gen-pkg-target
-$1: $(subst -pkg,,$1)-zip $1-tar
-	@$(BUILD) $1 pkg
+$1: $(COMMON_DEPS) $(ELIXIR_COMMON_DEPS) merge-config
+	@env TAR_PKG_DIR=_build/$1 \
+		$(BUILD) $1 pkg
 endef
 $(foreach pt,$(PKG_PROFILES),$(eval $(call gen-pkg-target,$(pt))))
 
 .PHONY: run
-run: $(PROFILE) quickrun
+run: $(PROFILE) run-console
 
-.PHONY: quickrun
-quickrun:
-	./_build/$(PROFILE)/rel/emqx/bin/emqx console
+.PHONY: run-iex
+run-iex: $(PROFILE) run-console-iex
 
-include docker.mk
+.PHONY: run-console
+run-console:
+	_build/$(PROFILE)/rel/emqx/bin/emqx console
+
+.PHONY: run-console-iex
+run-console-iex:
+	_build/$(PROFILE)/rel/emqx/bin/emqx console --iex
+
+.PHONY: repl
+repl:
+	iex -S mix app.start --no-start
+
+## Take the currently set PROFILE
+.PHONY: docker
+docker:
+	@$(BUILD) $(PROFILE) docker
+
+## docker target is to create docker instructions
+.PHONY: $(REL_PROFILES:%=%-docker)
+define gen-docker-target
+$1-docker: $(COMMON_DEPS)
+	@$(BUILD) $1 docker
+endef
+ALL_DOCKERS = $(REL_PROFILES)
+$(foreach zt,$(ALL_DOCKERS),$(eval $(call gen-docker-target,$(zt))))
+
+.PHONY:
+merge-config:
+	@$(SCRIPTS)/merge-config.escript
+
+.PHONY: pre-compile
+pre-compile:
+	@$(SCRIPTS)/pre-compile.sh $(PROFILE)
+
+.PHONY: fmt
+fmt: $(REBAR)
+	@find . \( -name '*.app.src' -o \
+                    -name '*.erl' -o \
+                    -name '*.hrl' -o \
+                    -name 'rebar.config' -o \
+                    -name '*.eterm' -o \
+                    -name '*.escript' \) \
+                    -not -path '*/apps/emqx_bridge_zerobus/src/generated/*' \
+                    -not -path '*/apps/emqx_gcp_protos/src/generated/*' \
+                    -not -path '*/apps/emqx_exhook/src/pb/*' \
+                    -not -path '*/_build/*' \
+                    -not -path '*/deps/*' \
+                    -not -path '*/_checkouts/*' \
+                    -type f \
+		| xargs $(SCRIPTS)/erlfmt -w
+	@$(SCRIPTS)/erlfmt -w 'elvis.config'
+	@$(SCRIPTS)/erlfmt -w 'bin/nodetool'
+	@mix format
+
+.PHONY: fmt-diff
+fmt-diff:
+	@env ERLFMT_WRITE=true ./scripts/git-hook-pre-commit.sh
+
+.PHONY: clean-test-cluster-config
+clean-test-cluster-config:
+	@rm -f apps/emqx_conf/data/configs/cluster.hocon || true
+
+.PHONY: spellcheck
+spellcheck:
+	./scripts/spellcheck/spellcheck.sh _build/docgen/$(PROFILE)/schema-en.json
+
+.PHONY: nothing
+nothing:
+	@:

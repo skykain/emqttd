@@ -1,0 +1,1240 @@
+%%--------------------------------------------------------------------
+%% Copyright (c) 2023-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
+%%--------------------------------------------------------------------
+-module(emqx_audit_api_SUITE).
+-compile(export_all).
+-compile(nowarn_export_all).
+
+-include_lib("emqx_dashboard/include/emqx_dashboard.hrl").
+-include_lib("eunit/include/eunit.hrl").
+-include_lib("common_test/include/ct.hrl").
+-include_lib("emqx/include/logger.hrl").
+-include("emqx_audit.hrl").
+-include_lib("snabbkaffe/include/snabbkaffe.hrl").
+
+all() ->
+    [
+        {group, audit, [sequence]}
+    ].
+
+groups() ->
+    [
+        {audit, [sequence], common_tests()}
+    ].
+
+common_tests() ->
+    emqx_common_test_helpers:all(?MODULE).
+
+-define(CONF_DEFAULT, #{
+    node =>
+        #{
+            name => "emqx1@127.0.0.1",
+            cookie => "emqxsecretcookie",
+            data_dir => "data"
+        },
+    log => #{
+        audit =>
+            #{
+                enable => true,
+                ignore_high_frequency_request => true,
+                level => info,
+                cache_size => 15,
+                rotation_count => 2,
+                rotation_size => "10MB",
+                time_offset => "system"
+            }
+    }
+}).
+
+init_per_suite(Config) ->
+    Apps = emqx_cth_suite:start(
+        [
+            emqx_ctl,
+            emqx,
+            {emqx_conf, #{
+                config => ?CONF_DEFAULT,
+                schema_mod => emqx_conf_schema
+            }},
+            emqx_plugins,
+            emqx_modules,
+            emqx_license,
+            emqx_audit,
+            emqx_management,
+            emqx_mgmt_api_test_util:emqx_dashboard(),
+            emqx_dashboard_sso
+        ],
+        #{work_dir => emqx_cth_suite:work_dir(Config)}
+    ),
+    [{apps, Apps} | Config].
+
+end_per_suite(Config) ->
+    Apps = ?config(apps, Config),
+    ok = emqx_cth_suite:stop(Apps),
+    ok.
+
+t_http_api(_) ->
+    process_flag(trap_exit, true),
+    AuditPath = emqx_mgmt_api_test_util:api_path(["audit"]),
+    AuthHeader = emqx_mgmt_api_test_util:auth_header_(),
+    StartAt = erlang:system_time(microsecond),
+    {ok, Zones} = emqx_mgmt_api_configs_SUITE:get_global_zone(),
+    NewZones = emqx_utils_maps:deep_put([<<"mqtt">>, <<"max_qos_allowed">>], Zones, 1),
+    {ok, #{<<"mqtt">> := Res}} = emqx_mgmt_api_configs_SUITE:update_global_zone(NewZones),
+    ?assertMatch(#{<<"max_qos_allowed">> := 1}, Res),
+    Query =
+        lists:flatten(
+            io_lib:format(
+                "from=rest_api&operation_id=/configs/global_zone&gte_created_at=~B&limit=1",
+                [StartAt]
+            )
+        ),
+    Res1 = wait_for_matching_audit_entry(AuditPath, Query, AuthHeader, 2000),
+    ?assertMatch(
+        #{
+            <<"data">> := [
+                #{
+                    <<"from">> := <<"rest_api">>,
+                    <<"operation_id">> := <<"/configs/global_zone">>,
+                    <<"source_ip">> := <<"127.0.0.1">>,
+                    <<"source">> := _,
+                    <<"http_request">> := #{
+                        <<"method">> := <<"put">>,
+                        <<"body">> := _,
+                        <<"bindings">> := _,
+                        <<"headers">> := #{<<"authorization">> := <<"******">>}
+                    },
+                    <<"http_status_code">> := 200,
+                    <<"operation_result">> := <<"success">>,
+                    <<"operation_type">> := <<"configs">>
+                }
+            ]
+        },
+        emqx_utils_json:decode(Res1)
+    ),
+    ok.
+
+-doc """
+GET /audit must not 500 when a page includes a record written by an
+SSO-authenticated user, whose `auth_meta.source` is `{Backend, Name}`
+instead of a plain binary.
+""".
+t_http_api_sso_source(_) ->
+    process_flag(trap_exit, true),
+    SsoBackend = saml,
+    SsoUser = <<"jackson-http@example.com">>,
+    Desc = <<"desc">>,
+    SsoUsername = ?SSO_USERNAME(SsoBackend, SsoUser),
+    {ok, _} = emqx_dashboard_admin:add_sso_user(SsoBackend, SsoUser, ?ROLE_SUPERUSER, Desc),
+    {ok, #{role := ?ROLE_SUPERUSER, token := SsoToken}} =
+        emqx_dashboard_admin:sign_token(SsoUsername, <<>>),
+    SsoAuthHeader = {"Authorization", "Bearer " ++ binary_to_list(SsoToken)},
+    StartAt = erlang:system_time(microsecond),
+    {ok, Zones} = emqx_mgmt_api_configs_SUITE:get_global_zone(),
+    NewZones = emqx_utils_maps:deep_put([<<"mqtt">>, <<"max_qos_allowed">>], Zones, 1),
+    ConfigsPath = emqx_mgmt_api_test_util:api_path(["configs", "global_zone"]),
+    {ok, _} = emqx_mgmt_api_test_util:request_api(
+        put, ConfigsPath, "", SsoAuthHeader, NewZones
+    ),
+    AuditPath = emqx_mgmt_api_test_util:api_path(["audit"]),
+    AuthHeader = emqx_mgmt_api_test_util:auth_header_(),
+    Query =
+        lists:flatten(
+            io_lib:format(
+                "from=dashboard&operation_id=/configs/global_zone&gte_created_at=~B&limit=1",
+                [StartAt]
+            )
+        ),
+    %% Before the fix, this GET fails with 500 (invalid json term) because
+    %% `format/1` passed the tuple `source` straight to the JSON encoder.
+    Res = wait_for_matching_audit_entry(AuditPath, Query, AuthHeader, 2000),
+    ?assertMatch(
+        #{
+            <<"data">> := [
+                #{
+                    <<"operation_id">> := <<"/configs/global_zone">>,
+                    <<"source">> := <<"saml:jackson-http@example.com">>
+                }
+            ]
+        },
+        emqx_utils_json:decode(Res)
+    ),
+    ok.
+
+-doc """
+GET /audit must not 500 when a page includes a record whose `source' is the
+bare SSO backend atom (e.g. `oidc'), which `POST /sso/login/:backend' sets
+as `log_source' during pre-authentication, before any user identity is
+known. Regression test for emqx/emqx#18711.
+""".
+t_http_api_sso_login_pre_auth_source(_) ->
+    StartAt = erlang:system_time(microsecond),
+    LoginPath = emqx_mgmt_api_test_util:api_path(["sso", "login", "oidc"]),
+    ?assertMatch(
+        {ok, 404, _},
+        emqx_mgmt_api_test_util:request_api_with_body(
+            post, LoginPath, #{<<"backend">> => <<"oidc">>}
+        )
+    ),
+    AuditPath = emqx_mgmt_api_test_util:api_path(["audit"]),
+    AuthHeader = emqx_mgmt_api_test_util:auth_header_(),
+    Query =
+        lists:flatten(
+            io_lib:format(
+                "from=dashboard&gte_created_at=~B&limit=1",
+                [StartAt]
+            )
+        ),
+    %% Before the fix, this GET fails with 500 because `format/1' passes the
+    %% bare atom `source' to `emqx_dashboard_admin:format_username/1', which
+    %% has no clause for it.
+    Res = wait_for_matching_audit_entry(AuditPath, Query, AuthHeader, 2000),
+    ?assertMatch(
+        #{
+            <<"data">> := [
+                #{<<"source">> := <<"oidc">>}
+            ]
+        },
+        emqx_utils_json:decode(Res)
+    ),
+    ok.
+
+-doc """
+GET /audit returns 403 to namespaced dashboard users (administrator and viewer)
+and namespaced API keys. A global administrator still reads the audit log.
+""".
+t_http_api_rejects_namespaced_principals(_) ->
+    AuditPath = emqx_mgmt_api_test_util:api_path(["audit"]),
+    NsAdmin = ns_dashboard_auth_header(<<"audit_ns_admin">>, <<"ns:ns1::administrator">>),
+    NsViewer = ns_dashboard_auth_header(<<"audit_ns_viewer">>, <<"ns:ns1::viewer">>),
+    NsApiKey = ns_api_key_auth_header(<<"audit_ns_key">>, <<"ns:ns1::administrator">>),
+    lists:foreach(
+        fun(AuthHeader) ->
+            ?assertMatch(
+                {403, #{<<"code">> := <<"UNAUTHORIZED_ROLE">>}},
+                emqx_mgmt_api_test_util:simple_request(#{
+                    method => get,
+                    url => AuditPath,
+                    auth_header => AuthHeader
+                })
+            )
+        end,
+        [NsAdmin, NsViewer, NsApiKey]
+    ),
+    ?assertMatch(
+        {200, #{<<"data">> := [_ | _]}},
+        emqx_mgmt_api_test_util:simple_request(#{
+            method => get,
+            url => AuditPath,
+            auth_header => emqx_mgmt_api_test_util:auth_header_()
+        })
+    ),
+    ok.
+
+-doc "Record the generated backup filename and retain restore and delete request details.".
+t_backup_export_audit(_) ->
+    StartAt = erlang:system_time(microsecond),
+    ExportPath = emqx_mgmt_api_test_util:api_path(["data", "export"]),
+    Auth = emqx_mgmt_api_test_util:auth_header_(),
+    Params = #{<<"root_keys">> => [<<"mqtt">>], <<"table_sets">> => []},
+    {ok, ExportBody} = emqx_mgmt_api_test_util:request_api(post, ExportPath, [], Auth, Params),
+    #{<<"filename">> := Filename} = emqx_utils_json:decode(ExportBody),
+    try
+        ExportAudit = latest_audit_record(
+            "operation_id=/data/export&operation_result=success", StartAt
+        ),
+        ?assertMatch(
+            #{<<"operation_details">> := #{<<"filename">> := Filename}},
+            ExportAudit
+        ),
+        ?assertEqual(
+            nomatch,
+            binary:match(maps:get(<<"body">>, maps:get(<<"http_request">>, ExportAudit)), Filename)
+        ),
+        ImportPath = emqx_mgmt_api_test_util:api_path(["data", "import"]),
+        {ok, _} = emqx_mgmt_api_test_util:request_api(
+            post, ImportPath, [], Auth, #{<<"filename">> => Filename}
+        ),
+        ImportAudit = latest_audit_record(
+            "operation_id=/data/import&operation_result=success", StartAt
+        ),
+        #{<<"http_request">> := #{<<"body">> := ImportBody}} = ImportAudit,
+        ?assertNotEqual(nomatch, binary:match(ImportBody, Filename)),
+        ?assertNot(maps:is_key(<<"operation_details">>, ImportAudit))
+    after
+        DeletePath = emqx_mgmt_api_test_util:api_path(["data", "files", binary_to_list(Filename)]),
+        {ok, _} = emqx_mgmt_api_test_util:request_api(delete, DeletePath, Auth)
+    end,
+    DeleteAudit = latest_audit_record(
+        "operation_id=/data/files/:filename&operation_result=success", StartAt
+    ),
+    ?assertMatch(
+        #{<<"http_request">> := #{<<"bindings">> := #{<<"filename">> := Filename}}},
+        DeleteAudit
+    ),
+    ?assertNot(maps:is_key(<<"operation_details">>, DeleteAudit)).
+
+-doc "A rejected backup export does not report a generated backup filename.".
+t_backup_export_failed_audit(_) ->
+    StartAt = erlang:system_time(microsecond),
+    ExportPath = emqx_mgmt_api_test_util:api_path(["data", "export"]),
+    Auth = emqx_mgmt_api_test_util:auth_header_(),
+    ?assertMatch(
+        {error, {"HTTP/1.1", 400, _}},
+        emqx_mgmt_api_test_util:request_api(
+            post, ExportPath, [], Auth, #{<<"root_keys">> => [<<"unknown_root_key">>]}
+        )
+    ),
+    Audit = latest_audit_record("operation_id=/data/export&operation_result=failure", StartAt),
+    ?assertNot(maps:is_key(<<"operation_details">>, Audit)).
+
+t_disabled(_) ->
+    Enable = [log, audit, enable],
+    ?assertEqual(true, emqx:get_config(Enable)),
+    AuditPath = emqx_mgmt_api_test_util:api_path(["audit"]),
+    AuthHeader = emqx_mgmt_api_test_util:auth_header_(),
+    {ok, _} = emqx_mgmt_api_test_util:request_api(get, AuditPath, "limit=1", AuthHeader),
+    Size1 = mnesia:table_info(emqx_audit, size),
+
+    {ok, Logs} = emqx_mgmt_api_configs_SUITE:get_config("log"),
+    Logs1 = emqx_utils_maps:deep_put([<<"audit">>, <<"cache_size">>], Logs, 199),
+    NewLogs = emqx_utils_maps:deep_put([<<"audit">>, <<"enable">>], Logs1, false),
+    {ok, _} = emqx_mgmt_api_configs_SUITE:update_config("log", NewLogs),
+    {ok, GetLog1} = emqx_mgmt_api_configs_SUITE:get_config("log"),
+    ?assertEqual(NewLogs, GetLog1),
+    ?assertMatch(
+        {error, _},
+        emqx_mgmt_api_test_util:request_api(get, AuditPath, "limit=1", AuthHeader)
+    ),
+
+    Size2 = mnesia:table_info(emqx_audit, size),
+    %% Record the audit disable action, so the size + 1
+    ?assertEqual(Size1 + 1, Size2),
+
+    {ok, Zones} = emqx_mgmt_api_configs_SUITE:get_global_zone(),
+    NewZones = emqx_utils_maps:deep_put([<<"mqtt">>, <<"max_topic_levels">>], Zones, 111),
+    {ok, #{<<"mqtt">> := Res}} = emqx_mgmt_api_configs_SUITE:update_global_zone(NewZones),
+    ?assertMatch(#{<<"max_topic_levels">> := 111}, Res),
+    Size3 = mnesia:table_info(emqx_audit, size),
+    %% Don't record mqtt update request.
+    ?assertEqual(Size2, Size3),
+    %% enabled again
+    {ok, _} = emqx_mgmt_api_configs_SUITE:update_config("log", Logs1),
+    {ok, GetLog2} = emqx_mgmt_api_configs_SUITE:get_config("log"),
+    ?assertEqual(Logs1, GetLog2),
+    Size4 = mnesia:table_info(emqx_audit, size),
+    ?assertEqual(Size3 + 1, Size4),
+    ok.
+
+t_cli(_Config) ->
+    Size = mnesia:table_info(emqx_audit, size),
+    TimeInt = erlang:system_time(microsecond) - 1000,
+    Time = integer_to_list(TimeInt),
+    DateStr = calendar:system_time_to_rfc3339(TimeInt, [{unit, microsecond}]),
+    Date = emqx_http_lib:uri_encode(DateStr),
+    ok = emqx_ctl:run_command(["conf", "show", "log"]),
+    AuditPath = emqx_mgmt_api_test_util:api_path(["audit"]),
+    AuthHeader = emqx_mgmt_api_test_util:auth_header_(),
+    {ok, Res} = emqx_mgmt_api_test_util:request_api(get, AuditPath, "limit=1", AuthHeader),
+    #{<<"data">> := Data} = emqx_utils_json:decode(Res),
+    ?assertMatch(
+        [
+            #{
+                <<"from">> := <<"cli">>,
+                <<"operation_id">> := <<"">>,
+                <<"source_ip">> := <<"">>,
+                <<"operation_type">> := <<"conf">>,
+                <<"args">> := [<<"show">>, <<"log">>],
+                <<"node">> := _,
+                <<"source">> := <<"">>,
+                <<"http_request">> := <<"">>
+            }
+        ],
+        Data
+    ),
+    [ShowLogEntry] = Data,
+    %% check create at is valid
+    [#{<<"created_at">> := CreateAtRaw}] = Data,
+    CreateAt = calendar:rfc3339_to_system_time(binary_to_list(CreateAtRaw), [{unit, microsecond}]),
+    ?assert(CreateAt > TimeInt, CreateAtRaw),
+    ?assert(CreateAt < TimeInt + 5000000, CreateAtRaw),
+    %% check cli filter
+    {ok, Res1} = emqx_mgmt_api_test_util:request_api(get, AuditPath, "from=cli", AuthHeader),
+    #{<<"data">> := Data1} = emqx_utils_json:decode(Res1),
+    ?assertMatch(
+        [ShowLogEntry, #{<<"operation_type">> := <<"emqx">>, <<"args">> := [<<"start">>]}],
+        Data1
+    ),
+    {ok, Res2} = emqx_mgmt_api_test_util:request_api(
+        get, AuditPath, "from=erlang_console", AuthHeader
+    ),
+    ?assertMatch(#{<<"data">> := []}, emqx_utils_json:decode(Res2)),
+
+    %% check created_at filter microsecond
+    {ok, Res3} = emqx_mgmt_api_test_util:request_api(
+        get, AuditPath, "gte_created_at=" ++ Time, AuthHeader
+    ),
+    #{<<"data">> := Data3} = emqx_utils_json:decode(Res3),
+    ?assertEqual(1, erlang:length(Data3)),
+    %% check created_at filter rfc3339
+    {ok, Res31} = emqx_mgmt_api_test_util:request_api(
+        get, AuditPath, "gte_created_at=" ++ Date, AuthHeader
+    ),
+    ?assertEqual(Res3, Res31),
+    %% check created_at filter millisecond
+    TimeMs = integer_to_list(TimeInt div 1000),
+    {ok, Res32} = emqx_mgmt_api_test_util:request_api(
+        get, AuditPath, "gte_created_at=" ++ TimeMs, AuthHeader
+    ),
+    ?assertEqual(Res3, Res32),
+
+    %% check created_at filter microsecond
+    {ok, Res4} = emqx_mgmt_api_test_util:request_api(
+        get, AuditPath, "lte_created_at=" ++ Time, AuthHeader
+    ),
+    #{<<"data">> := Data4} = emqx_utils_json:decode(Res4),
+    ?assertEqual(Size, erlang:length(Data4)),
+
+    %% check created_at filter rfc3339
+    {ok, Res41} = emqx_mgmt_api_test_util:request_api(
+        get, AuditPath, "lte_created_at=" ++ Date, AuthHeader
+    ),
+    ?assertEqual(Res4, Res41),
+    %% check created_at filter millisecond
+    {ok, Res42} = emqx_mgmt_api_test_util:request_api(
+        get, AuditPath, "lte_created_at=" ++ TimeMs, AuthHeader
+    ),
+    ?assertEqual(Res4, Res42),
+
+    %% check duration_ms filter
+    {ok, Res5} = emqx_mgmt_api_test_util:request_api(
+        get, AuditPath, "gte_duration_ms=0", AuthHeader
+    ),
+    #{<<"data">> := Data5} = emqx_utils_json:decode(Res5),
+    ?assertEqual(Size + 1, erlang:length(Data5)),
+    {ok, Res6} = emqx_mgmt_api_test_util:request_api(
+        get, AuditPath, "lte_duration_ms=-1", AuthHeader
+    ),
+    ?assertMatch(#{<<"data">> := []}, emqx_utils_json:decode(Res6)),
+    ok.
+
+t_cli_redaction(_Config) ->
+    Secret = "12345678901234567890123456789012",
+    Name = "audit-redaction-key",
+    ok = emqx_ctl:run_command([
+        "api_keys",
+        "add",
+        "--name",
+        Name,
+        "--api-secret",
+        Secret,
+        "--role",
+        "viewer"
+    ]),
+    AuditPath = emqx_mgmt_api_test_util:api_path(["audit"]),
+    AuthHeader = emqx_mgmt_api_test_util:auth_header_(),
+    {ok, Res} = emqx_mgmt_api_test_util:request_api(get, AuditPath, "limit=1", AuthHeader),
+    ?assertMatch(
+        #{
+            <<"data">> := [
+                #{
+                    <<"operation_type">> := <<"api_keys">>,
+                    <<"args">> := [
+                        <<"add">>,
+                        <<"--name">>,
+                        <<"audit-redaction-key">>,
+                        <<"--api-secret">>,
+                        <<"******">>,
+                        <<"--role">>,
+                        <<"viewer">>
+                    ]
+                }
+            ]
+        },
+        emqx_utils_json:decode(Res)
+    ),
+    {ok, _} = emqx_mgmt_auth:delete(iolist_to_binary(Name)),
+    ok.
+
+-doc """
+Regression test for #18588: `bin/node_dump' used to drive the node through
+`emqx eval', which is audited as `eval_erl' carrying the raw Erlang
+expression. Running the `node_dump' CLI command must write ordinary `cli'
+audit records identifying the sub-command, and must not write any
+`eval_erl' record.
+""".
+t_node_dump(_Config) ->
+    %% Need to explicitly load the commands because they are loaded by `emqx_machine'.
+    ok = emqx_mgmt_cli:load(),
+    %% Sub-command output content is covered by `emqx_mgmt_cli_SUITE:t_node_dump/1';
+    %% this only needs each call to succeed, to trigger the audit write below.
+    lists:foreach(
+        fun(SubCmd) ->
+            ?assertEqual(ok, emqx_ctl:run_command(["node_dump", SubCmd]), SubCmd)
+        end,
+        ["sys_info", "app_env", "conf"]
+    ),
+    AuditPath = emqx_mgmt_api_test_util:api_path(["audit"]),
+    AuthHeader = emqx_mgmt_api_test_util:auth_header_(),
+    {ok, Res} = emqx_mgmt_api_test_util:request_api(
+        get, AuditPath, "operation_type=node_dump&limit=10", AuthHeader
+    ),
+    #{<<"data">> := Data} = emqx_utils_json:decode(Res),
+    ?assertEqual(3, length(Data)),
+    lists:foreach(
+        fun(#{<<"from">> := From, <<"operation_type">> := OpType}) ->
+            ?assertEqual(<<"cli">>, From),
+            ?assertEqual(<<"node_dump">>, OpType)
+        end,
+        Data
+    ),
+    ?assertEqual(
+        lists:sort([<<"app_env">>, <<"conf">>, <<"sys_info">>]),
+        lists:sort([Arg || #{<<"args">> := [Arg]} <- Data])
+    ),
+    %% no `eval_erl' record was written for any of the sub-commands
+    {ok, ResEval} = emqx_mgmt_api_test_util:request_api(
+        get, AuditPath, "operation_type=eval_erl", AuthHeader
+    ),
+    ?assertMatch(#{<<"data">> := []}, emqx_utils_json:decode(ResEval)),
+    ok.
+
+-doc """
+`emqx ctl plugins' arguments are not secrets: the audit record must keep the
+plugin name-vsn and the `--cluster' flag instead of masking them (emqx#18717).
+""".
+t_cli_plugins_redaction(_Config) ->
+    NameVsn = "audit_redaction_plugin-1.0.0",
+    AuditPath = emqx_mgmt_api_test_util:api_path(["audit"]),
+    AuthHeader = emqx_mgmt_api_test_util:auth_header_(),
+    ok = emqx_ctl:run_command(["plugins", "install", NameVsn]),
+    {ok, Res} = emqx_mgmt_api_test_util:request_api(get, AuditPath, "limit=1", AuthHeader),
+    ?assertMatch(
+        #{
+            <<"data">> := [
+                #{
+                    <<"operation_type">> := <<"plugins">>,
+                    <<"args">> := [
+                        <<"install">>,
+                        <<"audit_redaction_plugin-1.0.0">>
+                    ]
+                }
+            ]
+        },
+        emqx_utils_json:decode(Res)
+    ),
+    ok = emqx_ctl:run_command(["plugins", "install", NameVsn, "--cluster"]),
+    {ok, Res2} = emqx_mgmt_api_test_util:request_api(get, AuditPath, "limit=1", AuthHeader),
+    ?assertMatch(
+        #{
+            <<"data">> := [
+                #{
+                    <<"operation_type">> := <<"plugins">>,
+                    <<"args">> := [
+                        <<"install">>,
+                        <<"audit_redaction_plugin-1.0.0">>,
+                        <<"--cluster">>
+                    ]
+                }
+            ]
+        },
+        emqx_utils_json:decode(Res2)
+    ),
+    ok.
+
+t_max_size(_Config) ->
+    {ok, _} = emqx:update_config([log, audit, cache_size], 999),
+    %% Make sure this process is using latest cache_size.
+    ?assertEqual(ignore, gen_server:call(emqx_audit, whatever)),
+    SizeFun =
+        fun() ->
+            AuditPath = emqx_mgmt_api_test_util:api_path(["audit"]),
+            AuthHeader = emqx_mgmt_api_test_util:auth_header_(),
+            Limit = "limit=1000",
+            {ok, Res} = emqx_mgmt_api_test_util:request_api(get, AuditPath, Limit, AuthHeader),
+            #{<<"data">> := Data} = emqx_utils_json:decode(Res),
+            erlang:length(Data)
+        end,
+    InitSize = SizeFun(),
+    lists:foreach(
+        fun(_) ->
+            ok = emqx_ctl:run_command(["conf", "show", "log"])
+        end,
+        lists:duplicate(100, 1)
+    ),
+    _ = mnesia:dump_log(),
+    LogCount = wait_for_dirty_write_log_done(1500),
+    Size1 = SizeFun(),
+    ?assert(Size1 - InitSize >= 100, #{
+        api => Size1,
+        init => InitSize,
+        log_size => LogCount,
+        config => emqx:get_config([log, audit, cache_size])
+    }),
+    {ok, _} = emqx:update_config([log, audit, cache_size], 10),
+    %% wait for clean_expired
+    timer:sleep(250),
+    ExpectSize = emqx:get_config([log, audit, cache_size]),
+    Size2 = SizeFun(),
+    ?assertEqual(ExpectSize, Size2, {sys:get_state(emqx_audit)}),
+    ok.
+
+-doc """
+The audit log records the `POST /license` request body as `******`
+so the license key does not appear in cleartext in `GET /audit`.
+""".
+t_license_key_redacted(_) ->
+    StartAt = erlang:system_time(microsecond),
+    AuthHeader = emqx_mgmt_api_test_util:auth_header_(),
+    LicensePath = emqx_mgmt_api_test_util:api_path(["license"]),
+    {ok, _} = emqx_mgmt_api_test_util:request_api(
+        post, LicensePath, "", AuthHeader, #{<<"key">> => <<"default">>}
+    ),
+    AuditPath = emqx_mgmt_api_test_util:api_path(["audit"]),
+    Query =
+        lists:flatten(
+            io_lib:format(
+                "operation_id=/license&gte_created_at=~B&limit=1",
+                [StartAt]
+            )
+        ),
+    Res = wait_for_matching_audit_entry(AuditPath, Query, AuthHeader, 2000),
+    ?assertMatch(
+        #{
+            <<"data">> := [
+                #{
+                    <<"operation_id">> := <<"/license">>,
+                    <<"http_request">> := #{<<"method">> := <<"post">>, <<"body">> := _}
+                }
+            ]
+        },
+        emqx_utils_json:decode(Res)
+    ),
+    #{<<"data">> := [#{<<"http_request">> := #{<<"body">> := AuditBody}}]} =
+        emqx_utils_json:decode(Res),
+    %% the recorded body is redacted: no license key, only the redaction mark
+    ?assertEqual(nomatch, binary:match(AuditBody, <<"default">>), AuditBody),
+    ?assertNotEqual(nomatch, binary:match(AuditBody, <<"******">>), AuditBody),
+    ok.
+
+-doc """
+Regression test for #18534: an audit event that `to_audit/1' has no
+clause for must not crash the ?AUDIT caller — audit events are
+emitted from within cluster_rpc transactions and CLI commands, where
+a raise breaks the audited operation itself.
+""".
+t_malformed_event_does_not_crash(_) ->
+    ?assertEqual(true, emqx:get_config([log, audit, enable])),
+    ?assertMatch({ok, _}, logger_config:get(logger, emqx_audit)),
+    ?assertEqual(ok, ?AUDIT(info, #{from => bogus_from, cmd => bogus})),
+    ok.
+
+-doc """
+SSO MFA audit bodies retain only the non-secret identity fields. Unknown
+credential fields under the SSO MFA operation namespace must be redacted by
+position, so adding a new MFA credential cannot reintroduce an audit leak.
+""".
+t_sso_mfa_body_redacted_by_position(_) ->
+    Now = erlang:monotonic_time(),
+    Meta = #{
+        method => post,
+        code => 200,
+        operation_id => <<"/sso/mfa/future_challenge">>,
+        headers => #{},
+        bindings => #{},
+        body => #{
+            <<"username">> => <<"mfa-audit-user">>,
+            <<"backend">> => <<"ldap">>,
+            <<"future_credential">> => <<"file://credential">>,
+            <<"nested_credential">> => #{<<"value">> => <<"must-not-survive">>}
+        },
+        req_start => Now,
+        req_end => Now
+    },
+    Req = #{headers => #{}, peer => {{127, 0, 0, 1}, 18083}},
+    #{http_request := #{body := Body}} = emqx_dashboard_audit:log_meta(60, Meta, Req),
+    ?assertEqual(<<"mfa-audit-user">>, maps:get(<<"username">>, Body)),
+    ?assertEqual(<<"ldap">>, maps:get(<<"backend">>, Body)),
+    ?assertEqual(<<"******">>, maps:get(<<"future_credential">>, Body)),
+    ?assertEqual(<<"******">>, maps:get(<<"nested_credential">>, Body)),
+    ok.
+
+-doc """
+SCRAM verification request bodies contain authentication material and are
+redacted as a whole before the event reaches either persistence sink.
+""".
+t_scram_verify_body_redacted(_) ->
+    Now = erlang:monotonic_time(),
+    Meta = #{
+        method => post,
+        code => 200,
+        operation_id => <<"/login/verify">>,
+        headers => #{},
+        bindings => #{},
+        body => #{
+            <<"challenge_id">> => <<"scram-challenge-id">>,
+            <<"combined_nonce">> => <<"client-and-server-nonce">>,
+            <<"client_proof">> => <<"client-proof">>,
+            <<"mfa_token">> => <<"123456">>
+        },
+        req_start => Now,
+        req_end => Now
+    },
+    Req = #{headers => #{}, peer => {{127, 0, 0, 1}, 18083}},
+    #{http_request := #{body := <<"******">>}} =
+        emqx_dashboard_audit:log_meta(60, Meta, Req),
+    #{http_request := #{body := <<"******">>}} =
+        emqx_dashboard_audit:log_meta(60, Meta#{body => [<<"not-a-map">>]}, Req),
+    FailureMeta = Meta#{
+        code => 400,
+        failure => #{code => 'BAD_REQUEST', message => <<"review-synthetic-proof">>}
+    },
+    #{
+        http_request := #{body := <<"******">>},
+        failure := #{code := 'BAD_REQUEST', message := <<"******">>}
+    } = emqx_dashboard_audit:log_meta(60, FailureMeta, Req),
+    %% A failure that is not a structured map is still redacted as a whole.
+    #{failure := <<"******">>} =
+        emqx_dashboard_audit:log_meta(
+            60, FailureMeta#{failure => <<"review-synthetic-proof">>}, Req
+        ),
+    ok.
+
+-doc """
+A successful SCRAM login must redact the submitted client proof before the
+audit event is stored. Neither the raw Mnesia record nor GET /audit may retain
+any field from the verification request body.
+""".
+t_scram_client_proof_redacted(_) ->
+    Username = <<"scram_audit_user">>,
+    Password = <<"scramAuditP@ss1">>,
+    ClientNonce = <<"auditClientNonce1234567890">>,
+    {ok, _} = emqx_dashboard_admin:add_user(
+        Username, Password, ?ROLE_SUPERUSER, <<"SCRAM audit test user">>
+    ),
+    try
+        StartAt = erlang:system_time(microsecond),
+        {ok, 200, Challenge} = request_api_without_auth(
+            post,
+            emqx_mgmt_api_test_util:api_path(["login", "challenge"]),
+            #{username => Username, client_nonce => ClientNonce}
+        ),
+        ChallengeId = maps:get(<<"challenge_id">>, Challenge),
+        ServerNonce = maps:get(<<"server_nonce">>, Challenge),
+        CombinedNonce = <<ClientNonce/binary, ServerNonce/binary>>,
+        Proof = emqx_dashboard_scram:client_proof(
+            Username,
+            ClientNonce,
+            ServerNonce,
+            base64:decode(maps:get(<<"salt">>, Challenge)),
+            maps:get(<<"iterations">>, Challenge),
+            Password
+        ),
+        EncodedProof = base64:encode(Proof),
+        {ok, 200, #{<<"token">> := _}} = request_api_without_auth(
+            post,
+            emqx_mgmt_api_test_util:api_path(["login", "verify"]),
+            #{
+                challenge_id => ChallengeId,
+                combined_nonce => CombinedNonce,
+                client_proof => EncodedProof
+            }
+        ),
+        AuditPath = emqx_mgmt_api_test_util:api_path(["audit"]),
+        AuthHeader = emqx_mgmt_api_test_util:auth_header_(),
+        Query = lists:flatten(
+            io_lib:format(
+                "from=dashboard&source=~ts&operation_id=/login/verify&gte_created_at=~B&limit=1",
+                [Username, StartAt]
+            )
+        ),
+        Response = wait_for_matching_audit_entry(AuditPath, Query, AuthHeader, 2000),
+        #{
+            <<"data">> := [
+                #{
+                    <<"source">> := Username,
+                    <<"operation_id">> := <<"/login/verify">>,
+                    <<"operation_type">> := <<"login">>,
+                    <<"operation_result">> := <<"success">>,
+                    <<"http_status_code">> := 200,
+                    <<"http_method">> := <<"post">>,
+                    <<"http_request">> := #{<<"body">> := ApiBody}
+                }
+            ]
+        } = emqx_utils_json:decode(Response),
+        assert_scram_audit_body(ApiBody, EncodedProof, ChallengeId, CombinedNonce),
+        #?AUDIT{http_request = #{body := StoredBody}} =
+            find_stored_audit_entry(Username, StartAt),
+        assert_scram_audit_body(StoredBody, EncodedProof, ChallengeId, CombinedNonce)
+    after
+        _ = emqx_dashboard_admin:remove_user(Username)
+    end.
+
+-doc """
+A rejected SCRAM proof is answered by the handler, which does not populate the
+audit `failure' field. The redaction of that field therefore cannot hide the
+handler's error diagnostics: the outcome is carried by operation_result and
+http_status_code, while the submitted body stays redacted.
+""".
+t_scram_bad_proof_redacts_body_without_failure(_) ->
+    Username = <<"scram_bad_proof_user">>,
+    Password = <<"scramAuditP@ss1">>,
+    ClientNonce = <<"auditBadProofNonce1234567890">>,
+    {ok, _} = emqx_dashboard_admin:add_user(
+        Username, Password, ?ROLE_SUPERUSER, <<"SCRAM bad proof test user">>
+    ),
+    try
+        StartAt = erlang:system_time(microsecond),
+        {ok, 200, Challenge} = request_api_without_auth(
+            post,
+            emqx_mgmt_api_test_util:api_path(["login", "challenge"]),
+            #{username => Username, client_nonce => ClientNonce}
+        ),
+        ChallengeId = maps:get(<<"challenge_id">>, Challenge),
+        ServerNonce = maps:get(<<"server_nonce">>, Challenge),
+        CombinedNonce = <<ClientNonce/binary, ServerNonce/binary>>,
+        Proof = emqx_dashboard_scram:client_proof(
+            Username,
+            ClientNonce,
+            ServerNonce,
+            base64:decode(maps:get(<<"salt">>, Challenge)),
+            maps:get(<<"iterations">>, Challenge),
+            Password
+        ),
+        %% Flip one byte so the proof no longer matches the stored credential.
+        <<First, Rest/binary>> = Proof,
+        BadProof = base64:encode(<<(First bxor 16#FF), Rest/binary>>),
+        {ok, 401, _} = request_api_without_auth(
+            post,
+            emqx_mgmt_api_test_util:api_path(["login", "verify"]),
+            #{
+                challenge_id => ChallengeId,
+                combined_nonce => CombinedNonce,
+                client_proof => BadProof
+            }
+        ),
+        AuditPath = emqx_mgmt_api_test_util:api_path(["audit"]),
+        AuthHeader = emqx_mgmt_api_test_util:auth_header_(),
+        Query = lists:flatten(
+            io_lib:format(
+                "source=~ts&operation_id=/login/verify&gte_created_at=~B&limit=1",
+                [Username, StartAt]
+            )
+        ),
+        Response = wait_for_matching_audit_entry(AuditPath, Query, AuthHeader, 2000),
+        #{<<"data">> := [AuditEntry]} = emqx_utils_json:decode(Response),
+        ?assertMatch(
+            #{
+                <<"source">> := Username,
+                <<"operation_id">> := <<"/login/verify">>,
+                <<"operation_result">> := <<"failure">>,
+                <<"http_status_code">> := 401,
+                <<"failure">> := <<>>
+            },
+            AuditEntry
+        ),
+        ApiBody = maps:get(<<"body">>, maps:get(<<"http_request">>, AuditEntry)),
+        assert_scram_audit_body(ApiBody, BadProof, ChallengeId, CombinedNonce)
+    after
+        _ = emqx_dashboard_admin:remove_user(Username)
+    end.
+
+-doc """
+A malformed SCRAM verification request must not copy the submitted proof into
+the validation failure stored in the audit record.
+""".
+t_scram_malformed_proof_redacted(_) ->
+    Marker = <<"review-synthetic-proof">>,
+    StartAt = erlang:system_time(microsecond),
+    {ok, 400, _} = request_api_without_auth(
+        post,
+        emqx_mgmt_api_test_util:api_path(["login", "verify"]),
+        #{
+            challenge_id => <<"malformed-challenge">>,
+            combined_nonce => <<"malformed-nonce">>,
+            client_proof => #{proof => Marker}
+        }
+    ),
+    AuditPath = emqx_mgmt_api_test_util:api_path(["audit"]),
+    AuthHeader = emqx_mgmt_api_test_util:auth_header_(),
+    Query = lists:flatten(
+        io_lib:format("operation_id=/login/verify&gte_created_at=~B&limit=1", [StartAt])
+    ),
+    Response = wait_for_matching_audit_entry(AuditPath, Query, AuthHeader, 2000),
+    #{<<"data">> := [AuditEntry]} = emqx_utils_json:decode(Response),
+    ?assertEqual(nomatch, binary:match(emqx_utils_json:encode(AuditEntry), Marker)),
+    ?assertMatch(
+        #{
+            <<"operation_id">> := <<"/login/verify">>,
+            <<"operation_result">> := <<"failure">>,
+            <<"http_status_code">> := 400,
+            %% minirest collapses the schema-validation error to an empty map,
+            %% so the whole failure is replaced by the redaction marker.
+            <<"failure">> := <<"******">>
+        },
+        AuditEntry
+    ),
+    ApiBody = maps:get(<<"body">>, maps:get(<<"http_request">>, AuditEntry)),
+    ?assertNotEqual(nomatch, binary:match(ApiBody, <<"******">>), ApiBody),
+    Stored =
+        #?AUDIT{failure = <<"******">>, http_request = #{body := StoredBody}} =
+        find_stored_audit_entry(<<>>, StartAt),
+    ?assertEqual(nomatch, binary:match(term_to_binary(Stored), Marker)),
+    ?assertEqual(nomatch, binary:match(StoredBody, Marker)),
+    ok.
+
+-doc """
+An unparsable SCRAM verification body reaches the parse-failure branch, whose
+audit failure is a structured map. The error code must survive redaction while
+the message is replaced, and the raw payload must not be persisted.
+""".
+t_scram_invalid_json_keeps_error_code(_) ->
+    RawBody = <<"{not-json-proof">>,
+    StartAt = erlang:system_time(microsecond),
+    {ok, 400, _} = request_api_with_raw_body(
+        emqx_mgmt_api_test_util:api_path(["login", "verify"]),
+        RawBody
+    ),
+    AuditPath = emqx_mgmt_api_test_util:api_path(["audit"]),
+    AuthHeader = emqx_mgmt_api_test_util:auth_header_(),
+    Query = lists:flatten(
+        io_lib:format("operation_id=/login/verify&gte_created_at=~B&limit=1", [StartAt])
+    ),
+    Response = wait_for_matching_audit_entry(AuditPath, Query, AuthHeader, 2000),
+    #{<<"data">> := [AuditEntry]} = emqx_utils_json:decode(Response),
+    ?assertMatch(
+        #{
+            <<"operation_id">> := <<"/login/verify">>,
+            <<"operation_result">> := <<"failure">>,
+            <<"http_status_code">> := 400,
+            <<"failure">> := #{
+                <<"code">> := <<"BAD_REQUEST">>,
+                <<"message">> := <<"******">>
+            }
+        },
+        AuditEntry
+    ),
+    ?assertEqual(nomatch, binary:match(emqx_utils_json:encode(AuditEntry), RawBody)),
+    ok.
+
+-doc """
+The three public SSO MFA endpoints must not persist their temporary tokens or
+TOTP codes in the audit record returned by GET /audit.
+""".
+t_sso_mfa_credentials_redacted(_) ->
+    AuditPath = emqx_mgmt_api_test_util:api_path(["audit"]),
+    AuthHeader = emqx_mgmt_api_test_util:auth_header_(),
+    Cases = [
+        {
+            <<"/sso/mfa/setup_info">>,
+            ["sso", "mfa", "setup_info"],
+            #{
+                <<"setup_token">> => <<"setup-token-audit-probe">>,
+                <<"username">> => <<"mfa-audit-setup-user">>,
+                <<"backend">> => <<"ldap">>
+            },
+            [<<"setup-token-audit-probe">>]
+        },
+        {
+            <<"/sso/mfa/setup">>,
+            ["sso", "mfa", "setup"],
+            #{
+                <<"setup_token">> => <<"setup-token-audit-probe-2">>,
+                <<"totp_code">> => <<"123456">>,
+                <<"username">> => <<"mfa-audit-setup-user-2">>,
+                <<"backend">> => <<"ldap">>
+            },
+            [<<"setup-token-audit-probe-2">>, <<"123456">>]
+        },
+        {
+            <<"/sso/mfa/verify">>,
+            ["sso", "mfa", "verify"],
+            #{
+                <<"verify_token">> => <<"verify-token-audit-probe">>,
+                <<"totp_code">> => <<"654321">>,
+                <<"username">> => <<"mfa-audit-verify-user">>,
+                <<"backend">> => <<"ldap">>
+            },
+            [<<"verify-token-audit-probe">>, <<"654321">>]
+        }
+    ],
+    lists:foreach(
+        fun({OperationId, Parts, Body, Secrets}) ->
+            StartAt = erlang:system_time(microsecond),
+            {ok, 401, _} = emqx_mgmt_api_test_util:request_api_with_body(
+                post,
+                emqx_mgmt_api_test_util:api_path(Parts),
+                Body
+            ),
+            Query = lists:flatten(
+                io_lib:format(
+                    "operation_id=~ts&gte_created_at=~B&limit=1",
+                    [OperationId, StartAt]
+                )
+            ),
+            Res = wait_for_matching_audit_entry(AuditPath, Query, AuthHeader, 2000),
+            #{<<"data">> := [#{<<"http_request">> := #{<<"body">> := AuditBody}}]} =
+                emqx_utils_json:decode(Res),
+            lists:foreach(
+                fun(Secret) ->
+                    ?assertEqual(nomatch, binary:match(AuditBody, Secret), AuditBody)
+                end,
+                Secrets
+            ),
+            ?assertNotEqual(nomatch, binary:match(AuditBody, <<"******">>), AuditBody)
+        end,
+        Cases
+    ),
+    ok.
+
+t_kickout_clients_without_log(_) ->
+    process_flag(trap_exit, true),
+    AuditPath = emqx_mgmt_api_test_util:api_path(["audit"]),
+    {ok, AuditLogs1} = emqx_mgmt_api_test_util:request_api(get, AuditPath),
+    kickout_clients(),
+    {ok, AuditLogs2} = emqx_mgmt_api_test_util:request_api(get, AuditPath),
+    ?assertEqual(AuditLogs1, AuditLogs2),
+    ok.
+
+kickout_clients() ->
+    ClientId1 = <<"client1">>,
+    ClientId2 = <<"client2">>,
+    ClientId3 = <<"client3">>,
+
+    {ok, C1} = emqtt:start_link(#{
+        clientid => ClientId1,
+        proto_ver => v5,
+        properties => #{'Session-Expiry-Interval' => 120}
+    }),
+    {ok, _} = emqtt:connect(C1),
+    {ok, C2} = emqtt:start_link(#{clientid => ClientId2}),
+    {ok, _} = emqtt:connect(C2),
+    {ok, C3} = emqtt:start_link(#{clientid => ClientId3}),
+    {ok, _} = emqtt:connect(C3),
+
+    timer:sleep(300),
+
+    %% get /clients
+    ClientsPath = emqx_mgmt_api_test_util:api_path(["clients"]),
+    {ok, Clients} = emqx_mgmt_api_test_util:request_api(get, ClientsPath),
+    ClientsResponse = emqx_utils_json:decode(Clients),
+    ClientsMeta = maps:get(<<"meta">>, ClientsResponse),
+    ClientsPage = maps:get(<<"page">>, ClientsMeta),
+    ClientsLimit = maps:get(<<"limit">>, ClientsMeta),
+    ClientsCount = maps:get(<<"count">>, ClientsMeta),
+    ?assertEqual(ClientsPage, 1),
+    ?assertEqual(ClientsLimit, emqx_mgmt:default_row_limit()),
+    ?assertEqual(ClientsCount, 3),
+
+    %% kickout clients
+    KickoutPath = emqx_mgmt_api_test_util:api_path(["clients", "kickout", "bulk"]),
+    KickoutBody = [ClientId1, ClientId2, ClientId3],
+    {ok, 204, _} = emqx_mgmt_api_test_util:request_api_with_body(post, KickoutPath, KickoutBody),
+
+    %% The kick call is answered before emqx_cm reaps the channel DOWN and
+    %% cleans its tables, so the clients API can still list the kicked clients.
+    ?retry(100, 20, begin
+        {ok, Clients2} = emqx_mgmt_api_test_util:request_api(get, ClientsPath),
+        ?assertMatch(#{<<"data">> := []}, emqx_utils_json:decode(Clients2))
+    end).
+
+ns_dashboard_auth_header(Username, Role) ->
+    Password = <<"public_www1">>,
+    {ok, _} = emqx_dashboard_admin:add_user(Username, Password, Role, <<"audit test user">>),
+    {ok, #{token := Token}} = emqx_dashboard_admin:sign_token(Username, Password),
+    {"Authorization", "Bearer " ++ binary_to_list(Token)}.
+
+ns_api_key_auth_header(Name, Role) ->
+    ApiKey = <<Name/binary, "_key">>,
+    ApiSecret = <<Name/binary, "_secret">>,
+    ExpiresAt = list_to_binary(
+        calendar:system_time_to_rfc3339(erlang:system_time(second) + 1_000)
+    ),
+    {ok, _} = emqx_mgmt_auth:create_with_key(
+        Name, ApiKey, ApiSecret, true, ExpiresAt, <<"audit test key">>, Role
+    ),
+    emqx_common_test_http:auth_header(binary_to_list(ApiKey), binary_to_list(ApiSecret)).
+
+request_api_without_auth(Method, Url, Body) ->
+    FlatUrl = binary_to_list(iolist_to_binary(Url)),
+    case emqx_common_test_http:request_api(Method, FlatUrl, [], no_auth_header, Body) of
+        {ok, Code, ResponseBody} ->
+            {ok, Code, emqx_utils_json:decode(ResponseBody)};
+        Error ->
+            Error
+    end.
+
+%% `emqx_common_test_http' always JSON-encodes the body, so a raw payload is
+%% needed to exercise the server-side JSON parse failure.
+request_api_with_raw_body(Url, RawBody) ->
+    FlatUrl = binary_to_list(iolist_to_binary(Url)),
+    Request = {FlatUrl, [], "application/json", RawBody},
+    case httpc:request(post, Request, [], [{body_format, binary}]) of
+        {ok, {{"HTTP/1.1", Code, _}, _Headers, ResponseBody}} ->
+            {ok, Code, emqx_utils_json:decode(ResponseBody)};
+        Error ->
+            Error
+    end.
+
+assert_scram_audit_body(Body, EncodedProof, ChallengeId, CombinedNonce) ->
+    ?assertEqual(nomatch, binary:match(Body, EncodedProof), Body),
+    ?assertNotEqual(nomatch, binary:match(Body, <<"******">>), Body),
+    ?assertEqual(nomatch, binary:match(Body, ChallengeId), Body),
+    ?assertEqual(nomatch, binary:match(Body, CombinedNonce), Body),
+    ok.
+
+find_stored_audit_entry(Username, StartAt) ->
+    Records = mnesia:dirty_match_object(
+        ?AUDIT,
+        #?AUDIT{source = Username, operation_id = <<"/login/verify">>, _ = '_'}
+    ),
+    case [Record || #?AUDIT{created_at = CreatedAt} = Record <- Records, CreatedAt >= StartAt] of
+        [Record | _] -> Record;
+        [] -> ct:fail(scram_audit_entry_not_found_in_mnesia)
+    end.
+
+wait_for_dirty_write_log_done(MaxMs) ->
+    Size = mnesia:table_info(emqx_audit, size),
+    wait_for_dirty_write_log_done(Size, MaxMs).
+
+wait_for_dirty_write_log_done(Size, RemainMs) when RemainMs =< 0 -> Size;
+wait_for_dirty_write_log_done(Prev, RemainMs) ->
+    SleepMs = 100,
+    ct:sleep(SleepMs),
+    case mnesia:table_info(emqx_audit, size) of
+        Prev ->
+            ct:sleep(SleepMs * 2),
+            Prev;
+        New ->
+            wait_for_dirty_write_log_done(New, RemainMs - SleepMs)
+    end.
+
+-doc """
+An authenticated dashboard user denied by role-based access control is named in
+the audit record. The 403 record carries the username in `source` and the path
+parameters in `http_request.bindings`.
+""".
+t_rbac_denied_dashboard_user(_) ->
+    StartAt = erlang:system_time(microsecond),
+    Username = <<"audit_rbac_viewer">>,
+    Password = <<"public_www1">>,
+    {ok, _} = emqx_dashboard_admin:add_user(Username, Password, ?ROLE_VIEWER, <<"viewer">>),
+    {ok, #{role := ?ROLE_VIEWER, token := Token}} =
+        emqx_dashboard_admin:sign_token(Username, Password),
+    ClientId = <<"audit-rbac-denied-dashboard">>,
+    ?assertMatch({ok, 403, _}, delete_client(ClientId, bearer_header(Token))),
+    ?assertMatch(
+        #{
+            <<"from">> := <<"dashboard">>,
+            <<"source">> := Username,
+            <<"source_ip">> := <<"127.0.0.1">>,
+            <<"operation_id">> := <<"/clients/:clientid">>,
+            <<"operation_type">> := <<"clients">>,
+            <<"http_status_code">> := 403,
+            <<"operation_result">> := <<"failure">>,
+            <<"http_request">> := #{
+                <<"method">> := <<"delete">>,
+                <<"bindings">> := #{<<"clientid">> := ClientId}
+            }
+        },
+        latest_audit_record("http_status_code=403", StartAt)
+    ),
+    ok.
+
+-doc """
+An API key denied by role-based access control is named in the audit record.
+The 403 record carries the API key in `source`, `rest_api` in `from`, and the
+path parameters in `http_request.bindings`.
+""".
+t_rbac_denied_api_key(_) ->
+    StartAt = erlang:system_time(microsecond),
+    Name = <<"audit_rbac_viewer_key">>,
+    Key = <<"audit_rbac_viewer_key">>,
+    Secret = <<"audit_rbac_viewer_secret">>,
+    ExpiredAt = erlang:system_time(second) + 3600,
+    {ok, _} = emqx_mgmt_auth:create_with_key(
+        Name, Key, Secret, true, ExpiredAt, <<"audit rbac test key">>, ?ROLE_API_VIEWER
+    ),
+    ClientId = <<"audit-rbac-denied-api-key">>,
+    AuthHeader = emqx_common_test_http:auth_header(
+        binary_to_list(Key), binary_to_list(Secret)
+    ),
+    ?assertMatch({ok, 403, _}, delete_client(ClientId, AuthHeader)),
+    ?assertMatch(
+        #{
+            <<"from">> := <<"rest_api">>,
+            <<"source">> := Key,
+            <<"operation_id">> := <<"/clients/:clientid">>,
+            <<"http_status_code">> := 403,
+            <<"operation_result">> := <<"failure">>,
+            <<"http_request">> := #{
+                <<"method">> := <<"delete">>,
+                <<"bindings">> := #{<<"clientid">> := ClientId}
+            }
+        },
+        latest_audit_record("http_status_code=403", StartAt)
+    ),
+    ok.
+
+-doc """
+An unauthenticated request is still recorded without an actor. A bad bearer
+token is rejected with 401 before any identity is established, so the record
+keeps an empty `source` and does not carry the path parameters.
+""".
+t_unauthenticated_request_has_no_actor(_) ->
+    StartAt = erlang:system_time(microsecond),
+    ClientId = <<"audit-bad-token">>,
+    ?assertMatch({ok, 401, _}, delete_client(ClientId, bearer_header(<<"not-a-token">>))),
+    Record = latest_audit_record("http_status_code=401", StartAt),
+    ?assertMatch(
+        #{
+            <<"from">> := <<"dashboard">>,
+            <<"source">> := <<"">>,
+            <<"http_status_code">> := 401,
+            <<"operation_result">> := <<"failure">>,
+            <<"http_request">> := #{<<"method">> := <<"delete">>}
+        },
+        Record
+    ),
+    #{<<"http_request">> := HttpRequest} = Record,
+    ?assertEqual(false, maps:is_key(<<"bindings">>, HttpRequest), HttpRequest),
+    ok.
+
+bearer_header(Token) ->
+    {"Authorization", "Bearer " ++ binary_to_list(Token)}.
+
+delete_client(ClientId, AuthHeader) ->
+    Path = emqx_mgmt_api_test_util:api_path(["clients", binary_to_list(ClientId)]),
+    emqx_mgmt_api_test_util:request_api(
+        delete, Path, "", AuthHeader, [], #{compatible_mode => true}
+    ).
+
+%% Fetch the newest audit record matching `Filter', created no earlier than
+%% `StartAt' (microseconds).
+latest_audit_record(Filter, StartAt) ->
+    AuditPath = emqx_mgmt_api_test_util:api_path(["audit"]),
+    AuthHeader = emqx_mgmt_api_test_util:auth_header_(),
+    Query = lists:flatten(
+        io_lib:format("~s&gte_created_at=~B&limit=1", [Filter, StartAt])
+    ),
+    Res = wait_for_matching_audit_entry(AuditPath, Query, AuthHeader, 5000),
+    #{<<"data">> := [Record]} = emqx_utils_json:decode(Res),
+    Record.
+
+wait_for_matching_audit_entry(_AuditPath, _Query, _AuthHeader, RemainMs) when RemainMs =< 0 ->
+    ct:fail(audit_entry_not_found_in_time);
+wait_for_matching_audit_entry(AuditPath, Query, AuthHeader, RemainMs) ->
+    case emqx_mgmt_api_test_util:request_api(get, AuditPath, Query, AuthHeader) of
+        {ok, Res} ->
+            case emqx_utils_json:decode(Res) of
+                #{<<"data">> := [_ | _]} ->
+                    Res;
+                _ ->
+                    SleepMs = 100,
+                    ct:sleep(SleepMs),
+                    wait_for_matching_audit_entry(AuditPath, Query, AuthHeader, RemainMs - SleepMs)
+            end;
+        _ ->
+            SleepMs = 100,
+            ct:sleep(SleepMs),
+            wait_for_matching_audit_entry(AuditPath, Query, AuthHeader, RemainMs - SleepMs)
+    end.

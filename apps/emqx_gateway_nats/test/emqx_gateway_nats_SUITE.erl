@@ -1,0 +1,926 @@
+%%--------------------------------------------------------------------
+%% Copyright (c) 2025-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
+%%--------------------------------------------------------------------
+
+-module(emqx_gateway_nats_SUITE).
+
+-include("emqx_nats.hrl").
+-include_lib("eunit/include/eunit.hrl").
+-include_lib("common_test/include/ct.hrl").
+-include_lib("snabbkaffe/include/snabbkaffe.hrl").
+
+-compile(export_all).
+-compile(nowarn_export_all).
+
+-define(VALID_USER_NKEY, <<"UB4G32YJ2GVZG3KTC3Z7BLIU3PXPJC2Y4QF6SNJUN2XIF3M3E3NDEUCZ">>).
+-define(VALID_OPERATOR_NKEY, <<"OB43KVROR7TFJ6KAPCYRF2FJROTZAH4FHLTJLPWX4DRZCC5NASLGIT25">>).
+-define(VALID_ACCOUNT_NKEY, <<"ADT7CYVBBPWFLGX6UGK6JXHIJNUVNDK5FSYJMPVUI3AGQXRLC7ZPAOJZ">>).
+-define(REDACTED, <<"******">>).
+
+all() ->
+    [{group, legacy}, {group, hardened}].
+
+groups() ->
+    Tests = emqx_common_test_helpers:all(?MODULE),
+    [{legacy, [], Tests}, {hardened, [], Tests}].
+
+init_per_suite(Config) ->
+    emqx_common_test_helpers:clear_security_profile(),
+    Config.
+
+end_per_suite(_Config) ->
+    emqx_common_test_helpers:clear_security_profile().
+
+init_per_group(Profile, Config) when Profile =:= legacy; Profile =:= hardened ->
+    ok = emqx_common_test_helpers:set_security_profile(Profile),
+    application:load(emqx_gateway_nats),
+    Apps = emqx_cth_suite:start(
+        [
+            emqx,
+            emqx_conf,
+            emqx_auth,
+            emqx_gateway,
+            emqx_management,
+            {emqx_dashboard, "dashboard.listeners.http { enable = true, bind = 18083 }"},
+            emqx_gateway_nats
+        ],
+        #{work_dir => emqx_cth_suite:work_dir(Profile, Config)}
+    ),
+    emqx_common_test_http:create_default_app(),
+    _ = application:ensure_all_started(emqx_gateway_nats),
+    [{apps, Apps}, {security_profile, Profile} | Config].
+
+end_per_group(_Profile, Config) ->
+    emqx_common_test_http:delete_default_app(),
+    emqx_cth_suite:stop(?config(apps, Config)),
+    emqx_common_test_helpers:clear_security_profile().
+
+init_per_testcase(TestCase, Config) ->
+    _ = emqx_gateway_conf:unload_gateway(nats),
+    ct:sleep(100),
+    case needs_gateway(TestCase) of
+        true ->
+            Port = emqx_common_test_helpers:select_free_port(tcp),
+            Conf = nats_conf(Port),
+            {ok, _} = emqx_gateway_conf:load_gateway(nats, Conf),
+            _ = emqx_gateway_test_utils:disable_gateway_auth(<<"nats">>),
+            ok = assert_can_connect(Port, 10),
+            [
+                {client_opts, default_client_opts(Port)},
+                {group_name, tcp},
+                {nats_port, Port}
+                | Config
+            ];
+        false ->
+            Config
+    end.
+
+end_per_testcase(TestCase, _Config) ->
+    case needs_gateway(TestCase) of
+        true ->
+            _ = emqx_gateway_conf:unload_gateway(nats),
+            ok;
+        false ->
+            ok
+    end.
+
+%%--------------------------------------------------------------------
+%% Test Cases
+%%--------------------------------------------------------------------
+
+t_load_badconf_listener_in_use(_Config) ->
+    Port = emqx_common_test_helpers:select_free_port(tcp),
+    {ok, LSock} = gen_tcp:listen(Port, [binary, {active, false}]),
+    Conf = nats_conf(Port),
+    try
+        ?assertMatch({error, {badconf, _}}, emqx_gateway_conf:load_gateway(nats, Conf))
+    after
+        gen_tcp:close(LSock)
+    end.
+
+t_load_badconf_partial_authn_jwt(_Config) ->
+    BaseConf0 = nats_conf(emqx_common_test_helpers:select_free_port(tcp)),
+    EmptyJWTMethod = BaseConf0#{
+        <<"internal_authn">> => [
+            #{
+                <<"type">> => <<"jwt">>
+            }
+        ]
+    },
+    ?assertMatch(
+        {error, #{kind := validation_error}},
+        emqx_gateway_conf:load_gateway(nats, EmptyJWTMethod)
+    ),
+
+    BaseConf1 = nats_conf(emqx_common_test_helpers:select_free_port(tcp)),
+    MissingTrustedOperators = BaseConf1#{
+        <<"internal_authn">> => [
+            #{
+                <<"type">> => <<"jwt">>,
+                <<"resolver">> => #{
+                    <<"type">> => <<"memory">>,
+                    <<"resolver_preload">> => [
+                        #{
+                            <<"pubkey">> => <<"A">>,
+                            <<"jwt">> => <<"jwt-account">>
+                        }
+                    ]
+                }
+            }
+        ]
+    },
+    ?assertMatch(
+        {error, #{kind := validation_error}},
+        emqx_gateway_conf:load_gateway(nats, MissingTrustedOperators)
+    ),
+
+    BaseConf2 = nats_conf(emqx_common_test_helpers:select_free_port(tcp)),
+    MissingResolverPreload = BaseConf2#{
+        <<"internal_authn">> => [
+            #{
+                <<"type">> => <<"jwt">>,
+                <<"trusted_operators">> => [<<"OP">>]
+            }
+        ]
+    },
+    ?assertMatch(
+        {error, #{kind := validation_error}},
+        emqx_gateway_conf:load_gateway(nats, MissingResolverPreload)
+    ),
+
+    BaseConfInvalidAccountJWT = nats_conf(emqx_common_test_helpers:select_free_port(tcp)),
+    InvalidAccountJWT = BaseConfInvalidAccountJWT#{
+        <<"internal_authn">> => [
+            #{
+                <<"type">> => <<"jwt">>,
+                <<"trusted_operators">> => [?VALID_OPERATOR_NKEY],
+                <<"resolver">> => #{
+                    <<"type">> => <<"memory">>,
+                    <<"resolver_preload">> => [
+                        #{
+                            <<"pubkey">> => ?VALID_ACCOUNT_NKEY,
+                            <<"jwt">> => <<"invalid-jwt">>
+                        }
+                    ]
+                }
+            }
+        ]
+    },
+    ?assertMatch(
+        {error, #{kind := validation_error}},
+        emqx_gateway_conf:load_gateway(nats, InvalidAccountJWT)
+    ),
+
+    BaseConfToken = nats_conf(emqx_common_test_helpers:select_free_port(tcp)),
+    EmptyTokenMethod = BaseConfToken#{
+        <<"internal_authn">> => [
+            #{
+                <<"type">> => <<"token">>,
+                <<"token">> => <<>>
+            }
+        ]
+    },
+    ?assertMatch(
+        {error, #{kind := validation_error}},
+        emqx_gateway_conf:load_gateway(nats, EmptyTokenMethod)
+    ),
+
+    BaseConfNKey = nats_conf(emqx_common_test_helpers:select_free_port(tcp)),
+    EmptyNKeysMethod = BaseConfNKey#{
+        <<"internal_authn">> => [
+            #{
+                <<"type">> => <<"nkey">>,
+                <<"nkeys">> => []
+            }
+        ]
+    },
+    ?assertMatch(
+        {error, #{kind := validation_error}},
+        emqx_gateway_conf:load_gateway(nats, EmptyNKeysMethod)
+    ),
+
+    BaseConf3 = nats_conf(emqx_common_test_helpers:select_free_port(tcp)),
+    InvalidNKeyMethod = BaseConf3#{
+        <<"internal_authn">> => [
+            #{
+                <<"type">> => <<"nkey">>,
+                <<"nkeys">> => [<<"bad-nkey">>]
+            }
+        ]
+    },
+    ?assertMatch(
+        {error, #{kind := validation_error}},
+        emqx_gateway_conf:load_gateway(nats, InvalidNKeyMethod)
+    ),
+
+    BaseConf4 = nats_conf(emqx_common_test_helpers:select_free_port(tcp)),
+    InvalidTrustedOperators = BaseConf4#{
+        <<"internal_authn">> => [
+            #{
+                <<"type">> => <<"jwt">>,
+                <<"trusted_operators">> => [<<"bad-nkey">>],
+                <<"resolver">> => #{
+                    <<"type">> => <<"memory">>,
+                    <<"resolver_preload">> => [
+                        #{
+                            <<"pubkey">> => ?VALID_USER_NKEY,
+                            <<"jwt">> => <<"jwt-account">>
+                        }
+                    ]
+                }
+            }
+        ]
+    },
+    ?assertMatch(
+        {error, #{kind := validation_error}},
+        emqx_gateway_conf:load_gateway(nats, InvalidTrustedOperators)
+    ),
+
+    BaseConf5 = nats_conf(emqx_common_test_helpers:select_free_port(tcp)),
+    InvalidTrustedOperatorClass = BaseConf5#{
+        <<"internal_authn">> => [
+            #{
+                <<"type">> => <<"jwt">>,
+                <<"trusted_operators">> => [?VALID_USER_NKEY],
+                <<"resolver">> => #{
+                    <<"type">> => <<"memory">>,
+                    <<"resolver_preload">> => [
+                        #{
+                            <<"pubkey">> => ?VALID_ACCOUNT_NKEY,
+                            <<"jwt">> => <<"jwt-account">>
+                        }
+                    ]
+                }
+            }
+        ]
+    },
+    ?assertMatch(
+        {error, #{kind := validation_error}},
+        emqx_gateway_conf:load_gateway(nats, InvalidTrustedOperatorClass)
+    ),
+
+    BaseConf6 = nats_conf(emqx_common_test_helpers:select_free_port(tcp)),
+    InvalidResolverPubKeyClass = BaseConf6#{
+        <<"internal_authn">> => [
+            #{
+                <<"type">> => <<"jwt">>,
+                <<"trusted_operators">> => [?VALID_OPERATOR_NKEY],
+                <<"resolver">> => #{
+                    <<"type">> => <<"memory">>,
+                    <<"resolver_preload">> => [
+                        #{
+                            <<"pubkey">> => ?VALID_USER_NKEY,
+                            <<"jwt">> => <<"jwt-account">>
+                        }
+                    ]
+                }
+            }
+        ]
+    },
+    ?assertMatch(
+        {error, #{kind := validation_error}},
+        emqx_gateway_conf:load_gateway(nats, InvalidResolverPubKeyClass)
+    ).
+
+t_load_badconf_duplicate_internal_authn_type(_Config) ->
+    BaseConf = nats_conf(emqx_common_test_helpers:select_free_port(tcp)),
+    DuplicateTokenMethods = BaseConf#{
+        <<"internal_authn">> => [
+            #{
+                <<"type">> => <<"token">>,
+                <<"token">> => <<"token-a">>
+            },
+            #{
+                <<"type">> => <<"token">>,
+                <<"token">> => <<"token-b">>
+            }
+        ]
+    },
+    ?assertMatch(
+        {error, #{kind := validation_error}},
+        emqx_gateway_conf:load_gateway(nats, DuplicateTokenMethods)
+    ).
+
+t_load_badconf_duplicate_nkeys(_Config) ->
+    BaseConf = nats_conf(emqx_common_test_helpers:select_free_port(tcp)),
+    DuplicateNKeys = BaseConf#{
+        <<"internal_authn">> => [
+            #{
+                <<"type">> => <<"nkey">>,
+                <<"nkeys">> => [?VALID_USER_NKEY, ?VALID_USER_NKEY]
+            }
+        ]
+    },
+    ?assertMatch(
+        {error, #{kind := validation_error}},
+        emqx_gateway_conf:load_gateway(nats, DuplicateNKeys)
+    ).
+
+t_load_badconf_duplicate_resolver_preload_pubkey(_Config) ->
+    BaseConf = nats_conf(emqx_common_test_helpers:select_free_port(tcp)),
+    Fixture = emqx_nats_authn_SUITE:jwt_fixture(),
+    OperatorNKey = maps:get(operator_nkey, Fixture),
+    AccountNKey = maps:get(account_nkey, Fixture),
+    AccountJWT = maps:get(account_jwt, Fixture),
+    DuplicatePubKeys = BaseConf#{
+        <<"internal_authn">> => [
+            #{
+                <<"type">> => <<"jwt">>,
+                <<"trusted_operators">> => [OperatorNKey],
+                <<"resolver">> => #{
+                    <<"type">> => <<"memory">>,
+                    <<"resolver_preload">> => [
+                        #{
+                            <<"pubkey">> => AccountNKey,
+                            <<"jwt">> => AccountJWT
+                        },
+                        #{
+                            <<"pubkey">> => AccountNKey,
+                            <<"jwt">> => AccountJWT
+                        }
+                    ]
+                }
+            }
+        ]
+    },
+    ?assertMatch(
+        {error, #{kind := validation_error}},
+        emqx_gateway_conf:load_gateway(nats, DuplicatePubKeys)
+    ).
+
+t_load_badconf_duplicate_trusted_operators(_Config) ->
+    BaseConf = nats_conf(emqx_common_test_helpers:select_free_port(tcp)),
+    Fixture = emqx_nats_authn_SUITE:jwt_fixture(),
+    OperatorNKey = maps:get(operator_nkey, Fixture),
+    AccountNKey = maps:get(account_nkey, Fixture),
+    AccountJWT = maps:get(account_jwt, Fixture),
+    DuplicateTrustedOperators = BaseConf#{
+        <<"internal_authn">> => [
+            #{
+                <<"type">> => <<"jwt">>,
+                <<"trusted_operators">> => [OperatorNKey, OperatorNKey],
+                <<"resolver">> => #{
+                    <<"type">> => <<"memory">>,
+                    <<"resolver_preload">> => [
+                        #{
+                            <<"pubkey">> => AccountNKey,
+                            <<"jwt">> => AccountJWT
+                        }
+                    ]
+                }
+            }
+        ]
+    },
+    ?assertMatch(
+        {error, #{kind := validation_error}},
+        emqx_gateway_conf:load_gateway(nats, DuplicateTrustedOperators)
+    ).
+
+t_load_badconf_authn_jwt_cache_ttl(_Config) ->
+    BaseConf = nats_conf(emqx_common_test_helpers:select_free_port(tcp)),
+    UnsupportedCacheTTL = BaseConf#{
+        <<"internal_authn">> => [
+            #{
+                <<"type">> => <<"jwt">>,
+                <<"trusted_operators">> => [<<"OP">>],
+                <<"resolver">> => #{
+                    <<"type">> => <<"memory">>,
+                    <<"resolver_preload">> => [
+                        #{
+                            <<"pubkey">> => <<"A">>,
+                            <<"jwt">> => <<"jwt-account">>
+                        }
+                    ]
+                },
+                <<"cache_ttl">> => <<"5m">>
+            }
+        ]
+    },
+    ?assertMatch(
+        {error, #{kind := validation_error}},
+        emqx_gateway_conf:load_gateway(nats, UnsupportedCacheTTL)
+    ).
+
+t_load_update_unload(_Config) ->
+    Port1 = emqx_common_test_helpers:select_free_port(tcp),
+    Port2 = emqx_common_test_helpers:select_free_port(tcp),
+    Conf1 = nats_conf(Port1),
+    {ok, _} = emqx_gateway_conf:load_gateway(nats, Conf1),
+    ok = assert_can_connect(Port1, 10),
+    Raw0 = emqx:get_raw_config([gateway]),
+    Raw1 = Raw0#{<<"nats">> => nats_raw_conf(Port2)},
+    ?assertMatch({ok, _}, emqx:update_config([gateway], Raw1)),
+    ok = assert_can_connect(Port2, 10),
+    ok = emqx_gateway_conf:unload_gateway(nats),
+    ?assertMatch({error, _}, gen_tcp:connect("127.0.0.1", Port2, [binary], 1000)).
+
+t_update_error_listener_in_use(_Config) ->
+    Port1 = emqx_common_test_helpers:select_free_port(tcp),
+    Port2 = emqx_common_test_helpers:select_free_port(tcp),
+    Conf1 = nats_conf(Port1),
+    {ok, _} = emqx_gateway_conf:load_gateway(nats, Conf1),
+    {ok, LSock} = gen_tcp:listen(Port2, [binary, {active, false}]),
+    try
+        GwConf0 = emqx:get_config([gateway, nats]),
+        GwConf1 = emqx_utils_maps:deep_put([listeners, tcp, default, bind], GwConf0, Port2),
+        ?assertMatch({error, _}, emqx_gateway:update(nats, GwConf1))
+    after
+        gen_tcp:close(LSock),
+        _ = emqx_gateway_conf:unload_gateway(nats)
+    end.
+
+t_gateway_api_preserves_redacted_internal_authn(_Config) ->
+    OriginalToken = <<"original-token">>,
+    InternalAuthn = [
+        #{
+            <<"type">> => <<"token">>,
+            <<"token">> => OriginalToken
+        }
+    ],
+    {204, _} = emqx_gateway_test_utils:request(
+        put,
+        "/gateways/nats",
+        #{<<"internal_authn">> => InternalAuthn}
+    ),
+    {200, GatewayConf} = emqx_gateway_test_utils:request(get, "/gateways/nats"),
+    [#{type := <<"token">>, token := ?REDACTED}] = maps:get(internal_authn, GatewayConf),
+
+    {400, _} = emqx_gateway_test_utils:request(
+        put,
+        "/gateways/nats",
+        #{
+            <<"internal_authn">> => [
+                #{
+                    <<"type">> => <<"token">>,
+                    <<"token">> => OriginalToken
+                },
+                #{
+                    <<"type">> => <<"token">>,
+                    <<"token">> => <<"another-token">>
+                }
+            ]
+        }
+    ),
+
+    {204, _} = emqx_gateway_test_utils:request(
+        put,
+        "/gateways/nats",
+        #{
+            <<"server_name">> => <<"updated-server">>,
+            <<"internal_authn">> => [
+                #{
+                    <<"type">> => <<"token">>,
+                    <<"token">> => ?REDACTED
+                }
+            ]
+        }
+    ),
+    ?assertEqual(
+        InternalAuthn,
+        emqx:get_raw_config([gateway, nats, internal_authn])
+    ).
+
+t_full_gateway_update_propagates_deobfuscation_error(_Config) ->
+    OldConf = #{
+        <<"nats">> => #{
+            <<"internal_authn">> => [
+                #{<<"type">> => <<"nkey">>}
+            ]
+        }
+    },
+    NewConf = #{
+        <<"nats">> => #{
+            <<"internal_authn">> => [
+                #{<<"type">> => <<"token">>, <<"token">> => <<"******">>}
+            ]
+        }
+    },
+    ?assertMatch(
+        {error,
+            {badconf, #{
+                key := internal_authn,
+                reason := "masked_secret_without_matching_old_value",
+                value := token
+            }}},
+        emqx_gateway_conf:pre_config_update([gateway], NewConf, OldConf)
+    ).
+
+t_gateway_client_management(Config) ->
+    ClientOpts = maps:merge(
+        ?config(client_opts, Config),
+        #{
+            user => <<"test_user">>,
+            verbose => true
+        }
+    ),
+
+    %% Start a client
+    {ok, Client} = emqx_nats_client:start_link(ClientOpts),
+    {ok, [_]} = emqx_nats_client:receive_message(Client),
+    ok = emqx_nats_client:connect(Client),
+    {ok, [_]} = emqx_nats_client:receive_message(Client),
+
+    %% Test list clients
+    %% the channel is registered into the gateway connection-manager
+    %% asynchronously after the connect ack is sent, so retry until the
+    %% client appears in the list
+    [ClientInfo0] = ?retry(
+        100, 30, [_] = emqx_gateway_test_utils:list_gateway_clients(<<"nats">>)
+    ),
+    ?assertEqual(<<"test_user">>, maps:get(username, ClientInfo0)),
+    %% ClientId assigned by emqx_gateway_nats, it's a random string.
+    %% We can get it from the client info.
+    ClientId = maps:get(clientid, ClientInfo0),
+
+    %% Test get client info
+    ClientInfo = emqx_gateway_test_utils:get_gateway_client(<<"nats">>, ClientId),
+    ?assertEqual(ClientId, maps:get(clientid, ClientInfo)),
+    ?assertEqual(true, maps:get(connected, ClientInfo)),
+
+    %% Test kick client
+    ok = emqx_gateway_test_utils:kick_gateway_client(<<"nats">>, ClientId),
+    {ok, [ErrorMsg]} = emqx_nats_client:receive_message(Client),
+    ?assertMatch(
+        #nats_frame{
+            operation = ?OP_ERR,
+            message = <<"Kicked out">>
+        },
+        ErrorMsg
+    ),
+
+    emqx_nats_client:stop(Client).
+
+t_gateway_client_subscription_management(Config) ->
+    ClientOpts = maps:merge(
+        ?config(client_opts, Config),
+        #{
+            user => <<"test_user">>,
+            verbose => true
+        }
+    ),
+    Topic = <<"test/subject">>,
+    Subject = <<"test.subject">>,
+    QueueSubject = <<"test.subject.queue">>,
+    Queue = <<"queue-1">>,
+    %% Start a client
+    {ok, Client} = emqx_nats_client:start_link(ClientOpts),
+    {ok, [_]} = emqx_nats_client:receive_message(Client),
+    ok = emqx_nats_client:connect(Client),
+    {ok, [_]} = emqx_nats_client:receive_message(Client),
+
+    %% the channel is registered into the gateway connection-manager
+    %% asynchronously after the connect ack is sent, so retry until the
+    %% client appears in the list
+    [ClientInfo0] = ?retry(
+        100, 30, [_] = emqx_gateway_test_utils:list_gateway_clients(<<"nats">>)
+    ),
+    ?assertEqual(<<"test_user">>, maps:get(username, ClientInfo0)),
+    ClientId = maps:get(clientid, ClientInfo0),
+
+    %% Create subscription by client
+    ok = emqx_nats_client:subscribe(Client, Subject, <<"sid-1">>),
+    {ok, [SubAck]} = emqx_nats_client:receive_message(Client),
+    ?assertMatch(
+        #nats_frame{
+            operation = ?OP_OK
+        },
+        SubAck
+    ),
+
+    %% Create queue subscription by client
+    ok = emqx_nats_client:subscribe(Client, QueueSubject, <<"sid-2">>, Queue),
+    {ok, [SubAck2]} = emqx_nats_client:receive_message(Client),
+    ?assertMatch(
+        #nats_frame{
+            operation = ?OP_OK
+        },
+        SubAck2
+    ),
+
+    %% Verify subscription list
+    Subscriptions = emqx_gateway_test_utils:get_gateway_client_subscriptions(<<"nats">>, ClientId),
+    ?assertEqual(2, length(Subscriptions)),
+
+    %% XXX: Not implemented yet
+    ?assertMatch(
+        {400, _},
+        emqx_gateway_test_utils:create_gateway_client_subscription(<<"nats">>, ClientId, Topic)
+    ),
+
+    %% XXX: Not implemented yet
+    ?assertMatch(
+        {400, _},
+        emqx_gateway_test_utils:delete_gateway_client_subscription(<<"nats">>, ClientId, Topic)
+    ),
+
+    %% Delete subscription by client
+    ok = emqx_nats_client:unsubscribe(Client, <<"sid-1">>),
+    {ok, [UnsubAck]} = emqx_nats_client:receive_message(Client),
+    ?assertMatch(
+        #nats_frame{
+            operation = ?OP_OK
+        },
+        UnsubAck
+    ),
+    %% Delete queue subscription by client
+    ok = emqx_nats_client:unsubscribe(Client, <<"sid-2">>),
+    {ok, [UnsubAck2]} = emqx_nats_client:receive_message(Client),
+    ?assertMatch(
+        #nats_frame{
+            operation = ?OP_OK
+        },
+        UnsubAck2
+    ),
+
+    ?assertEqual(
+        [], emqx_gateway_test_utils:get_gateway_client_subscriptions(<<"nats">>, ClientId)
+    ),
+
+    emqx_nats_client:stop(Client).
+
+t_clientinfo_override_with_empty_clientid(Config) ->
+    update_nats_with_clientinfo_override(#{<<"clientid">> => <<>>}),
+
+    ClientOpts = maps:merge(
+        ?config(client_opts, Config),
+        #{
+            user => <<"test_user">>,
+            pass => <<"password">>,
+            verbose => true
+        }
+    ),
+    {ok, Client} = emqx_nats_client:start_link(ClientOpts),
+    {ok, [_]} = emqx_nats_client:receive_message(Client),
+    ok = emqx_nats_client:connect(Client),
+    {ok, [_]} = emqx_nats_client:receive_message(Client),
+
+    %% The gateway registers the client after CONNECT asynchronously.
+    [ClientInfo] = ?retry(100, 50, [_] = find_client_by_username(<<"test_user">>)),
+    ?assertNotEqual(undefined, maps:get(clientid, ClientInfo)),
+    ?assertNotEqual(<<>>, maps:get(clientid, ClientInfo)),
+
+    emqx_nats_client:stop(Client).
+
+t_clientinfo_override_with_prefix_and_empty_clientid(Config) ->
+    update_nats_with_clientinfo_override(#{<<"clientid">> => <<"prefix-${Packet.clientid}">>}),
+
+    ClientOpts = maps:merge(
+        ?config(client_opts, Config),
+        #{
+            user => <<"test_user">>,
+            pass => <<"password">>,
+            verbose => true
+        }
+    ),
+    {ok, Client} = emqx_nats_client:start_link(ClientOpts),
+    {ok, [_]} = emqx_nats_client:receive_message(Client),
+    ok = emqx_nats_client:connect(Client),
+    {ok, [_]} = emqx_nats_client:receive_message(Client),
+
+    %% The gateway registers the client after CONNECT asynchronously.
+    [ClientInfo] = ?retry(100, 50, [_] = find_client_by_username(<<"test_user">>)),
+    ?assertNotEqual(undefined, maps:get(clientid, ClientInfo)),
+    ?assertEqual(<<"prefix-">>, maps:get(clientid, ClientInfo)),
+
+    update_nats_with_clientinfo_override(#{}),
+    emqx_nats_client:stop(Client).
+
+t_schema_coverage(_Config) ->
+    _ = emqx_nats_schema:fields(wss_listener),
+    _ = emqx_nats_schema:desc(wss_listener),
+    ok.
+
+-doc """
+A WebSocket gateway listener hands its `websocket.max_frame_size` to cowboy.
+A larger message closes the connection with status code 1009.
+""".
+t_ws_max_frame_size(_Config) ->
+    {ok, _} = application:ensure_all_started(gun),
+    Port = emqx_common_test_helpers:select_free_port(tcp),
+    Listener = #{
+        <<"type">> => <<"ws">>,
+        <<"name">> => <<"default">>,
+        <<"bind">> => Port,
+        <<"websocket">> => #{<<"max_frame_size">> => 1024}
+    },
+    {ok, _} = emqx_gateway_conf:load_gateway(nats, nats_conf_list([Listener])),
+    try
+        {ok, ConnPid} = gun:open("127.0.0.1", Port, #{retry => 0}),
+        {ok, _} = gun:await_up(ConnPid, 5000),
+        StreamRef = gun:ws_upgrade(ConnPid, "/", [], #{protocols => [{<<"NATS">>, gun_ws_h}]}),
+        receive
+            {gun_upgrade, ConnPid, StreamRef, [<<"websocket">>], _} -> ok
+        after 5000 -> ct:fail(ws_upgrade_timeout)
+        end,
+        ok = gun:ws_send(ConnPid, StreamRef, {text, binary:copy(<<"a">>, 1025)}),
+        ?assertEqual(1009, await_ws_close_code(ConnPid, StreamRef)),
+        gun:close(ConnPid)
+    after
+        _ = emqx_gateway_conf:unload_gateway(nats)
+    end.
+
+%% Skip the frames the gateway sends before it closes the connection.
+await_ws_close_code(ConnPid, StreamRef) ->
+    receive
+        {gun_ws, ConnPid, StreamRef, {close, Code, _}} -> Code;
+        {gun_ws, ConnPid, StreamRef, _Frame} -> await_ws_close_code(ConnPid, StreamRef)
+    after 5000 ->
+        ct:fail(ws_close_timeout)
+    end.
+
+%%--------------------------------------------------------------------
+%% Helpers
+%%--------------------------------------------------------------------
+
+nats_conf(Port) ->
+    nats_conf_list([listener(<<"default">>, Port)]).
+
+nats_conf_list(Listeners) ->
+    #{
+        <<"server_id">> => <<"emqx_nats_gateway">>,
+        <<"server_name">> => <<"emqx_nats_gateway">>,
+        <<"default_heartbeat_interval">> => <<"2s">>,
+        <<"heartbeat_wait_timeout">> => <<"1s">>,
+        <<"protocol">> => #{<<"max_payload_size">> => 1024},
+        <<"listeners">> => Listeners
+    }.
+
+listener(Name, Port) ->
+    #{
+        <<"type">> => <<"tcp">>,
+        <<"name">> => Name,
+        <<"bind">> => Port
+    }.
+
+nats_raw_conf(Port) ->
+    #{
+        <<"server_id">> => <<"emqx_nats_gateway">>,
+        <<"server_name">> => <<"emqx_nats_gateway">>,
+        <<"default_heartbeat_interval">> => <<"2s">>,
+        <<"heartbeat_wait_timeout">> => <<"1s">>,
+        <<"protocol">> => #{<<"max_payload_size">> => 1024},
+        <<"listeners">> => #{
+            <<"tcp">> => #{
+                <<"default">> => #{<<"bind">> => Port}
+            }
+        }
+    }.
+
+assert_can_connect(_Port, 0) ->
+    exit({connect_failed, timeout});
+assert_can_connect(Port, Attempts) ->
+    case gen_tcp:connect("127.0.0.1", Port, [binary], 1000) of
+        {ok, Socket} ->
+            gen_tcp:close(Socket),
+            ok;
+        _Error ->
+            timer:sleep(200),
+            assert_can_connect(Port, Attempts - 1)
+    end.
+
+default_client_opts(Port) ->
+    #{
+        host => "tcp://127.0.0.1",
+        port => Port,
+        verbose => false
+    }.
+
+needs_gateway(TestCase) ->
+    lists:member(
+        TestCase,
+        [
+            t_connect_hook_rejection,
+            t_gateway_client_management,
+            t_gateway_client_subscription_management,
+            t_clientinfo_override_with_empty_clientid,
+            t_clientinfo_override_with_prefix_and_empty_clientid,
+            t_gateway_api_preserves_redacted_internal_authn
+        ]
+    ).
+
+update_nats_with_clientinfo_override(ClientInfoOverride) ->
+    DefaultOverride = #{
+        <<"username">> => <<"${Packet.user}">>,
+        <<"password">> => <<"${Packet.pass}">>
+    },
+    ClientInfoOverride1 = maps:merge(DefaultOverride, ClientInfoOverride),
+    Conf = emqx:get_raw_config([gateway, nats]),
+    emqx_gateway_conf:update_gateway(
+        nats,
+        Conf#{<<"clientinfo_override">> => ClientInfoOverride1}
+    ).
+
+find_client_by_username(Username) ->
+    ClientInfos = emqx_gateway_test_utils:list_gateway_clients(<<"nats">>),
+    lists:filter(
+        fun(ClientInfo) ->
+            maps:get(username, ClientInfo) =:= Username
+        end,
+        ClientInfos
+    ).
+
+-doc "The NATS gateway exchanges INFO and PING/PONG after an upgrade without a subprotocol.".
+t_ws_optional_subprotocol(_Config) ->
+    {ok, _} = application:ensure_all_started(gun),
+    lists:foreach(fun check_ws_optional_subprotocol/1, [<<>>, <<"NATS">>]).
+
+check_ws_optional_subprotocol(SupportedSubprotocols) ->
+    Port = emqx_common_test_helpers:select_free_port(tcp),
+    Listener = #{
+        <<"type">> => <<"ws">>,
+        <<"name">> => <<"default">>,
+        <<"bind">> => Port,
+        <<"websocket">> => #{
+            <<"path">> => <<"/nats">>,
+            <<"fail_if_no_subprotocol">> => false,
+            <<"supported_subprotocols">> => SupportedSubprotocols
+        }
+    },
+    {ok, _} = emqx_gateway_conf:load_gateway(nats, nats_conf_list([Listener])),
+    try
+        check_nats_ws_exchange(Port)
+    after
+        _ = emqx_gateway_conf:unload_gateway(nats)
+    end.
+
+check_nats_ws_exchange(Port) ->
+    {ok, ConnPid} = gun:open("127.0.0.1", Port, #{retry => 0, protocols => [http]}),
+    try
+        {ok, _} = gun:await_up(ConnPid, 5000),
+        StreamRef = gun:ws_upgrade(ConnPid, "/nats"),
+        receive
+            {gun_upgrade, ConnPid, StreamRef, [<<"websocket">>], Headers} ->
+                ?assertEqual(false, lists:keymember(<<"sec-websocket-protocol">>, 1, Headers));
+            {gun_response, ConnPid, StreamRef, _, Status, _} ->
+                ct:fail({unexpected_upgrade_status, Status});
+            {gun_error, ConnPid, StreamRef, Reason} ->
+                ct:fail({ws_upgrade_error, Reason})
+        after 5000 ->
+            ct:fail(ws_upgrade_timeout)
+        end,
+        receive
+            {gun_ws, ConnPid, StreamRef, {binary, <<"INFO ", _/binary>>}} -> ok
+        after 5000 ->
+            ct:fail(nats_info_timeout)
+        end,
+        ok = gun:ws_send(ConnPid, StreamRef, {text, <<"PING", 13, 10>>}),
+        receive
+            {gun_ws, ConnPid, StreamRef, {binary, <<"PONG", 13, 10>>}} -> ok
+        after 5000 ->
+            ct:fail(nats_pong_timeout)
+        end
+    after
+        gun:close(ConnPid)
+    end.
+
+-doc "NATS returns a numeric hook rejection as -ERR and connects after the hook is removed.".
+t_connect_hook_rejection(Config) ->
+    Port = ?config(nats_port, Config),
+    emqx_gateway_test_utils:with_quota_exceeded(fun() ->
+        check_hook_connect(Port, rejected)
+    end),
+    ListenerId = emqx_gateway_utils:listener_id(nats, tcp, default),
+    ?retry(
+        20,
+        100,
+        ?assertEqual(
+            1,
+            proplists:get_value(quota_exceeded, esockd:get_shutdown_count({ListenerId, Port}))
+        )
+    ),
+    check_hook_connect(Port, accepted).
+
+check_hook_connect(Port, Expected) ->
+    Options = maps:put(verbose, true, default_client_opts(Port)),
+    {ok, Client} = emqx_nats_client:start_link(Options),
+    try
+        ?assertMatch(
+            {ok, [#nats_frame{operation = ?OP_INFO}]},
+            emqx_nats_client:receive_message(Client)
+        ),
+        ok = emqx_nats_client:connect(Client),
+        case Expected of
+            rejected ->
+                ?assertMatch(
+                    {ok, [
+                        #nats_frame{
+                            operation = ?OP_ERR, message = <<"Login Failed: Quota exceeded">>
+                        },
+                        tcp_closed
+                    ]},
+                    emqx_nats_client:receive_message(Client, 2)
+                );
+            accepted ->
+                ?assertMatch(
+                    {ok, [#nats_frame{operation = ?OP_OK}]},
+                    emqx_nats_client:receive_message(Client)
+                ),
+                ok = emqx_nats_client:ping(Client),
+                ?assertMatch(
+                    {ok, [#nats_frame{operation = ?OP_PONG}]},
+                    emqx_nats_client:receive_message(Client)
+                )
+        end
+    after
+        emqx_nats_client:stop(Client)
+    end.

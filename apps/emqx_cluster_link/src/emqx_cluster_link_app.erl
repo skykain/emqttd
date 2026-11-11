@@ -1,0 +1,78 @@
+%%--------------------------------------------------------------------
+%% Copyright (c) 2024-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
+%%--------------------------------------------------------------------
+
+-module(emqx_cluster_link_app).
+
+-behaviour(application).
+
+-include_lib("emqx/include/logger.hrl").
+
+-export([start/2, stop/1]).
+
+start(_StartType, _StartArgs) ->
+    ok = mria:wait_for_tables(emqx_cluster_link_extrouter:create_tables()),
+    ok = emqx_cluster_link:register_if_enabled(emqx_cluster_link_config:get_links()),
+    ok = emqx_cluster_link_config:load(),
+    ok = emqx_cluster_link:put_hook(),
+    {ok, Sup} = emqx_cluster_link_sup:start_link(),
+    ok = start_configured_links(),
+    {ok, Sup}.
+
+start_configured_links() ->
+    %% Cluster linking requires a non-community license. Under a community
+    %% (single-node) license, configured links stay inert until the license
+    %% is upgraded and a user toggles them via the REST API or dashboard.
+    case emqx_cluster:is_single_node_mode() of
+        true ->
+            warn_if_links_configured(),
+            ok;
+        false ->
+            lists:foreach(
+                fun start_configured_link/1,
+                emqx_cluster_link_config:get_enabled_links()
+            )
+    end.
+
+%% One link that fails to start must not stop the application. The config
+%% handler stays registered, so the link can still be fixed or deleted.
+start_configured_link(#{name := Name} = LinkConf) ->
+    try
+        {ok, _} = emqx_cluster_link_sup:ensure_actor(LinkConf),
+        {ok, _} = emqx_cluster_link_mqtt:ensure_msg_fwd_resource(LinkConf),
+        ok
+    catch
+        Class:Reason:Stacktrace ->
+            ?SLOG(error, #{
+                msg => "cluster_link_start_failed",
+                link => Name,
+                exception => Class,
+                reason => Reason,
+                stacktrace => Stacktrace
+            })
+    end.
+
+warn_if_links_configured() ->
+    case [Name || #{name := Name} <- emqx_cluster_link_config:get_enabled_links()] of
+        [] ->
+            ok;
+        Names ->
+            ?SLOG(warning, #{
+                msg => "cluster_link_disabled_no_license",
+                hint =>
+                    "cluster linking requires a non-community license; "
+                    "configured links are inactive on this node",
+                configured_links => Names
+            })
+    end.
+
+stop(_State) ->
+    _ = emqx_cluster_link:delete_hook(),
+    _ = emqx_cluster_link:unregister_external_broker(),
+    _ = emqx_cluster_link_config:unload(),
+    lists:foreach(
+        fun(_LinkConf = #{name := ClusterName}) ->
+            emqx_cluster_link_mqtt:remove_msg_fwd_resource(ClusterName)
+        end,
+        emqx_cluster_link_config:get_links()
+    ).

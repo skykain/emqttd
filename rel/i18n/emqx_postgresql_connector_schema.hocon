@@ -1,0 +1,24 @@
+
+emqx_postgresql_connector_schema {
+
+server.desc:
+"""The IPv4 or IPv6 address or the hostname to connect to.<br/>
+A host entry has the following form: `Host[:Port]`.<br/>
+The PostgreSQL default port 5432 is used if `[:Port]` is not specified."""
+
+server.label:
+"""Server Host"""
+
+application_name.desc:
+"""The application name to use for PostgreSQL connections. This value appears in PostgreSQL activity views and logs. It must be 1 to 63 bytes long and cannot contain zero bytes."""
+
+application_name.label:
+"""Application Name"""
+
+config_connector.desc:
+"""The configuration for the PostgreSQL connector."""
+
+config_connector.label:
+"""PostgreSQL Connector Config"""
+
+}

@@ -1,9 +1,33 @@
-version: '3.9'
-
 services:
   mysql_server:
     container_name: mysql
-    image: mysql:${MYSQL_TAG}
+    image: public.ecr.aws/docker/library/mysql:${MYSQL_TAG}
+    restart: always
+    ports:
+      - "3306:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: public
+      MYSQL_DATABASE: mqtt
+    networks:
+      - emqx_bridge
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-ppublic"]
+      interval: 1s
+      timeout: 1s
+      retries: 20
+    command:
+      - --bind-address=0.0.0.0
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_general_ci
+      - --lower-case-table-names=1
+      - --max-allowed-packet=128M
+      # Severely limit maximum number of prepared statements the server must permit
+      # so that we hit potential resource exhaustion earlier in tests.
+      - --max-prepared-stmt-count=64
+      - --skip-symbolic-links
+  mysql_server_nbe:
+    container_name: mysql-nbe
+    image: public.ecr.aws/docker/library/mysql:${MYSQL_TAG}
     restart: always
     environment:
       MYSQL_ROOT_PASSWORD: public
@@ -11,10 +35,13 @@ services:
     networks:
       - emqx_bridge
     command:
-      --bind-address "::"
-      --character-set-server=utf8mb4
-      --collation-server=utf8mb4_general_ci
-      --explicit_defaults_for_timestamp=true
-      --lower_case_table_names=1
-      --max_allowed_packet=128M
-      --skip-symbolic-links
+      - --bind-address=0.0.0.0
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_general_ci
+      - --lower-case-table-names=1
+      - --max-allowed-packet=128M
+      - --max-prepared-stmt-count=64
+      - --skip-symbolic-links
+      # Default session sql_mode for tests that exercise escaping behavior
+      # when backslash escapes are disabled.
+      - --sql-mode=NO_BACKSLASH_ESCAPES,ANSI_QUOTES

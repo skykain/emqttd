@@ -1,210 +1,1071 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
-
 -module(emqx_mgmt_auth).
 
-%% Mnesia Bootstrap
--export([mnesia/1]).
--boot_mnesia({mnesia, [boot]}).
--copy_mnesia({mnesia, [copy]}).
+-include_lib("stdlib/include/ms_transform.hrl").
+-include_lib("emqx/include/emqx.hrl").
+-include_lib("emqx/include/logger.hrl").
+-include_lib("emqx_utils/include/emqx_api_key_scopes.hrl").
+-include_lib("emqx_utils/include/emqx_http_api.hrl").
+-include_lib("emqx_dashboard/include/emqx_dashboard_rbac.hrl").
+-include_lib("emqx/include/emqx_config.hrl").
 
-%% APP Management API
--export([ add_default_app/0
-        , add_app/2
-        , add_app/5
-        , add_app/6
-        , force_add_app/6
-        , lookup_app/1
-        , get_appsecret/1
-        , update_app/2
-        , update_app/5
-        , del_app/1
-        , list_apps/0
-        ]).
+-behaviour(emqx_db_backup).
 
-%% APP Auth/ACL API
--export([is_authorized/2]).
+%% API
+-export([create_tables/0]).
 
--define(APP, emqx_management).
+-behaviour(emqx_config_handler).
 
--record(mqtt_app, {id, secret, name, desc, status, expired}).
+-export([
+    create/5,
+    create/6,
+    create_with_secret/6,
+    create_with_secret/7,
+    create_with_key/7,
+    create_with_key/8,
+    read/1,
+    update/5,
+    update/6,
+    delete/1,
+    list/0,
+    try_init_bootstrap_file/0,
+    format/1,
+    check_scopes/2
+]).
 
--type(appid() :: binary()).
+-export([authorize/4, is_api_key_allowed/1]).
+-export([post_config_update/5]).
 
--type(appsecret() :: binary()).
+-export([backup_tables/0, validate_mnesia_backup/1]).
+
+-export([delete_all_keys_from_namespace/1]).
+
+%% Internal exports (RPC)
+-export([
+    do_update/6,
+    do_delete/1,
+    do_create_app/1,
+    do_force_create_app/1
+]).
+
+%% Role-default scopes and `scopes' write-intent normalization.
+-export([role_default_scopes/1, write_scope_intent/2]).
+
+-ifdef(TEST).
+-export([trans/2, force_create_app/1]).
+-export([init_bootstrap_file/1]).
+%% Exported for emqx_mgmt_auth_tests.
+-export([parse_bootstrap_scopes_lenient/3, group_rejected_by_reason/1]).
+-endif.
+
+-define(APP, emqx_app).
+
+-record(?APP, {
+    name = <<>> :: binary() | '_',
+    api_key = <<>> :: binary() | '_',
+    api_secret_hash = <<>> :: binary() | '_',
+    enable = true :: boolean() | '_',
+    %% Since v5.4.0 the `desc` has changed to `extra`
+    %% desc = <<>> :: binary() | '_',
+    extra = #{} :: binary() | map() | '_',
+    expired_at = 0 :: integer() | undefined | infinity | '_',
+    created_at = 0 :: integer() | '_'
+}).
+
+-define(DEFAULT_HASH_LEN, 16).
+
+create_tables() ->
+    Fields = record_info(fields, ?APP),
+    ok = mria:create_table(?APP, [
+        {type, set},
+        {rlog_shard, ?COMMON_SHARD},
+        {storage, disc_copies},
+        {record_name, ?APP},
+        {attributes, Fields}
+    ]),
+    [?APP].
 
 %%--------------------------------------------------------------------
-%% Mnesia Bootstrap
+%% Data backup
 %%--------------------------------------------------------------------
 
-mnesia(boot) ->
-    ok = ekka_mnesia:create_table(mqtt_app, [
-                {disc_copies, [node()]},
-                {record_name, mqtt_app},
-                {attributes, record_info(fields, mqtt_app)}]);
+backup_tables() -> {<<"api_keys">>, [?APP]}.
 
-mnesia(copy) ->
-    ok = ekka_mnesia:copy_table(mqtt_app, disc_copies).
-
-%%--------------------------------------------------------------------
-%% Manage Apps
-%%--------------------------------------------------------------------
--spec(add_default_app() -> ok | {ok, appsecret()} | {error, term()}).
-add_default_app() ->
-    AppId = application:get_env(?APP, default_application_id, undefined),
-    AppSecret = application:get_env(?APP, default_application_secret, undefined),
-    case {AppId, AppSecret} of
-        {undefined, _} -> ok;
-        {_, undefined} -> ok;
-        {_, _} ->
-            AppId1 = erlang:list_to_binary(AppId),
-            AppSecret1 = erlang:list_to_binary(AppSecret),
-            add_app(AppId1, <<"Default">>, AppSecret1, <<"Application user">>, true, undefined)
-    end.
-
--spec(add_app(appid(), binary()) -> {ok, appsecret()} | {error, term()}).
-add_app(AppId, Name) when is_binary(AppId) ->
-    add_app(AppId, Name, <<"Application user">>, true, undefined).
-
--spec(add_app(appid(), binary(), binary(), boolean(), integer() | undefined)
-      -> {ok, appsecret()}
-       | {error, term()}).
-add_app(AppId, Name, Desc, Status, Expired) when is_binary(AppId) ->
-    add_app(AppId, Name, undefined, Desc, Status, Expired).
-
--spec(add_app(appid(), binary(), binary() | undefined, binary(), boolean(), integer() | undefined)
-      -> {ok, appsecret()}
-       | {error, term()}).
-add_app(AppId, Name, Secret, Desc, Status, Expired) when is_binary(AppId) ->
-    Secret1 = generate_appsecret_if_need(Secret),
-    App = #mqtt_app{id = AppId,
-                    secret = Secret1,
-                    name = Name,
-                    desc = Desc,
-                    status = Status,
-                    expired = Expired},
-    AddFun = fun() ->
-                 case mnesia:wread({mqtt_app, AppId}) of
-                     [] -> mnesia:write(App);
-                     _  -> mnesia:abort(alread_existed)
-                 end
-             end,
-    case mnesia:transaction(AddFun) of
-        {atomic, ok} -> {ok, Secret1};
-        {aborted, Reason} -> {error, Reason}
-    end.
-
-force_add_app(AppId, Name, Secret, Desc, Status, Expired) ->
-    AddFun = fun() ->
-                 mnesia:write(#mqtt_app{id = AppId,
-                                        secret = Secret,
-                                        name = Name,
-                                        desc = Desc,
-                                        status = Status,
-                                        expired = Expired})
-             end,
-    case mnesia:transaction(AddFun) of
-        {atomic, ok} -> ok;
-        {aborted, Reason} -> {error, Reason}
-    end.
-
--spec(generate_appsecret_if_need(binary() | undefined) -> binary()).
-generate_appsecret_if_need(InSecrt) when is_binary(InSecrt), byte_size(InSecrt) > 0 ->
-    InSecrt;
-generate_appsecret_if_need(_) ->
-    AppConf = application:get_env(?APP, application, []),
-    case proplists:get_value(default_secret,  AppConf) of
-       undefined -> emqx_guid:to_base62(emqx_guid:gen());
-       Secret when is_binary(Secret) -> Secret
-    end.
-
--spec(get_appsecret(appid()) -> {appsecret() | undefined}).
-get_appsecret(AppId) when is_binary(AppId) ->
-    case mnesia:dirty_read(mqtt_app, AppId) of
-        [#mqtt_app{secret = Secret}] -> Secret;
-        [] -> undefined
-    end.
-
--spec(lookup_app(appid()) -> undefined | {appid(), appsecret(), binary(), binary(), boolean(), integer() | undefined}).
-lookup_app(AppId) when is_binary(AppId) ->
-    case mnesia:dirty_read(mqtt_app, AppId) of
-        [#mqtt_app{id = AppId,
-                   secret = AppSecret,
-                   name = Name,
-                   desc = Desc,
-                   status = Status,
-                   expired = Expired}] -> {AppId, AppSecret, Name, Desc, Status, Expired};
-        [] -> undefined
-    end.
-
--spec(update_app(appid(), boolean()) -> ok | {error, term()}).
-update_app(AppId, Status) ->
-    case mnesia:dirty_read(mqtt_app, AppId) of
-        [App = #mqtt_app{}] ->
-            case mnesia:transaction(fun() -> mnesia:write(App#mqtt_app{status = Status}) end) of
-                {atomic, ok} -> ok;
-                {aborted, Reason} -> {error, Reason}
-            end;
-        [] ->
-            {error, not_found}
-    end.
-
--spec(update_app(appid(), binary(), binary(), boolean(), integer() | undefined) -> ok | {error, term()}).
-update_app(AppId, Name, Desc, Status, Expired) ->
-    case mnesia:dirty_read(mqtt_app, AppId) of
-        [App = #mqtt_app{}] ->
-            case mnesia:transaction(fun() -> mnesia:write(App#mqtt_app{name = Name,
-                                                                       desc = Desc,
-                                                                       status = Status,
-                                                                       expired = Expired}) end) of
-                {atomic, ok} -> ok;
-                {aborted, Reason} -> {error, Reason}
-            end;
-        [] ->
-            {error, not_found}
-    end.
-
--spec(del_app(appid()) -> ok | {error, term()}).
-del_app(AppId) when is_binary(AppId) ->
-    case mnesia:transaction(fun mnesia:delete/1, [{mqtt_app, AppId}]) of
-        {atomic, Ok} -> Ok;
-        {aborted, Reason} -> {error, Reason}
-    end.
-
--spec(list_apps() -> [{appid(), appsecret(), binary(), binary(), boolean(), integer() | undefined}]).
-list_apps() ->
-    [ {AppId, AppSecret, Name, Desc, Status, Expired} || #mqtt_app{id = AppId,
-                                                                   secret = AppSecret,
-                                                                   name = Name,
-                                                                   desc = Desc,
-                                                                   status = Status,
-                                                                   expired = Expired} <- ets:tab2list(mqtt_app) ].
-%%--------------------------------------------------------------------
-%% Authenticate App
-%%--------------------------------------------------------------------
-
--spec(is_authorized(appid(), appsecret()) -> boolean()).
-is_authorized(AppId, AppSecret) ->
-    case lookup_app(AppId) of
-        {_, AppSecret1, _, _, Status, Expired} ->
-            Status andalso is_expired(Expired) andalso AppSecret =:= AppSecret1;
+validate_mnesia_backup({schema, _Tab, CreateList} = Schema) ->
+    case emqx_mgmt_data_backup:default_validate_mnesia_backup(Schema) of
+        ok ->
+            ok;
         _ ->
-            false
+            case proplists:get_value(attributes, CreateList) of
+                %% Since v5.4.0 the `desc` has changed to `extra`
+                [name, api_key, api_secret_hash, enable, desc, expired_at, created_at] ->
+                    ok;
+                Fields ->
+                    {error, {unknow_fields, Fields}}
+            end
+    end;
+validate_mnesia_backup(_Other) ->
+    ok.
+
+post_config_update([api_key], _Req, NewConf, _OldConf, _AppEnvs) ->
+    #{bootstrap_file := File} = NewConf,
+    case init_bootstrap_file(File) of
+        ok ->
+            ?SLOG(debug, #{msg => "init_bootstrap_api_keys_from_file_ok", file => File});
+        {error, Reason} ->
+            Msg = "init_bootstrap_api_keys_from_file_failed",
+            ?SLOG(error, #{msg => Msg, reason => Reason, file => File})
+    end,
+    ok.
+
+-spec try_init_bootstrap_file() -> ok | {error, _}.
+try_init_bootstrap_file() ->
+    case mria_rlog:role() of
+        core ->
+            File = bootstrap_file(),
+            ?SLOG(debug, #{msg => "init_bootstrap_api_keys_from_file", file => File}),
+            _ = init_bootstrap_file(File),
+            ok;
+        _ ->
+            ok
     end.
 
-is_expired(undefined) -> true;
-is_expired(Expired)   -> Expired >= erlang:system_time(second).
+%% Three public entry points, one purpose each:
+%%
+%%   create/{5,6}             — REST API: auto-generate both ApiKey and ApiSecret.
+%%   create_with_secret/{6,7} — Dashboard CLI when user provides --api-secret;
+%%                              auto-generate ApiKey only.
+%%   create_with_key/{7,8}    — Tests / bootstrap: caller provides both
+%%                              ApiKey and ApiSecret explicitly.
+%%
+%% Each function has exactly one signature shape; no guard-based dispatch
+%% on positional arguments.
+create(Name, Enable, ExpiredAt, Desc, Role) ->
+    create(Name, Enable, ExpiredAt, Desc, Role, undefined).
 
+create(Name, Enable, ExpiredAt, Desc, Role, Scopes) ->
+    ApiKey = generate_unique_api_key(),
+    ApiSecret = generate_api_secret(),
+    create_with_key(Name, ApiKey, ApiSecret, Enable, ExpiredAt, Desc, Role, Scopes).
+
+create_with_secret(Name, ApiSecret, Enable, ExpiredAt, Desc, Role) ->
+    create_with_secret(Name, ApiSecret, Enable, ExpiredAt, Desc, Role, undefined).
+
+create_with_secret(Name, ApiSecret, Enable, ExpiredAt, Desc, Role, Scopes) when
+    is_binary(ApiSecret) andalso byte_size(ApiSecret) >= 32
+->
+    ApiKey = generate_unique_api_key(),
+    create_with_key(Name, ApiKey, ApiSecret, Enable, ExpiredAt, Desc, Role, Scopes);
+create_with_secret(_Name, _ApiSecret, _Enable, _ExpiredAt, _Desc, _Role, _Scopes) ->
+    {error, <<"api_secret_too_short">>}.
+
+create_with_key(Name, ApiKey, ApiSecret, Enable, ExpiredAt, Desc, Role) ->
+    create_with_key(Name, ApiKey, ApiSecret, Enable, ExpiredAt, Desc, Role, undefined).
+
+create_with_key(Name, ApiKey, ApiSecret, Enable, ExpiredAt, Desc, Role, Scopes) ->
+    case mnesia:table_info(?APP, size) < 100 of
+        true -> create_app(Name, ApiKey, ApiSecret, Enable, ExpiredAt, Desc, Role, Scopes);
+        false -> {error, "Maximum number of ApiKeys reached."}
+    end.
+
+read(Name) ->
+    case mnesia:dirty_read(?APP, Name) of
+        [App] -> {ok, to_map(App)};
+        [] -> {error, not_found}
+    end.
+
+update(Name, Enable, ExpiredAt, Desc, Role) ->
+    update(Name, Enable, ExpiredAt, Desc, Role, undefined).
+
+%% An absent role means the caller did not ask for a role change, so there is nothing
+%% to validate: `do_update/6' keeps the stored one, like it does for `desc' and
+%% `enable'.
+update(Name, Enable, ExpiredAt, Desc, undefined, Scopes) ->
+    trans(fun ?MODULE:do_update/6, [Name, Enable, ExpiredAt, Desc, undefined, Scopes]);
+update(Name, Enable, ExpiredAt, Desc, Role0, Scopes) ->
+    case parse_role(Role0) of
+        {ok, ParsedRole} ->
+            trans(fun ?MODULE:do_update/6, [Name, Enable, ExpiredAt, Desc, ParsedRole, Scopes]);
+        Error ->
+            Error
+    end.
+
+do_update(Name, Enable, ExpiredAt, Desc, Role0, Scopes) ->
+    case mnesia:read(?APP, Name, write) of
+        [] ->
+            mnesia:abort(not_found);
+        [App0 = #?APP{enable = Enable0, expired_at = ExpiredAt0, extra = Extra0}] ->
+            #{desc := Desc0} = Extra1 = normalize_extra(Extra0),
+            PreviousNamespace = maps:get(?namespace, Extra1, ?global_ns),
+            %% A field left out of the request is `undefined' and keeps its stored value,
+            %% so a partial update cannot silently change more than it was asked to.
+            %% An `undefined' role means no role change was requested: keep the stored
+            %% role and, with it, the stored namespace.
+            #{?role := Role, ?namespace := Namespace} = ensure_not_undefined(
+                Role0,
+                #{?role => get_role(Extra1), ?namespace => PreviousNamespace}
+            ),
+            case PreviousNamespace /= Namespace of
+                true ->
+                    %% Namespace is part of the RBAC boundary.  Require delete/recreate
+                    %% instead of moving an existing API key across scopes.
+                    mnesia:abort(<<"changing_namespace_is_forbidden">>);
+                false ->
+                    ok
+            end,
+            Extra2 = emqx_utils_maps:put_if(
+                Extra1#{?role => Role, desc => ensure_not_undefined(Desc, Desc0)},
+                ?namespace,
+                Namespace,
+                is_binary(Namespace)
+            ),
+            Extra3 = maybe_set_scopes(Extra2, Scopes),
+            App =
+                App0#?APP{
+                    expired_at = ensure_not_undefined(ExpiredAt, ExpiredAt0),
+                    enable = ensure_not_undefined(Enable, Enable0),
+                    extra = Extra3
+                },
+            ok = mnesia:write(App),
+            to_map(App)
+    end.
+
+delete(Name) ->
+    trans(fun ?MODULE:do_delete/1, [Name]).
+
+do_delete(Name) ->
+    case mnesia:read(?APP, Name) of
+        [] -> mnesia:abort(not_found);
+        [_App] -> mnesia:delete({?APP, Name})
+    end.
+
+delete_all_keys_from_namespace(Namespace) when is_binary(Namespace) ->
+    MS = ets:fun2ms(
+        fun(#?APP{name = Name, extra = #{?namespace := Ns}}) when Ns == Namespace ->
+            Name
+        end
+    ),
+    APIKeyNames = ets:select(?APP, MS),
+    lists:foreach(fun delete/1, APIKeyNames).
+
+format(App = #{expired_at := ExpiredAt, created_at := CreateAt}) ->
+    format_app_extend(App#{
+        expired_at => format_epoch(ExpiredAt),
+        created_at => format_epoch(CreateAt)
+    }).
+
+%% `undefined' is how releases before 5.0.0 encoded "never expires" (`is_expired/1'
+%% and `authorize/4' still treat it that way), so format it like `infinity' instead of
+%% crashing on records carried over from such a release or restored from a backup.
+format_epoch(undefined) ->
+    <<"infinity">>;
+format_epoch(infinity) ->
+    <<"infinity">>;
+format_epoch(Epoch) ->
+    emqx_utils_calendar:epoch_to_rfc3339(Epoch, second).
+
+list() ->
+    to_map(ets:match_object(?APP, #?APP{_ = '_'})).
+
+authorize(#{module := emqx_dashboard_api, function := user}, _Req, _ApiKey, _ApiSecret) ->
+    {error, <<"not_allowed">>, <<"users">>};
+authorize(#{module := emqx_dashboard_api, function := users}, _Req, _ApiKey, _ApiSecret) ->
+    {error, <<"not_allowed">>, <<"users">>};
+authorize(#{module := emqx_dashboard_api, function := logout}, _Req, _ApiKey, _ApiSecret) ->
+    {error, <<"not_allowed">>, <<"logout">>};
+authorize(#{module := emqx_dashboard_api, function := change_mfa}, _Req, _ApiKey, _ApiSecret) ->
+    {error, <<"not_allowed">>, <<"users">>};
+%% Self-service endpoints authorize on "the caller IS the subject". An
+%% API key has no such subject -- it is a machine credential, not a
+%% dashboard account -- so there is no account for it to act on here.
+%% These paths are ?SCOPE_PUBLIC, so the scope check lets an API key
+%% through; this clause is what rejects it.
+authorize(#{module := emqx_dashboard_api, function := Fn}, _Req, _ApiKey, _ApiSecret) when
+    Fn == current_user;
+    Fn == current_user_change_pwd;
+    Fn == current_user_mfa;
+    %% Same reasoning for the deprecated `/users/:username/change_pwd'
+    %% shim, which is a self operation and so equally meaningless for a
+    %% machine credential. It is ?SCOPE_PUBLIC as well, so the scope
+    %% layer would not stop an API key either.
+    Fn == change_pwd
+->
+    {error, <<"not_allowed">>, <<"users">>};
+authorize(#{module := emqx_mgmt_api_api_keys}, _Req, _ApiKey, _ApiSecret) ->
+    {error, <<"not_allowed">>, <<"api_key">>};
+authorize(HandlerInfo, Req, ApiKey, ApiSecret) ->
+    case not_allowed_resource(HandlerInfo) of
+        {true, Resource} ->
+            {error, <<"not_allowed">>, Resource};
+        false ->
+            do_authorize(HandlerInfo, Req, ApiKey, ApiSecret)
+    end.
+
+do_authorize(HandlerInfo, Req, ApiKey, ApiSecret) ->
+    Now = erlang:system_time(second),
+    case find_by_api_key(ApiKey) of
+        {ok, true, ExpiredAt, SecretHash, Role, Namespace, Extra} when ExpiredAt >= Now ->
+            case emqx_dashboard_admin:verify_hash(ApiSecret, SecretHash) of
+                ok ->
+                    check_rbac_and_scopes(Req, HandlerInfo, ApiKey, Role, Namespace, Extra);
+                error ->
+                    {error, "secret_error"}
+            end;
+        {ok, true, _ExpiredAt, _SecretHash, _Role, _Namespace, _Extra} ->
+            {error, "secret_expired"};
+        {ok, false, _ExpiredAt, _SecretHash, _Role, _Namespace, _Extra} ->
+            {error, "secret_disabled"};
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+%% @doc Whether HandlerInfo's endpoint accepts API key (Basic auth) credentials at all.
+%% Shared by authorize/4 so the set of API-key-rejecting endpoints has one definition.
+-spec is_api_key_allowed(map()) -> boolean().
+is_api_key_allowed(HandlerInfo) ->
+    not_allowed_resource(HandlerInfo) =:= false.
+
+not_allowed_resource(#{module := emqx_dashboard_api, function := user}) ->
+    {true, <<"users">>};
+not_allowed_resource(#{module := emqx_dashboard_api, function := users}) ->
+    {true, <<"users">>};
+not_allowed_resource(#{module := emqx_dashboard_api, function := logout}) ->
+    {true, <<"logout">>};
+not_allowed_resource(#{module := emqx_dashboard_api, function := change_pwd}) ->
+    {true, <<"users">>};
+not_allowed_resource(#{module := emqx_dashboard_api, function := change_mfa}) ->
+    {true, <<"users">>};
+not_allowed_resource(#{module := emqx_mgmt_api_api_keys}) ->
+    {true, <<"api_key">>};
+not_allowed_resource(_HandlerInfo) ->
+    false.
+
+check_rbac_and_scopes(Req, HandlerInfo, ApiKey, Role, Namespace, Extra) ->
+    case check_rbac(Req, HandlerInfo, ApiKey, Role, Namespace) of
+        {ok, ActorContext} ->
+            case check_scopes(Extra, HandlerInfo) of
+                ok ->
+                    {ok, ActorContext};
+                {error, unauthorized_role} ->
+                    {error, {unauthorized_role, ?API_KEY_NOT_ALLOW_MSG}}
+            end;
+        {error, Reason} when is_binary(Reason) ->
+            {error, {unauthorized_role, Reason}}
+    end.
+
+find_by_api_key(ApiKey) ->
+    Fun = fun() -> mnesia:match_object(#?APP{api_key = ApiKey, _ = '_'}) end,
+    case mria:ro_transaction(?COMMON_SHARD, Fun) of
+        {atomic, [
+            #?APP{
+                api_secret_hash = SecretHash,
+                enable = Enable,
+                expired_at = ExpiredAt,
+                extra = Extra
+            }
+        ]} ->
+            Role = get_role(Extra),
+            Namespace = namespace_of(Extra),
+            {ok, Enable, ExpiredAt, SecretHash, Role, Namespace, normalize_extra(Extra)};
+        _ ->
+            {error, "not_found"}
+    end.
+
+%% @doc Check if the request's endpoint is within the allowed scopes for this API key.
+%% Denied scopes are always blocked, regardless of configuration.
+%% If no scopes are configured (key not present or undefined), all non-denied endpoints are allowed.
+%% If scopes is an empty list, all *mapped* endpoints are denied; unmapped
+%% ones (e.g. status, prometheus data) remain allowed so an operator can
+%% still reach the node and reconfigure the key via the UI.
+%% Publisher role skips scope check (has its own hardcoded path restrictions).
+%%
+%% The endpoint is identified by the `module' and `function' of minirest's
+%% HandlerInfo: the handler cowboy dispatched to. The scope cache is keyed
+%% the same way, so no path is re-matched here.
+-spec check_scopes(map(), map()) -> ok | {error, unauthorized_role}.
+check_scopes(Extra, HandlerInfo) ->
+    case is_denied_handler(HandlerInfo) of
+        true ->
+            {error, unauthorized_role};
+        false ->
+            check_scopes_for_handler(Extra, HandlerInfo)
+    end.
+
+%% @doc Internal: check scopes for a handler that has already passed denied check.
+check_scopes_for_handler(Extra, HandlerInfo) ->
+    case get_scopes(Extra) of
+        undefined ->
+            %% No scopes configured = all non-denied endpoints allowed (backward compat)
+            ok;
+        Scopes ->
+            Role = maps:get(?role, Extra, ?ROLE_API_DEFAULT),
+            case Role of
+                ?ROLE_API_PUBLISHER ->
+                    %% Publisher role has its own hardcoded path restrictions,
+                    %% skip scope check
+                    ok;
+                _ ->
+                    check_handler_in_scopes(HandlerInfo, Scopes)
+            end
+    end.
+
+check_handler_in_scopes(HandlerInfo, Scopes) ->
+    case emqx_mgmt_api_key_scopes:handler_scopes(HandlerInfo) of
+        undefined ->
+            %% Endpoint not mapped to any scope — allow access regardless
+            %% of whether `Scopes' is empty. This keeps unmapped public
+            %% endpoints (status, prometheus data, etc.) reachable for
+            %% keys whose scope list was filtered down to `[]' by the
+            %% bootstrap loader, so an operator can still observe the
+            %% node and reconfigure the key via the UI.
+            ok;
+        Declared ->
+            %% An endpoint may declare more than one acceptable scope;
+            %% holding any one of them grants access.
+            case emqx_mgmt_api_key_scopes:any_scope_granted(Declared, Scopes) of
+                true -> ok;
+                false -> {error, unauthorized_role}
+            end
+    end.
+
+%% @doc Check if a handler belongs to a denied scope.
+is_denied_handler(HandlerInfo) ->
+    case emqx_mgmt_api_key_scopes:handler_scopes(HandlerInfo) of
+        undefined ->
+            false;
+        Declared ->
+            lists:any(fun emqx_mgmt_api_key_scopes:is_denied_scope/1, Declared)
+    end.
+
+get_scopes(#{scopes := Scopes}) when is_list(Scopes) ->
+    Scopes;
+get_scopes(#{scopes := undefined}) ->
+    undefined;
+get_scopes(_) ->
+    %% No scopes key in extra = backward compatible, allow all
+    undefined.
+
+%% @doc Set scopes in extra map. `undefined' means "don't change";
+%% `unset' clears the field back to role-default behavior.
+maybe_set_scopes(Extra, undefined) ->
+    Extra;
+maybe_set_scopes(Extra, unset) ->
+    maps:remove(scopes, Extra);
+maybe_set_scopes(Extra, Scopes) when is_list(Scopes) ->
+    Extra#{scopes => Scopes}.
+
+%% @doc Resolve the role-default scopes that should be materialized into
+%% the persisted record when the caller did not explicitly supply a scope
+%% list (POST without `scopes', 2-/3-segment bootstrap line). Accepts a
+%% bare role or a serialized namespaced role (`ns:<ns>::<role>').
+%%
+%%   * global administrator / viewer -> `?GENERIC_SCOPES' (the management
+%%     scopes, no login-only scopes — those are reserved for dashboard
+%%     users).
+%%   * namespaced administrator -> `?NS_ADMIN_COMMON_SCOPES': the subset a
+%%     namespaced admin can actually exercise, notably without `publish'
+%%     (the publish APIs are global-only). This mirrors the namespaced
+%%     dashboard-user default (`?NS_ADMIN_ALLOWED_SCOPES') minus the
+%%     login-only scopes, exactly as the global administrator default is
+%%     `?GENERIC_SCOPES' without the login-only scopes.
+%%   * namespaced viewer -> `?NS_VIEWER_ALLOWED_SCOPES', the same as the
+%%     namespaced dashboard-viewer default.
+%%   * publisher              -> `[<<"publish">>]' (the only scope the
+%%     publisher role is ever permitted to hold; runtime RBAC also
+%%     hard-restricts publisher to `/publish*' regardless of the stored
+%%     scope list).
+role_default_scopes(Role0) ->
+    case parse_role(Role0) of
+        {ok, #{?role := Role, ?namespace := Namespace}} ->
+            role_default_scopes(Role, Namespace);
+        {error, _} ->
+            ?GENERIC_SCOPES
+    end.
+
+role_default_scopes(?ROLE_API_PUBLISHER, _Namespace) ->
+    [?SCOPE_PUBLISH];
+role_default_scopes(?ROLE_API_SUPERUSER, Namespace) when is_binary(Namespace) ->
+    ?NS_ADMIN_COMMON_SCOPES;
+role_default_scopes(_Role, Namespace) when is_binary(Namespace) ->
+    ?NS_VIEWER_ALLOWED_SCOPES;
+role_default_scopes(_Role, _Namespace) ->
+    ?GENERIC_SCOPES.
+
+%% @doc Normalize a `scopes' request value to a write intent:
+%% `keep' (field omitted), `unset' (the `unset' sentinel or a list
+%% set-equal to the role default: store no explicit scopes so a
+%% read-modify-write never freezes the implicit default), or
+%% `{set, L}' (store `L' verbatim; downstream validation rejects
+%% non-list garbage). Counterpart of
+%% `emqx_dashboard_api:write_scope_intent/2'; keep the two consistent.
+write_scope_intent(_Role, undefined) ->
+    keep;
+write_scope_intent(_Role, unset) ->
+    unset;
+write_scope_intent(_Role, <<"unset">>) ->
+    unset;
+write_scope_intent(Role, Scopes) when is_list(Scopes) ->
+    case is_role_default_scopes(Role, Scopes) of
+        true -> unset;
+        false -> {set, Scopes}
+    end;
+write_scope_intent(_Role, Other) ->
+    {set, Other}.
+
+is_role_default_scopes(Role, Scopes) ->
+    lists:usort(Scopes) =:= lists:usort(role_default_scopes(Role)).
+
+ensure_not_undefined(undefined, Old) -> Old;
+ensure_not_undefined(New, _Old) -> New.
+
+to_map(Apps) when is_list(Apps) ->
+    [to_map(App) || App <- Apps];
+to_map(#?APP{
+    name = N, api_key = K, enable = E, expired_at = ET, created_at = CT, extra = Extra0
+}) ->
+    #{?role := Role, desc := Desc} = Extra = normalize_extra(Extra0),
+    Namespace = maps:get(?namespace, Extra, ?global_ns),
+    Base = #{
+        name => N,
+        api_key => K,
+        enable => E,
+        expired_at => ET,
+        created_at => CT,
+        desc => Desc,
+        expired => is_expired(ET),
+        role => Role,
+        namespace => Namespace
+    },
+    maybe_add_scopes(Base, Extra).
+
+%% @doc Surface raw scope state to the API consumer with a tri-state contract:
+%%   - `[]`            : explicit deny-all (only `security => []` paths reachable)
+%%   - `[binary(), …]` : explicit allow-list
+%%   - `<<"unset">>`   : the persisted record has no `scopes' field at all
+%%                       (legacy record or unset-equivalent write); the runtime
+%%                       falls back to role-default behaviour.
+%% This intentionally exposes the persisted shape rather than an effective list so
+%% that the dashboard read-modify-write cycle cannot silently sediment role-default
+%% into an explicit list.  The `<<"unset">>' binary is a stable string sentinel
+%% (not JSON `null') so the consumer cannot confuse it with `field missing' or
+%% `field cleared' — both of which can happen in HTTP/JSON intermediaries.
+maybe_add_scopes(Map, #{scopes := Scopes}) when is_list(Scopes) ->
+    Map#{scopes => Scopes};
+maybe_add_scopes(Map, _) ->
+    Map#{scopes => <<"unset">>}.
+
+is_expired(undefined) -> false;
+is_expired(ExpiredTime) -> ExpiredTime < erlang:system_time(second).
+
+create_app(Name, ApiKey, ApiSecret, Enable, ExpiredAt, Desc, Role0, Scopes) ->
+    maybe
+        {ok, #{?role := Role, ?namespace := Namespace}} ?= parse_role(Role0),
+        ActorProps = #{?role => Role, ?namespace => Namespace},
+        ok ?= emqx_hooks:run_fold('api_actor.pre_create', [ActorProps], ok),
+        Extra0 = emqx_utils_maps:put_if(
+            #{?role => Role, desc => Desc},
+            ?namespace,
+            Namespace,
+            is_binary(Namespace)
+        ),
+        Extra = maybe_set_scopes(Extra0, Scopes),
+        App =
+            #?APP{
+                name = Name,
+                enable = Enable,
+                expired_at = ExpiredAt,
+                extra = Extra,
+                created_at = erlang:system_time(second),
+                api_secret_hash = emqx_dashboard_admin:hash_api_secret(ApiSecret),
+                api_key = ApiKey
+            },
+        {ok, Res} ?= trans(fun ?MODULE:do_create_app/1, [App]),
+        {ok, Res#{api_secret => ApiSecret}}
+    end.
+
+force_create_app(App) ->
+    trans(fun ?MODULE:do_force_create_app/1, [App]).
+
+do_create_app(App = #?APP{api_key = ApiKey, name = Name}) ->
+    case mnesia:read(?APP, Name) of
+        [_] ->
+            mnesia:abort(name_already_exists);
+        [] ->
+            case mnesia:match_object(?APP, #?APP{api_key = ApiKey, _ = '_'}, read) of
+                [] ->
+                    ok = mnesia:write(App),
+                    to_map(App);
+                _ ->
+                    mnesia:abort(api_key_already_exists)
+            end
+    end.
+
+do_force_create_app(App) ->
+    _ = maybe_cleanup_api_key(App),
+    ok = mnesia:write(App).
+
+maybe_cleanup_api_key(#?APP{name = Name, api_key = ApiKey}) ->
+    case mnesia:match_object(?APP, #?APP{api_key = ApiKey, _ = '_'}, read) of
+        [] ->
+            ok;
+        [#?APP{name = Name}] ->
+            ?SLOG(debug, #{
+                msg => "same_apikey_detected",
+                info => <<"The last `KEY:SECRET` in bootstrap file will be used.">>
+            }),
+            ok;
+        Existed ->
+            %% Duplicated or upgraded from old version:
+            %% Which `Name` and `ApiKey` are not related in old version.
+            %% So delete it/(them) and write a new record with a name strongly related to the apikey.
+            %% The apikeys generated from the file do not have names.
+            %% Generate a name for the apikey from the apikey itself by rule:
+            %% Use `from_bootstrap_file_` as the prefix, and the first 16 digits of the
+            %% sha512 hexadecimal value of the `ApiKey` as the suffix to form the name of the apikey.
+            %% e.g. The name of the apikey: `example-api-key:secret_xxxx` is `from_bootstrap_file_53280fb165b6cd37`
+
+            %% Note for EMQX-11844:
+            %% emqx.conf has the highest priority
+            %% if there is a key conflict, delete the old one and keep the key which from the bootstrap file
+            ?SLOG(info, #{
+                msg => "duplicated_apikey_detected",
+                info => <<"Delete duplicated apikeys and write a new one from bootstrap file">>,
+                keys => [EName || #?APP{name = EName} <- Existed]
+            }),
+            lists:foreach(
+                fun(#?APP{name = N}) -> ok = mnesia:delete({?APP, N}) end, Existed
+            ),
+            ok
+    end.
+
+hash_string_from_seed(Seed, PrefixLen) ->
+    <<Integer:512>> = crypto:hash(sha512, Seed),
+    list_to_binary(string:slice(io_lib:format("~128.16.0b", [Integer]), 0, PrefixLen)).
+
+%% Generate a random Dashboard API key.
+generate_unique_api_key() ->
+    emqx_utils:rand_id(?DEFAULT_HASH_LEN).
+
+%% Form BootStrap File, only `ApiKey` provided from file, no `Name`
+generate_unique_name(NamePrefix, ApiKey) ->
+    <<NamePrefix/binary, (hash_string_from_seed(ApiKey, ?DEFAULT_HASH_LEN))/binary>>.
+
+trans(Fun, Args) ->
+    case mria:sync_transaction(?COMMON_SHARD, Fun, Args) of
+        {atomic, Res} -> {ok, Res};
+        {aborted, Error} -> {error, Error}
+    end.
+
+generate_api_secret() ->
+    Random = crypto:strong_rand_bytes(32),
+    emqx_base62:encode(Random).
+
+bootstrap_file() ->
+    emqx:get_config([api_key, bootstrap_file], <<>>).
+
+init_bootstrap_file(<<>>) ->
+    ok;
+init_bootstrap_file(File) ->
+    case file:open(File, [read, binary]) of
+        {ok, Dev} ->
+            %% Bootstrap line grammar:
+            %%   key:secret
+            %%   key:secret:role
+            %%   key:secret:role:scopes
+            %% where `role' may be either a simple name (e.g. "administrator")
+            %% or a namespaced tag "ns:<namespace>::<role>" (the `::' separates
+            %% the namespace prefix from the role). `scopes' is a comma-separated
+            %% list of scope names; an empty 4th segment means "deny all mapped
+            %% paths". Unknown scope names are dropped at load time with a
+            %% warning (lenient).
+            %%
+            %% The regex only splits off `key' and `secret' (both forbid `:').
+            %% The remaining tail is parsed in parse_bootstrap_line/2 where we
+            %% disambiguate namespace-vs-simple by looking for `::'.
+            {ok, MP} = re:compile(<<"^([^:]+):([^:]+)(?::(.+))?$">>),
+            init_bootstrap_file(File, Dev, MP);
+        {error, Reason0} ->
+            Reason = emqx_utils:explain_posix(Reason0),
+
+            ?SLOG(
+                error,
+                #{
+                    msg => "failed_to_open_the_bootstrap_file",
+                    file => File,
+                    reason => Reason
+                }
+            ),
+
+            {error, Reason}
+    end.
+
+init_bootstrap_file(File, Dev, MP) ->
+    try
+        add_bootstrap_file(File, Dev, MP, 1)
+    catch
+        throw:Error -> {error, Error};
+        Type:Reason:Stacktrace -> {error, {Type, Reason, Stacktrace}}
+    after
+        file:close(Dev)
+    end.
+
+-define(BOOTSTRAP_TAG, <<"Bootstrapped From File">>).
+-define(FROM_BOOTSTRAP_FILE_PREFIX, <<"from_bootstrap_file_">>).
+
+add_bootstrap_file(File, Dev, MP, Line) ->
+    case read_line(Dev) of
+        {ok, Bin} ->
+            case parse_bootstrap_line(Bin, MP) of
+                {ok, #{
+                    api_key := ApiKey,
+                    api_secret := ApiSecret,
+                    role := Role,
+                    namespace := Namespace,
+                    scopes := Scopes,
+                    rejected_scopes := Rejected
+                }} ->
+                    maybe_warn_rejected_scopes(File, Line, ApiKey, Rejected),
+                    Extra0 = emqx_utils_maps:put_if(
+                        #{desc => ?BOOTSTRAP_TAG, role => Role},
+                        ?namespace,
+                        Namespace,
+                        is_binary(Namespace)
+                    ),
+                    Extra = maybe_set_scopes(Extra0, Scopes),
+                    App =
+                        #?APP{
+                            name = generate_unique_name(?FROM_BOOTSTRAP_FILE_PREFIX, ApiKey),
+                            api_key = ApiKey,
+                            api_secret_hash = bootstrap_secret_hash(ApiKey, ApiSecret),
+                            enable = true,
+                            extra = Extra,
+                            created_at = erlang:system_time(second),
+                            expired_at = infinity
+                        },
+                    case force_create_app(App) of
+                        {ok, ok} ->
+                            add_bootstrap_file(File, Dev, MP, Line + 1);
+                        {error, Reason} ->
+                            throw(#{
+                                file => File,
+                                line => Line,
+                                content => <<"******">>,
+                                reason => Reason
+                            })
+                    end;
+                {error, Reason} ->
+                    ?SLOG(
+                        error,
+                        #{
+                            msg => "failed_to_load_bootstrap_file",
+                            file => File,
+                            line => Line,
+                            content => <<"******">>,
+                            reason => Reason
+                        }
+                    ),
+                    throw(#{file => File, line => Line, content => <<"******">>, reason => Reason})
+            end;
+        skip ->
+            add_bootstrap_file(File, Dev, MP, Line + 1);
+        eof ->
+            ok;
+        {error, Reason} ->
+            throw(#{file => File, line => Line, reason => Reason})
+    end.
+
+%% Keep the hash already stored for this key when the bootstrap file still
+%% holds the same secret. A fresh hash on every boot rewrites the
+%% cluster-shared record in a format older nodes cannot verify during a
+%% rolling upgrade.
+bootstrap_secret_hash(ApiKey, ApiSecret) ->
+    case find_by_api_key(ApiKey) of
+        {ok, _Enable, _ExpiredAt, StoredHash, _Role, _Namespace, _Extra} ->
+            keep_or_rehash(ApiSecret, StoredHash);
+        {error, _} ->
+            emqx_dashboard_admin:hash_api_secret(ApiSecret)
+    end.
+
+keep_or_rehash(ApiSecret, StoredHash) ->
+    case emqx_dashboard_admin:verify_hash(ApiSecret, StoredHash) of
+        ok -> StoredHash;
+        error -> emqx_dashboard_admin:hash_api_secret(ApiSecret)
+    end.
+
+read_line(Dev) ->
+    case file:read_line(Dev) of
+        {ok, Bin} ->
+            case string:trim(Bin) of
+                <<>> ->
+                    skip;
+                Result ->
+                    {ok, Result}
+            end;
+        Result ->
+            Result
+    end.
+
+parse_bootstrap_line(Bin, MP) ->
+    case re:run(Bin, MP, [global, {capture, all_but_first, binary}]) of
+        {match, [[ApiKey, ApiSecret]]} ->
+            %% 2-seg `key:secret' lines have no role/scope column. Materialise
+            %% the role default at parse time so the persisted record is on
+            %% the same footing as a POST that omitted `scopes': only legacy
+            %% records that survived an upgrade can produce `<<"unset">>'.
+            Role = ?ROLE_API_DEFAULT,
+            {ok,
+                bootstrap_entry(ApiKey, ApiSecret, Role, ?global_ns, role_default_scopes(Role), [])};
+        {match, [[ApiKey, ApiSecret, Tail]]} ->
+            %% 3+ seg: Tail is either
+            %%   - "role"                                    (simple)
+            %%   - "role:scopes"                             (simple + scopes)
+            %%   - "ns:<namespace>::<role>"                  (namespaced)
+            %%   - "ns:<namespace>::<role>:scopes"           (namespaced + scopes)
+            parse_bootstrap_tail(ApiKey, ApiSecret, Tail);
+        _ ->
+            {error, "invalid_format"}
+    end.
+
+%% @doc Parse the role[:scopes] tail of a bootstrap line.
+%%
+%% Disambiguation rule: a tail containing `::' is the namespaced form
+%% (`ns:<namespace>::<role>[:<scopes>]'). Otherwise it is the simple form
+%% (`<role>[:<scopes>]'). Scope names are simple words and cannot contain
+%% colons, so the absence of `::' is a reliable signal.
+parse_bootstrap_tail(ApiKey, ApiSecret, Tail) ->
+    case binary:match(Tail, <<"::">>) of
+        nomatch ->
+            parse_simple_tail(ApiKey, ApiSecret, Tail);
+        _ ->
+            parse_namespaced_tail(ApiKey, ApiSecret, Tail)
+    end.
+
+%% Tail = "role" | "role:scopes" | "role:"
+parse_simple_tail(ApiKey, ApiSecret, Tail) ->
+    case binary:split(Tail, <<":">>) of
+        [Role] ->
+            with_valid_role(Role, fun(R) ->
+                %% Simple `role'-only tail: materialise the role default so
+                %% the persisted record is on the same footing as a POST
+                %% that omitted `scopes'.
+                bootstrap_entry(ApiKey, ApiSecret, R, ?global_ns, role_default_scopes(R), [])
+            end);
+        [Role, ScopesStr] ->
+            with_valid_role(Role, fun(R) ->
+                {Scopes, Rejected} = parse_bootstrap_scopes_lenient(R, ?global_ns, ScopesStr),
+                bootstrap_entry(ApiKey, ApiSecret, R, ?global_ns, Scopes, Rejected)
+            end);
+        _ ->
+            {error, "invalid_format"}
+    end.
+
+%% Tail = "ns:<ns>::<role>" | "ns:<ns>::<role>:scopes" | "ns:<ns>::<role>:"
+parse_namespaced_tail(ApiKey, ApiSecret, Tail) ->
+    case binary:split(Tail, <<"::">>) of
+        [NsTag, RoleAndScopes] ->
+            case parse_namespace_tag_bin(NsTag) of
+                {ok, Namespace} ->
+                    parse_role_and_scopes(ApiKey, ApiSecret, Namespace, RoleAndScopes);
+                {error, Reason} ->
+                    {error, Reason}
+            end;
+        _ ->
+            {error, "invalid_format"}
+    end.
+
+parse_namespace_tag_bin(NsTag) ->
+    case binary:split(NsTag, <<":">>) of
+        [<<"ns">>, Ns] when byte_size(Ns) > 0 ->
+            {ok, Ns};
+        _ ->
+            {error, {"invalid_namespace_tag", NsTag}}
+    end.
+
+%% Resolve "<role>" | "<role>:scopes" | "<role>:" for a namespaced bootstrap line.
+%% Extracted from parse_namespaced_tail/3 to keep nesting depth within elvis limits.
+parse_role_and_scopes(ApiKey, ApiSecret, Namespace, RoleAndScopes) ->
+    case binary:split(RoleAndScopes, <<":">>) of
+        [Role] ->
+            with_valid_role(Role, fun(R) ->
+                %% Namespaced `role'-only tail: same rationale as the
+                %% simple `role'-only case above — materialise the
+                %% namespace-aware role default.
+                Scopes = role_default_scopes(R, Namespace),
+                bootstrap_entry(ApiKey, ApiSecret, R, Namespace, Scopes, [])
+            end);
+        [Role, ScopesStr] ->
+            with_valid_role(Role, fun(R) ->
+                {Scopes, Rejected} = parse_bootstrap_scopes_lenient(R, Namespace, ScopesStr),
+                bootstrap_entry(ApiKey, ApiSecret, R, Namespace, Scopes, Rejected)
+            end);
+        _ ->
+            {error, "invalid_format"}
+    end.
+
+%% Validate that Role is a known role name. We bypass the namespace-aware
+%% parse_role/1 here because the namespace has already been stripped (or was
+%% never present) before reaching this function — `Role' is always a simple
+%% role binary at this point.
+with_valid_role(Role, Cont) ->
+    case lists:member(Role, emqx_dashboard_rbac:role_list(api)) of
+        true ->
+            {ok, Cont(Role)};
+        false ->
+            {error, {"invalid_role", Role}}
+    end.
+
+bootstrap_entry(ApiKey, ApiSecret, Role, Namespace, Scopes, Rejected) ->
+    #{
+        api_key => ApiKey,
+        api_secret => ApiSecret,
+        role => Role,
+        namespace => Namespace,
+        scopes => Scopes,
+        rejected_scopes => Rejected
+    }.
+
+%% @doc Parse the comma-separated scopes string from the 4th bootstrap segment.
+%% Lenient by design — unknown scope names are dropped and reported separately.
+%%
+%% Publisher API keys can only hold the `publish' scope; other scope names
+%% are dropped (same lenient policy as unknown scopes — a typo in ops
+%% config must not abort the whole load). A namespaced `Role' (`Namespace'
+%% is a binary) additionally drops any scope outside
+%% `?NS_ADMIN_ALLOWED_SCOPES', mirroring the create/update-path allowlist
+%% and the dashboard login-user rule.
+%%
+%% Returns `{Valid, Rejected}'.
+%%   Valid    — list of validated scope name binaries (possibly empty).
+%%   Rejected — list of scope name binaries that were not recognised or
+%%              not allowed for the given role/namespace.
+%%
+%% An empty input (`<<>>') returns `{[], []}' — explicit deny-all marker.
+parse_bootstrap_scopes_lenient(Role, _Namespace, <<>>) ->
+    filter_publisher_scopes(Role, [], []);
+parse_bootstrap_scopes_lenient(Role, Namespace, ScopesStr) ->
+    Candidates = binary:split(ScopesStr, <<",">>, [global, trim_all]),
+    Raw = [string:lowercase(string:trim(S)) || S <- Candidates, string:trim(S) =/= <<>>],
+    Available = [Name || #{name := Name} <- emqx_scope_catalog:scope_catalog()],
+    {Valid0, Unknown0} = lists:partition(fun(S) -> lists:member(S, Available) end, Raw),
+    Rejected0 = [{S, unknown_scope} || S <- Unknown0],
+    {Valid1, Rejected1} = filter_publisher_scopes(Role, Valid0, Rejected0),
+    {Valid2, Rejected2} = drop_mixed_privilege_scopes(Valid1, Rejected1),
+    drop_disallowed_namespaced_scopes(Namespace, Valid2, Rejected2).
+
+%% A privilege scope is administrator-equivalent, so it must not be
+%% combined with restricted scopes in the same list. In the strict HTTP
+%% path this is a 400; in the lenient bootstrap path we instead drop the
+%% privilege scopes (keeping the more restricted, non-privilege subset)
+%% and report them as rejected, matching the loader's fail-safe policy
+%% for other disallowed scopes.
+drop_mixed_privilege_scopes(Valid, Rejected) ->
+    case emqx_scope_catalog:partition_privilege_scopes(Valid) of
+        {[], _} -> {Valid, Rejected};
+        {_, []} -> {Valid, Rejected};
+        {Priv, Other} -> {Other, Rejected ++ [{S, privilege_scope_conflict} || S <- Priv]}
+    end.
+
+%% A namespaced bootstrap key (`Namespace' is a binary) may only hold
+%% scopes in `?NS_ADMIN_ALLOWED_SCOPES'; a global line (`Namespace' is
+%% `?global_ns') is unaffected. Returns updated `{Valid, Rejected}'.
+drop_disallowed_namespaced_scopes(Namespace, Valid, Rejected) when is_binary(Namespace) ->
+    {Keep, Drop} = lists:partition(
+        fun(S) -> lists:member(S, ?NS_ADMIN_ALLOWED_SCOPES) end,
+        Valid
+    ),
+    {Keep, Rejected ++ [{S, namespaced_scope_not_allowed} || S <- Drop]};
+drop_disallowed_namespaced_scopes(?global_ns, Valid, Rejected) ->
+    {Valid, Rejected}.
+
+%% Restrict publisher role to the `publish' scope only. Other roles
+%% pass through unchanged. Returns updated {Valid, Rejected}.
+filter_publisher_scopes(?ROLE_API_PUBLISHER, Valid, Rejected) ->
+    {Keep, Drop} = lists:partition(
+        fun(S) -> S =:= ?SCOPE_PUBLISH end,
+        Valid
+    ),
+    {Keep, Rejected ++ [{S, not_allowed_for_publisher_role} || S <- Drop]};
+filter_publisher_scopes(_OtherRole, Valid, Rejected) ->
+    {Valid, Rejected}.
+
+%% `Rejected' is a list of `{ScopeName, Reason}' pairs. Emit a single
+%% warning that groups the dropped scopes by reason, so an operator can
+%% see exactly which scopes were dropped and why, instead of a blanket
+%% "unknown scopes" message that is inaccurate for scopes dropped by the
+%% privilege-scope or publisher-role rules.
+maybe_warn_rejected_scopes(_File, _Line, _ApiKey, []) ->
+    ok;
+maybe_warn_rejected_scopes(File, Line, ApiKey, Rejected) ->
+    ?SLOG(warning, #{
+        msg => "bootstrap_file_scopes_dropped",
+        info => <<
+            "Some scopes in the bootstrap file were dropped; the API key was created/updated "
+            "with the remaining scopes. See `dropped' for each scope name and why it was "
+            "dropped: `unknown_scope' (not a known scope name, likely a typo), "
+            "`not_allowed_for_publisher_role' (publisher keys may only hold `publish'), "
+            "`privilege_scope_conflict' (a privilege/administrator-equivalent scope cannot be "
+            "combined with other scopes; the non-privilege scopes were kept), "
+            "`namespaced_scope_not_allowed' (a namespaced key may only hold scopes in the "
+            "namespaced-administrator allowlist)."
+        >>,
+        dropped => group_rejected_by_reason(Rejected),
+        file => File,
+        line => Line,
+        api_key => ApiKey
+    }).
+
+%% Group `{ScopeName, Reason}' pairs into `#{Reason => [ScopeName]}',
+%% preserving input order within each reason.
+group_rejected_by_reason(Rejected) ->
+    lists:foldr(
+        fun({Scope, Reason}, Acc) ->
+            maps:update_with(Reason, fun(Scopes) -> [Scope | Scopes] end, [Scope], Acc)
+        end,
+        #{},
+        Rejected
+    ).
+
+get_role(#{?role := Role}) ->
+    Role;
+%% Before v5.4.0,
+%% the field in the position of the `extra` is `desc` which is a binary for description
+get_role(_Desc) ->
+    ?ROLE_API_DEFAULT.
+
+namespace_of(#{?namespace := Namespace}) when is_binary(Namespace) ->
+    Namespace;
+namespace_of(_) ->
+    ?global_ns.
+
+normalize_extra(Map) when is_map(Map) ->
+    Map;
+normalize_extra(Desc) ->
+    #{desc => Desc, ?role => ?ROLE_API_DEFAULT, ?namespace => ?global_ns}.
+
+check_rbac(Req, HandlerInfo, ApiKey, Role, Namespace) ->
+    ActorContext = actor_context_of(ApiKey, Role, Namespace),
+    emqx_dashboard_rbac:check_rbac(Req, HandlerInfo, ActorContext).
+
+format_app_extend(App) ->
+    emqx_utils_maps:update_if_present(
+        ?namespace,
+        fun
+            (?global_ns) ->
+                null;
+            (Namespace) ->
+                Namespace
+        end,
+        App
+    ).
+
+parse_role(Role) ->
+    emqx_dashboard_rbac:parse_api_role(Role).
+
+actor_context_of(ApiKey, Role, Namespace) ->
+    #{
+        ?actor => ApiKey,
+        ?namespace => Namespace,
+        ?role => Role
+    }.

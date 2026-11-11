@@ -1,0 +1,502 @@
+%%--------------------------------------------------------------------
+%% Copyright (c) 2020-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
+%%--------------------------------------------------------------------
+
+%% @doc
+%%
+%% Stomp Frame:
+%%
+%% COMMAND
+%% header1:value1
+%% header2:value2
+%%
+%% Body^@
+%%
+%% Stomp 1.2 BNF grammar:
+%%
+%% NULL                = <US-ASCII null (octet 0)>
+%% LF                  = <US-ASCII line feed (aka newline) (octet 10)>
+%% CR                  = <US-ASCII carriage return (octet 13)>
+%% EOL                 = [CR] LF
+%% OCTET               = <any 8-bit sequence of data>
+%%
+%% frame-stream        = 1*frame
+%%
+%% frame               = command EOL
+%%                       *( header EOL )
+%%                       EOL
+%%                       *OCTET
+%%                       NULL
+%%                       *( EOL )
+%%
+%% command             = client-command | server-command
+%%
+%% client-command      = "SEND"
+%%                       | "SUBSCRIBE"
+%%                       | "UNSUBSCRIBE"
+%%                       | "BEGIN"
+%%                       | "COMMIT"
+%%                       | "ABORT"
+%%                       | "ACK"
+%%                       | "NACK"
+%%                       | "DISCONNECT"
+%%                       | "CONNECT"
+%%                       | "STOMP"
+%%
+%% server-command      = "CONNECTED"
+%%                       | "MESSAGE"
+%%                       | "RECEIPT"
+%%                       | "ERROR"
+%%
+%% header              = header-name ":" header-value
+%% header-name         = 1*<any OCTET except CR or LF or ":">
+%% header-value        = *<any OCTET except CR or LF or ":">
+%%
+%% @end
+
+-module(emqx_stomp_frame).
+
+-behaviour(emqx_gateway_frame).
+
+-include("emqx_stomp.hrl").
+
+-export([
+    initial_parse_state/1,
+    parse/2,
+    serialize_opts/0,
+    serialize_pkt/2
+]).
+
+-export([
+    make/1,
+    make/2,
+    make/3,
+    format/1
+]).
+
+-export([
+    type/1,
+    is_message/1
+]).
+
+-define(NULL, 0).
+-define(CR, $\r).
+-define(LF, $\n).
+-define(BSL, $\\).
+-define(COLON, $:).
+
+%% CONNECT and CONNECTED frames do not use header escaping, for backward
+%% compatibility with STOMP 1.0 (STOMP 1.2, "Value Encoding").
+-define(NO_HEADER_ESCAPE(Cmd), (Cmd =:= ?CMD_CONNECT orelse Cmd =:= ?CMD_CONNECTED)).
+
+-record(parser_state, {
+    cmd,
+    headers = [],
+    hdname,
+    acc = <<>> :: binary(),
+    limit
+}).
+
+-record(frame_limit, {max_header_num, max_header_length, max_body_length}).
+
+-type parse_result() ::
+    {ok, stomp_frame(), binary(), parse_state()}
+    | {more, parse_state()}.
+
+-type parse_state() ::
+    #{
+        phase := none | command | headers | hdname | hdvalue | body,
+        pre => binary(),
+        state := #parser_state{}
+    }.
+
+%-dialyzer({nowarn_function, [serialize_pkt/2,make/1]}).
+
+%% @doc Initialize a parser
+-spec initial_parse_state(map()) -> parse_state().
+initial_parse_state(Opts) ->
+    #{phase => none, state => #parser_state{limit = limit(Opts)}}.
+
+limit(Opts) ->
+    #frame_limit{
+        max_header_num = g(max_headers, Opts, ?MAX_HEADER_NUM),
+        max_header_length = g(max_headers_length, Opts, ?MAX_HEADER_LENGTH),
+        max_body_length = g(max_body_length, Opts, ?MAX_BODY_LENGTH)
+    }.
+
+g(Key, Opts, Val) ->
+    maps:get(Key, Opts, Val).
+
+-spec parse(binary(), parse_state()) -> parse_result().
+parse(<<>>, Parser) ->
+    {more, Parser};
+%% a byte kept from the previous chunk (a trailing `\r` or `\\`)
+parse(Bytes, Parser = #{pre := Pre}) ->
+    parse(<<Pre/binary, Bytes/binary>>, maps:without([pre], Parser));
+parse(<<?LF, Rest/binary>>, Parser = #{phase := none}) ->
+    {ok, #stomp_frame{command = ?CMD_HEARTBEAT}, Rest, Parser};
+parse(<<?CR, ?LF, Rest/binary>>, Parser = #{phase := none}) ->
+    {ok, #stomp_frame{command = ?CMD_HEARTBEAT}, Rest, Parser};
+parse(<<?CR>>, Parser = #{phase := none}) ->
+    {more, Parser#{pre => <<?CR>>}};
+parse(Bytes, #{phase := body, length := Len, state := State}) ->
+    parse(body, Bytes, State, Len);
+parse(Bytes, #{phase := Phase, state := State}) when Phase =/= none ->
+    parse(Phase, Bytes, State);
+parse(Bytes, #{phase := none, state := State}) ->
+    parse(command, Bytes, State).
+
+%% @private
+parse(command, <<?LF, Rest/binary>>, State = #parser_state{acc = Acc}) ->
+    parse(headers, Rest, State#parser_state{cmd = Acc, acc = <<>>});
+parse(command, <<?CR>>, State) ->
+    {more, #{phase => command, pre => <<?CR>>, state => State}};
+parse(command, <<?CR, ?LF, Rest/binary>>, State) ->
+    parse(command, <<?LF, Rest/binary>>, State);
+parse(command, <<?CR, _Rest/binary>>, _State) ->
+    error(linefeed_expected);
+parse(command, <<Ch:8, Rest/binary>>, State) ->
+    parse(command, Rest, acc_header(Ch, State));
+parse(command, <<>>, State) ->
+    {more, #{phase => command, state => State}};
+parse(headers, <<?LF, Rest/binary>>, State0) ->
+    State = State0#parser_state{acc = <<>>},
+    Len = content_len(State),
+    %% Reject an oversized declared body before buffering it, otherwise a client
+    %% could make the parser wait for an arbitrarily large payload.
+    ok = check_declared_body_length(Len, State#parser_state.limit),
+    parse(body, Rest, State, Len);
+parse(headers, <<?CR>>, State) ->
+    {more, #{phase => headers, pre => <<?CR>>, state => State}};
+parse(headers, <<?CR, ?LF, Rest/binary>>, State) ->
+    parse(headers, <<?LF, Rest/binary>>, State);
+parse(headers, <<?CR, _Rest/binary>>, _State) ->
+    error(linefeed_expected);
+parse(headers, <<>>, State) ->
+    {more, #{phase => headers, state => State}};
+parse(headers, Bin, State) ->
+    parse(hdname, Bin, State);
+parse(hdname, <<?LF, _Rest/binary>>, _State) ->
+    error(unexpected_linefeed);
+parse(hdname, <<?CR, _Rest/binary>>, _State) ->
+    error(unexpected_linefeed);
+parse(hdname, <<?COLON, Rest/binary>>, State = #parser_state{acc = Acc}) ->
+    parse(hdvalue, Rest, State#parser_state{hdname = Acc, acc = <<>>});
+parse(hdname, <<?BSL, Rest/binary>>, State = #parser_state{cmd = Cmd}) when
+    ?NO_HEADER_ESCAPE(Cmd)
+->
+    parse(hdname, Rest, acc_header(?BSL, State));
+parse(hdname, <<?BSL>>, State) ->
+    {more, #{phase => hdname, pre => <<?BSL>>, state => State}};
+parse(hdname, <<?BSL, Ch:8, Rest/binary>>, State) ->
+    parse(hdname, Rest, acc_header(unescape(Ch), State));
+parse(hdname, <<Ch:8, Rest/binary>>, State) ->
+    parse(hdname, Rest, acc_header(Ch, State));
+parse(hdname, <<>>, State) ->
+    {more, #{phase => hdname, state => State}};
+parse(
+    hdvalue,
+    <<?LF, Rest/binary>>,
+    State = #parser_state{headers = Headers, hdname = Name, acc = Acc}
+) ->
+    NHeaders = add_header(Name, Acc, Headers),
+    %% Bound the number of headers while buffering, not only once the frame is
+    %% complete, so a flood of headers cannot grow the accumulator.
+    ok = check_max_header_num(NHeaders, State#parser_state.limit),
+    NState = State#parser_state{
+        headers = NHeaders,
+        hdname = undefined,
+        acc = <<>>
+    },
+    parse(headers, Rest, NState);
+parse(hdvalue, <<?CR>>, State) ->
+    {more, #{phase => hdvalue, pre => <<?CR>>, state => State}};
+parse(hdvalue, <<?CR, ?LF, Rest/binary>>, State) ->
+    parse(hdvalue, <<?LF, Rest/binary>>, State);
+parse(hdvalue, <<?CR, _Rest/binary>>, _State) ->
+    error(linefeed_expected);
+parse(hdvalue, <<?BSL, Rest/binary>>, State = #parser_state{cmd = Cmd}) when
+    ?NO_HEADER_ESCAPE(Cmd)
+->
+    parse(hdvalue, Rest, acc_header(?BSL, State));
+parse(hdvalue, <<?BSL>>, State) ->
+    {more, #{phase => hdvalue, pre => <<?BSL>>, state => State}};
+parse(hdvalue, <<?BSL, Ch:8, Rest/binary>>, State) ->
+    parse(hdvalue, Rest, acc_header(unescape(Ch), State));
+parse(hdvalue, <<Ch:8, Rest/binary>>, State) ->
+    parse(hdvalue, Rest, acc_header(Ch, State));
+parse(hdvalue, <<>>, State) ->
+    {more, #{phase => hdvalue, state => State}}.
+
+%% @private
+parse(body, <<>>, State, Length) ->
+    {more, #{phase => body, length => Length, state => State}};
+parse(body, Bin, State, none) ->
+    case binary:split(Bin, <<?NULL>>) of
+        [Chunk, Rest] ->
+            {ok, new_frame(acc_body(Chunk, State)), Rest, new_state(State)};
+        [Chunk] ->
+            {more, #{
+                phase => body,
+                length => none,
+                state => acc_body(Chunk, State)
+            }}
+    end;
+parse(body, Bin, State, Len) when byte_size(Bin) >= (Len + 1) ->
+    <<Chunk:Len/binary, ?NULL, Rest/binary>> = Bin,
+    {ok, new_frame(acc_body(Chunk, State)), Rest, new_state(State)};
+parse(body, Bin, State, Len) ->
+    {more, #{
+        phase => body,
+        length => Len - byte_size(Bin),
+        state => acc_body(Bin, State)
+    }}.
+
+add_header(Name, Value, Headers) ->
+    case lists:keyfind(Name, 1, Headers) of
+        {Name, _} -> Headers;
+        false -> [{Name, Value} | Headers]
+    end.
+
+content_len(#parser_state{headers = Headers}) ->
+    case lists:keyfind(<<"content-length">>, 1, Headers) of
+        {_, Val} ->
+            try binary_to_integer(Val) of
+                Len when Len >= 0 -> Len;
+                _ -> error({invalid_content_length, Val})
+            catch
+                error:badarg -> error({invalid_content_length, Val})
+            end;
+        false ->
+            none
+    end.
+
+new_frame(#parser_state{cmd = Cmd, headers = Headers, acc = Acc, limit = Limit}) ->
+    ok = check_max_headers(Headers, Limit),
+    ok = check_max_body_size(byte_size(Acc), Limit),
+    #stomp_frame{command = Cmd, headers = Headers, body = Acc}.
+
+%% Bound command and header bytes as they are accumulated. While the header
+%% value is accumulated the already parsed name is counted too, so the name and
+%% value together stay within `max_header_length`.
+acc_header(Chunk, State = #parser_state{limit = Limit, hdname = HdName, acc = Acc}) ->
+    ok = check_max_header_size(acc_size(Chunk, Acc), HdName, Limit),
+    State#parser_state{acc = concat(Chunk, Acc)}.
+
+acc_body(Chunk, State = #parser_state{limit = Limit, acc = Acc}) ->
+    ok = check_max_body_size(acc_size(Chunk, Acc), Limit),
+    State#parser_state{acc = concat(Chunk, Acc)}.
+
+%% The size the accumulator would reach is computed before concatenating, so an
+%% oversized chunk is rejected without first allocating a copy of it.
+acc_size(Chunk, Acc) when is_binary(Chunk) ->
+    byte_size(Acc) + byte_size(Chunk);
+acc_size(_Ch, Acc) ->
+    byte_size(Acc) + 1.
+
+concat(Chunk, Acc) when is_binary(Chunk) ->
+    <<Acc/binary, Chunk/binary>>;
+concat(Ch, Acc) ->
+    <<Acc/binary, Ch:8>>.
+
+%% \r (octet 92 and 114) translates to carriage return (octet 13)
+%% \n (octet 92 and 110) translates to line feed (octet 10)
+%% \c (octet 92 and 99) translates to : (octet 58)
+%% \\ (octet 92 and 92) translates to \ (octet 92)
+unescape($r) -> ?CR;
+unescape($n) -> ?LF;
+unescape($c) -> ?COLON;
+unescape($\\) -> ?BSL;
+unescape(Ch) -> error({cannot_unescape, <<?BSL, Ch>>}).
+
+check_max_headers(Headers, Limit) ->
+    ok = check_max_header_num(Headers, Limit),
+    lists:foreach(
+        fun({Name, Val}) ->
+            check_max_header_size(byte_size(Val), Name, Limit)
+        end,
+        Headers
+    ).
+
+check_max_header_num(Headers, #frame_limit{max_header_num = MaxNum}) ->
+    HeadersLen = length(Headers),
+    case HeadersLen > MaxNum of
+        true ->
+            error(
+                {too_many_headers, #{
+                    max_header_num => MaxNum,
+                    received_headers_num => HeadersLen
+                }}
+            );
+        false ->
+            ok
+    end.
+
+%% A header is bounded by the length of its name plus value: `Len` is the
+%% accumulated part (the name while it is being read, the value afterwards) and
+%% `HdName` is the name once it has been parsed.
+check_max_header_size(Len, HdName, #frame_limit{max_header_length = MaxLen}) ->
+    Found = Len + header_name_length(HdName),
+    case Found > MaxLen of
+        true ->
+            error(
+                {too_long_header, #{
+                    max_header_length => MaxLen,
+                    found_header_length => Found
+                }}
+            );
+        false ->
+            ok
+    end.
+
+header_name_length(undefined) ->
+    0;
+header_name_length(Name) ->
+    byte_size(Name).
+
+check_max_body_size(Len, #frame_limit{max_body_length = MaxLen}) ->
+    case Len > MaxLen of
+        true ->
+            error(
+                {too_long_body, #{
+                    max_body_length => MaxLen,
+                    received_body_length => Len
+                }}
+            );
+        false ->
+            ok
+    end.
+
+check_declared_body_length(none, _Limit) ->
+    ok;
+check_declared_body_length(Len, Limit) ->
+    check_max_body_size(Len, Limit).
+
+%%--------------------------------------------------------------------
+%% Serialize funcs
+%%--------------------------------------------------------------------
+
+serialize_opts() ->
+    #{}.
+
+serialize_pkt(#stomp_frame{command = ?CMD_HEARTBEAT}, _SerializeOpts) ->
+    <<$\n>>;
+serialize_pkt(
+    #stomp_frame{command = Cmd, headers = Headers, body = Body},
+    _SerializeOpts
+) ->
+    Headers1 = lists:keydelete(<<"content-length">>, 1, Headers),
+    Headers2 =
+        case iolist_size(Body) of
+            0 -> Headers1;
+            Len -> Headers1 ++ [{<<"content-length">>, Len}]
+        end,
+    [
+        Cmd,
+        ?LF,
+        [serialize_pkt(header, Header) || Header <- Headers2],
+        ?LF,
+        Body,
+        0
+    ];
+serialize_pkt(header, {Name, Val}) when is_integer(Val) ->
+    [escape(Name), ?COLON, integer_to_list(Val), ?LF];
+serialize_pkt(header, {Name, Val}) ->
+    [escape(Name), ?COLON, escape(Val), ?LF].
+
+escape(Bin) when is_binary(Bin) ->
+    <<<<(escape(Ch))/binary>> || <<Ch>> <= Bin>>;
+escape(?CR) ->
+    <<?BSL, $r>>;
+escape(?LF) ->
+    <<?BSL, $n>>;
+escape(?BSL) ->
+    <<?BSL, ?BSL>>;
+escape(?COLON) ->
+    <<?BSL, $c>>;
+escape(Ch) ->
+    <<Ch>>.
+
+new_state(#parser_state{limit = Limit}) ->
+    #{phase => none, state => #parser_state{limit = Limit}}.
+
+%%--------------------------------------------------------------------
+%% ???
+%%--------------------------------------------------------------------
+
+%% @doc Make a frame
+
+make(?CMD_HEARTBEAT) ->
+    #stomp_frame{command = ?CMD_HEARTBEAT}.
+
+make(<<"CONNECTED">>, Headers) ->
+    #stomp_frame{
+        command = <<"CONNECTED">>,
+        headers = [{<<"server">>, ?STOMP_SERVER} | Headers]
+    };
+make(Command, Headers) ->
+    #stomp_frame{command = Command, headers = Headers}.
+
+make(Command, Headers, Body) ->
+    #stomp_frame{command = Command, headers = Headers, body = Body}.
+
+%% @doc Format a frame
+format({frame_error, _Reason} = Error) ->
+    Error;
+format(#stomp_frame{headers = Headers} = Frame) ->
+    RedactedHeaders = redact_stomp_headers(Headers),
+    serialize_pkt(Frame#stomp_frame{headers = RedactedHeaders}, #{}).
+
+redact_stomp_headers(Headers) ->
+    lists:map(
+        fun
+            ({<<"passcode">>, _}) -> {<<"passcode">>, <<"******">>};
+            (Header) -> Header
+        end,
+        Headers
+    ).
+
+is_message(#stomp_frame{command = Cmd}) when
+    Cmd == ?CMD_SEND;
+    Cmd == ?CMD_MESSAGE
+->
+    true;
+is_message(_) ->
+    false.
+
+type(#stomp_frame{command = Cmd}) ->
+    type(Cmd);
+type(?CMD_STOMP) ->
+    connect;
+type(?CMD_CONNECT) ->
+    connect;
+type(?CMD_SEND) ->
+    send;
+type(?CMD_SUBSCRIBE) ->
+    subscribe;
+type(?CMD_UNSUBSCRIBE) ->
+    unsubscribe;
+type(?CMD_BEGIN) ->
+    'begin';
+type(?CMD_COMMIT) ->
+    commit;
+type(?CMD_ABORT) ->
+    abort;
+type(?CMD_ACK) ->
+    ack;
+type(?CMD_NACK) ->
+    nack;
+type(?CMD_DISCONNECT) ->
+    disconnect;
+type(?CMD_CONNECTED) ->
+    connected;
+type(?CMD_MESSAGE) ->
+    message;
+type(?CMD_RECEIPT) ->
+    receipt;
+type(?CMD_ERROR) ->
+    error;
+type(?CMD_HEARTBEAT) ->
+    heartbeat;
+type(_) ->
+    undefined.

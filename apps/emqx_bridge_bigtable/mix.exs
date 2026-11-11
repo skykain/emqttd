@@ -1,0 +1,58 @@
+defmodule EMQXBridgeBigtable.MixProject do
+  use Mix.Project
+  alias EMQXUmbrella.MixProject, as: UMP
+
+  # Note: we store the proto files and scripts in a directory different from `priv`
+  # because we don't want to copy them to the release.
+
+  def project do
+    [
+      app: :emqx_bridge_bigtable,
+      version: "7.0.0",
+      build_path: "../../_build",
+      compilers: Mix.compilers() ++ [:copy_srcs],
+      # used by our `Mix.Tasks.Compile.CopySrcs` compiler
+      extra_dirs: extra_dirs(),
+      erlc_options: UMP.strict_erlc_options(),
+      erlc_paths: UMP.erlc_paths(),
+      deps_path: "../../deps",
+      lockfile: "../../mix.lock",
+      elixir: "~> 1.14",
+      start_permanent: Mix.env() == :prod,
+      deps: deps()
+    ]
+  end
+
+  def application do
+    [
+      extra_applications: UMP.extra_applications(),
+      mod: {:emqx_bridge_bigtable_app, []},
+      env: [
+        emqx_action_info_modules: [:emqx_bridge_bigtable_action_info],
+        emqx_connector_info_modules: [:emqx_bridge_bigtable_connector_info]
+      ]
+    ]
+  end
+
+  def deps() do
+    UMP.deps([
+      {:emqx_mix_utils, in_umbrella: true, runtime: false},
+      {:emqx_gen_bridge, in_umbrella: true},
+      {:emqx_resource, in_umbrella: true},
+      {:emqx_connector_jwt, in_umbrella: true},
+      {:emqx_bridge_gcp_pubsub, in_umbrella: true},
+      {:emqx_gcp_protos, in_umbrella: true},
+      :grpc
+    ])
+  end
+
+  defp extra_dirs() do
+    dirs = []
+
+    if UMP.test_env?() do
+      ["test" | dirs]
+    else
+      dirs
+    end
+  end
+end

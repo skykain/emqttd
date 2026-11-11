@@ -1,0 +1,1103 @@
+%%--------------------------------------------------------------------
+%% Copyright (c) 2026 EMQ Technologies Co., Ltd. All Rights Reserved.
+%%--------------------------------------------------------------------
+
+-module(emqx_dashboard_sso_saml_SUITE).
+
+-compile(nowarn_export_all).
+-compile(export_all).
+
+-include_lib("eunit/include/eunit.hrl").
+-include_lib("common_test/include/ct.hrl").
+-include_lib("snabbkaffe/include/snabbkaffe.hrl").
+-include_lib("esaml/include/esaml.hrl").
+-include_lib("emqx_dashboard/include/emqx_dashboard_rbac.hrl").
+
+%% Keycloak integration test settings
+-define(KEYCLOAK_HOST, "172.100.239.120").
+-define(KEYCLOAK_HTTP_PORT, 8080).
+-define(KEYCLOAK_REALM, "emqx").
+-define(KEYCLOAK_TEST_USER, "testuser").
+-define(KEYCLOAK_TEST_PASSWORD, "testpassword").
+
+-define(BASE_URL, "http://127.0.0.1:18083").
+-define(SAML_HTTP_REDIRECT_BINDING,
+    <<"urn:oasis:names:tc:SAML:2.0:bindings:URL-Encoding:DEFLATE">>
+).
+-define(TEST_RELAY_STATE, <<"test-relay-state">>).
+
+%%------------------------------------------------------------------------------
+%% CT Callbacks
+%%------------------------------------------------------------------------------
+
+all() ->
+    [
+        {group, unit},
+        {group, api},
+        {group, keycloak_integration},
+        {group, signature_combinations}
+    ].
+
+groups() ->
+    [
+        {unit, [sequence], [
+            t_signature_defaults,
+            t_validate_signature_config,
+            t_missing_idp_certificate_with_default_signing,
+            t_maybe_load_cert_or_key,
+            t_callback_rejects_xxe_response,
+            t_callback_rejects_deflate_xxe_response,
+            t_callback_rejects_unsigned_response_by_default,
+            t_callback_accepts_unsigned_response_with_explicit_escape_hatch,
+            t_callback_requires_matching_browser_cookie,
+            t_callback_concurrent_logins_in_one_browser,
+            t_callback_skip_login_cookie_check
+        ]},
+        {api, [sequence], [
+            t_sso_running_disabled,
+            t_saml_metadata_not_initialized
+        ]},
+        {keycloak_integration, [sequence], [
+            t_saml_init_with_keycloak,
+            t_saml_metadata_generation,
+            t_saml_login_redirect,
+            t_saml_callback_invalid_response,
+            t_saml_full_login_flow
+        ]},
+        {signature_combinations, [sequence], [
+            t_sig_combo_no_sp_both_idp,
+            t_sig_combo_no_sp_envelope_only,
+            t_sig_combo_no_sp_assertion_only,
+            t_sig_combo_no_signatures,
+            t_sig_combo_sp_sign_both_idp
+        ]}
+    ].
+
+init_per_suite(Config) ->
+    Apps = emqx_cth_suite:start(
+        [
+            emqx,
+            emqx_conf,
+            emqx_management,
+            {emqx_dashboard, "dashboard.listeners.http { enable = true, bind = 18083 }"},
+            emqx_dashboard_sso
+        ],
+        #{work_dir => emqx_cth_suite:work_dir(Config)}
+    ),
+    _ = emqx_common_test_http:create_default_app(),
+    %% SSO endpoints are denied for API Keys (scope deny list).
+    %% Use a dashboard admin Bearer Token instead.
+    {ok, _} = emqx_dashboard_admin:add_user(
+        <<"admin_saml_test">>, <<"admin_pass_123!">>, ?ROLE_SUPERUSER, <<"admin for saml test">>
+    ),
+    {ok, #{token := Token}} = emqx_dashboard_admin:sign_token(
+        <<"admin_saml_test">>, <<"admin_pass_123!">>
+    ),
+    AuthHeader = {"Authorization", "Bearer " ++ binary_to_list(Token)},
+    persistent_term:put({?MODULE, auth_header}, AuthHeader),
+    [{apps, Apps} | Config].
+
+end_per_suite(Config) ->
+    Apps = ?config(apps, Config),
+    persistent_term:erase({?MODULE, auth_header}),
+    emqx_cth_suite:stop(Apps),
+    ok.
+
+init_per_group(keycloak_integration, Config) ->
+    init_keycloak_group(Config);
+init_per_group(signature_combinations, Config) ->
+    init_keycloak_group(Config);
+init_per_group(_, Config) ->
+    Config.
+
+init_keycloak_group(Config) ->
+    case is_keycloak_available() of
+        true ->
+            ct:pal("Keycloak is available, running integration tests"),
+            Config;
+        false ->
+            ct:pal("Keycloak is not available, skipping integration tests"),
+            {skip,
+                "Keycloak not available. Start with: "
+                "docker-compose -f .ci/docker-compose-file/docker-compose-keycloak.yaml up -d"}
+    end.
+
+end_per_group(keycloak_integration, Config) ->
+    cleanup_saml_module(),
+    Config;
+end_per_group(signature_combinations, Config) ->
+    cleanup_saml_module(),
+    Config;
+end_per_group(_, Config) ->
+    Config.
+
+init_per_testcase(Case, Config) ->
+    ct:pal("Starting test case: ~p", [Case]),
+    Config.
+
+end_per_testcase(Case, _Config) ->
+    ct:pal("Finished test case: ~p", [Case]),
+    %% Cleanup any SAML backend created during test
+    _ = emqx_dashboard_sso_manager:delete(saml),
+    ok.
+
+%%------------------------------------------------------------------------------
+%% Unit Tests
+%%------------------------------------------------------------------------------
+
+t_signature_defaults(_Config) ->
+    %% Signature verification defaults to enabled in every security profile;
+    %% it is no longer tied to `emqx_security_profile:policy/1`.
+    emqx_common_test_helpers:with_security_profile("legacy", fun() ->
+        ?assertMatch(
+            #{idp_signs_envelopes := true, idp_signs_assertions := true},
+            checked_saml_config(#{})
+        ),
+        ?assertMatch(
+            #{idp_signs_envelopes := false, idp_signs_assertions := false},
+            checked_saml_config(#{
+                <<"idp_signs_envelopes">> => false,
+                <<"idp_signs_assertions">> => false
+            })
+        )
+    end),
+    emqx_common_test_helpers:with_security_profile("hardened", fun() ->
+        ?assertMatch(
+            #{idp_signs_envelopes := true, idp_signs_assertions := true},
+            checked_saml_config(#{})
+        ),
+        ?assertMatch(
+            #{idp_signs_envelopes := false, idp_signs_assertions := false},
+            checked_saml_config(#{
+                <<"idp_signs_envelopes">> => false,
+                <<"idp_signs_assertions">> => false
+            })
+        )
+    end).
+
+t_validate_signature_config(_Config) ->
+    %% Test signature configuration validation
+    %% When both signatures are disabled, should log warning but succeed
+    FakeFingerprints = [crypto:hash(sha, <<"fake_cert">>)],
+
+    %% Valid: both signatures enabled with fingerprints
+    ?assertEqual(
+        ok, emqx_dashboard_sso_saml:validate_signature_config(true, true, FakeFingerprints)
+    ),
+
+    %% Valid: envelope only
+    ?assertEqual(
+        ok, emqx_dashboard_sso_saml:validate_signature_config(true, false, FakeFingerprints)
+    ),
+
+    %% Valid: assertion only
+    ?assertEqual(
+        ok, emqx_dashboard_sso_saml:validate_signature_config(false, true, FakeFingerprints)
+    ),
+
+    %% Valid but warns: no signatures (insecure)
+    ?assertEqual(
+        ok, emqx_dashboard_sso_saml:validate_signature_config(false, false, FakeFingerprints)
+    ),
+
+    ok.
+
+t_missing_idp_certificate_with_default_signing(_Config) ->
+    %% Defaulting idp_signs_* to true means a deployment whose IdP metadata
+    %% carries no certificate now fails to start, instead of silently
+    %% accepting unsigned assertions.
+    ?assertThrow(
+        {error, missing_idp_certificate},
+        emqx_dashboard_sso_saml:validate_signature_config(true, true, [])
+    ),
+    ?assertThrow(
+        {error, missing_idp_certificate},
+        emqx_dashboard_sso_saml:validate_signature_config(true, false, [])
+    ),
+    ?assertThrow(
+        {error, missing_idp_certificate},
+        emqx_dashboard_sso_saml:validate_signature_config(false, true, [])
+    ),
+    ok.
+
+t_maybe_load_cert_or_key(_Config) ->
+    %% Test cert/key loading helper
+    LoadFun = fun(Path) -> {loaded, Path} end,
+
+    %% undefined returns undefined
+    ?assertEqual(undefined, emqx_dashboard_sso_saml:maybe_load_cert_or_key(undefined, LoadFun)),
+
+    %% Empty binary returns undefined
+    ?assertEqual(undefined, emqx_dashboard_sso_saml:maybe_load_cert_or_key(<<>>, LoadFun)),
+
+    %% Empty string returns undefined
+    ?assertEqual(undefined, emqx_dashboard_sso_saml:maybe_load_cert_or_key("", LoadFun)),
+
+    %% Binary path calls function with list
+    ?assertEqual(
+        {loaded, "/path/to/cert"},
+        emqx_dashboard_sso_saml:maybe_load_cert_or_key(<<"/path/to/cert">>, LoadFun)
+    ),
+
+    %% List path calls function directly
+    ?assertEqual(
+        {loaded, "/path/to/cert"},
+        emqx_dashboard_sso_saml:maybe_load_cert_or_key("/path/to/cert", LoadFun)
+    ),
+
+    ok.
+
+t_callback_rejects_xxe_response(Config) ->
+    assert_callback_rejects_xxe_response(Config, undefined).
+
+t_callback_rejects_deflate_xxe_response(Config) ->
+    assert_callback_rejects_xxe_response(Config, ?SAML_HTTP_REDIRECT_BINDING).
+
+t_callback_rejects_unsigned_response_by_default(_Config) ->
+    %% Reproduces the forged-assertion bypass: under the legacy (default)
+    %% security profile, idp_signs_envelopes/idp_signs_assertions used to
+    %% default to false, so this same unsigned, attacker-forged assertion
+    %% used to be accepted and would log the attacker in.
+    emqx_common_test_helpers:with_security_profile("legacy", fun() ->
+        ?assertMatch(
+            #{idp_signs_envelopes := true, idp_signs_assertions := true},
+            checked_saml_config(#{})
+        )
+    end),
+    Username = <<"forged-attacker">>,
+    State = #{sp := SP} = signature_test_state(true, true),
+    Body = unsigned_response_body(SP, Username),
+    Result = emqx_dashboard_sso_saml:callback(bound_callback_req(Body), State),
+    ?assertMatch({error, _}, Result),
+    ?assertEqual([], emqx_dashboard_admin:lookup_user(saml, Username)).
+
+t_callback_accepts_unsigned_response_with_explicit_escape_hatch(_Config) ->
+    %% The all-false escape hatch stays available for operators who
+    %% deliberately run an unsigned/test IdP.
+    Username = <<"unsigned-idp-user">>,
+    State = #{sp := SP} = signature_test_state(false, false),
+    Body = unsigned_response_body(SP, Username),
+    try
+        Result = emqx_dashboard_sso_saml:callback(bound_callback_req(Body), State),
+        ?assertMatch({redirect, Username, _}, Result),
+        ?assertMatch([_], emqx_dashboard_admin:lookup_user(saml, Username))
+    after
+        _ = emqx_dashboard_admin:remove_user({saml, Username})
+    end.
+
+t_callback_requires_matching_browser_cookie(_Config) ->
+    %% Signature verification is off, so the only thing that can reject these
+    %% assertions is the browser binding.
+    Username = <<"unbound-user">>,
+    State = #{sp := SP} = signature_test_state(false, false),
+    Body = unsigned_response_body(SP, Username),
+    Bound = bound_callback_req(Body),
+    try
+        %% Replayed in another browser: no cookie at all.
+        ?assertMatch(
+            {error, _},
+            emqx_dashboard_sso_saml:callback(#{body => maps:get(body, Bound)}, State)
+        ),
+        %% A cookie left over from another login.
+        ?assertMatch(
+            {error, _},
+            emqx_dashboard_sso_saml:callback(
+                Bound#{headers := relay_state_cookie(<<"another-relay-state">>)}, State
+            )
+        ),
+        %% Nothing echoed back by the IdP, as in an IdP initiated login.
+        ?assertMatch(
+            {error, _},
+            emqx_dashboard_sso_saml:callback(
+                #{body => Body, headers => relay_state_cookie(?TEST_RELAY_STATE)}, State
+            )
+        ),
+        ?assertEqual([], emqx_dashboard_admin:lookup_user(saml, Username)),
+        %% The browser that started the login completes it.
+        ?assertMatch({redirect, Username, _}, emqx_dashboard_sso_saml:callback(Bound, State)),
+        ?assertMatch([_], emqx_dashboard_admin:lookup_user(saml, Username))
+    after
+        _ = emqx_dashboard_admin:remove_user({saml, Username})
+    end.
+
+-doc """
+Two tabs of one browser each start a SAML login. Both logins complete, the one
+started last first, while the browser sends both cookies with each assertion.
+""".
+t_callback_concurrent_logins_in_one_browser(_Config) ->
+    UserA = <<"tab-a-user">>,
+    UserB = <<"tab-b-user">>,
+    State = #{sp := SP} = signature_test_state(false, false),
+    Jar = relay_state_jar([<<"relay-a">>, <<"relay-b">>]),
+    ReqA = #{
+        body => with_relay_state(unsigned_response_body(SP, UserA), <<"relay-a">>),
+        headers => Jar
+    },
+    ReqB = #{
+        body => with_relay_state(unsigned_response_body(SP, UserB), <<"relay-b">>),
+        headers => Jar
+    },
+    try
+        %% The login started last completes first. It deletes only its own cookie.
+        {redirect, UserB, {302, HeadersB, _}} = emqx_dashboard_sso_saml:callback(ReqB, State),
+        NameB = emqx_dashboard_sso_browser_binding:cookie_name(saml, <<"relay-b">>),
+        ?assertMatch(
+            {0, _}, binary:match(maps:get(<<"set-cookie">>, HeadersB), <<NameB/binary, "=;">>)
+        ),
+        %% The login started first still completes.
+        ?assertMatch({redirect, UserA, _}, emqx_dashboard_sso_saml:callback(ReqA, State))
+    after
+        _ = emqx_dashboard_admin:remove_user({saml, UserA}),
+        _ = emqx_dashboard_admin:remove_user({saml, UserB})
+    end.
+
+-doc """
+The login cookie check is on by default. With `skip_login_cookie_check` enabled,
+an assertion without the login cookie completes the login, with or without a
+`RelayState`.
+""".
+t_callback_skip_login_cookie_check(_Config) ->
+    ?assertMatch(#{skip_login_cookie_check := false}, checked_saml_config(#{})),
+    State0 = #{sp := SP} = signature_test_state(false, false),
+    State = State0#{skip_login_cookie_check => true},
+    UserA = <<"skip-cookie-user-a">>,
+    UserB = <<"skip-cookie-user-b">>,
+    %% No cookie, with the `RelayState' the login started with.
+    BodyA = with_relay_state(unsigned_response_body(SP, UserA), ?TEST_RELAY_STATE),
+    %% No cookie and no `RelayState', as in an IdP initiated login.
+    BodyB = unsigned_response_body(SP, UserB),
+    try
+        ?assertMatch(
+            {redirect, UserA, _}, emqx_dashboard_sso_saml:callback(#{body => BodyA}, State)
+        ),
+        ?assertMatch(
+            {redirect, UserB, _}, emqx_dashboard_sso_saml:callback(#{body => BodyB}, State)
+        )
+    after
+        _ = emqx_dashboard_admin:remove_user({saml, UserA}),
+        _ = emqx_dashboard_admin:remove_user({saml, UserB})
+    end.
+
+assert_callback_rejects_xxe_response(Config, SAMLEncoding) ->
+    SecretPath = filename:join(?config(priv_dir, Config), "xxe-secret.txt"),
+    Secret = <<"emqx_xxe_secret">>,
+    ok = file:write_file(SecretPath, Secret),
+    try
+        State = xxe_callback_state(),
+        Body = xxe_callback_body(SecretPath, SAMLEncoding, State),
+        Result = emqx_dashboard_sso_saml:callback(bound_callback_req(Body), State),
+        ?assertMatch({error, _}, Result),
+        ?assertEqual([], emqx_dashboard_admin:lookup_user(saml, Secret))
+    after
+        _ = emqx_dashboard_admin:remove_user({saml, Secret}),
+        _ = file:delete(SecretPath)
+    end.
+
+%%------------------------------------------------------------------------------
+%% API Tests
+%%------------------------------------------------------------------------------
+
+t_sso_running_disabled(_Config) ->
+    %% SSO running endpoint should show empty when not configured
+    {ok, 200, Result} = request(get, uri(["sso", "running"]), []),
+    ?assertEqual([], emqx_utils_json:decode(Result, [return_maps])),
+    ok.
+
+t_saml_metadata_not_initialized(_Config) ->
+    %% Metadata endpoint should return error when SAML is not initialized
+    %% compatible_mode returns {ok, Code, Body} for all status codes
+    {ok, Code, _Body} = request(get, uri(["sso", "saml", "metadata"]), []),
+    ?assert(Code >= 400, lists:flatten(io_lib:format("Expected 4xx, got ~p", [Code]))),
+    ok.
+
+%%------------------------------------------------------------------------------
+%% Keycloak Integration Tests
+%%------------------------------------------------------------------------------
+
+t_saml_init_with_keycloak(_Config) ->
+    %% Initialize SAML module with Keycloak (default settings)
+    Config = make_saml_config(#{
+        sp_entity_id => <<"emqx-sp-default">>,
+        sp_sign_request => false,
+        sp_public_key => <<>>,
+        sp_private_key => <<>>,
+        idp_signs_envelopes => true,
+        idp_signs_assertions => true
+    }),
+
+    %% Initialize SAML via create
+    Result = emqx_dashboard_sso_saml:create(Config),
+    ?assertMatch({ok, _}, Result),
+
+    {ok, State} = Result,
+    ?assert(maps:is_key(sp, State)),
+    ?assert(maps:is_key(idp_meta, State)),
+
+    %% Store state for other tests
+    persistent_term:put(saml_test_state, State).
+
+t_saml_metadata_generation(_Config) ->
+    %% Test SP metadata generation
+    State = persistent_term:get(saml_test_state),
+
+    SP = maps:get(sp, State),
+    MetadataXml = esaml_sp:generate_metadata(SP),
+    Metadata = xmerl:export_simple([MetadataXml], xmerl_xml),
+    MetadataBin = iolist_to_binary(Metadata),
+    ?assert(is_binary(MetadataBin)),
+
+    %% Metadata should be valid XML
+    ?assertMatch({match, _}, re:run(MetadataBin, "EntityDescriptor")),
+    ?assertMatch({match, _}, re:run(MetadataBin, "entityID=")),
+    ?assertMatch({match, _}, re:run(MetadataBin, "AssertionConsumerService")).
+
+t_saml_login_redirect(_Config) ->
+    %% Test SAML login redirect generation
+    State = persistent_term:get(saml_test_state),
+
+    Req = #{headers => #{}},
+    {redirect, Response} = emqx_dashboard_sso_saml:login(Req, State),
+
+    ?assertMatch({302, _, _}, Response),
+    {302, Headers, _Body} = Response,
+
+    %% Should have location header pointing to Keycloak
+    Location = maps:get(<<"location">>, Headers),
+    ?assert(is_binary(Location)),
+    ?assertMatch({match, _}, re:run(Location, "SAMLRequest=")),
+
+    %% The AuthnRequest carries the browser binding value, and the same value
+    %% is set as a cookie scoped to the SSO endpoints.
+    RelayState = binding_cookie_value(Headers),
+    ?assertMatch({match, _}, re:run(Location, <<"RelayState=", RelayState/binary>>)),
+    SetCookie = maps:get(<<"set-cookie">>, Headers),
+    ?assertMatch({match, _}, re:run(SetCookie, "Path=/api/v5/sso")),
+    ?assertMatch({match, _}, re:run(SetCookie, "HttpOnly")).
+
+t_saml_callback_invalid_response(_Config) ->
+    %% Test SAML callback with invalid response
+    State = persistent_term:get(saml_test_state),
+
+    %% Invalid SAMLResponse
+    InvalidBase64 = base64:encode(<<"not valid xml">>),
+    Req1 = bound_callback_req(<<"SAMLResponse=", InvalidBase64/binary>>),
+    Result1 = emqx_dashboard_sso_saml:callback(Req1, State),
+    ?assertMatch({error, _}, Result1),
+
+    %% Empty SAMLResponse should fail gracefully
+    EmptyBase64 = base64:encode(<<>>),
+    Req2 = bound_callback_req(<<"SAMLResponse=", EmptyBase64/binary>>),
+    Result2 = emqx_dashboard_sso_saml:callback(Req2, State),
+    ?assertMatch({error, _}, Result2).
+
+t_saml_full_login_flow(_Config) ->
+    %% Full SAML E2E login flow test with Keycloak
+    State = persistent_term:get(saml_test_state),
+
+    ct:pal("=== Starting Full E2E SAML Login Flow ==="),
+
+    %% Step 1: Get SAML login redirect URL from EMQX
+    ct:pal("Step 1: Getting SAML AuthnRequest redirect URL"),
+    Req = #{headers => #{}},
+    {redirect, {302, Headers, _}} = emqx_dashboard_sso_saml:login(Req, State),
+    LoginUrl = binary_to_list(maps:get(<<"location">>, Headers)),
+    RelayState = binding_cookie_value(Headers),
+    ct:pal("SAML Login URL: ~s", [LoginUrl]),
+
+    %% Step 2: Follow redirect to Keycloak login page
+    ct:pal("Step 2: Following redirect to Keycloak"),
+    {ok, {{_, 200, _}, LoginHeaders, LoginPageBody}} =
+        httpc:request(get, {LoginUrl, []}, [{autoredirect, true}], [{body_format, binary}]),
+
+    Cookies = extract_cookies(LoginHeaders),
+    ct:pal("Got Keycloak session cookies: ~p", [length(Cookies)]),
+
+    %% Step 3: Parse login form to get action URL
+    ct:pal("Step 3: Parsing Keycloak login form"),
+    {ok, FormAction} = extract_form_action(LoginPageBody),
+    ct:pal("Form action URL: ~s", [FormAction]),
+
+    %% Step 4: Submit credentials to Keycloak
+    ct:pal("Step 4: Submitting credentials to Keycloak"),
+    LoginData =
+        "username=" ++ ?KEYCLOAK_TEST_USER ++ "&password=" ++ ?KEYCLOAK_TEST_PASSWORD ++
+            "&credentialId=",
+    CookieHeader = {"Cookie", format_cookies(Cookies)},
+
+    {ok, {{_, LoginRespCode, _}, LoginRespHeaders, LoginRespBody}} =
+        httpc:request(
+            post,
+            {FormAction, [CookieHeader], "application/x-www-form-urlencoded", LoginData},
+            [{autoredirect, false}],
+            [{body_format, binary}]
+        ),
+
+    ct:pal("Login response code: ~p", [LoginRespCode]),
+
+    %% Step 5: Handle the SAML response
+    SAMLResponse =
+        case LoginRespCode of
+            200 ->
+                ct:pal("Step 5: Extracting SAMLResponse from form (POST binding)"),
+                {ok, SAMLResp} = extract_saml_response(LoginRespBody),
+                SAMLResp;
+            302 ->
+                ct:pal("Step 5: Following redirect to get SAMLResponse"),
+                RedirectLocation = proplists:get_value("location", LoginRespHeaders),
+                ct:pal("Redirect to: ~s", [RedirectLocation]),
+                NewCookies = extract_cookies(LoginRespHeaders) ++ Cookies,
+                {ok, {{_, 200, _}, _, RedirectBody}} =
+                    httpc:request(
+                        get,
+                        {RedirectLocation, [{"Cookie", format_cookies(NewCookies)}]},
+                        [{autoredirect, false}],
+                        [{body_format, binary}]
+                    ),
+                {ok, SAMLResp} = extract_saml_response(RedirectBody),
+                SAMLResp
+        end,
+
+    ct:pal("Got SAMLResponse (length: ~p bytes)", [byte_size(SAMLResponse)]),
+
+    %% Step 6: Submit SAMLResponse to EMQX callback
+    ct:pal("Step 6: Submitting SAMLResponse to EMQX callback"),
+    CallbackBody = <<"SAMLResponse=", (uri_encode(SAMLResponse))/binary>>,
+    %% The browser posts back the `RelayState' the IdP echoed, together with the
+    %% cookie emqx set when the login started.
+    CallbackReq = bound_callback_req(CallbackBody, RelayState),
+
+    %% Without that cookie the same assertion is refused.
+    ?assertMatch(
+        {error, _},
+        emqx_dashboard_sso_saml:callback(#{body => maps:get(body, CallbackReq)}, State)
+    ),
+
+    CallbackResult = emqx_dashboard_sso_saml:callback(CallbackReq, State),
+    ct:pal("Callback result: ~p", [CallbackResult]),
+
+    %% Step 7: Verify successful login
+    ct:pal("Step 7: Verifying login result"),
+    case CallbackResult of
+        {redirect, Username, {302, RedirectHeaders, _}} ->
+            ct:pal("SUCCESS! User logged in: ~s", [Username]),
+            RedirectUrl = maps:get(<<"location">>, RedirectHeaders),
+            ct:pal("Redirect URL: ~s", [RedirectUrl]),
+            ?assertMatch({match, _}, re:run(RedirectUrl, "login_meta=")),
+            ?assertEqual(<<"testuser">>, Username);
+        {error, Reason} ->
+            ct:pal("Login failed with reason: ~p", [Reason]),
+            ct:fail("SAML callback failed: ~p", [Reason])
+    end,
+
+    ct:pal("=== Full E2E SAML Login Flow Completed Successfully ==="),
+    ok.
+
+%%------------------------------------------------------------------------------
+%% Signature Combination E2E Tests
+%%------------------------------------------------------------------------------
+
+t_sig_combo_no_sp_both_idp(_Config) ->
+    ct:pal("=== E2E Signature Combo: SP=false, Envelope=true, Assertion=true (Default) ==="),
+
+    Config = make_saml_config(#{
+        sp_entity_id => <<"emqx-sp-default">>,
+        sp_sign_request => false,
+        sp_public_key => <<>>,
+        sp_private_key => <<>>,
+        idp_signs_envelopes => true,
+        idp_signs_assertions => true
+    }),
+
+    run_signature_combo_e2e_test(Config, #{
+        expect_sp_signature => false,
+        test_name => "SP=false, Envelope=true, Assertion=true"
+    }).
+
+t_sig_combo_no_sp_envelope_only(_Config) ->
+    ct:pal("=== E2E Signature Combo: SP=false, Envelope=true, Assertion=false ==="),
+
+    Config = make_saml_config(#{
+        sp_entity_id => <<"emqx-sp-envelope-only">>,
+        sp_sign_request => false,
+        sp_public_key => <<>>,
+        sp_private_key => <<>>,
+        idp_signs_envelopes => true,
+        idp_signs_assertions => false
+    }),
+
+    run_signature_combo_e2e_test(Config, #{
+        expect_sp_signature => false,
+        test_name => "SP=false, Envelope=true, Assertion=false"
+    }).
+
+t_sig_combo_no_sp_assertion_only(_Config) ->
+    ct:pal("=== E2E Signature Combo: SP=false, Envelope=false, Assertion=true ==="),
+
+    Config = make_saml_config(#{
+        sp_entity_id => <<"emqx-sp-assertion-only">>,
+        sp_sign_request => false,
+        sp_public_key => <<>>,
+        sp_private_key => <<>>,
+        idp_signs_envelopes => false,
+        idp_signs_assertions => true
+    }),
+
+    run_signature_combo_e2e_test(Config, #{
+        expect_sp_signature => false,
+        test_name => "SP=false, Envelope=false, Assertion=true"
+    }).
+
+t_sig_combo_no_signatures(_Config) ->
+    ct:pal("=== E2E Signature Combo: SP=false, Envelope=false, Assertion=false (INSECURE) ==="),
+
+    Config = make_saml_config(#{
+        sp_entity_id => <<"emqx-sp-no-signatures">>,
+        sp_sign_request => false,
+        sp_public_key => <<>>,
+        sp_private_key => <<>>,
+        idp_signs_envelopes => false,
+        idp_signs_assertions => false
+    }),
+
+    run_signature_combo_e2e_test(Config, #{
+        expect_sp_signature => false,
+        test_name => "SP=false, Envelope=false, Assertion=false (INSECURE)"
+    }).
+
+t_sig_combo_sp_sign_both_idp(TCConfig) ->
+    ct:pal("=== E2E Signature Combo: SP=true, Envelope=true, Assertion=true (Full Security) ==="),
+
+    {SpPublicKey, SpPrivateKey} = sp_signing_key_pair(TCConfig),
+    ok = register_sp_certificate_with_keycloak(<<"emqx-sp-full-security">>, SpPublicKey),
+
+    Config = make_saml_config(#{
+        sp_entity_id => <<"emqx-sp-full-security">>,
+        sp_sign_request => true,
+        sp_public_key => SpPublicKey,
+        sp_private_key => SpPrivateKey,
+        idp_signs_envelopes => true,
+        idp_signs_assertions => true
+    }),
+
+    run_signature_combo_e2e_test(Config, #{
+        expect_sp_signature => true,
+        test_name => "SP=true, Envelope=true, Assertion=true (Full Security)"
+    }).
+
+%%------------------------------------------------------------------------------
+%% Helper Functions
+%%------------------------------------------------------------------------------
+
+checked_saml_config(Overrides) ->
+    Config = maps:merge(#{<<"backend">> => <<"saml">>}, Overrides),
+    RawConf = #{<<"dashboard">> => #{<<"sso">> => #{<<"saml">> => Config}}},
+    #{dashboard := #{sso := #{saml := Checked}}} = hocon_tconf:check_plain(
+        emqx_dashboard_schema,
+        RawConf,
+        #{required => false, atom_key => true, make_serializable => false}
+    ),
+    Checked.
+
+uri(Parts) ->
+    ?BASE_URL ++ "/" ++ filename:join(["api", "v5" | Parts]).
+
+request(Method, Url, Body) ->
+    AuthHeader = persistent_term:get({?MODULE, auth_header}),
+    Opts = #{compatible_mode => true, httpc_req_opts => [{body_format, binary}]},
+    emqx_mgmt_api_test_util:request_api(Method, Url, [], AuthHeader, Body, Opts).
+
+xxe_callback_state() ->
+    signature_test_state(false, false).
+
+%% @doc A `RelayState' plus the browser binding cookie that carries it, as the
+%% browser which started the login would send them back.
+relay_state_cookie(RelayState) ->
+    relay_state_jar([RelayState]).
+
+%% @doc The cookies of several logins started in one browser.
+relay_state_jar(RelayStates) ->
+    Pairs = [
+        <<(emqx_dashboard_sso_browser_binding:cookie_name(saml, RS))/binary, "=", RS/binary>>
+     || RS <- RelayStates
+    ],
+    #{<<"cookie">> => iolist_to_binary(lists:join(<<"; ">>, Pairs))}.
+
+%% @doc Turn a bare SAMLResponse body into a request bound to this browser.
+bound_callback_req(Body) ->
+    bound_callback_req(Body, ?TEST_RELAY_STATE).
+
+bound_callback_req(Body, RelayState) ->
+    #{
+        body => with_relay_state(Body, RelayState),
+        headers => relay_state_cookie(RelayState)
+    }.
+
+with_relay_state(Body, RelayState) ->
+    iolist_to_binary([Body, <<"&RelayState=">>, RelayState]).
+
+%% @doc The value emqx put in the browser binding cookie of a login response.
+binding_cookie_value(Headers) ->
+    SetCookie = maps:get(<<"set-cookie">>, Headers),
+    [Pair | _] = binary:split(SetCookie, <<";">>),
+    [Name, Value] = binary:split(Pair, <<"=">>),
+    ?assertEqual(emqx_dashboard_sso_browser_binding:cookie_name(saml, Value), Name),
+    Value.
+
+%% @doc Build a callback state with the given signature-verification flags,
+%% for tests that exercise `emqx_dashboard_sso_saml:callback/2` directly.
+signature_test_state(IdpSignsEnvelopes, IdpSignsAssertions) ->
+    DashboardAddr = list_to_binary(?BASE_URL),
+    ConsumeURI = ?BASE_URL ++ "/api/v5/sso/saml/acs",
+    MetadataURI = ?BASE_URL ++ "/api/v5/sso/saml/metadata",
+    SP = #esaml_sp{
+        consume_uri = ConsumeURI,
+        metadata_uri = MetadataURI,
+        idp_signs_envelopes = IdpSignsEnvelopes,
+        idp_signs_assertions = IdpSignsAssertions
+    },
+    #{sp => SP, dashboard_addr => DashboardAddr}.
+
+%% @doc Build a well-formed but unsigned SAMLResponse body (HTTP-POST
+%% binding), for tests that exercise signature verification.
+unsigned_response_body(SP, Username) ->
+    Xml = iolist_to_binary([
+        <<"<?xml version=\"1.0\"?>">>,
+        <<"<samlp:Response ">>,
+        <<"xmlns:samlp=\"urn:oasis:names:tc:SAML:2.0:protocol\" ">>,
+        <<"xmlns:saml=\"urn:oasis:names:tc:SAML:2.0:assertion\" ">>,
+        <<"Version=\"2.0\" IssueInstant=\"2026-01-01T00:00:00Z\">">>,
+        <<"<samlp:Status><samlp:StatusCode ">>,
+        <<"Value=\"urn:oasis:names:tc:SAML:2.0:status:Success\"/>">>,
+        <<"</samlp:Status>">>,
+        <<"<saml:Assertion Version=\"2.0\" IssueInstant=\"2026-01-01T00:00:00Z\">">>,
+        <<"<saml:Issuer>emqx-test-idp</saml:Issuer>">>,
+        <<"<saml:Subject>">>,
+        <<"<saml:NameID>">>,
+        Username,
+        <<"</saml:NameID>">>,
+        <<"<saml:SubjectConfirmation Method=\"urn:oasis:names:tc:SAML:2.0:cm:bearer\">">>,
+        <<"<saml:SubjectConfirmationData Recipient=\"">>,
+        SP#esaml_sp.consume_uri,
+        <<"\" NotOnOrAfter=\"2099-01-01T00:00:00Z\"/>">>,
+        <<"</saml:SubjectConfirmation>">>,
+        <<"</saml:Subject>">>,
+        <<"<saml:Conditions NotOnOrAfter=\"2099-01-01T00:00:00Z\">">>,
+        <<"<saml:AudienceRestriction><saml:Audience>">>,
+        SP#esaml_sp.metadata_uri,
+        <<"</saml:Audience></saml:AudienceRestriction>">>,
+        <<"</saml:Conditions>">>,
+        <<"</saml:Assertion>">>,
+        <<"</samlp:Response>">>
+    ]),
+    Payload = base64:encode(Xml),
+    iolist_to_binary(uri_string:compose_query([{<<"SAMLResponse">>, Payload}])).
+
+xxe_callback_body(SecretPath, SAMLEncoding, #{sp := SP}) ->
+    Xml = iolist_to_binary([
+        <<"<?xml version=\"1.0\"?>">>,
+        <<"<!DOCTYPE foo [<!ENTITY xxe SYSTEM \"file://">>,
+        SecretPath,
+        <<"\">]>\n">>,
+        <<"<samlp:Response ">>,
+        <<"xmlns:samlp=\"urn:oasis:names:tc:SAML:2.0:protocol\" ">>,
+        <<"xmlns:saml=\"urn:oasis:names:tc:SAML:2.0:assertion\" ">>,
+        <<"Version=\"2.0\" IssueInstant=\"2026-01-01T00:00:00Z\">">>,
+        <<"<samlp:Status><samlp:StatusCode ">>,
+        <<"Value=\"urn:oasis:names:tc:SAML:2.0:status:Success\"/>">>,
+        <<"</samlp:Status>">>,
+        <<"<saml:Assertion Version=\"2.0\" IssueInstant=\"2026-01-01T00:00:00Z\">">>,
+        <<"<saml:Issuer>emqx-test-idp</saml:Issuer>">>,
+        <<"<saml:Subject>">>,
+        <<"<saml:NameID>&xxe;</saml:NameID>">>,
+        <<"<saml:SubjectConfirmation Method=\"urn:oasis:names:tc:SAML:2.0:cm:bearer\">">>,
+        <<"<saml:SubjectConfirmationData Recipient=\"">>,
+        SP#esaml_sp.consume_uri,
+        <<"\" NotOnOrAfter=\"2099-01-01T00:00:00Z\"/>">>,
+        <<"</saml:SubjectConfirmation>">>,
+        <<"</saml:Subject>">>,
+        <<"<saml:Conditions NotOnOrAfter=\"2099-01-01T00:00:00Z\">">>,
+        <<"<saml:AudienceRestriction><saml:Audience>">>,
+        SP#esaml_sp.metadata_uri,
+        <<"</saml:Audience></saml:AudienceRestriction>">>,
+        <<"</saml:Conditions>">>,
+        <<"</saml:Assertion>">>,
+        <<"</samlp:Response>">>
+    ]),
+    Payload =
+        case SAMLEncoding of
+            undefined -> base64:encode(Xml);
+            ?SAML_HTTP_REDIRECT_BINDING -> base64:encode(zlib:zip(Xml))
+        end,
+    Query =
+        case SAMLEncoding of
+            undefined -> [{<<"SAMLResponse">>, Payload}];
+            _ -> [{<<"SAMLEncoding">>, SAMLEncoding}, {<<"SAMLResponse">>, Payload}]
+        end,
+    iolist_to_binary(uri_string:compose_query(Query)).
+
+%% @doc Check if Keycloak is available for integration tests
+is_keycloak_available() ->
+    Url = keycloak_metadata_url(),
+    case httpc:request(get, {Url, []}, [{timeout, 5000}], []) of
+        {ok, {{_, 200, _}, _, _}} ->
+            true;
+        _ ->
+            false
+    end.
+
+keycloak_metadata_url() ->
+    "http://" ++ ?KEYCLOAK_HOST ++ ":" ++ integer_to_list(?KEYCLOAK_HTTP_PORT) ++
+        "/realms/" ++ ?KEYCLOAK_REALM ++ "/protocol/saml/descriptor".
+
+%% @doc Make SAML configuration with defaults
+make_saml_config(Overrides) ->
+    Defaults = #{
+        enable => true,
+        dashboard_addr => <<"http://172.100.239.1:18083">>,
+        idp_metadata_url => list_to_binary(keycloak_metadata_url()),
+        sp_sign_request => false,
+        sp_public_key => <<>>,
+        sp_private_key => <<>>,
+        idp_signs_envelopes => true,
+        idp_signs_assertions => true
+    },
+    maps:merge(Defaults, Overrides).
+
+%% The SP's signing key pair, made for this run: an RSA certificate and key.
+sp_signing_key_pair(TCConfig) ->
+    #{certfile := CertFile, keyfile := KeyFile} = emqx_common_test_helpers:mock_server_certs(
+        ?config(priv_dir, TCConfig), "emqx-sp"
+    ),
+    {iolist_to_binary(CertFile), iolist_to_binary(KeyFile)}.
+
+%% Keycloak verifies the SP's request signature for a client whose
+%% `saml.client.signature' is on, against the certificate stored in that
+%% client. Store this run's certificate there through the admin API.
+register_sp_certificate_with_keycloak(ClientId, CertFile) ->
+    {ok, Pem} = file:read_file(CertFile),
+    [{'Certificate', Der, not_encrypted}] = public_key:pem_decode(Pem),
+    Token = keycloak_admin_token(),
+    [#{<<"id">> := Id, <<"attributes">> := Attrs} = Client] =
+        keycloak_admin_get(Token, "/clients?clientId=" ++ binary_to_list(ClientId)),
+    Updated = Client#{
+        <<"attributes">> => Attrs#{<<"saml.signing.certificate">> => base64:encode(Der)}
+    },
+    keycloak_admin_put(Token, "/clients/" ++ binary_to_list(Id), Updated).
+
+keycloak_base_url() ->
+    "http://" ++ ?KEYCLOAK_HOST ++ ":" ++ integer_to_list(?KEYCLOAK_HTTP_PORT).
+
+%% `realm_admin' from `realm-export.json': a user of the `emqx' realm holding
+%% `realm-management' client roles, so the realm's own token endpoint serves.
+%% The master realm would refuse: it requires HTTPS from the compose network's
+%% addresses, which fall outside the private ranges.
+keycloak_admin_token() ->
+    Url = keycloak_base_url() ++ "/realms/" ++ ?KEYCLOAK_REALM ++ "/protocol/openid-connect/token",
+    Body = "client_id=admin-cli&grant_type=password&username=realm_admin&password=realm_admin_pass",
+    {ok, {{_, 200, _}, _, RespBody}} = httpc:request(
+        post,
+        {Url, [], "application/x-www-form-urlencoded", Body},
+        [{timeout, 10000}],
+        [{body_format, binary}]
+    ),
+    #{<<"access_token">> := Token} = emqx_utils_json:decode(RespBody),
+    binary_to_list(Token).
+
+keycloak_admin_get(Token, Path) ->
+    Url = keycloak_base_url() ++ "/admin/realms/" ++ ?KEYCLOAK_REALM ++ Path,
+    Headers = [{"authorization", "Bearer " ++ Token}],
+    {ok, {{_, 200, _}, _, RespBody}} = httpc:request(
+        get, {Url, Headers}, [{timeout, 10000}], [{body_format, binary}]
+    ),
+    emqx_utils_json:decode(RespBody).
+
+keycloak_admin_put(Token, Path, Body) ->
+    Url = keycloak_base_url() ++ "/admin/realms/" ++ ?KEYCLOAK_REALM ++ Path,
+    Headers = [{"authorization", "Bearer " ++ Token}],
+    {ok, {{_, 204, _}, _, _}} = httpc:request(
+        put,
+        {Url, Headers, "application/json", emqx_utils_json:encode(Body)},
+        [{timeout, 10000}],
+        [{body_format, binary}]
+    ),
+    ok.
+
+%% @doc Cleanup SAML module state
+cleanup_saml_module() ->
+    catch persistent_term:erase(saml_test_state),
+    _ = emqx_dashboard_sso_manager:delete(saml),
+    ok.
+
+%%------------------------------------------------------------------------------
+%% E2E Test Helper Functions
+%%------------------------------------------------------------------------------
+
+%% @doc Extract cookies from HTTP response headers
+extract_cookies(Headers) ->
+    [Cookie || {"set-cookie", Cookie} <- Headers].
+
+%% @doc Format cookies for Cookie header
+format_cookies(Cookies) ->
+    CookieParts = [extract_cookie_value(C) || C <- Cookies],
+    string:join(CookieParts, "; ").
+
+extract_cookie_value(Cookie) ->
+    [NameValue | _] = string:split(Cookie, ";"),
+    string:trim(NameValue).
+
+%% @doc Extract form action URL from Keycloak login page HTML
+extract_form_action(Html) ->
+    case re:run(Html, <<"action=\"([^\"]+)\"">>, [{capture, [1], binary}]) of
+        {match, [ActionUrl]} ->
+            Unescaped = binary:replace(ActionUrl, <<"&amp;">>, <<"&">>, [global]),
+            {ok, binary_to_list(Unescaped)};
+        nomatch ->
+            {error, form_action_not_found}
+    end.
+
+%% @doc Extract SAMLResponse from Keycloak's auto-submit form
+extract_saml_response(Html) ->
+    case
+        re:run(Html, <<"name=\"SAMLResponse\"[^>]*value=\"([^\"]+)\"">>, [{capture, [1], binary}])
+    of
+        {match, [SAMLResponse]} ->
+            {ok, SAMLResponse};
+        nomatch ->
+            case
+                re:run(Html, <<"value=\"([^\"]+)\"[^>]*name=\"SAMLResponse\"">>, [
+                    {capture, [1], binary}
+                ])
+            of
+                {match, [SAMLResponse]} ->
+                    {ok, SAMLResponse};
+                nomatch ->
+                    {error, saml_response_not_found}
+            end
+    end.
+
+%% @doc URL encode binary for form submission
+uri_encode(Bin) when is_binary(Bin) ->
+    list_to_binary(uri_encode_string(binary_to_list(Bin))).
+
+uri_encode_string([]) ->
+    [];
+uri_encode_string([H | T]) ->
+    if
+        H >= $a, H =< $z -> [H | uri_encode_string(T)];
+        H >= $A, H =< $Z -> [H | uri_encode_string(T)];
+        H >= $0, H =< $9 -> [H | uri_encode_string(T)];
+        H =:= $-; H =:= $_; H =:= $.; H =:= $~ -> [H | uri_encode_string(T)];
+        true -> [$%, hex(H div 16), hex(H rem 16) | uri_encode_string(T)]
+    end.
+
+hex(N) when N < 10 -> $0 + N;
+hex(N) -> $A + N - 10.
+
+%% @doc Run E2E signature combination test
+run_signature_combo_e2e_test(Config, TestOpts) ->
+    #{expect_sp_signature := ExpectSpSig, test_name := TestName} = TestOpts,
+
+    %% Step 1: Initialize SAML with the configuration
+    ct:pal("Step 1: Initializing SAML with config for ~s", [TestName]),
+    {ok, State} = emqx_dashboard_sso_saml:create(Config),
+    ?assert(maps:is_key(sp, State)),
+    ?assert(maps:is_key(idp_meta, State)),
+
+    %% Verify SP signature settings
+    SP = maps:get(sp, State),
+    ?assertEqual(ExpectSpSig, SP#esaml_sp.sp_sign_requests),
+
+    %% Step 2: Get login redirect URL
+    ct:pal("Step 2: Getting SAML AuthnRequest redirect URL"),
+    {redirect, {302, Headers, _}} = emqx_dashboard_sso_saml:login(#{headers => #{}}, State),
+    LoginUrl = binary_to_list(maps:get(<<"location">>, Headers)),
+    RelayState = binding_cookie_value(Headers),
+
+    %% Verify SP signature presence in URL
+    case ExpectSpSig of
+        true ->
+            ?assertMatch({match, _}, re:run(LoginUrl, "Signature=")),
+            ?assertMatch({match, _}, re:run(LoginUrl, "SigAlg=")),
+            ct:pal("Verified: AuthnRequest URL contains SP signature");
+        false ->
+            ?assertMatch(nomatch, re:run(LoginUrl, "Signature=")),
+            ct:pal("Verified: AuthnRequest URL does NOT contain SP signature")
+    end,
+
+    %% Step 3: Follow redirect to Keycloak login page
+    ct:pal("Step 3: Following redirect to Keycloak"),
+    {ok, {{_, 200, _}, LoginHeaders, LoginPageBody}} =
+        httpc:request(get, {LoginUrl, []}, [{autoredirect, true}], [{body_format, binary}]),
+    Cookies = extract_cookies(LoginHeaders),
+    ct:pal("Got Keycloak session cookies: ~p", [length(Cookies)]),
+
+    %% Step 4: Parse login form to get action URL
+    ct:pal("Step 4: Parsing Keycloak login form"),
+    {ok, FormAction} = extract_form_action(LoginPageBody),
+
+    %% Step 5: Submit credentials to Keycloak
+    ct:pal("Step 5: Submitting credentials to Keycloak"),
+    LoginData =
+        "username=" ++ ?KEYCLOAK_TEST_USER ++ "&password=" ++ ?KEYCLOAK_TEST_PASSWORD ++
+            "&credentialId=",
+    CookieHeader = {"Cookie", format_cookies(Cookies)},
+
+    {ok, {{_, LoginRespCode, _}, LoginRespHeaders, LoginRespBody}} =
+        httpc:request(
+            post,
+            {FormAction, [CookieHeader], "application/x-www-form-urlencoded", LoginData},
+            [{autoredirect, false}],
+            [{body_format, binary}]
+        ),
+
+    ct:pal("Login response code: ~p", [LoginRespCode]),
+
+    %% Step 6: Handle the SAML response
+    SAMLResponse =
+        case LoginRespCode of
+            200 ->
+                ct:pal("Step 6: Extracting SAMLResponse from form (POST binding)"),
+                {ok, SAMLResp} = extract_saml_response(LoginRespBody),
+                SAMLResp;
+            302 ->
+                ct:pal("Step 6: Following redirect to get SAMLResponse"),
+                RedirectLocation = proplists:get_value("location", LoginRespHeaders),
+                NewCookies = extract_cookies(LoginRespHeaders) ++ Cookies,
+                {ok, {{_, 200, _}, _, RedirectBody}} =
+                    httpc:request(
+                        get,
+                        {RedirectLocation, [{"Cookie", format_cookies(NewCookies)}]},
+                        [{autoredirect, false}],
+                        [{body_format, binary}]
+                    ),
+                {ok, SAMLResp} = extract_saml_response(RedirectBody),
+                SAMLResp
+        end,
+
+    ct:pal("Got SAMLResponse (length: ~p bytes)", [byte_size(SAMLResponse)]),
+
+    %% Step 7: Submit SAMLResponse to EMQX callback
+    ct:pal("Step 7: Submitting SAMLResponse to EMQX callback"),
+    CallbackBody = <<"SAMLResponse=", (uri_encode(SAMLResponse))/binary>>,
+    CallbackReq = bound_callback_req(CallbackBody, RelayState),
+
+    CallbackResult = emqx_dashboard_sso_saml:callback(CallbackReq, State),
+    ct:pal("Callback result: ~p", [CallbackResult]),
+
+    %% Step 8: Verify successful login
+    ct:pal("Step 8: Verifying login result"),
+    case CallbackResult of
+        {redirect, Username, {302, RedirectHeaders, _}} ->
+            ct:pal("SUCCESS! User logged in: ~s", [Username]),
+            RedirectUrl = maps:get(<<"location">>, RedirectHeaders),
+            ?assertMatch({match, _}, re:run(RedirectUrl, "login_meta=")),
+            ?assertEqual(<<"testuser">>, Username);
+        {error, Reason} ->
+            ct:pal("Login failed with reason: ~p", [Reason]),
+            ct:fail("SAML callback failed for ~s: ~p", [TestName, Reason])
+    end,
+
+    %% Cleanup
+    _ = emqx_dashboard_sso_manager:delete(saml),
+    ct:pal("=== E2E Signature Combo Test PASSED: ~s ===", [TestName]),
+    ok.

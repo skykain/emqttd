@@ -1,0 +1,364 @@
+%%--------------------------------------------------------------------
+%% Copyright (c) 2020-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
+%%--------------------------------------------------------------------
+
+-module(emqx_dashboard_token).
+
+%% dialyzer sees several match/record patterns here as unreachable given
+%% the strict #emqx_admin_jwt{} type spec, but these paths guard against
+%% old records written by pre-6.0 nodes during rolling upgrades.
+-dialyzer({nowarn_function, [lookup_by_username/1, clean_expired_jwt/1, role_of/1]}).
+
+-include("emqx_dashboard.hrl").
+-include("emqx_dashboard_rbac.hrl").
+-include_lib("emqx/include/emqx_config.hrl").
+
+-export([create_tables/0]).
+
+-export([
+    sign/1,
+    verify/3,
+    lookup/1,
+    owner/1,
+    destroy/1,
+    destroy_by_username/1,
+    resolve_admin_key/1
+]).
+
+-ifdef(TEST).
+-export([lookup_by_username/1, clean_expired_jwt/1]).
+-endif.
+
+-define(TAB, ?ADMIN_JWT).
+-define(EXPTIME, 60 * 60 * 1000).
+
+%%--------------------------------------------------------------------
+%% gen server part
+-behaviour(gen_server).
+
+-export([start_link/0]).
+
+-export([
+    init/1,
+    handle_call/3,
+    handle_cast/2,
+    handle_info/2,
+    terminate/2,
+    code_change/3
+]).
+
+%%--------------------------------------------------------------------
+%% jwt function
+
+-spec verify(emqx_dashboard:request(), emqx_dashboard:handler_info(), Token :: binary()) ->
+    {ok, emqx_dashboard_rbac:actor_context()}
+    | {error, token_timeout | not_found | {unauthorized_role, binary(), dashboard_username()}}.
+verify(Req, HandlerInfo, Token) ->
+    do_verify(Req, HandlerInfo, Token).
+
+-spec destroy(KeyOrKeys :: list() | binary() | #?ADMIN_JWT{}) -> ok.
+destroy([]) ->
+    ok;
+destroy(JWTorTokenList) when is_list(JWTorTokenList) ->
+    lists:foreach(fun destroy/1, JWTorTokenList);
+destroy(#?ADMIN_JWT{token = Token}) ->
+    destroy(Token);
+destroy(Token) when is_binary(Token) ->
+    do_destroy(Token).
+
+-spec destroy_by_username(dashboard_username()) -> ok.
+destroy_by_username(Username) ->
+    do_destroy_by_username(Username).
+
+create_tables() ->
+    ok = mria:create_table(?TAB, [
+        {type, set},
+        {rlog_shard, ?DASHBOARD_SHARD},
+        {storage, disc_copies},
+        {record_name, ?ADMIN_JWT},
+        {attributes, record_info(fields, ?ADMIN_JWT)},
+        {storage_properties, [
+            {ets, [
+                {read_concurrency, true},
+                {write_concurrency, true}
+            ]}
+        ]}
+    ]),
+    [?TAB].
+
+-spec sign(User :: dashboard_user()) ->
+    {ok, dashboard_user_role(), Token :: binary(), Namespace :: binary()}.
+sign(#?ADMIN{username = Username} = User) ->
+    ExpTime = jwt_expiration_time(),
+    JWK = jwk(),
+    JWS = #{
+        <<"alg">> => <<"HS256">>
+    },
+    JWT = #{
+        <<"iss">> => <<"EMQX">>,
+        <<"exp">> => ExpTime
+    },
+    Signed = jose_jwt:sign(JWK, JWS, JWT),
+    {_, Token} = jose_jws:compact(Signed),
+    Role = emqx_dashboard_admin:role(User),
+    Namespace = emqx_dashboard_admin:namespace_of(User),
+    JWTRec = format(Token, Username, Role, ExpTime, Namespace),
+    _ = mria:sync_transaction(?DASHBOARD_SHARD, fun mnesia:write/1, [JWTRec]),
+    {ok, Role, Token, Namespace}.
+
+-spec do_verify(emqx_dashboard:request(), emqx_dashboard:handler_info(), Token :: binary()) ->
+    {ok, emqx_dashboard_rbac:actor_context()}
+    | {error, token_timeout | not_found | {unauthorized_role, binary(), dashboard_username()}}.
+do_verify(Req, HandlerInfo, Token) ->
+    case lookup(Token) of
+        {ok, JWT = #?ADMIN_JWT{exptime = ExpTime, extra = _Extra, username = _Username}} ->
+            case ExpTime > erlang:system_time(millisecond) of
+                true ->
+                    check_rbac(Req, HandlerInfo, JWT);
+                _ ->
+                    {error, token_timeout}
+            end;
+        Error ->
+            Error
+    end.
+
+%% @doc Resolve a JWT token to the original admin record's primary key.
+%% For local users this is just the username binary; for SSO users it
+%% is the `?SSO_USERNAME(Backend, Name)' tuple. Used by dashboard
+%% authorize to populate `auth_meta.source' so downstream handlers can
+%% look up the caller via `emqx_dashboard_admin:lookup_user/1' without
+%% guessing the backend from the request.
+-spec resolve_admin_key(Token :: binary()) -> dashboard_username() | undefined.
+resolve_admin_key(Token) ->
+    case lookup(Token) of
+        {ok, #?ADMIN_JWT{username = Username, extra = #{backend := Backend}}} when
+            Backend =/= ?BACKEND_LOCAL
+        ->
+            ?SSO_USERNAME(Backend, Username);
+        {ok, #?ADMIN_JWT{username = Username}} ->
+            Username;
+        _ ->
+            undefined
+    end.
+
+do_destroy(Token) ->
+    Fun = fun mnesia:delete/1,
+    {atomic, ok} = mria:sync_transaction(?DASHBOARD_SHARD, Fun, [{?TAB, Token}]),
+    ok.
+
+do_destroy_by_username(Username) ->
+    Fun = fun() ->
+        lists:foreach(
+            fun(#?ADMIN_JWT{token = Token}) ->
+                mnesia:delete({?TAB, Token})
+            end,
+            select_by_username(Username)
+        ),
+        ok
+    end,
+    {atomic, ok} = mria:sync_transaction(?DASHBOARD_SHARD, Fun),
+    ok.
+
+%%--------------------------------------------------------------------
+%% jwt internal util function
+-spec lookup(Token :: binary()) -> {ok, #?ADMIN_JWT{}} | {error, not_found}.
+lookup(Token) ->
+    Fun = fun() -> mnesia:read(?TAB, Token) end,
+    case mria:ro_transaction(?DASHBOARD_SHARD, Fun) of
+        {atomic, [JWT]} -> {ok, JWT};
+        {atomic, []} -> {error, not_found}
+    end.
+
+lookup_by_username(Username) ->
+    Fun = fun() -> select_by_username(Username) end,
+    {atomic, List} = mria:ro_transaction(?DASHBOARD_SHARD, Fun),
+    List.
+
+-spec owner(Token :: binary()) -> {ok, Username :: binary()} | {error, not_found}.
+owner(Token) ->
+    Fun = fun() -> mnesia:read(?TAB, Token) end,
+    case mria:ro_transaction(?DASHBOARD_SHARD, Fun) of
+        {atomic, [#?ADMIN_JWT{username = Username}]} -> {ok, Username};
+        {atomic, []} -> {error, not_found}
+    end.
+
+jwk() ->
+    Key = crypto:strong_rand_bytes(32),
+    #{
+        <<"kty">> => <<"oct">>,
+        <<"k">> => jose_base64url:encode(Key)
+    }.
+
+jwt_expiration_time() ->
+    erlang:system_time(millisecond) + token_ttl().
+
+token_ttl() ->
+    emqx_conf:get([dashboard, token_expired_time], ?EXPTIME).
+
+format(Token, ?SSO_USERNAME(Backend, Name), Role, ExpTime, Namespace) ->
+    format(Token, Backend, Name, Role, ExpTime, Namespace);
+format(Token, Username, Role, ExpTime, Namespace) ->
+    format(Token, ?BACKEND_LOCAL, Username, Role, ExpTime, Namespace).
+
+format(Token, Backend, Username, Role, ExpTime, Namespace) ->
+    Extra = emqx_utils_maps:put_if(
+        #{role => Role, backend => Backend},
+        ?namespace,
+        Namespace,
+        is_binary(Namespace)
+    ),
+    #?ADMIN_JWT{
+        token = Token,
+        username = Username,
+        exptime = ExpTime,
+        extra = Extra
+    }.
+
+%% A row keeps the bare name in `username' and the backend in `extra',
+%% so an SSO key matches nothing on its own.  Select on the name and
+%% keep the rows whose backend belongs to the same account, so that a
+%% local user and an SSO user of the same name stay isolated.
+select_by_username(Username) ->
+    Rows = mnesia:select(?TAB, jwt_by_username_spec(name_of(Username))),
+    [
+        JWT
+     || #?ADMIN_JWT{username = Name, extra = Extra} = JWT <- Rows,
+        full_admin_key(Name, Extra) =:= Username
+    ].
+
+name_of(?SSO_USERNAME(_Backend, Name)) ->
+    Name;
+name_of(Username) ->
+    Username.
+
+jwt_by_username_spec(Name) ->
+    [{jwt_pat([{#?ADMIN_JWT.username, Name}]), [], ['$_']}].
+
+jwt_pat(Overrides) ->
+    erlang:make_tuple(
+        record_info(size, ?ADMIN_JWT),
+        '_',
+        [{1, ?ADMIN_JWT} | Overrides]
+    ).
+
+%%--------------------------------------------------------------------
+%% gen server
+start_link() ->
+    gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
+
+init([]) ->
+    timer_clean(self()),
+    {ok, state}.
+
+handle_call(_Request, _From, State) ->
+    {reply, ok, State}.
+
+handle_cast({destroy, Username}, State) ->
+    Tokens = lookup_by_username(Username),
+    destroy(Tokens),
+    {noreply, State};
+handle_cast(_Request, State) ->
+    {noreply, State}.
+
+handle_info(clean_jwt, State) ->
+    timer_clean(self()),
+    Now = erlang:system_time(millisecond),
+    ok = clean_expired_jwt(Now),
+    {noreply, State};
+handle_info(_Info, State) ->
+    {noreply, State}.
+
+terminate(_Reason, _State) ->
+    ok.
+
+code_change(_OldVsn, State, _Extra) ->
+    {ok, State}.
+
+timer_clean(Pid) ->
+    erlang:send_after(token_ttl(), Pid, clean_jwt).
+
+clean_expired_jwt(Now) ->
+    Spec = [
+        {jwt_pat([{#?ADMIN_JWT.exptime, '$1'}, {#?ADMIN_JWT.token, '$2'}]), [{'<', '$1', Now}], [
+            '$2'
+        ]}
+    ],
+    {atomic, JWTList} = mria:ro_transaction(
+        ?DASHBOARD_SHARD,
+        fun() -> mnesia:select(?TAB, Spec) end
+    ),
+    ok = destroy(JWTList).
+
+check_rbac(Req, HandlerInfo, JWT) ->
+    ActorContext = actor_context_of(JWT),
+    case emqx_dashboard_rbac:check_rbac(Req, HandlerInfo, ActorContext) of
+        {ok, ActorContextFinal} ->
+            %% Layer the login-user scope check ON TOP of role-based
+            %% RBAC. Only invoked here (dashboard JWT path) — API key
+            %% authorisation uses its own scope mechanism via
+            %% emqx_mgmt_auth:check_scopes/2 and must not trip on this.
+            #?ADMIN_JWT{extra = Extra, username = Username} = JWT,
+            AdminKey = full_admin_key(Username, Extra),
+            case emqx_dashboard_rbac:check_login_user_scopes(AdminKey, Req, HandlerInfo) of
+                true ->
+                    ok = save_new_jwt(JWT),
+                    {ok, ActorContextFinal};
+                false ->
+                    {error, {
+                        unauthorized_role,
+                        <<"Login user scope does not permit this endpoint">>,
+                        AdminKey
+                    }}
+            end;
+        {error, Reason} when is_binary(Reason) ->
+            %% The token is valid, so the caller is authenticated. Return the
+            %% admin key so the audit record can name who was denied.
+            #?ADMIN_JWT{extra = Extra, username = Username} = JWT,
+            {error, {unauthorized_role, Reason, full_admin_key(Username, Extra)}}
+    end.
+
+full_admin_key(Username, #{backend := ?BACKEND_LOCAL}) ->
+    Username;
+full_admin_key(Username, #{backend := Backend}) when is_atom(Backend) ->
+    ?SSO_USERNAME(Backend, Username);
+full_admin_key(Username, _) ->
+    Username.
+
+save_new_jwt(OldJWT) ->
+    #?ADMIN_JWT{exptime = _ExpTime, extra = _Extra} = OldJWT,
+    NewJWT = OldJWT#?ADMIN_JWT{exptime = jwt_expiration_time()},
+    {atomic, ok} = mria:sync_transaction(
+        ?DASHBOARD_SHARD,
+        fun mnesia:write/1,
+        [NewJWT]
+    ),
+    ok.
+
+actor_context_of(#?ADMIN_JWT{} = JWT) ->
+    #?ADMIN_JWT{exptime = _ExpTime, extra = Extra, username = Username} = JWT,
+    Role = role_of(Extra),
+    Namespace = namespace_of(Extra),
+    Backend = backend_of(Extra),
+    #{
+        ?actor => Username,
+        ?role => Role,
+        ?namespace => Namespace,
+        ?backend => Backend
+    }.
+
+%% For compatibility
+role_of([]) ->
+    %% Very old record definition had `[]` as the default for `extra`....
+    ?ROLE_SUPERUSER;
+role_of(#{?role := Role}) ->
+    Role.
+
+namespace_of(#{?namespace := Namespace}) when is_binary(Namespace) ->
+    Namespace;
+namespace_of(_) ->
+    ?global_ns.
+
+backend_of(#{backend := Backend}) ->
+    Backend;
+backend_of(_) ->
+    ?BACKEND_LOCAL.

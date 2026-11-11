@@ -1,0 +1,646 @@
+%%--------------------------------------------------------------------
+%% Copyright (c) 2020-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
+%%--------------------------------------------------------------------
+
+-module(emqx_authz_postgresql_SUITE).
+
+-compile(nowarn_export_all).
+-compile(export_all).
+
+-include_lib("emqx_auth/include/emqx_authz.hrl").
+-include_lib("eunit/include/eunit.hrl").
+-include_lib("common_test/include/ct.hrl").
+
+-define(PGSQL_HOST, "pgsql").
+-define(PGSQL_RESOURCE, <<"emqx_authz_pgsql_SUITE">>).
+-define(PROXY_HOST, "toxiproxy").
+-define(PROXY_PORT, 8474).
+-define(PROXY_NAME, "pgsql_tcp").
+
+-define(TABLE_TESTS, [t_run_case, t_run_case_with_disable_prepared_statements]).
+
+all() ->
+    TableTests = [t_run_case, t_run_case_with_disable_prepared_statements],
+    (emqx_common_test_helpers:all(?MODULE) -- TableTests) ++ [{group, table_tests}].
+
+groups() ->
+    emqx_common_test_helpers:nested_groups([
+        [table_tests],
+        emqx_authz_test_lib:case_names(cases()),
+        ?TABLE_TESTS
+    ]).
+
+init_per_suite(Config) ->
+    Apps = emqx_cth_suite:start(
+        [
+            emqx,
+            {emqx_conf, """
+            authorization {
+                no_match = deny
+                cache {enable = false}
+            }
+            """},
+            emqx_auth,
+            emqx_auth_postgresql
+        ],
+        #{work_dir => ?config(priv_dir, Config)}
+    ),
+    {ok, _} = create_pgsql_resource(),
+    [{suite_apps, Apps} | Config].
+
+end_per_suite(Config) ->
+    ok = emqx_authz_test_lib:restore_authorizers(),
+    ok = emqx_resource:remove_local(?PGSQL_RESOURCE),
+    ok = emqx_cth_suite:stop_apps(?config(suite_apps, Config)).
+
+init_per_group(table_tests, Config) ->
+    Config;
+init_per_group(TableCaseName, Config) ->
+    [{test_case, emqx_authz_test_lib:get_case(TableCaseName, cases())} | Config].
+
+end_per_group(_Group, _Config) ->
+    ok.
+
+init_per_testcase(_TestCase, Config) ->
+    ok = emqx_authz_test_lib:reset_authorizers(),
+    Config.
+end_per_testcase(_TestCase, _Config) ->
+    _ = emqx_auth_cache:reset(?AUTHZ_CACHE),
+    ok = emqx_authz_test_lib:enable_node_cache(false),
+    ok = drop_table(),
+    ok.
+
+%%------------------------------------------------------------------------------
+%% Testcases
+%%------------------------------------------------------------------------------
+
+t_run_case(Config) ->
+    Case = ?config(test_case, Config),
+    ok = setup_source_data(Case),
+    ok = setup_authz_source(Case, #{}),
+    ok = emqx_authz_test_lib:run_table_checks(Case).
+
+t_run_case_with_disable_prepared_statements(Config) ->
+    Case = ?config(test_case, Config),
+    ok = setup_source_data(Case),
+    ok = setup_authz_source(Case, #{<<"disable_prepared_statements">> => true}),
+    ok = emqx_authz_test_lib:run_table_checks(Case).
+
+t_create_invalid(_Config) ->
+    BadConfig = maps:merge(
+        raw_pgsql_authz_config(),
+        #{<<"server">> => <<"255.255.255.255:33333">>}
+    ),
+    {ok, _} = emqx_authz:update(?CMD_REPLACE, [BadConfig]),
+
+    [_] = emqx_authz:lookup_states().
+
+t_node_cache(_Config) ->
+    Case = #{
+        name => cache_publish,
+        setup => [
+            """
+            CREATE TABLE acl(username VARCHAR(255), topic VARCHAR(255),
+            permission VARCHAR(255), action VARCHAR(255))
+            """,
+            """
+            INSERT INTO acl(username, topic, permission, action) VALUES('username', 'a', 'allow', 'publish')
+            """
+        ],
+        query => "SELECT permission, action, topic FROM acl WHERE username = ${username}",
+        client_info => #{username => <<"username">>},
+        checks => []
+    },
+    ok = setup_source_data(Case),
+    ok = setup_authz_source(Case, #{}),
+    ok = emqx_authz_test_lib:enable_node_cache(true),
+
+    %% Subscribe to twice, should hit cache the second time
+    emqx_authz_test_lib:run_checks(
+        Case#{
+            checks => [
+                {allow, ?AUTHZ_PUBLISH, <<"a">>},
+                {allow, ?AUTHZ_PUBLISH, <<"a">>}
+            ]
+        }
+    ),
+    ?assertMatch(
+        #{hits := #{value := 1}, misses := #{value := 1}},
+        emqx_auth_cache:metrics(?AUTHZ_CACHE)
+    ),
+
+    %% Change variable, should miss cache
+    emqx_authz_test_lib:run_checks(
+        Case#{
+            checks => [{deny, ?AUTHZ_PUBLISH, <<"a">>}],
+            client_info => #{username => <<"username2">>}
+        }
+    ),
+    ?assertMatch(
+        #{hits := #{value := 1}, misses := #{value := 2}},
+        emqx_auth_cache:metrics(?AUTHZ_CACHE)
+    ).
+
+t_conn_error_legacy_ignores(_Config) ->
+    emqx_common_test_helpers:with_security_profile("legacy", fun() ->
+        ok = setup_conn_error_source(),
+        {ok, _} = emqx:update_config([authorization, no_match], allow),
+        with_failure(down, fun() ->
+            ?assertEqual(
+                allow,
+                emqx_access_control:authorize(
+                    emqx_authz_context:make(emqx_authz_test_lib:base_client_info()),
+                    ?AUTHZ_PUBLISH,
+                    <<"a">>
+                )
+            )
+        end)
+    end).
+
+t_conn_error_hardened_denies(_Config) ->
+    emqx_common_test_helpers:with_security_profile("hardened", fun() ->
+        ok = setup_conn_error_source(),
+        {ok, _} = emqx:update_config([authorization, no_match], allow),
+        with_failure(down, fun() ->
+            ?assertEqual(
+                deny,
+                emqx_access_control:authorize(
+                    emqx_authz_context:make(emqx_authz_test_lib:base_client_info()),
+                    ?AUTHZ_PUBLISH,
+                    <<"a">>
+                )
+            )
+        end)
+    end).
+
+%%------------------------------------------------------------------------------
+%% Cases
+%%------------------------------------------------------------------------------
+
+cases() ->
+    [
+        #{
+            name => base_publish,
+            setup => [
+                """
+                CREATE TABLE acl(username VARCHAR(255), topic VARCHAR(255),
+                permission VARCHAR(255), action VARCHAR(255))
+                """,
+                "INSERT INTO acl(username, topic, permission, action) VALUES('username', 'a', 'allow', 'publish')",
+                "INSERT INTO acl(username, topic, permission, action) VALUES('username', 'b', 'allow', 'subscribe')"
+            ],
+            query => "SELECT permission, action, topic FROM acl WHERE username = ${username}",
+            client_info => #{username => <<"username">>},
+            checks => [
+                {allow, ?AUTHZ_PUBLISH, <<"a">>},
+                {deny, ?AUTHZ_PUBLISH, <<"b">>},
+                {deny, ?AUTHZ_SUBSCRIBE, <<"a">>},
+                {allow, ?AUTHZ_SUBSCRIBE, <<"b">>}
+            ]
+        },
+        #{
+            name => publish_many_and_unknown_query_params,
+            setup => [
+                """
+                CREATE TABLE acl(username VARCHAR(255), clientid VARCHAR(255), topic VARCHAR(255),
+                permission VARCHAR(255), action VARCHAR(255))
+                """,
+                """
+                INSERT INTO acl(username, clientid, topic, permission, action)
+                VALUES('username', 'clientid', 'a', 'allow', 'publish')
+                """,
+                """
+                INSERT INTO acl(username, clientid, topic, permission, action)
+                VALUES('username', 'clientid', 'b', 'allow', 'subscribe')
+                """
+            ],
+            query =>
+                ~b"""
+            SELECT permission, action, topic FROM acl
+            WHERE username = ${username}
+            AND clientid = ${clientid}
+            AND ${topic}::text = '${$}{topic}'
+            """,
+            client_info => #{username => <<"username">>, clientid => <<"clientid">>},
+            checks => [
+                {allow, ?AUTHZ_PUBLISH, <<"a">>},
+                {deny, ?AUTHZ_PUBLISH, <<"b">>},
+                {deny, ?AUTHZ_SUBSCRIBE, <<"a">>},
+                {allow, ?AUTHZ_SUBSCRIBE, <<"b">>}
+            ]
+        },
+        #{
+            name => rule_by_authz_context_variables,
+            security_profile => hardened,
+            setup => [
+                """
+                CREATE TABLE acl(username VARCHAR(255), clientid VARCHAR(255), cn VARCHAR(255), dn VARCHAR(255),
+                peerhost VARCHAR(255), peerport VARCHAR(255), zone VARCHAR(255), listener VARCHAR(255),
+                client_group VARCHAR(255), topic VARCHAR(255),
+                permission VARCHAR(255), action VARCHAR(255))
+                """,
+                """
+                INSERT INTO acl(username, clientid, cn, dn, peerhost, peerport, zone, listener,
+                client_group, topic, permission, action)
+                VALUES('username', 'clientid', 'cn', 'dn', '127.0.0.1', '1883', 'default', 'tcp:default',
+                'g1', 'a', 'allow', 'publish')
+                """
+            ],
+            query =>
+                ~b"""
+                SELECT permission, action, topic FROM acl WHERE
+                username = ${username} AND clientid = ${clientid} AND cn = ${cert_common_name}
+                AND dn = ${cert_subject} AND peerhost = ${peerhost}
+                AND peerport = ${peerport} AND zone = ${zone} AND listener = ${listener}
+                AND client_group = ${client_attrs.group}
+                """,
+            client_info => #{
+                clientid => <<"clientid">>,
+                cn => <<"cn">>,
+                dn => <<"dn">>,
+                peerhost => {127, 0, 0, 1},
+                peername => {{127, 0, 0, 1}, 1883},
+                zone => default,
+                listener => 'tcp:default',
+                client_attrs => #{<<"group">> => <<"g1">>}
+            },
+            checks => [
+                {allow, ?AUTHZ_PUBLISH, <<"a">>},
+                {deny, ?AUTHZ_PUBLISH, <<"b">>}
+            ]
+        },
+        #{
+            name => topics_literal_wildcard_variable,
+            setup => [
+                """
+                CREATE TABLE acl(username VARCHAR(255), topic VARCHAR(255),
+                permission VARCHAR(255), action VARCHAR(255))
+                """,
+                """
+                INSERT INTO acl(username, topic, permission, action)
+                VALUES('username', 't/${username}', 'allow', 'publish')
+                """,
+                """
+                INSERT INTO acl(username, topic, permission, action)
+                VALUES('username', 't/${clientid}', 'allow', 'publish')
+                """,
+                """
+                INSERT INTO acl(username, topic, permission, action)
+                VALUES('username', 'eq t/${username}', 'allow', 'publish')
+                """,
+                """
+                INSERT INTO acl(username, topic, permission, action)
+                VALUES('username', 't/#', 'allow', 'publish')
+                """,
+                """
+                INSERT INTO acl(username, topic, permission, action)
+                VALUES('username', 't1/+', 'allow', 'publish')
+                """
+            ],
+            query => "SELECT permission, action, topic FROM acl WHERE username = ${username}",
+            client_info => #{
+                username => <<"username">>
+            },
+            checks => [
+                {allow, ?AUTHZ_PUBLISH, <<"t/username">>},
+                {allow, ?AUTHZ_PUBLISH, <<"t/clientid">>},
+                {allow, ?AUTHZ_PUBLISH, <<"t/${username}">>},
+                {allow, ?AUTHZ_PUBLISH, <<"t/1/2">>},
+                {allow, ?AUTHZ_PUBLISH, <<"t1/1">>},
+                {deny, ?AUTHZ_PUBLISH, <<"t1/1/2">>},
+                {deny, ?AUTHZ_PUBLISH, <<"abc">>},
+                {deny, ?AUTHZ_SUBSCRIBE, <<"t/username">>}
+            ]
+        },
+        #{
+            name => qos_retain_in_query_result,
+            setup => [
+                """
+                CREATE TABLE acl(username VARCHAR(255), topic VARCHAR(255),
+                permission VARCHAR(255), action VARCHAR(255),
+                qos_s VARCHAR(255), retain_s VARCHAR(255))
+                """,
+                """
+                INSERT INTO acl(username, topic, permission, action, qos_s, retain_s)
+                 VALUES('username', 't1', 'allow', 'publish', '1', 'true')
+                """,
+                """
+                INSERT INTO acl(username, topic, permission, action, qos_s, retain_s)
+                 VALUES('username', 't2', 'allow', 'publish', '2', 'false')
+                """,
+                """
+                INSERT INTO acl(username, topic, permission, action, qos_s, retain_s)
+                 VALUES('username', 't3', 'allow', 'publish', '0,1,2', 'all')
+                """,
+                """
+                INSERT INTO acl(username, topic, permission, action, qos_s, retain_s)
+                 VALUES('username', 't4', 'allow', 'subscribe', '1', null)
+                """,
+                """
+                INSERT INTO acl(username, topic, permission, action, qos_s, retain_s)
+                 VALUES('username', 't5', 'allow', 'subscribe', '0,1,2', null)
+                """
+            ],
+            query =>
+                ~b"""
+                SELECT permission, action, topic, qos_s as qos, retain_s as retain
+                FROM acl WHERE username = ${username}
+                """,
+            client_info => #{
+                username => <<"username">>
+            },
+            checks => [
+                {allow, ?AUTHZ_PUBLISH(1, true), <<"t1">>},
+                {deny, ?AUTHZ_PUBLISH(1, false), <<"t1">>},
+                {deny, ?AUTHZ_PUBLISH(0, true), <<"t1">>},
+
+                {allow, ?AUTHZ_PUBLISH(2, false), <<"t2">>},
+                {deny, ?AUTHZ_PUBLISH(1, false), <<"t2">>},
+                {deny, ?AUTHZ_PUBLISH(2, true), <<"t2">>},
+
+                {allow, ?AUTHZ_PUBLISH(1, true), <<"t3">>},
+                {allow, ?AUTHZ_PUBLISH(2, false), <<"t3">>},
+                {allow, ?AUTHZ_PUBLISH(2, true), <<"t3">>},
+                {allow, ?AUTHZ_PUBLISH(0, false), <<"t3">>},
+
+                {allow, ?AUTHZ_SUBSCRIBE(1), <<"t4">>},
+                {deny, ?AUTHZ_SUBSCRIBE(2), <<"t4">>},
+
+                {allow, ?AUTHZ_SUBSCRIBE(1), <<"t5">>},
+                {allow, ?AUTHZ_SUBSCRIBE(2), <<"t5">>},
+                {allow, ?AUTHZ_SUBSCRIBE(0), <<"t5">>}
+            ]
+        },
+        #{
+            name => qos_retain_in_query_result_as_integer,
+            setup => [
+                """
+                CREATE TABLE acl(username VARCHAR(255), topic VARCHAR(255),
+                permission VARCHAR(255), action VARCHAR(255),
+                qos_i VARCHAR(255), retain_i VARCHAR(255))
+                """,
+                """
+                INSERT INTO acl(username, topic, permission, action, qos_i, retain_i)
+                 VALUES('username', 't1', 'allow', 'publish', 1, 1)
+                """
+            ],
+            query =>
+                ~b"""
+                SELECT permission, action, topic, qos_i as qos, retain_i as retain
+                FROM acl WHERE username = ${username}
+                """,
+            client_info => #{
+                username => <<"username">>
+            },
+            checks => [
+                {allow, ?AUTHZ_PUBLISH(1, true), <<"t1">>},
+                {deny, ?AUTHZ_PUBLISH(1, false), <<"t1">>},
+                {deny, ?AUTHZ_PUBLISH(0, true), <<"t1">>}
+            ]
+        },
+        #{
+            name => retain_in_query_result_as_boolean,
+            setup => [
+                """
+                CREATE TABLE acl(username VARCHAR(255), topic VARCHAR(255), permission VARCHAR(255),
+                 action VARCHAR(255), retain_b BOOLEAN)
+                """,
+                """
+                INSERT INTO acl(username, topic, permission, action, retain_b)
+                 VALUES('username', 't1', 'allow', 'publish', true)
+                """,
+                """
+                INSERT INTO acl(username, topic, permission, action, retain_b)
+                 VALUES('username', 't2', 'allow', 'publish', false)
+                """
+            ],
+            query =>
+                ~b"""
+                SELECT permission, action, topic, retain_b as retain
+                FROM acl WHERE username = ${username}
+                """,
+            client_info => #{
+                username => <<"username">>
+            },
+            checks => [
+                {allow, ?AUTHZ_PUBLISH(1, true), <<"t1">>},
+                {deny, ?AUTHZ_PUBLISH(1, false), <<"t1">>},
+                {allow, ?AUTHZ_PUBLISH(1, false), <<"t2">>},
+                {deny, ?AUTHZ_PUBLISH(1, true), <<"t2">>}
+            ]
+        },
+        #{
+            name => nonbin_values_in_client_info,
+            setup => [
+                """
+                CREATE TABLE acl(who VARCHAR(255), topic VARCHAR(255), permission VARCHAR(255),
+                 action VARCHAR(255))
+                """,
+                """
+                INSERT INTO acl(who, topic, permission, action)
+                VALUES('username', 't/${username}', 'allow', 'publish')
+                """,
+                """
+                INSERT INTO acl(who, topic, permission, action)
+                VALUES('clientid', 't/${clientid}', 'allow', 'publish')
+                """
+            ],
+            query =>
+                ~b"""
+                SELECT permission, action, topic
+                FROM acl WHERE who = ${username} OR who = ${clientid}
+                """,
+            client_info => #{
+                %% string, not a binary
+                username => "username",
+                %% atom, not a binary
+                clientid => clientid
+            },
+            checks => [
+                {allow, ?AUTHZ_PUBLISH, <<"t/username">>},
+                {allow, ?AUTHZ_PUBLISH, <<"t/clientid">>},
+                {deny, ?AUTHZ_PUBLISH, <<"t/foo">>}
+            ]
+        },
+        #{
+            name => array_null_qos,
+            setup => [
+                """
+                CREATE TABLE acl(qos INTEGER[],
+                 topic VARCHAR(255), permission VARCHAR(255), action VARCHAR(255))
+                """,
+                """
+                INSERT INTO acl(qos, topic, permission, action)
+                VALUES('{1,2}', 'tp', 'allow', 'publish')
+                """,
+                """
+                INSERT INTO acl(qos, topic, permission, action)
+                VALUES(NULL, 'ts', 'allow', 'subscribe')
+                """
+            ],
+            query =>
+                <<"SELECT permission, action, topic, qos FROM acl">>,
+            checks => [
+                {allow, ?AUTHZ_PUBLISH(1, false), <<"tp">>},
+                {allow, ?AUTHZ_PUBLISH(2, false), <<"tp">>},
+                {deny, ?AUTHZ_PUBLISH(3, false), <<"tp">>},
+
+                {allow, ?AUTHZ_SUBSCRIBE(1), <<"ts">>},
+                {allow, ?AUTHZ_SUBSCRIBE(2), <<"ts">>}
+            ]
+        },
+        #{
+            name => strip_double_quote,
+            setup => [
+                """
+                CREATE TABLE acl(username VARCHAR(255), topic VARCHAR(255),
+                permission VARCHAR(255), action VARCHAR(255))
+                """,
+                "INSERT INTO acl(username, topic, permission, action) VALUES('username', 'a', 'allow', 'publish')"
+            ],
+            query =>
+                <<"SELECT permission, action, topic FROM acl WHERE username = \"${username}\"">>,
+            checks => [
+                {allow, ?AUTHZ_PUBLISH, <<"a">>}
+            ]
+        },
+        #{
+            name => invalid_query,
+            setup => [],
+            query => <<"SELECT permission, action, topic FROM acl WHER">>,
+            checks => [
+                {deny, ?AUTHZ_PUBLISH, <<"a">>}
+            ]
+        },
+        #{
+            name => pgsql_error,
+            setup => [],
+            query =>
+                <<"SELECT permission, action, topic FROM table_not_exists WHERE username = ${username}">>,
+            checks => [
+                {deny, ?AUTHZ_PUBLISH, <<"t">>}
+            ]
+        },
+        #{
+            name => invalid_rule,
+            setup => [
+                """
+                CREATE TABLE acl(username VARCHAR(255), topic VARCHAR(255),
+                permission VARCHAR(255), action VARCHAR(255))
+                """,
+                %% 'permit' is invalid value for action
+                "INSERT INTO acl(username, topic, permission, action) VALUES('username', 'a', 'permit', 'publish')"
+            ],
+            query => <<"SELECT permission, action, topic FROM acl WHERE username = ${username}">>,
+            checks => [
+                {deny, ?AUTHZ_PUBLISH, <<"a">>}
+            ]
+        },
+        #{
+            name => invalid_rule_hardened_fail_closed,
+            security_profile => hardened,
+            default_permission => allow,
+            setup => [
+                """
+                CREATE TABLE acl(username VARCHAR(255), topic VARCHAR(255),
+                permission VARCHAR(255), action VARCHAR(255))
+                """,
+                %% 'permit' is invalid value for action
+                "INSERT INTO acl(username, topic, permission, action) VALUES('username', 'a', 'permit', 'publish')"
+            ],
+            query => <<"SELECT permission, action, topic FROM acl WHERE username = ${username}">>,
+            checks => [
+                {deny, ?AUTHZ_PUBLISH, <<"a">>}
+            ]
+        }
+        %% TODO: add case for unknown variables after fixing EMQX-10400
+    ].
+
+%%------------------------------------------------------------------------------
+%% Helpers
+%%------------------------------------------------------------------------------
+
+setup_source_data(#{setup := Queries}) ->
+    lists:foreach(
+        fun(Query) ->
+            _ = q(Query)
+        end,
+        Queries
+    ).
+
+setup_authz_source(#{query := Query}, SpecialParams) ->
+    setup_config(
+        SpecialParams#{
+            <<"query">> => Query
+        }
+    ).
+
+setup_conn_error_source() ->
+    {ok, _, _} = q(
+        "CREATE TABLE acl(username VARCHAR(255), topic VARCHAR(255), permission VARCHAR(255), action VARCHAR(255))"
+    ),
+    setup_config(#{<<"server">> => <<"toxiproxy:5432">>}).
+
+raw_pgsql_authz_config() ->
+    #{
+        <<"enable">> => <<"true">>,
+
+        <<"type">> => <<"postgresql">>,
+        <<"database">> => <<"mqtt">>,
+        <<"username">> => <<"root">>,
+        <<"password">> => <<"public">>,
+
+        <<"query">> =>
+            ~b"""
+            SELECT permission, action, topic
+            FROM acl WHERE username = ${username}
+            """,
+        <<"server">> => <<?PGSQL_HOST>>
+    }.
+
+q(Sql) ->
+    emqx_resource:simple_sync_query(
+        ?PGSQL_RESOURCE,
+        {query, Sql}
+    ).
+
+drop_table() ->
+    {ok, _, _} = q("DROP TABLE IF EXISTS acl"),
+    ok.
+
+setup_config(SpecialParams) ->
+    emqx_authz_test_lib:setup_config(
+        raw_pgsql_authz_config(),
+        SpecialParams
+    ).
+
+with_failure(FailureType, Fun) ->
+    emqx_common_test_helpers:with_failure(
+        FailureType,
+        ?PROXY_NAME,
+        ?PROXY_HOST,
+        ?PROXY_PORT,
+        Fun
+    ).
+
+pgsql_config() ->
+    #{
+        auto_reconnect => true,
+        disable_prepared_statements => false,
+        database => <<"mqtt">>,
+        username => <<"root">>,
+        password => <<"public">>,
+        pool_size => 8,
+        server => <<?PGSQL_HOST>>,
+        ssl => #{enable => false},
+        connect_timeout => 5000
+    }.
+
+create_pgsql_resource() ->
+    emqx_resource:create_local(
+        ?PGSQL_RESOURCE,
+        ?AUTHZ_RESOURCE_GROUP,
+        emqx_auth_postgresql_connector,
+        pgsql_config(),
+        #{}
+    ).

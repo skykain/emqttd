@@ -1,0 +1,48 @@
+emqx_scope_catalog {
+
+scope_connections.desc:
+"""Client connections, subscriptions, topics, banning, retained messages, file transfer, and delayed messages"""
+
+scope_publish.desc:
+"""MQTT message publishing"""
+
+scope_data_integration.desc:
+"""Rules, bridges, connectors, schema registry, schema validation, message transformation, ExHook, and AI completion"""
+
+scope_access_control.desc:
+"""Client authentication and authorization configuration"""
+
+scope_gateways.desc:
+"""Protocol gateways (CoAP, LwM2M, etc.) and their authentication, clients, and listeners"""
+
+scope_monitoring.desc:
+"""Metrics, monitoring, alarms, trace, slow subscriptions, telemetry, and Prometheus data endpoints"""
+
+scope_cluster_operations.desc:
+"""Cluster management, node operations, load rebalancing, node eviction, and multi-tenancy"""
+
+scope_system.desc:
+"""Core configuration, listeners, plugins, storage, backup, status, hot upgrade, Prometheus settings, and OpenTelemetry"""
+
+scope_audit.desc:
+"""Audit log query"""
+
+scope_license.desc:
+"""License management"""
+
+scope_plugin_api.desc:
+"""Call the API endpoints a plugin publishes, under /plugin_api. Does not grant plugin installation or configuration, which stay in the system scope"""
+
+scope_user_management.desc:
+"""Manage dashboard users (create, update, delete)"""
+
+scope_mfa_management.desc:
+"""Reset, re-key or disable another dashboard user's MFA. Administrator role only. Managing your own MFA needs no scope: use `/current_user/mfa`"""
+
+scope_sso_management.desc:
+"""Configure SSO backends (LDAP, OIDC, SAML)"""
+
+scope_api_key_management.desc:
+"""Manage API keys (create, update, delete)"""
+
+}

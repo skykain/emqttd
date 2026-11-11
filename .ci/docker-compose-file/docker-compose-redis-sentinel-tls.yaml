@@ -1,12 +1,45 @@
-version: '3.9'
-
 services:
-  redis_server:
-    container_name: redis
-    image: redis:${REDIS_TAG}
+
+  redis-sentinel-tls-master:
+    container_name: redis-sentinel-tls-master
+    image: public.ecr.aws/docker/library/redis:${REDIS_TAG}
     volumes:
-      - ../../apps/emqx_auth_redis/test/emqx_auth_redis_SUITE_data/certs:/tls
-      - ./redis/:/data/conf
-    command: bash -c "/bin/bash /data/conf/redis.sh --node sentinel --tls-enabled && tail -f /var/log/redis-server.log"
+      - ./redis/sentinel-tls:/usr/local/etc/redis
+      - ./certs/cert.pem:/etc/certs/cert.pem
+      - ./certs/key.pem:/etc/certs/key.pem
+      - ./certs/cacert.pem:/etc/certs/cacert.pem
+    command: redis-server /usr/local/etc/redis/master.conf
+    networks:
+      - emqx_bridge
+
+  redis-sentinel-tls-slave:
+    container_name: redis-sentinel-tls-slave
+    image: public.ecr.aws/docker/library/redis:${REDIS_TAG}
+    volumes:
+      - ./redis/sentinel-tls:/usr/local/etc/redis
+      - ./certs/cert.pem:/etc/certs/cert.pem
+      - ./certs/key.pem:/etc/certs/key.pem
+      - ./certs/cacert.pem:/etc/certs/cacert.pem
+    command: redis-server /usr/local/etc/redis/slave.conf
+    networks:
+      - emqx_bridge
+    depends_on:
+      - redis-sentinel-tls-master
+
+  redis-sentinel-tls:
+    container_name: redis-sentinel-tls
+    image: public.ecr.aws/docker/library/redis:${REDIS_TAG}
+    volumes:
+      - ./redis/sentinel-tls/sentinel-base.conf:/usr/local/etc/redis/sentinel-base.conf
+      - ./certs/cert.pem:/etc/certs/cert.pem
+      - ./certs/key.pem:/etc/certs/key.pem
+      - ./certs/cacert.pem:/etc/certs/cacert.pem
+      - ./redis/sentinel-tls/users.acl:/usr/local/etc/redis/users.acl
+    depends_on:
+      - redis-sentinel-tls-master
+      - redis-sentinel-tls-slave
+    command: >
+      bash -c "cp -f /usr/local/etc/redis/sentinel-base.conf /usr/local/etc/redis/sentinel.conf &&
+               redis-sentinel /usr/local/etc/redis/sentinel.conf"
     networks:
       - emqx_bridge

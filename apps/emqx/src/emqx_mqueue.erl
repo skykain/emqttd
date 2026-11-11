@@ -1,0 +1,575 @@
+%%--------------------------------------------------------------------
+%% Copyright (c) 2017-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
+%%--------------------------------------------------------------------
+
+%%--------------------------------------------------------------------
+%% @doc A Simple in-memory message queue.
+%%
+%% Notice that MQTT is not a (on-disk) persistent messaging queue.
+%% It assumes that clients should be online in most of the time.
+%%
+%% This module implements a simple in-memory queue for MQTT persistent session.
+%%
+%% If the broker restarts or crashes, all queued messages will be lost.
+%%
+%% Concept of Message Queue and Inflight Window:
+%%
+%%       |<----------------- Max Len ----------------->|
+%%       -----------------------------------------------
+%% IN -> |      Messages Queue   |  Inflight Window    | -> Out
+%%       -----------------------------------------------
+%%                               |<---   Win Size  --->|
+%%
+%%
+%% 1. Inflight Window is to store the messages
+%%    that are delivered but still awaiting for puback.
+%%
+%% 2. Messages are enqueued to tail when the inflight window is full.
+%%
+%% 3. QoS=0 messages are only enqueued when `store_qos0' is given `true`
+%%    in init options
+%%
+%% 4. If the queue is full, drop the oldest one
+%%    unless `max_len' is set to `0' which implies (`infinity').
+%%
+%% @end
+%%--------------------------------------------------------------------
+
+-module(emqx_mqueue).
+
+-compile({inline, [payload_bytes/1, qos0_count/1, inc_num_qos0/2]}).
+
+-include("emqx.hrl").
+-include("types.hrl").
+-include("emqx_mqtt.hrl").
+
+-export([
+    init/1,
+    info/1,
+    info/2
+]).
+
+-export([
+    is_empty/1,
+    len/1,
+    num_qos0/1,
+    num_qos12/1,
+    max_len/1,
+    in/2,
+    out/1,
+    out_qos0/1,
+    stats/1,
+    dropped/1,
+    payload_bytes/1,
+    to_list/1,
+    export/1,
+    filter/2,
+    query/2
+]).
+
+-define(NO_PRIORITY_TABLE, disabled).
+
+-export_type([mqueue/0, options/0]).
+
+-type priority() :: infinity | integer().
+-type pq() :: emqx_pqueue:q().
+-type count() :: non_neg_integer().
+-type p_table() :: #{emqx_types:topic() := priority()}.
+-type options() :: #{
+    max_len := count(),
+    priorities => p_table(),
+    default_priority => highest | lowest,
+    store_qos0 => boolean()
+}.
+-type message() :: emqx_types:message().
+
+-type stat() ::
+    {len, non_neg_integer()}
+    | {max_len, non_neg_integer()}
+    | {dropped, non_neg_integer()}.
+
+-define(LOWEST_PRIORITY, 0).
+-define(HIGHEST_PRIORITY, infinity).
+-define(MAX_LEN_INFINITY, 0).
+-define(INFO_KEYS, [store_qos0, max_len, len, dropped]).
+-define(INSERT_TS, mqueue_insert_ts).
+
+-record(prios, {
+    t :: p_table(),
+    default :: priority(),
+    shift_mult :: non_neg_integer(),
+    shift_base :: integer()
+}).
+
+-record(mqueue, {
+    %% Number of QoS0 messages / `false` if QoS0 skips mqueue.
+    num_qos0 = false :: false | non_neg_integer(),
+    max_len = ?MAX_LEN_INFINITY :: count(),
+    dropped = 0 :: count(),
+    payload_bytes = 0 :: count(),
+    q = emqx_pqueue:new() :: pq(),
+    prios = ?NO_PRIORITY_TABLE :: #prios{} | ?NO_PRIORITY_TABLE,
+    p_credit :: non_neg_integer() | undefined
+}).
+
+-type mqueue() :: #mqueue{}.
+
+-spec init(options()) -> mqueue().
+init(Opts = #{max_len := MaxLen0, store_qos0 := Qos0}) ->
+    MaxLen =
+        case (is_integer(MaxLen0) andalso MaxLen0 > ?MAX_LEN_INFINITY) of
+            true -> MaxLen0;
+            false -> ?MAX_LEN_INFINITY
+        end,
+    Prios =
+        case get_opt(priorities, Opts, ?NO_PRIORITY_TABLE) of
+            ?NO_PRIORITY_TABLE ->
+                ?NO_PRIORITY_TABLE;
+            PTab ->
+                {Mult, Base} = get_shift_opt(PTab, Opts),
+                #prios{
+                    t = p_table(PTab),
+                    default = get_priority_opt(Opts),
+                    shift_mult = Mult,
+                    shift_base = Base
+                }
+        end,
+    NumQoS0 =
+        case Qos0 of
+            true -> 0;
+            false -> false
+        end,
+    #mqueue{
+        max_len = MaxLen,
+        num_qos0 = NumQoS0,
+        prios = Prios
+    }.
+
+-spec info(mqueue()) -> emqx_types:infos().
+info(MQ) ->
+    maps:from_list([{Key, info(Key, MQ)} || Key <- ?INFO_KEYS]).
+
+-spec info(atom(), mqueue()) -> term().
+info(store_qos0, #mqueue{num_qos0 = NumQoS0}) ->
+    is_integer(NumQoS0);
+info(max_len, #mqueue{max_len = MaxLen}) ->
+    MaxLen;
+info(len, #mqueue{q = Q}) ->
+    emqx_pqueue:len(Q);
+info(dropped, #mqueue{dropped = Dropped}) ->
+    Dropped.
+
+is_empty(#mqueue{q = Q}) ->
+    emqx_pqueue:is_empty(Q).
+
+-spec num_qos0(mqueue()) -> count().
+num_qos0(#mqueue{num_qos0 = false}) ->
+    0;
+num_qos0(#mqueue{num_qos0 = NumQoS0}) ->
+    NumQoS0.
+
+-spec num_qos12(mqueue()) -> count().
+num_qos12(MQ) ->
+    len(MQ) - num_qos0(MQ).
+
+len(#mqueue{q = Q}) ->
+    emqx_pqueue:len(Q).
+
+max_len(#mqueue{max_len = MaxLen}) -> MaxLen.
+
+%% @doc Return all queued items in a list.
+-spec to_list(mqueue()) -> list().
+to_list(MQ) ->
+    to_list(MQ, []).
+
+%% Preserve queue metadata and order within each priority for session transfer.
+-spec export(mqueue()) -> [message()].
+export(#mqueue{q = Q}) ->
+    lists:reverse(emqx_pqueue:fold(fun(Msg, _Priority, Acc) -> [Msg | Acc] end, [], Q)).
+
+-spec filter(fun((any()) -> boolean()), mqueue()) -> mqueue().
+filter(Pred, #mqueue{q = Q, dropped = Dropped} = MQ) ->
+    L0 = emqx_pqueue:len(Q),
+    Q1 = emqx_pqueue:filter(Pred, Q),
+    case emqx_pqueue:len(Q1) of
+        L0 ->
+            MQ;
+        L1 ->
+            {PayloadBytes, NumQoS0} = pqueue_stats(Q1),
+            MQ#mqueue{
+                q = Q1,
+                num_qos0 =
+                    case MQ#mqueue.num_qos0 of
+                        false -> false;
+                        _ -> NumQoS0
+                    end,
+                dropped = Dropped + (L0 - L1),
+                payload_bytes = PayloadBytes
+            }
+    end.
+
+-spec query(mqueue(), #{position => Pos, limit := Limit}) ->
+    {[message()], #{position := Pos, start := Pos}}
+when
+    Pos :: none | {integer(), priority()},
+    Limit :: non_neg_integer().
+query(MQ, #{limit := Limit} = PagerParams) ->
+    Pos = maps:get(position, PagerParams, none),
+    PQsList = emqx_pqueue:to_queues_list(MQ#mqueue.q),
+    {Msgs, NxtPos} = sublist(skip_until(PQsList, Pos), Limit, [], Pos),
+    {Msgs, #{position => NxtPos, start => first_msg_pos(PQsList)}}.
+
+first_msg_pos([]) ->
+    none;
+first_msg_pos([{Prio, PQ} | T]) ->
+    case emqx_pqueue:out(PQ) of
+        {empty, _PQ} ->
+            first_msg_pos(T);
+        {{value, Msg}, _Q} ->
+            {insert_ts(Msg), Prio}
+    end.
+
+skip_until(PQsList, none = _Pos) ->
+    PQsList;
+skip_until(PQsList, {MsgPos, PrioPos}) ->
+    case skip_until_prio(PQsList, PrioPos) of
+        [{Prio, PQ} | T] ->
+            PQ1 = skip_until_msg(PQ, MsgPos),
+            [{Prio, PQ1} | T];
+        [] ->
+            []
+    end.
+
+skip_until_prio(PQsList, PrioPos) ->
+    lists:dropwhile(fun({Prio, _PQ}) -> Prio > PrioPos end, PQsList).
+
+skip_until_msg(PQ, MsgPos) ->
+    case emqx_pqueue:out(PQ) of
+        {empty, PQ1} ->
+            PQ1;
+        {{value, Msg}, PQ1} ->
+            case insert_ts(Msg) > MsgPos of
+                true -> PQ;
+                false -> skip_until_msg(PQ1, MsgPos)
+            end
+    end.
+
+sublist(PQs, Len, Acc, LastPosPrio) when PQs =:= []; Len =:= 0 ->
+    {Acc, LastPosPrio};
+sublist([{Prio, PQ} | T], Len, Acc, LastPosPrio) ->
+    {SingleQAcc, SingleQSize} = sublist_single_pq(Prio, PQ, Len, [], 0),
+    Acc1 = Acc ++ lists:reverse(SingleQAcc),
+    NxtPosPrio =
+        case SingleQAcc of
+            [H | _] -> {insert_ts(H), Prio};
+            [] -> LastPosPrio
+        end,
+    case SingleQSize =:= Len of
+        true ->
+            {Acc1, NxtPosPrio};
+        false ->
+            sublist(T, Len - SingleQSize, Acc1, NxtPosPrio)
+    end.
+
+sublist_single_pq(_Prio, _PQ, 0, Acc, AccSize) ->
+    {Acc, AccSize};
+sublist_single_pq(Prio, PQ, Len, Acc, AccSize) ->
+    case emqx_pqueue:out(0, PQ) of
+        {empty, _PQ} ->
+            {Acc, AccSize};
+        {{value, Msg}, PQ1} ->
+            Msg1 = with_prio(Msg, Prio),
+            sublist_single_pq(Prio, PQ1, Len - 1, [Msg1 | Acc], AccSize + 1)
+    end.
+
+with_prio(#message{extra = Extra} = Msg, Prio) ->
+    Msg#message{extra = Extra#{mqueue_priority => Prio}}.
+
+to_list(MQ, Acc) ->
+    case out(MQ) of
+        {empty, _MQ} ->
+            lists:reverse(Acc);
+        {{value, Msg}, Q1} ->
+            to_list(Q1, [Msg | Acc])
+    end.
+
+%% @doc Return number of dropped messages.
+-spec dropped(mqueue()) -> count().
+dropped(#mqueue{dropped = Dropped}) -> Dropped.
+
+-spec payload_bytes(mqueue()) -> non_neg_integer().
+payload_bytes(#mqueue{payload_bytes = PayloadBytes}) ->
+    PayloadBytes.
+
+%% @doc Stats of the mqueue
+-spec stats(mqueue()) -> [stat()].
+stats(#mqueue{max_len = MaxLen, dropped = Dropped} = MQ) ->
+    [{len, len(MQ)}, {max_len, MaxLen}, {dropped, Dropped}].
+
+%% @doc Enqueue a message.
+-spec in(message(), mqueue()) -> {option(message()), mqueue()} | false.
+in(#message{qos = ?QOS_0}, #mqueue{num_qos0 = false}) ->
+    false;
+in(
+    Msg = #message{topic = Topic, qos = QoS},
+    MQ =
+        #mqueue{
+            prios = Prios,
+            q = Q0,
+            max_len = MaxLen,
+            dropped = Dropped,
+            num_qos0 = NumQoS0,
+            payload_bytes = PayloadBytes
+        } = MQ
+) ->
+    Class =
+        case QoS of
+            ?QOS_0 -> qos0;
+            _ -> default
+        end,
+    Prio =
+        case Prios of
+            %% MICRO-OPTIMIZATION: When there is no priority table defined (from config),
+            %% disregard default priority from config, always use lowest (?LOWEST_PRIORITY=0)
+            %% because the lowest priority in emqx_pqueue is a fallback to queue:queue()
+            %% while the highest 'infinity' is a [{infinity, queue:queue()}]
+            ?NO_PRIORITY_TABLE ->
+                ?LOWEST_PRIORITY;
+            #prios{t = PTab, default = Dp} ->
+                maps:get(Topic, PTab, Dp)
+        end,
+    Msg1 = with_ts(Msg),
+    Q1 = emqx_pqueue:in(Msg1, Prio, Class, Q0),
+    case MaxLen =/= ?MAX_LEN_INFINITY andalso emqx_pqueue:len(Q1) > MaxLen of
+        false ->
+            {_DroppedMsg = undefined, MQ#mqueue{
+                q = Q1,
+                num_qos0 = inc_num_qos0(NumQoS0, qos0_count(Msg1)),
+                payload_bytes = PayloadBytes + emqx_message:payload_size(Msg1)
+            }};
+        true ->
+            %% Reached max length: drop the oldest message from the lowest-priority
+            %% non-empty lane, so a lower-priority message never survives at the
+            %% expense of a higher-priority one. This may not be the lane the
+            %% incoming message was just added to.
+            {{value, DroppedMsg}, Q2} = emqx_pqueue:drop_lowest(Q1),
+            PayloadBytes1 =
+                PayloadBytes - emqx_message:payload_size(DroppedMsg) +
+                    emqx_message:payload_size(Msg1),
+            {DroppedMsg, MQ#mqueue{
+                q = Q2,
+                num_qos0 = inc_num_qos0(NumQoS0, qos0_count(Msg1) - qos0_count(DroppedMsg)),
+                dropped = Dropped + 1,
+                payload_bytes = PayloadBytes1
+            }}
+    end.
+
+-spec out(mqueue()) -> {empty | {value, message()}, mqueue()}.
+out(
+    MQ = #mqueue{
+        q = Q,
+        payload_bytes = PayloadBytes,
+        num_qos0 = NumQoS0,
+        prios = ?NO_PRIORITY_TABLE
+    }
+) ->
+    case emqx_pqueue:out(Q) of
+        {{value, V}, Q1} ->
+            {{value, without_ts(V)}, MQ#mqueue{
+                q = Q1,
+                num_qos0 = inc_num_qos0(NumQoS0, -qos0_count(V)),
+                payload_bytes = PayloadBytes - emqx_message:payload_size(V)
+            }};
+        {empty, _} ->
+            {empty, MQ}
+    end;
+out(
+    MQ = #mqueue{
+        q = Q,
+        payload_bytes = PayloadBytes,
+        num_qos0 = NumQoS0,
+        p_credit = undefined,
+        prios = Prios
+    }
+) ->
+    case emqx_pqueue:out_p(Q) of
+        {{value, V, Prio}, Q1} ->
+            MQ1 = MQ#mqueue{
+                q = Q1,
+                num_qos0 = inc_num_qos0(NumQoS0, -qos0_count(V)),
+                payload_bytes = PayloadBytes - emqx_message:payload_size(V),
+                p_credit = get_credits(Prio, Prios)
+            },
+            {{value, without_ts(V)}, MQ1};
+        {empty, _} ->
+            {empty, MQ}
+    end;
+out(MQ = #mqueue{q = Q, p_credit = 0}) ->
+    out(MQ#mqueue{
+        q = emqx_pqueue:shift(Q),
+        p_credit = undefined
+    });
+out(MQ = #mqueue{q = Q, payload_bytes = PayloadBytes, num_qos0 = NumQoS0, p_credit = C}) ->
+    case emqx_pqueue:out(Q) of
+        {{value, V}, Q1} ->
+            {{value, without_ts(V)}, MQ#mqueue{
+                q = Q1,
+                num_qos0 = inc_num_qos0(NumQoS0, -qos0_count(V)),
+                payload_bytes = PayloadBytes - emqx_message:payload_size(V),
+                p_credit = C - 1
+            }};
+        {empty, _} ->
+            {empty, MQ}
+    end.
+
+-doc """
+Extract the oldest QoS0 message from the currently selected priority, bypassing
+QoS1/2 messages within that priority. Returns `empty` if that priority has no QoS0.
+Normal priority-credit rotation still applies after successful extraction.
+""".
+-spec out_qos0(mqueue()) -> {empty | {value, message()}, mqueue()}.
+out_qos0(MQ = #mqueue{num_qos0 = false}) ->
+    {empty, MQ};
+out_qos0(MQ = #mqueue{num_qos0 = 0}) ->
+    {empty, MQ};
+out_qos0(MQ0 = #mqueue{q = Q, p_credit = 0}) ->
+    MQ = MQ0#mqueue{q = emqx_pqueue:shift(Q), p_credit = undefined},
+    case out_qos0(MQ) of
+        {empty, _} ->
+            {empty, MQ0};
+        Out ->
+            Out
+    end;
+out_qos0(
+    MQ = #mqueue{
+        q = Q,
+        payload_bytes = PayloadBytes,
+        num_qos0 = NumQoS0,
+        prios = ?NO_PRIORITY_TABLE
+    }
+) ->
+    case emqx_pqueue:drop(0, Q) of
+        {{value, Msg = #message{qos = ?QOS_0}}, Q1} ->
+            {{value, without_ts(Msg)}, MQ#mqueue{
+                q = Q1,
+                num_qos0 = NumQoS0 - 1,
+                payload_bytes = PayloadBytes - emqx_message:payload_size(Msg)
+            }};
+        _EmptyOrQoS12 ->
+            {empty, MQ}
+    end;
+out_qos0(
+    MQ = #mqueue{
+        q = Q,
+        payload_bytes = PayloadBytes,
+        num_qos0 = NumQoS0,
+        p_credit = Credit,
+        prios = Prios
+    }
+) ->
+    P = emqx_pqueue:active_p(Q),
+    case emqx_pqueue:drop(P, Q) of
+        {{value, Msg = #message{qos = ?QOS_0}}, Q1} ->
+            {{value, without_ts(Msg)}, MQ#mqueue{
+                q = Q1,
+                num_qos0 = NumQoS0 - 1,
+                payload_bytes = PayloadBytes - emqx_message:payload_size(Msg),
+                p_credit =
+                    case Credit of
+                        undefined -> get_credits(P, Prios);
+                        _ -> Credit - 1
+                    end
+            }};
+        _EmptyOrQoS12 ->
+            {empty, MQ}
+    end.
+
+pqueue_stats(Q) ->
+    emqx_pqueue:fold(
+        fun(Msg, _Priority, {PayloadBytes, NumQoS0}) ->
+            {PayloadBytes + emqx_message:payload_size(Msg), NumQoS0 + qos0_count(Msg)}
+        end,
+        {0, 0},
+        Q
+    ).
+
+qos0_count(#message{qos = ?QOS_0}) -> 1;
+qos0_count(#message{}) -> 0.
+
+inc_num_qos0(false, _Delta) -> false;
+inc_num_qos0(NumQoS0, Delta) -> NumQoS0 + Delta.
+
+get_opt(Key, Opts, Default) ->
+    case maps:get(Key, Opts, Default) of
+        undefined -> Default;
+        X -> X
+    end.
+
+get_priority_opt(Opts) ->
+    case get_opt(default_priority, Opts, ?LOWEST_PRIORITY) of
+        lowest -> ?LOWEST_PRIORITY;
+        highest -> ?HIGHEST_PRIORITY;
+        N when is_integer(N) -> N
+    end.
+
+get_credits(?HIGHEST_PRIORITY, Prios) ->
+    Infinity = 1000000,
+    get_credits(Infinity, Prios);
+get_credits(Prio, #prios{shift_mult = Mult, shift_base = Base}) ->
+    (Prio + Base + 1) * Mult - 1.
+
+get_shift_opt(PTab, Opts) ->
+    %% Using 10 as a multiplier by default. This is needed to minimize
+    %% overhead of emqx_pqueue:rotate
+    Mult = maps:get(shift_multiplier, Opts, 10),
+    true = is_integer(Mult) andalso Mult > 0,
+    Min =
+        case maps:size(PTab) of
+            0 -> 0;
+            _ -> lists:min(maps:values(PTab))
+        end,
+    %% `mqueue' module supports negative priorities, but we don't want
+    %% the counter to be negative, so all priorities should be shifted
+    %% by a constant, if negative priorities are used:
+    Base =
+        case Min < 0 of
+            true -> -Min;
+            false -> 0
+        end,
+    {Mult, Base}.
+
+%% topic from mqtt.mqueue_priorities(map()) is atom.
+p_table(PTab = #{}) ->
+    maps:fold(
+        fun
+            (Topic, Priority, Acc) when is_atom(Topic) ->
+                maps:put(atom_to_binary(Topic), Priority, Acc);
+            (Topic, Priority, Acc) when is_binary(Topic) ->
+                maps:put(Topic, Priority, Acc)
+        end,
+        #{},
+        PTab
+    ).
+
+%% This is used to sort/traverse messages in query/2
+%% Existing timestamp means an imported queue entry.
+with_ts(Msg = #message{extra = #{?INSERT_TS := _}}) ->
+    Msg;
+with_ts(#message{extra = Extra} = Msg) ->
+    TsNano = erlang:system_time(nanosecond),
+    Extra1 =
+        case is_map(Extra) of
+            true -> Extra;
+            %% extra field has not being used before EMQX 5.4.0
+            %% and defaulted to an empty list,
+            %% if it's not a map it's safe to overwrite it
+            false -> #{}
+        end,
+    Msg#message{extra = Extra1#{?INSERT_TS => TsNano}}.
+
+without_ts(#message{extra = Extra} = Msg) ->
+    Msg#message{extra = maps:remove(?INSERT_TS, Extra)};
+without_ts(Msg) ->
+    Msg.
+
+insert_ts(#message{extra = #{?INSERT_TS := Ts}}) -> Ts.

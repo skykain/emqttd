@@ -1,19 +1,6 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2022-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
-
 -module(emqx_mgmt_api_SUITE).
 
 -compile(export_all).
@@ -21,608 +8,306 @@
 
 -include_lib("eunit/include/eunit.hrl").
 
--include_lib("emqx/include/emqx.hrl").
--include_lib("emqx/include/emqx_mqtt.hrl").
--include_lib("emqx_management/include/emqx_mgmt.hrl").
-
--define(CONTENT_TYPE, "application/x-www-form-urlencoded").
-
--define(HOST, "http://127.0.0.1:8081/").
-
--define(API_VERSION, "v4").
-
--define(BASE_PATH, "api").
+%%--------------------------------------------------------------------
+%% setup
+%%--------------------------------------------------------------------
 
 all() ->
-    [{group, rest_api}].
-
-groups() ->
-    [{rest_api,
-      [sequence],
-      [ alarms
-      , apps
-      , banned
-      , brokers
-      , clients
-      , listeners
-      , metrics
-      , nodes
-      , plugins
-      , acl_cache
-      , pubsub
-      , routes_and_subscriptions
-      , stats
-      , data
-      ]
-    }].
+    emqx_common_test_helpers:all(?MODULE).
 
 init_per_suite(Config) ->
-    emqx_ct_helpers:start_apps([emqx_management, emqx_auth_mnesia, emqx_modules]),
-    ekka_mnesia:start(),
-    emqx_mgmt_auth:mnesia(boot),
     Config.
 
-end_per_suite(_Config) ->
-    emqx_ct_helpers:stop_apps([emqx_auth_mnesia, emqx_management, emqx_modules]),
-    ekka_mnesia:ensure_stopped().
-
-init_per_testcase(data, Config) ->
-    ok = emqx_dashboard_admin:mnesia(boot),
-    application:ensure_all_started(emqx_dashboard),
-    ok = emqx_rule_registry:mnesia(boot),
-    application:ensure_all_started(emqx_rule_engine),
-    Config;
-
-init_per_testcase(_, Config) ->
-    Config.
-
-end_per_testcase(data, _Config) ->
-    application:stop(emqx_dahboard),
-    application:stop(emqx_rule_engine),
-    ok;
-
-end_per_testcase(_, _Config) ->
+end_per_suite(_) ->
     ok.
 
-get(Key, ResponseBody) ->
-   maps:get(Key, jiffy:decode(list_to_binary(ResponseBody), [return_maps])).
+%%--------------------------------------------------------------------
+%% cases
+%%--------------------------------------------------------------------
 
-lookup_alarm(Name, [#{<<"name">> := Name} | _More]) ->
-    true;
-lookup_alarm(Name, [_Alarm | More]) ->
-    lookup_alarm(Name, More);
-lookup_alarm(_Name, []) ->
-    false.
+t_cluster_query(Config) ->
+    ct:timetrap({seconds, 120}),
+    Nodes = [Node1, Node2] = start_mgmt_cluster(?FUNCTION_NAME, Config),
+    try
+        process_flag(trap_exit, true),
+        ClientLs1 = [start_emqtt_client(Node1, I) || I <- lists:seq(1, 10)],
+        ClientLs2 = [start_emqtt_client(Node2, I) || I <- lists:seq(1, 10)],
 
-is_existing(Name, [#{name := Name} | _More]) ->
-    true;
-is_existing(Name, [_Alarm | More]) ->
-    is_existing(Name, More);
-is_existing(_Name, []) ->
-    false.
+        %% returned list should be the same regardless of which node is requested
+        {200, ClientsAll} = query_clients(Node1, #{}),
+        %% The process stats are read from the process on each request.
+        ?assertEqual(
+            {200, without_process_stats(ClientsAll)},
+            without_process_stats(query_clients(Node2, #{}))
+        ),
+        ?assertMatch(
+            #{page := 1, limit := 100, count := 20},
+            maps:get(meta, ClientsAll)
+        ),
+        ?assertMatch(20, length(maps:get(data, ClientsAll))),
+        %% query the first page, counting in entire cluster
+        {200, ClientsPage1} = query_clients(Node1, #{<<"limit">> => 5}),
+        ?assertMatch(
+            #{page := 1, limit := 5, count := 20},
+            maps:get(meta, ClientsPage1)
+        ),
+        ?assertMatch(5, length(maps:get(data, ClientsPage1))),
 
-alarms(_) ->
-    emqx_alarm:activate(alarm1),
-    emqx_alarm:activate(alarm2),
+        %% assert: AllPage = Page1 + Page2 + Page3 + Page4
+        %% !!!Note: this equation requires that the queried tables must be ordered_set
+        {200, ClientsPage2} = query_clients(Node1, #{<<"page">> => <<"2">>, <<"limit">> => 5}),
+        {200, ClientsPage3} = query_clients(Node2, #{<<"page">> => 3, <<"limit">> => 5}),
+        {200, ClientsPage4} = query_clients(Node1, #{<<"page">> => 4, <<"limit">> => 5}),
+        GetClientIds = fun(L) -> lists:map(fun(#{clientid := Id}) -> Id end, L) end,
+        ?assertEqual(
+            GetClientIds(maps:get(data, ClientsAll)),
+            GetClientIds(
+                maps:get(data, ClientsPage1) ++ maps:get(data, ClientsPage2) ++
+                    maps:get(data, ClientsPage3) ++ maps:get(data, ClientsPage4)
+            )
+        ),
 
-    ?assert(is_existing(alarm1, emqx_alarm:get_alarms(activated))),
-    ?assert(is_existing(alarm2, emqx_alarm:get_alarms(activated))),
+        %% Scroll past count
+        {200, ClientsPage10} = query_clients(Node1, #{<<"page">> => <<"10">>, <<"limit">> => 5}),
+        ?assertEqual(
+            #{data => [], meta => #{page => 10, limit => 5, count => 20, hasnext => false}},
+            ClientsPage10
+        ),
 
-    {ok, Return1} = request_api(get, api_path(["alarms/activated"]), auth_header_()),
-    ?assert(lookup_alarm(<<"alarm1">>, maps:get(<<"alarms">>, lists:nth(1, get(<<"data">>, Return1))))),
-    ?assert(lookup_alarm(<<"alarm2">>, maps:get(<<"alarms">>, lists:nth(1, get(<<"data">>, Return1))))),
+        %% Node queries
+        {200, ClientsNode2} = query_clients(Node1, #{<<"node">> => Node2}),
+        ?assertEqual(
+            {200, without_process_stats(ClientsNode2)},
+            without_process_stats(query_clients(Node2, #{<<"node">> => Node2}))
+        ),
+        ?assertMatch(
+            #{page := 1, limit := 100, count := 10},
+            maps:get(meta, ClientsNode2)
+        ),
+        ?assertMatch(10, length(maps:get(data, ClientsNode2))),
 
-    emqx_alarm:deactivate(alarm1),
+        {200, ClientsNode2Page1} = query_clients(Node2, #{<<"node">> => Node2, <<"limit">> => 5}),
+        {200, ClientsNode2Page2} = query_clients(Node1, #{
+            <<"node">> => Node2, <<"page">> => <<"2">>, <<"limit">> => 5
+        }),
+        {200, ClientsNode2Page3} = query_clients(Node2, #{
+            <<"node">> => Node2, <<"page">> => 3, <<"limit">> => 5
+        }),
+        {200, ClientsNode2Page4} = query_clients(Node1, #{
+            <<"node">> => Node2, <<"page">> => 4, <<"limit">> => 5
+        }),
+        ?assertEqual(
+            GetClientIds(maps:get(data, ClientsNode2)),
+            GetClientIds(
+                lists:append([
+                    maps:get(data, Page)
+                 || Page <- [
+                        ClientsNode2Page1,
+                        ClientsNode2Page2,
+                        ClientsNode2Page3,
+                        ClientsNode2Page4
+                    ]
+                ])
+            )
+        ),
 
-    {ok, Return2} = request_api(get, api_path(["alarms"]), auth_header_()),
-    ?assert(lookup_alarm(<<"alarm1">>, maps:get(<<"alarms">>, lists:nth(1, get(<<"data">>, Return2))))),
-    ?assert(lookup_alarm(<<"alarm2">>, maps:get(<<"alarms">>, lists:nth(1, get(<<"data">>, Return2))))),
+        %% Scroll past count
+        {200, ClientsNode2Page10} = query_clients(Node1, #{
+            <<"node">> => Node2, <<"page">> => <<"10">>, <<"limit">> => 5
+        }),
+        ?assertEqual(
+            #{data => [], meta => #{page => 10, limit => 5, count => 10, hasnext => false}},
+            ClientsNode2Page10
+        ),
 
-    {ok, Return3} = request_api(get, api_path(["alarms/deactivated"]), auth_header_()),
-    ?assert(lookup_alarm(<<"alarm1">>, maps:get(<<"alarms">>, lists:nth(1, get(<<"data">>, Return3))))),
-    ?assertNot(lookup_alarm(<<"alarm2">>, maps:get(<<"alarms">>, lists:nth(1, get(<<"data">>, Return3))))),
+        %% Query with bad params
+        ?assertEqual(
+            {400, #{
+                code => <<"INVALID_PARAMETER">>,
+                message => <<"page_limit_invalid">>
+            }},
+            query_clients(Node1, #{<<"page">> => -1})
+        ),
+        ?assertEqual(
+            {400, #{
+                code => <<"INVALID_PARAMETER">>,
+                message => <<"page_limit_invalid">>
+            }},
+            query_clients(Node1, #{<<"node">> => Node1, <<"page">> => -1})
+        ),
 
-    emqx_alarm:deactivate(alarm2),
+        %% Query bad node
+        ?assertMatch(
+            {500, #{code := <<"NODE_DOWN">>}},
+            query_clients(Node1, #{<<"node">> => 'nonode@nohost'})
+        ),
 
-    {ok, Return4} = request_api(get, api_path(["alarms/deactivated"]), auth_header_()),
-    ?assert(lookup_alarm(<<"alarm1">>, maps:get(<<"alarms">>, lists:nth(1, get(<<"data">>, Return4))))),
-    ?assert(lookup_alarm(<<"alarm2">>, maps:get(<<"alarms">>, lists:nth(1, get(<<"data">>, Return4))))),
+        %% exact match can return non-zero total
+        {200, ClientsNode1} = query_clients(Node2, #{<<"username">> => <<"corenode1@127.0.0.1">>}),
+        ?assertMatch(
+            #{count := 10},
+            maps:get(meta, ClientsNode1)
+        ),
 
-    {ok, _} = request_api(delete, api_path(["alarms/deactivated"]), auth_header_()),
+        %% fuzzy searching can't return total
+        {200, ClientsFuzzyNode2} = query_clients(Node2, #{<<"like_username">> => <<"corenode2">>}),
+        MetaNode2 = maps:get(meta, ClientsFuzzyNode2),
+        ?assertNotMatch(#{count := _}, MetaNode2),
+        ?assertMatch(#{hasnext := false}, MetaNode2),
+        ?assertMatch(10, length(maps:get(data, ClientsFuzzyNode2))),
 
-    {ok, Return5} = request_api(get, api_path(["alarms/deactivated"]), auth_header_()),
-    ?assertNot(lookup_alarm(<<"alarm1">>, maps:get(<<"alarms">>, lists:nth(1, get(<<"data">>, Return5))))),
-    ?assertNot(lookup_alarm(<<"alarm2">>, maps:get(<<"alarms">>, lists:nth(1, get(<<"data">>, Return5))))).
+        _ = lists:foreach(fun(C) -> emqtt:disconnect(C) end, ClientLs1),
+        _ = lists:foreach(fun(C) -> emqtt:disconnect(C) end, ClientLs2)
+    after
+        emqx_cth_cluster:stop(Nodes)
+    end.
 
-apps(_) ->
-    AppId = <<"123456">>,
-    meck:new(emqx_mgmt_auth, [passthrough, no_history]),
-    meck:expect(emqx_mgmt_auth, add_app, 6, fun(_, _, _, _, _, _) -> {error, undefined} end),
-    {ok, Error1} = request_api(post, api_path(["apps"]), [],
-                               auth_header_(), #{<<"app_id">> => AppId,
-                                                 <<"name">> => <<"test">>,
-                                                 <<"status">> => true}),
-    ?assertMatch(<<"undefined">>, get(<<"message">>, Error1)),
+t_cluster_query_deep_subscription_page(Config) ->
+    ct:timetrap({seconds, 120}),
+    Nodes = [Coordinator, DataNode] = start_mgmt_cluster(?FUNCTION_NAME, Config),
+    try
+        %% The API only scans this table; a live MQTT client is unnecessary here.
+        ok = erpc:call(DataNode, ?MODULE, insert_subscription_rows, [4]),
+        ok = erpc:call(Coordinator, meck, new, [emqx, [passthrough, no_link]]),
+        ok = erpc:call(Coordinator, meck, expect, [emqx, running_nodes, 0, [DataNode]]),
+        ok = erpc:call(DataNode, meck, new, [emqx_mgmt_api, [passthrough, no_link]]),
 
-    meck:expect(emqx_mgmt_auth, del_app, 1, fun(_) -> {error, undefined} end),
-    {ok, Error2} = request_api(delete, api_path(["apps", binary_to_list(AppId)]), auth_header_()),
-    ?assertMatch(<<"undefined">>, get(<<"message">>, Error2)),
-    meck:unload(emqx_mgmt_auth),
+        Response =
+            {200, #{data := [_], meta := #{page := 4, limit := 1, count := 4}}} =
+            query_subscriptions(Coordinator, #{<<"page">> => 4, <<"limit">> => 1}),
+        ?assertEqual(1, remote_query_call_count(DataNode)),
 
-    {ok, NoApp} = request_api(get, api_path(["apps", binary_to_list(AppId)]), auth_header_()),
-    ?assertEqual(0, maps:size(get(<<"data">>, NoApp))),
-    {ok, NotFound} = request_api(put, api_path(["apps", binary_to_list(AppId)]), [],
-                                 auth_header_(), #{<<"name">> => <<"test 2">>,
-                                                   <<"status">> => true}),
-    ?assertEqual(<<"not_found">>, get(<<"message">>, NotFound)),
+        %% Emulate an old node which ignores the new request state and returns one batch.
+        ok = erpc:call(DataNode, meck, unload, [emqx_mgmt_api]),
+        ok = erpc:call(DataNode, meck, new, [emqx_mgmt_api, [passthrough, no_link]]),
+        ok = erpc:call(DataNode, meck, expect, [
+            emqx_mgmt_api,
+            do_query,
+            fun(Node, QueryState) ->
+                ResultAcc = maps:get(result_acc, QueryState),
+                LegacyQueryState = maps:remove(result_acc, QueryState),
+                {Rows, NQueryState} = meck:passthrough([Node, LegacyQueryState]),
+                {Rows, NQueryState#{result_acc => ResultAcc}}
+            end
+        ]),
+        ?assertEqual(
+            Response,
+            query_subscriptions(Coordinator, #{<<"page">> => 4, <<"limit">> => 1})
+        ),
+        ?assertEqual(4, remote_query_call_count(DataNode))
+    after
+        _ = catch erpc:call(DataNode, meck, unload, [emqx_mgmt_api]),
+        _ = catch erpc:call(Coordinator, meck, unload, [emqx]),
+        emqx_cth_cluster:stop(Nodes)
+    end.
 
-    {ok, _} = request_api(post, api_path(["apps"]), [],
-                          auth_header_(), #{<<"app_id">> => AppId,
-                                            <<"name">> => <<"test">>,
-                                            <<"status">> => true}),
-    {ok, _} = request_api(get, api_path(["apps"]), auth_header_()),
-    {ok, _} = request_api(get, api_path(["apps", binary_to_list(AppId)]), auth_header_()),
-    {ok, _} = request_api(put, api_path(["apps", binary_to_list(AppId)]), [],
-                          auth_header_(), #{<<"name">> => <<"test 2">>,
-                                            <<"status">> => true}),
-    {ok, AppInfo} = request_api(get, api_path(["apps", binary_to_list(AppId)]), auth_header_()),
-    ?assertEqual(<<"test 2">>, maps:get(<<"name">>, get(<<"data">>, AppInfo))),
-    {ok, _} = request_api(delete, api_path(["apps", binary_to_list(AppId)]), auth_header_()),
-    {ok, Result} = request_api(get, api_path(["apps"]), auth_header_()),
-    [App] = get(<<"data">>, Result),
-    ?assertEqual(<<"admin">>, maps:get(<<"app_id">>, App)).
+t_cluster_query_subscription_page_across_nodes(Config) ->
+    ct:timetrap({seconds, 120}),
+    Nodes = [Coordinator, DataNode] = start_mgmt_cluster(?FUNCTION_NAME, Config),
+    try
+        ok = erpc:call(Coordinator, ?MODULE, insert_subscription_rows, [2]),
+        ok = erpc:call(DataNode, ?MODULE, insert_subscription_rows, [2]),
+        ok = erpc:call(Coordinator, meck, new, [emqx, [passthrough, no_link]]),
+        ok = erpc:call(Coordinator, meck, expect, [
+            emqx,
+            running_nodes,
+            0,
+            [Coordinator, DataNode]
+        ]),
 
-banned(_) ->
-    Who = <<"myclient">>,
-    {ok, _} = request_api(post, api_path(["banned"]), [],
-                          auth_header_(), #{<<"who">> => Who,
-                                            <<"as">> => <<"clientid">>,
-                                            <<"reason">> => <<"test">>,
-                                            <<"by">> => <<"dashboard">>,
-                                            <<"at">> => erlang:system_time(second),
-                                            <<"until">> => erlang:system_time(second) + 10}),
+        {200, #{
+            data := Subscriptions,
+            meta := #{page := 1, limit := 3, count := 4, hasnext := true}
+        }} = query_subscriptions(Coordinator, #{<<"page">> => 1, <<"limit">> => 3}),
+        ?assertEqual(3, length(Subscriptions)),
+        ?assertEqual(
+            [Coordinator, Coordinator, DataNode],
+            [maps:get(node, Subscription) || Subscription <- Subscriptions]
+        )
+    after
+        _ = catch erpc:call(Coordinator, meck, unload, [emqx]),
+        emqx_cth_cluster:stop(Nodes)
+    end.
 
-    {ok, Result} = request_api(get, api_path(["banned"]), auth_header_()),
-    [Banned] = get(<<"data">>, Result),
-    ?assertEqual(Who, maps:get(<<"who">>, Banned)),
-
-    {ok, _} = request_api(delete, api_path(["banned", "clientid", binary_to_list(Who)]), auth_header_()),
-    {ok, Result2} = request_api(get, api_path(["banned"]), auth_header_()),
-    ?assertEqual([], get(<<"data">>, Result2)).
-
-brokers(_) ->
-    {ok, _} = request_api(get, api_path(["brokers"]), auth_header_()),
-    {ok, _} = request_api(get, api_path(["brokers", atom_to_list(node())]), auth_header_()),
-    meck:new(emqx_mgmt, [passthrough, no_history]),
-    meck:expect(emqx_mgmt, lookup_broker, 1, fun(_) -> {error, undefined} end),
-    {ok, Error} = request_api(get, api_path(["brokers", atom_to_list(node())]), auth_header_()),
-    ?assertEqual(<<"undefined">>, get(<<"message">>, Error)),
-    meck:unload(emqx_mgmt).
-
-clients(_) ->
+t_bad_rpc(Config) ->
+    Apps = emqx_cth_suite:start(
+        [
+            emqx,
+            emqx_management,
+            {emqx_dashboard, "dashboard.listeners.http { enable = true, bind = 18083 }"}
+        ],
+        #{work_dir => emqx_cth_suite:work_dir(?FUNCTION_NAME, Config)}
+    ),
+    {ok, _} = emqx_common_test_http:create_default_app(),
     process_flag(trap_exit, true),
-    Username1 = <<"user1">>,
-    Username2 = <<"user2">>,
-    ClientId1 = <<"client1">>,
-    ClientId2 = <<"client2">>,
-    {ok, C1} = emqtt:start_link(#{username => Username1, clientid => ClientId1}),
-    {ok, _} = emqtt:connect(C1),
-    {ok, C2} = emqtt:start_link(#{username => Username2, clientid => ClientId2}),
-    {ok, _} = emqtt:connect(C2),
-
-    timer:sleep(300),
-
-    {ok, Clients1} = request_api(get, api_path(["clients", binary_to_list(ClientId1)])
-                               , auth_header_()),
-    ?assertEqual(<<"client1">>, maps:get(<<"clientid">>, lists:nth(1, get(<<"data">>, Clients1)))),
-
-    {ok, Clients2} = request_api(get, api_path(["nodes", atom_to_list(node()),
-                                                "clients", binary_to_list(ClientId2)])
-                                 , auth_header_()),
-    ?assertEqual(<<"client2">>, maps:get(<<"clientid">>, lists:nth(1, get(<<"data">>, Clients2)))),
-
-    {ok, Clients3} = request_api(get, api_path(["clients",
-                                                "username", binary_to_list(Username1)]),
-                                 auth_header_()),
-    ?assertEqual(<<"client1">>, maps:get(<<"clientid">>, lists:nth(1, get(<<"data">>, Clients3)))),
-
-    {ok, Clients4} = request_api(get, api_path(["nodes", atom_to_list(node()),
-                                                "clients",
-                                                "username", binary_to_list(Username2)])
-                                 , auth_header_()),
-    ?assertEqual(<<"client2">>, maps:get(<<"clientid">>, lists:nth(1, get(<<"data">>, Clients4)))),
-
-    {ok, Clients5} = request_api(get, api_path(["clients"]), "_limit=100&_page=1", auth_header_()),
-    ?assertEqual(2, maps:get(<<"count">>, get(<<"meta">>, Clients5))),
-
-    meck:new(emqx_mgmt, [passthrough, no_history]),
-    meck:expect(emqx_mgmt, kickout_client, 1, fun(_) -> {error, undefined} end),
-
-    {ok, MeckRet1} = request_api(delete, api_path(["clients", binary_to_list(ClientId1)]), auth_header_()),
-    ?assertEqual(?ERROR1, get(<<"code">>, MeckRet1)),
-
-    meck:expect(emqx_mgmt, clean_acl_cache, 1, fun(_) -> {error, undefined} end),
-    {ok, MeckRet2} = request_api(delete, api_path(["clients", binary_to_list(ClientId1), "acl_cache"]), auth_header_()),
-    ?assertEqual(?ERROR1, get(<<"code">>, MeckRet2)),
-
-    meck:expect(emqx_mgmt, list_acl_cache, 1, fun(_) -> {error, undefined} end),
-    {ok, MeckRet3} = request_api(get, api_path(["clients", binary_to_list(ClientId2), "acl_cache"]), auth_header_()),
-    ?assertEqual(?ERROR1, get(<<"code">>, MeckRet3)),
-
-    meck:unload(emqx_mgmt),
-
-    {ok, Ok} = request_api(delete, api_path(["clients", binary_to_list(ClientId1)]), auth_header_()),
-    ?assertEqual(?SUCCESS, get(<<"code">>, Ok)),
-
-    timer:sleep(300),
-
-    {ok, NotFound0} = request_api(delete, api_path(["clients", binary_to_list(ClientId1)]), auth_header_()),
-    ?assertEqual(?ERROR12, get(<<"code">>, NotFound0)),
-
-    {ok, Clients6} = request_api(get, api_path(["clients"]), "_limit=100&_page=1", auth_header_()),
-    ?assertEqual(1, maps:get(<<"count">>, get(<<"meta">>, Clients6))),
-
-    {ok, NotFound1} = request_api(get, api_path(["clients", binary_to_list(ClientId1), "acl_cache"]), auth_header_()),
-    ?assertEqual(?ERROR12, get(<<"code">>, NotFound1)),
-
-    {ok, NotFound2} = request_api(delete, api_path(["clients", binary_to_list(ClientId1), "acl_cache"]), auth_header_()),
-    ?assertEqual(?ERROR12, get(<<"code">>, NotFound2)),
-
-    {ok, EmptyAclCache} = request_api(get, api_path(["clients", binary_to_list(ClientId2), "acl_cache"]), auth_header_()),
-    ?assertEqual(0, length(get(<<"data">>, EmptyAclCache))),
-
-    {ok, Ok1} = request_api(delete, api_path(["clients", binary_to_list(ClientId2), "acl_cache"]), auth_header_()),
-    ?assertEqual(?SUCCESS, get(<<"code">>, Ok1)).
-
-receive_exit(0) ->
-    ok;
-receive_exit(Count) ->
-    receive
-        {'EXIT', Client, {shutdown, tcp_closed}} ->
-            ct:log("receive exit signal, Client: ~p", [Client]),
-            receive_exit(Count - 1);
-        {'EXIT', Client, _Reason} ->
-            ct:log("receive exit signal, Client: ~p", [Client]),
-            receive_exit(Count - 1)
-    after 1000 ->
-            ct:log("timeout")
+    ClientLs1 = [start_emqtt_client(node(), I, 1883) || I <- lists:seq(1, 10)],
+    Path = emqx_mgmt_api_test_util:api_path(["clients?limit=2&page=2"]),
+    try
+        meck:expect(emqx, running_nodes, 0, ['fake@nohost']),
+        {error, {_, 500, _}} = emqx_mgmt_api_test_util:request_api(get, Path),
+        %% good cop, bad cop
+        meck:expect(emqx, running_nodes, 0, [node(), 'fake@nohost']),
+        {error, {_, 500, _}} = emqx_mgmt_api_test_util:request_api(get, Path)
+    after
+        _ = lists:foreach(fun(C) -> emqtt:disconnect(C) end, ClientLs1),
+        meck:unload(emqx),
+        emqx_cth_suite:stop(Apps)
     end.
 
-listeners(_) ->
-    {ok, _} = request_api(get, api_path(["listeners"]), auth_header_()),
-    {ok, _} = request_api(get, api_path(["nodes", atom_to_list(node()), "listeners"]), auth_header_()),
-    meck:new(emqx_mgmt, [passthrough, no_history]),
-    meck:expect(emqx_mgmt, list_listeners, 0, fun() -> [{node(), {error, undefined}}] end),
-    {ok, Return} = request_api(get, api_path(["listeners"]), auth_header_()),
-    [Error] = get(<<"data">>, Return),
-    ?assertEqual(<<"undefined">>,
-                 maps:get(<<"error">>, maps:get(<<"listeners">>, Error))),
-    meck:unload(emqx_mgmt).
+%%--------------------------------------------------------------------
+%% helpers
+%%--------------------------------------------------------------------
 
-metrics(_) ->
-    {ok, _} = request_api(get, api_path(["metrics"]), auth_header_()),
-    {ok, _} = request_api(get, api_path(["nodes", atom_to_list(node()), "metrics"]), auth_header_()),
-    meck:new(emqx_mgmt, [passthrough, no_history]),
-    meck:expect(emqx_mgmt, get_metrics, 1, fun(_) -> {error, undefined} end),
-    {ok, "{\"message\":\"undefined\"}"} = request_api(get, api_path(["nodes", atom_to_list(node()), "metrics"]), auth_header_()),
-    meck:unload(emqx_mgmt).
+start_mgmt_cluster(Testcase, Config) ->
+    emqx_cth_cluster:start(
+        [
+            {corenode1, #{role => core, apps => [emqx, emqx_management]}},
+            {corenode2, #{role => core, apps => [emqx, emqx_management]}}
+        ],
+        #{work_dir => emqx_cth_suite:work_dir(Testcase, Config)}
+    ).
 
-nodes(_) ->
-    {ok, _} = request_api(get, api_path(["nodes"]), auth_header_()),
-    {ok, _} = request_api(get, api_path(["nodes", atom_to_list(node())]), auth_header_()),
-    meck:new(emqx_mgmt, [passthrough, no_history]),
-    meck:expect(emqx_mgmt, list_nodes, 0, fun() -> [{node(), {error, undefined}}] end),
-    {ok, Return} = request_api(get, api_path(["nodes"]), auth_header_()),
-    [Error] = get(<<"data">>, Return),
-    ?assertEqual(<<"undefined">>, maps:get(<<"error">>, Error)),
-    meck:unload(emqx_mgmt).
+start_emqtt_client(Node, N) ->
+    Port = emqx_cth_cluster:get_tcp_mqtt_port(Node),
+    start_emqtt_client(Node, N, Port).
 
-plugins(_) ->
-    {ok, Plugins1} = request_api(get, api_path(["plugins"]), auth_header_()),
-    [Plugins11] = filter(get(<<"data">>, Plugins1), <<"node">>, atom_to_binary(node(), utf8)),
-    [Plugin1] = filter(maps:get(<<"plugins">>, Plugins11), <<"name">>, <<"emqx_auth_mnesia">>),
-    ?assertEqual(<<"emqx_auth_mnesia">>, maps:get(<<"name">>, Plugin1)),
-    ?assertEqual(true, maps:get(<<"active">>, Plugin1)),
+start_emqtt_client(Node0, N, Port) ->
+    Node = atom_to_binary(Node0),
+    ClientId = iolist_to_binary([Node, "-", integer_to_binary(N)]),
+    {ok, C} = emqtt:start_link([{clientid, ClientId}, {username, Node}, {port, Port}]),
+    {ok, _} = emqtt:connect(C),
+    C.
 
-    {ok, _} = request_api(put,
-                          api_path(["plugins",
-                                    atom_to_list(emqx_auth_mnesia),
-                                    "unload"]),
-                          auth_header_()),
-    {ok, Error1} = request_api(put,
-                               api_path(["plugins",
-                                         atom_to_list(emqx_auth_mnesia),
-                                         "unload"]),
-                               auth_header_()),
-    ?assertEqual(<<"not_started">>, get(<<"message">>, Error1)),
-    {ok, Plugins2} = request_api(get,
-                                 api_path(["nodes", atom_to_list(node()), "plugins"]),
-                                 auth_header_()),
-    [Plugin2] = filter(get(<<"data">>, Plugins2), <<"name">>, <<"emqx_auth_mnesia">>),
-    ?assertEqual(<<"emqx_auth_mnesia">>, maps:get(<<"name">>, Plugin2)),
-    ?assertEqual(false, maps:get(<<"active">>, Plugin2)),
+query_clients(Node, Qs0) ->
+    Qs = maps:merge(
+        #{<<"page">> => 1, <<"limit">> => 100},
+        Qs0
+    ),
+    rpc:call(Node, emqx_mgmt_api_clients, clients, [get, #{query_string => Qs}]).
 
-    {ok, _} = request_api(put,
-                          api_path(["nodes",
-                                    atom_to_list(node()),
-                                    "plugins",
-                                    atom_to_list(emqx_auth_mnesia),
-                                    "load"]),
-                          auth_header_()),
-    {ok, Plugins3} = request_api(get,
-                                 api_path(["nodes", atom_to_list(node()), "plugins"]),
-                                 auth_header_()),
-    [Plugin3] = filter(get(<<"data">>, Plugins3), <<"name">>, <<"emqx_auth_mnesia">>),
-    ?assertEqual(<<"emqx_auth_mnesia">>, maps:get(<<"name">>, Plugin3)),
-    ?assertEqual(false, maps:get(<<"active">>, Plugin3)),
+query_subscriptions(Node, Qs0) ->
+    Qs = maps:merge(
+        #{<<"page">> => 1, <<"limit">> => 100},
+        Qs0
+    ),
+    erpc:call(Node, emqx_mgmt_api_subscriptions, subscriptions, [get, #{query_string => Qs}]).
 
-    {ok, _} = request_api(put,
-                          api_path(["nodes",
-                                    atom_to_list(node()),
-                                    "plugins",
-                                    atom_to_list(emqx_auth_mnesia),
-                                    "unload"]),
-                          auth_header_()),
-    {ok, Error2} = request_api(put,
-                               api_path(["nodes",
-                                         atom_to_list(node()),
-                                         "plugins",
-                                         atom_to_list(emqx_auth_mnesia),
-                                         "unload"]),
-                               auth_header_()),
-    ?assertEqual(<<"not_started">>, get(<<"message">>, Error2)).
-
-acl_cache(_) ->
-    ClientId = <<"client1">>,
-    Topic = <<"mytopic">>,
-    {ok, C1} = emqtt:start_link(#{clientid => ClientId}),
-    {ok, _} = emqtt:connect(C1),
-    {ok, _, _} = emqtt:subscribe(C1, Topic, 2),
-    %% get acl cache, should not be empty
-    {ok, Result} = request_api(get, api_path(["clients", binary_to_list(ClientId), "acl_cache"]), [], auth_header_()),
-    #{<<"code">> := 0, <<"data">> := Caches} = jiffy:decode(list_to_binary(Result), [return_maps]),
-    ?assert(length(Caches) > 0),
-    ?assertMatch(#{<<"access">> := <<"subscribe">>,
-                   <<"topic">> := Topic,
-                   <<"result">> := <<"allow">>,
-                   <<"updated_time">> := _}, hd(Caches)),
-    %% clear acl cache
-    {ok, Result2} = request_api(delete, api_path(["clients", binary_to_list(ClientId), "acl_cache"]), [], auth_header_()),
-    ?assertMatch(#{<<"code">> := 0}, jiffy:decode(list_to_binary(Result2), [return_maps])),
-    %% get acl cache again, after the acl cache is cleared
-    {ok, Result3} = request_api(get, api_path(["clients", binary_to_list(ClientId), "acl_cache"]), [], auth_header_()),
-    #{<<"code">> := 0, <<"data">> := Caches3} = jiffy:decode(list_to_binary(Result3), [return_maps]),
-    ?assertEqual(0, length(Caches3)),
-    ok = emqtt:disconnect(C1).
-
-pubsub(_) ->
-    Qos1Received = emqx_metrics:val('messages.qos1.received'),
-    Qos2Received = emqx_metrics:val('messages.qos2.received'),
-    Received = emqx_metrics:val('messages.received'),
-
-    ClientId = <<"client1">>,
-    Options = #{clientid => ClientId,
-                proto_ver => 5},
-    Topic = <<"mytopic">>,
-    {ok, C1} = emqtt:start_link(Options),
-    {ok, _} = emqtt:connect(C1),
-
-    meck:new(emqx_mgmt, [passthrough, no_history]),
-    meck:expect(emqx_mgmt, subscribe, 2, fun(_, _) -> {error, undefined} end),
-    {ok, NotFound1} = request_api(post, api_path(["mqtt/subscribe"]), [], auth_header_(),
-                                 #{<<"clientid">> => ClientId,
-                                   <<"topic">> => Topic,
-                                   <<"qos">> => 2}),
-    ?assertEqual(?ERROR12, get(<<"code">>, NotFound1)),
-    meck:unload(emqx_mgmt),
-
-    {ok, BadTopic1} = request_api(post, api_path(["mqtt/subscribe"]), [], auth_header_(),
-                                 #{<<"clientid">> => ClientId,
-                                   <<"topics">> => <<"">>,
-                                   <<"qos">> => 2}),
-    ?assertEqual(?ERROR15, get(<<"code">>, BadTopic1)),
-
-    {ok, BadTopic2} = request_api(post, api_path(["mqtt/publish"]), [], auth_header_(),
-                                 #{<<"clientid">> => ClientId,
-                                   <<"topics">> => <<"">>,
-                                   <<"qos">> => 1,
-                                   <<"payload">> => <<"hello">>}),
-    ?assertEqual(?ERROR15, get(<<"code">>, BadTopic2)),
-
-    {ok, BadTopic3} = request_api(post, api_path(["mqtt/unsubscribe"]), [], auth_header_(),
-                                 #{<<"clientid">> => ClientId,
-                                   <<"topic">> => <<"">>}),
-    ?assertEqual(?ERROR15, get(<<"code">>, BadTopic3)),
-
-    meck:new(emqx_mgmt, [passthrough, no_history]),
-    meck:expect(emqx_mgmt, unsubscribe, 2, fun(_, _) -> {error, undefined} end),
-    {ok, NotFound2} = request_api(post, api_path(["mqtt/unsubscribe"]), [], auth_header_(),
-                                 #{<<"clientid">> => ClientId,
-                                   <<"topic">> => Topic}),
-    ?assertEqual(?ERROR12, get(<<"code">>, NotFound2)),
-    meck:unload(emqx_mgmt),
-
-    {ok, Code} = request_api(post, api_path(["mqtt/subscribe"]), [], auth_header_(),
-                             #{<<"clientid">> => ClientId,
-                               <<"topic">> => Topic,
-                               <<"qos">> => 2}),
-    ?assertEqual(?SUCCESS, get(<<"code">>, Code)),
-    {ok, Code} = request_api(post, api_path(["mqtt/publish"]), [], auth_header_(),
-                             #{<<"clientid">> => ClientId,
-                               <<"topic">> => <<"mytopic">>,
-                               <<"qos">> => 1,
-                               <<"payload">> => <<"hello">>}),
-    ?assert(receive
-                {publish, #{payload := <<"hello">>}} ->
-                    true
-            after 100 ->
-                    false
-            end),
-    %% json payload
-    {ok, Code} = request_api(post, api_path(["mqtt/publish"]), [], auth_header_(),
-                             #{<<"clientid">> => ClientId,
-                               <<"topic">> => <<"mytopic">>,
-                               <<"qos">> => 1,
-                               <<"payload">> => #{body => "hello world"}}),
-    Payload = emqx_json:encode(#{body => "hello world"}),
-    ?assert(receive
-                {publish, #{payload := Payload}} ->
-                    true
-            after 100 ->
-                    false
-            end),
-
-    {ok, Code} = request_api(post, api_path(["mqtt/unsubscribe"]), [], auth_header_(),
-                             #{<<"clientid">> => ClientId,
-                              <<"topic">> => Topic}),
-
-    %% tests subscribe_batch
-    Topic_list = [<<"mytopic1">>, <<"mytopic2">>],
-    [ {ok, _, [2]} = emqtt:subscribe(C1, Topics, 2) || Topics <- Topic_list],
-
-    Body1 = [ #{<<"clientid">> => ClientId, <<"topic">> => Topics, <<"qos">> => 2} || Topics <- Topic_list],
-    {ok, Data1} = request_api(post, api_path(["mqtt/subscribe_batch"]), [], auth_header_(), Body1),
-    loop(maps:get(<<"data">>, jiffy:decode(list_to_binary(Data1), [return_maps]))),
-
-    %% tests publish_batch
-    Body2 = [ #{<<"clientid">> => ClientId, <<"topic">> => Topics, <<"qos">> => 2, <<"retain">> => <<"false">>, <<"payload">> => #{body => "hello world"}} || Topics <- Topic_list ],
-    {ok, Data2} = request_api(post, api_path(["mqtt/publish_batch"]), [], auth_header_(), Body2),
-    loop(maps:get(<<"data">>, jiffy:decode(list_to_binary(Data2), [return_maps]))),
-    [ ?assert(receive
-                    {publish, #{topic := Topics}} ->
-                        true
-                    after 100 ->
-                        false
-                    end) || Topics <- Topic_list ],
-
-    %% tests unsubscribe_batch
-    Body3 = [#{<<"clientid">> => ClientId, <<"topic">> => Topics} || Topics <- Topic_list],
-    {ok, Data3} = request_api(post, api_path(["mqtt/unsubscribe_batch"]), [], auth_header_(), Body3),
-    loop(maps:get(<<"data">>, jiffy:decode(list_to_binary(Data3), [return_maps]))),
-
-    ok = emqtt:disconnect(C1),
-
-    ?assertEqual(2, emqx_metrics:val('messages.qos1.received') - Qos1Received),
-    ?assertEqual(2, emqx_metrics:val('messages.qos2.received') - Qos2Received),
-    ?assertEqual(4, emqx_metrics:val('messages.received') - Received).
-
-loop([]) -> [];
-
-loop(Data) ->
-    [H | T] = Data,
-    ct:pal("H: ~p~n", [H]),
-    ?assertEqual(0, maps:get(<<"code">>, H)),
-    loop(T).
-
-routes_and_subscriptions(_) ->
-    ClientId = <<"myclient">>,
-    Topic = <<"mytopic">>,
-    {ok, NonRoute} = request_api(get, api_path(["routes"]), auth_header_()),
-    ?assertEqual([], get(<<"data">>, NonRoute)),
-    {ok, NonSubscription} = request_api(get, api_path(["subscriptions"]), auth_header_()),
-    ?assertEqual([], get(<<"data">>, NonSubscription)),
-    {ok, NonSubscription1} = request_api(get, api_path(["nodes", atom_to_list(node()), "subscriptions"]), auth_header_()),
-    ?assertEqual([], get(<<"data">>, NonSubscription1)),
-    {ok, NonSubscription2} = request_api(get,
-                                         api_path(["subscriptions", binary_to_list(ClientId)]),
-                                         auth_header_()),
-    ?assertEqual([], get(<<"data">>, NonSubscription2)),
-    {ok, NonSubscription3} = request_api(get, api_path(["nodes",
-                                                        atom_to_list(node()),
-                                                        "subscriptions",
-                                                        binary_to_list(ClientId)])
-                                         , auth_header_()),
-    ?assertEqual([], get(<<"data">>, NonSubscription3)),
-    {ok, C1} = emqtt:start_link(#{clean_start => true,
-                                  clientid    => ClientId,
-                                  proto_ver   => ?MQTT_PROTO_V5}),
-    {ok, _} = emqtt:connect(C1),
-    {ok, _, [2]} = emqtt:subscribe(C1, Topic, qos2),
-    {ok, Result} = request_api(get, api_path(["routes"]), auth_header_()),
-    [Route] = get(<<"data">>, Result),
-    ?assertEqual(Topic, maps:get(<<"topic">>, Route)),
-
-    {ok, Result2} = request_api(get, api_path(["routes", binary_to_list(Topic)]), auth_header_()),
-    [Route] = get(<<"data">>, Result2),
-
-    {ok, Result3} = request_api(get, api_path(["subscriptions"]), auth_header_()),
-    [Subscription] = get(<<"data">>, Result3),
-    ?assertEqual(Topic, maps:get(<<"topic">>, Subscription)),
-    ?assertEqual(ClientId, maps:get(<<"clientid">>, Subscription)),
-
-    {ok, Result3} = request_api(get, api_path(["nodes", atom_to_list(node()), "subscriptions"]), auth_header_()),
-
-    {ok, Result4} = request_api(get, api_path(["subscriptions", binary_to_list(ClientId)]), auth_header_()),
-    [Subscription] = get(<<"data">>, Result4),
-    {ok, Result4} = request_api(get, api_path(["nodes", atom_to_list(node()), "subscriptions", binary_to_list(ClientId)])
-                               , auth_header_()),
-
-    ok = emqtt:disconnect(C1).
-
-stats(_) ->
-    {ok, _} = request_api(get, api_path(["stats"]), auth_header_()),
-    {ok, _} = request_api(get, api_path(["nodes", atom_to_list(node()), "stats"]), auth_header_()),
-    meck:new(emqx_mgmt, [passthrough, no_history]),
-    meck:expect(emqx_mgmt, get_stats, 1, fun(_) -> {error, undefined} end),
-    {ok, Return} = request_api(get, api_path(["nodes", atom_to_list(node()), "stats"]), auth_header_()),
-    ?assertEqual(<<"undefined">>, get(<<"message">>, Return)),
-    meck:unload(emqx_mgmt).
-
-data(_) ->
-    {ok, Data} = request_api(post, api_path(["data","export"]), [], auth_header_(), [#{}]),
-    #{<<"filename">> := Filename, <<"node">> := Node} = emqx_ct_http:get_http_data(Data),
-    {ok, DataList} = request_api(get, api_path(["data","export"]), auth_header_()),
-    ?assertEqual(true, lists:member(emqx_ct_http:get_http_data(Data), emqx_ct_http:get_http_data(DataList))),
-
-    ?assertMatch({ok, _}, request_api(post, api_path(["data","import"]), [], auth_header_(), #{<<"filename">> => Filename, <<"node">> => Node})),
-    ?assertMatch({ok, _}, request_api(post, api_path(["data","import"]), [], auth_header_(), #{<<"filename">> => Filename})),
-
+insert_subscription_rows(N) ->
+    Subscriber = self(),
+    Rows = [
+        {
+            {<<"t/", (integer_to_binary(I))/binary>>, Subscriber},
+            #{subid => <<"client-", (integer_to_binary(I))/binary>>, qos => 0}
+        }
+     || I <- lists:seq(1, N)
+    ],
+    true = ets:insert(emqx_suboption, Rows),
     ok.
 
-request_api(Method, Url, Auth) ->
-    request_api(Method, Url, [], Auth, []).
+remote_query_call_count(DataNode) ->
+    erpc:call(DataNode, meck, num_calls, [emqx_mgmt_api, do_query, ['_', '_']]).
 
-request_api(Method, Url, QueryParams, Auth) ->
-    request_api(Method, Url, QueryParams, Auth, []).
-
-request_api(Method, Url, QueryParams, Auth, []) ->
-    NewUrl = case QueryParams of
-                 "" -> Url;
-                 _ -> Url ++ "?" ++ QueryParams
-             end,
-    do_request_api(Method, {NewUrl, [Auth]});
-request_api(Method, Url, QueryParams, Auth, Body) ->
-    NewUrl = case QueryParams of
-                 "" -> Url;
-                 _ -> Url ++ "?" ++ QueryParams
-             end,
-    do_request_api(Method, {NewUrl, [Auth], "application/json", emqx_json:encode(Body)}).
-
-do_request_api(Method, Request)->
-    ct:pal("Method: ~p, Request: ~p", [Method, Request]),
-    case httpc:request(Method, Request, [], []) of
-        {error, socket_closed_remotely} ->
-            {error, socket_closed_remotely};
-        {ok, {{"HTTP/1.1", Code, _}, _, Return} }
-            when Code =:= 200 orelse Code =:= 201 ->
-            {ok, Return};
-        {ok, {Reason, _, _}} ->
-            {error, Reason}
-    end.
-
-auth_header_() ->
-    AppId = <<"admin">>,
-    AppSecret = <<"public">>,
-    auth_header_(binary_to_list(AppId), binary_to_list(AppSecret)).
-
-auth_header_(User, Pass) ->
-    Encoded = base64:encode_to_string(lists:append([User,":",Pass])),
-    {"Authorization","Basic " ++ Encoded}.
-
-api_path(Parts)->
-    ?HOST ++ filename:join([?BASE_PATH, ?API_VERSION] ++ Parts).
-
-filter(List, Key, Value) ->
-    lists:filter(fun(Item) ->
-        maps:get(Key, Item) == Value
-    end, List).
+without_process_stats({Code, Result}) ->
+    {Code, without_process_stats(Result)};
+without_process_stats(#{data := Data} = Result) ->
+    Result#{data := [maps:without([mailbox_len, heap_size, reductions], C) || C <- Data]}.

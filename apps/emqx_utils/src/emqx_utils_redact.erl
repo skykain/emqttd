@@ -1,0 +1,660 @@
+%%--------------------------------------------------------------------
+%% Copyright (c) 2024-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
+%%
+%% Licensed under the Apache License, Version 2.0 (the "License");
+%% you may not use this file except in compliance with the License.
+%% You may obtain a copy of the License at
+%%
+%%     http://www.apache.org/licenses/LICENSE-2.0
+%%
+%% Unless required by applicable law or agreed to in writing, software
+%% distributed under the License is distributed on an "AS IS" BASIS,
+%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+%% See the License for the specific language governing permissions and
+%% limitations under the License.
+%%--------------------------------------------------------------------
+
+-module(emqx_utils_redact).
+
+-export([redact/1, redact/2, redact_headers/1, is_sensitive_key/1, is_redacted/2, is_redacted/3]).
+-export([deobfuscate/2]).
+-export([redacted_value/0]).
+
+-define(REDACT_VAL, "******").
+-define(IS_KEY_HEADERS(K), (K == headers orelse K == <<"headers">> orelse K == "headers")).
+-define(IS_KEY_CLIENT_JWKS(K),
+    (K == client_jwks orelse K == <<"client_jwks">> orelse K == "client_jwks")
+).
+-define(IS_VAL_NONE(V), (V == none orelse V == <<"none">> orelse V == "none")).
+-define(IS_KEY_CLIENT_JWKS_FILE(K), (K == file orelse K == <<"file">> orelse K == "file")).
+
+redacted_value() -> <<?REDACT_VAL>>.
+
+%% NOTE: keep alphabetical order
+is_sensitive_key(access_key_id) -> true;
+is_sensitive_key("access_key_id") -> true;
+is_sensitive_key(<<"access_key_id">>) -> true;
+is_sensitive_key(access_key_secret) -> true;
+is_sensitive_key("access_key_secret") -> true;
+is_sensitive_key(<<"access_key_secret">>) -> true;
+is_sensitive_key(access_token) -> true;
+is_sensitive_key("access_token") -> true;
+is_sensitive_key(<<"access_token">>) -> true;
+is_sensitive_key(account_key) -> true;
+is_sensitive_key("account_key") -> true;
+is_sensitive_key(<<"account_key">>) -> true;
+is_sensitive_key(api_key) -> true;
+is_sensitive_key("api_key") -> true;
+is_sensitive_key(<<"api_key">>) -> true;
+is_sensitive_key(api_secret) -> true;
+is_sensitive_key("api_secret") -> true;
+is_sensitive_key(<<"api_secret">>) -> true;
+is_sensitive_key(aws_secret_access_key) -> true;
+is_sensitive_key("aws_secret_access_key") -> true;
+is_sensitive_key(<<"aws_secret_access_key">>) -> true;
+is_sensitive_key(bind_password) -> true;
+is_sensitive_key("bind_password") -> true;
+is_sensitive_key(<<"bind_password">>) -> true;
+is_sensitive_key(client_jwks) -> true;
+is_sensitive_key("client_jwks") -> true;
+is_sensitive_key(<<"client_jwks">>) -> true;
+is_sensitive_key(client_secret) -> true;
+is_sensitive_key("client_secret") -> true;
+is_sensitive_key(<<"client_secret">>) -> true;
+is_sensitive_key(credentials_file_content) -> true;
+is_sensitive_key("credentials_file_content") -> true;
+is_sensitive_key(<<"credentials_file_content">>) -> true;
+is_sensitive_key(id_token) -> true;
+is_sensitive_key("id_token") -> true;
+is_sensitive_key(<<"id_token">>) -> true;
+is_sensitive_key(jwk) -> true;
+is_sensitive_key("jwk") -> true;
+is_sensitive_key(<<"jwk">>) -> true;
+is_sensitive_key(jwt) -> true;
+is_sensitive_key("jwt") -> true;
+is_sensitive_key(<<"jwt">>) -> true;
+is_sensitive_key(mfa_token) -> true;
+is_sensitive_key("mfa_token") -> true;
+is_sensitive_key(<<"mfa_token">>) -> true;
+is_sensitive_key(new_pwd) -> true;
+is_sensitive_key("new_pwd") -> true;
+is_sensitive_key(<<"new_pwd">>) -> true;
+is_sensitive_key(nkey_seed) -> true;
+is_sensitive_key("nkey_seed") -> true;
+is_sensitive_key(<<"nkey_seed">>) -> true;
+is_sensitive_key(old_pwd) -> true;
+is_sensitive_key("old_pwd") -> true;
+is_sensitive_key(<<"old_pwd">>) -> true;
+is_sensitive_key(passcode) -> true;
+is_sensitive_key("passcode") -> true;
+is_sensitive_key(<<"passcode">>) -> true;
+is_sensitive_key(passwd) -> true;
+is_sensitive_key("passwd") -> true;
+is_sensitive_key(<<"passwd">>) -> true;
+is_sensitive_key(password) -> true;
+is_sensitive_key("password") -> true;
+is_sensitive_key(<<"password">>) -> true;
+is_sensitive_key(private_key) -> true;
+is_sensitive_key("private_key") -> true;
+is_sensitive_key(<<"private_key">>) -> true;
+is_sensitive_key(private_key_password) -> true;
+is_sensitive_key(<<"private_key_password">>) -> true;
+is_sensitive_key(refresh_token) -> true;
+is_sensitive_key("refresh_token") -> true;
+is_sensitive_key(<<"refresh_token">>) -> true;
+is_sensitive_key(secret) -> true;
+is_sensitive_key("secret") -> true;
+is_sensitive_key(<<"secret">>) -> true;
+is_sensitive_key(secret_access_key) -> true;
+is_sensitive_key("secret_access_key") -> true;
+is_sensitive_key(<<"secret_access_key">>) -> true;
+is_sensitive_key(secret_key) -> true;
+is_sensitive_key("secret_key") -> true;
+is_sensitive_key(<<"secret_key">>) -> true;
+is_sensitive_key(security_token) -> true;
+is_sensitive_key("security_token") -> true;
+is_sensitive_key(<<"security_token">>) -> true;
+is_sensitive_key(sentinel_password) -> true;
+is_sensitive_key("sentinel_password") -> true;
+is_sensitive_key(<<"sentinel_password">>) -> true;
+is_sensitive_key(service_account_json) -> true;
+is_sensitive_key("service_account_json") -> true;
+is_sensitive_key(<<"service_account_json">>) -> true;
+is_sensitive_key(setup_token) -> true;
+is_sensitive_key("setup_token") -> true;
+is_sensitive_key(<<"setup_token">>) -> true;
+is_sensitive_key(sp_private_key) -> true;
+is_sensitive_key(<<"sp_private_key">>) -> true;
+is_sensitive_key(token) -> true;
+is_sensitive_key("token") -> true;
+is_sensitive_key(<<"token">>) -> true;
+is_sensitive_key(totp_code) -> true;
+is_sensitive_key("totp_code") -> true;
+is_sensitive_key(<<"totp_code">>) -> true;
+is_sensitive_key(verify_token) -> true;
+is_sensitive_key("verify_token") -> true;
+is_sensitive_key(<<"verify_token">>) -> true;
+is_sensitive_key(_) -> false.
+
+redact(Term) ->
+    do_redact(Term, fun is_sensitive_key/1).
+
+redact(Term, Checker) ->
+    do_redact(Term, fun(V) ->
+        is_sensitive_key(V) orelse Checker(V)
+    end).
+
+redact_headers(Term) ->
+    do_redact_headers(Term).
+
+do_redact([], _Checker) ->
+    [];
+do_redact([X | Xs], Checker) ->
+    %% Note: we could be dealing with an improper list
+    [do_redact(X, Checker) | do_redact(Xs, Checker)];
+do_redact(M, Checker) when is_map(M) ->
+    maps:map(
+        fun(K, V) ->
+            do_redact(K, V, Checker)
+        end,
+        M
+    );
+do_redact({Headers, Value}, _Checker) when ?IS_KEY_HEADERS(Headers) ->
+    {Headers, do_redact_headers(Value)};
+do_redact({Key, Value}, Checker) ->
+    case Checker(Key) of
+        true ->
+            {Key, redact_v(Key, Value)};
+        false ->
+            {do_redact(Key, Checker), do_redact(Value, Checker)}
+    end;
+do_redact({jose_jwk, _Keys, _Kty, _Fields}, _Checker) ->
+    %% A jose_jwk record carries the raw key material (a kty_oct binary for HMAC,
+    %% kty_rsa fields for RSA, etc.) in its inner tuples. Replace it wholesale so
+    %% the generic tuple walk below never descends into the key bytes.
+    {jose_jwk, '******'};
+do_redact(T, Checker) when is_tuple(T) ->
+    Elements = erlang:tuple_to_list(T),
+    Redact = do_redact(Elements, Checker),
+    erlang:list_to_tuple(Redact);
+do_redact(Any, _Checker) ->
+    Any.
+
+do_redact(Headers, V, _Checker) when ?IS_KEY_HEADERS(Headers) ->
+    do_redact_headers(V);
+do_redact(K, V, Checker) ->
+    case Checker(K) of
+        true ->
+            redact_v(K, V);
+        false ->
+            do_redact(V, Checker)
+    end.
+
+do_redact_headers(List) when is_list(List) ->
+    lists:map(
+        fun
+            ({K, V} = Pair) ->
+                case check_is_sensitive_header(K) of
+                    true ->
+                        {K, redact_v(V)};
+                    _ ->
+                        Pair
+                end;
+            (Any) ->
+                Any
+        end,
+        List
+    );
+do_redact_headers(Map) when is_map(Map) ->
+    maps:map(
+        fun(K, V) ->
+            case check_is_sensitive_header(K) of
+                true ->
+                    redact_v(V);
+                _ ->
+                    V
+            end
+        end,
+        Map
+    );
+do_redact_headers(Value) ->
+    Value.
+
+check_is_sensitive_header(Key) ->
+    is_sensitive_header(normalize_header_name(Key)).
+
+normalize_header_name(Key) ->
+    %% Keep this in sync with emqx_auth_http_utils:transform_header_name/1.
+    Key1 =
+        try iolist_to_binary(Key) of
+            Bin -> Bin
+        catch
+            _:_ -> Key
+        end,
+    string:lowercase(emqx_utils_conv:str(Key1)).
+
+find_header(Key, Headers) ->
+    case maps:find(Key, Headers) of
+        {ok, _} = Found ->
+            Found;
+        error ->
+            NormalizedKey = normalize_header_name(Key),
+            MatchingValues = [
+                Value
+             || {OldKey, Value} <- maps:to_list(Headers),
+                normalize_header_name(OldKey) =:= NormalizedKey
+            ],
+            find_unambiguous_header(MatchingValues)
+    end.
+
+find_unambiguous_header([]) ->
+    error;
+find_unambiguous_header([Value | Values]) ->
+    %% Raw connector and bridge configurations may preserve multiple casing
+    %% variants. Do not choose one when their stored values disagree.
+    case lists:all(fun(V) -> V =:= Value end, Values) of
+        true -> {ok, Value};
+        false -> error
+    end.
+
+is_sensitive_header("authorization") ->
+    true;
+is_sensitive_header("api-key") ->
+    true;
+is_sensitive_header("cookie") ->
+    true;
+is_sensitive_header("proxy-authorization") ->
+    true;
+is_sensitive_header("x-api-key") ->
+    true;
+is_sensitive_header("x-auth-token") ->
+    true;
+is_sensitive_header(_Any) ->
+    false.
+
+%% Scoped to the `client_jwks' object: only `file' (the JWKS content or path)
+%% holds key material, unlike the blanket `is_sensitive_key/1` check.
+is_client_jwks_file_key(K) ->
+    ?IS_KEY_CLIENT_JWKS_FILE(K).
+
+%% `client_jwks' is a union of the atom `none' and a JWKS object; only the
+%% object holds key material. `none' (the default) must stay readable. A
+%% configured object stays a union member instead of collapsing to a bare
+%% string: only `file' (the key material) is masked, so the redacted value
+%% still passes schema validation on the update path and `deobfuscate/2` can
+%% restore it.
+redact_v(K, V) when ?IS_KEY_CLIENT_JWKS(K), ?IS_VAL_NONE(V) ->
+    V;
+redact_v(K, V) when ?IS_KEY_CLIENT_JWKS(K), is_map(V) ->
+    maps:map(
+        fun(FK, FV) ->
+            case is_client_jwks_file_key(FK) of
+                true -> redact_v(FV);
+                false -> FV
+            end
+        end,
+        V
+    );
+redact_v(_K, V) ->
+    redact_v(V).
+
+redact_v(V) when is_binary(V) ->
+    case emqx_placeholder:preproc_tmpl(V) of
+        [{var, _}] ->
+            V;
+        _ ->
+            do_redact_v(V)
+    end;
+redact_v([{str, Bin}]) when is_binary(Bin) ->
+    %% The HOCON schema system may generate sensitive values with this format
+    [{str, do_redact_v(Bin)}];
+redact_v(V) ->
+    do_redact_v(V).
+
+do_redact_v(<<"file://", _/binary>> = V) ->
+    V;
+do_redact_v("file://" ++ _ = V) ->
+    V;
+do_redact_v(B) when is_binary(B) ->
+    <<?REDACT_VAL>>;
+do_redact_v(L) when is_list(L) ->
+    ?REDACT_VAL;
+do_redact_v(F) ->
+    try
+        %% this can happen in logs
+        case emqx_secret:term(F) of
+            {file, File} ->
+                File;
+            V ->
+                do_redact_v(V)
+        end
+    catch
+        _:_ ->
+            %% most of the time
+            ?REDACT_VAL
+    end.
+
+deobfuscate_headers(NewHeaders, OldHeaders) ->
+    %% Case-insensitive lookup applies only to direct entries of this map.
+    %% Nested maps re-enter deobfuscate/3 and retain exact-key matching.
+    deobfuscate(
+        NewHeaders,
+        OldHeaders,
+        fun check_is_sensitive_header/1,
+        fun find_header/2
+    ).
+
+deobfuscate(NewConf, OldConf) ->
+    deobfuscate(NewConf, OldConf, fun(_) -> false end).
+
+deobfuscate(NewConf, OldConf, IsSensitiveFun) ->
+    deobfuscate(NewConf, OldConf, IsSensitiveFun, fun maps:find/2).
+
+deobfuscate(NewConf, OldConf, IsSensitiveFun, FindOldValue) ->
+    maps:fold(
+        fun(K, V, Acc) ->
+            case FindOldValue(K, OldConf) of
+                error ->
+                    case is_redacted(K, V, IsSensitiveFun) of
+                        %% don't put redacted value into new config
+                        true -> Acc;
+                        false -> Acc#{K => V}
+                    end;
+                {ok, OldV} when is_map(V), is_map(OldV), ?IS_KEY_HEADERS(K) ->
+                    Acc#{K => deobfuscate_headers(V, OldV)};
+                {ok, OldV} when is_map(V), is_map(OldV), ?IS_KEY_CLIENT_JWKS(K) ->
+                    Acc#{K => deobfuscate(V, OldV, fun is_client_jwks_file_key/1)};
+                {ok, OldV} when is_map(V), is_map(OldV) ->
+                    Acc#{K => deobfuscate(V, OldV, IsSensitiveFun)};
+                {ok, OldV} ->
+                    case is_redacted(K, V, IsSensitiveFun) of
+                        true ->
+                            Acc#{K => OldV};
+                        _ ->
+                            Acc#{K => V}
+                    end
+            end
+        end,
+        #{},
+        NewConf
+    ).
+
+is_redacted(K, V) ->
+    do_is_redacted(K, V, fun is_sensitive_key/1).
+
+is_redacted(K, V, Fun) ->
+    do_is_redacted(K, V, fun(E) ->
+        is_sensitive_key(E) orelse Fun(E)
+    end).
+
+do_is_redacted(K, ?REDACT_VAL, Fun) ->
+    Fun(K);
+do_is_redacted(K, <<?REDACT_VAL>>, Fun) ->
+    Fun(K);
+do_is_redacted(K, WrappedFun, Fun) when is_function(WrappedFun, 0) ->
+    %% wrapped by `emqx_secret' or other module
+    do_is_redacted(K, WrappedFun(), Fun);
+do_is_redacted(_K, _V, _Fun) ->
+    false.
+
+-ifdef(TEST).
+-include_lib("eunit/include/eunit.hrl").
+
+redact_test_() ->
+    Case = fun(Type, KeyT) ->
+        Key =
+            case Type of
+                atom -> KeyT;
+                string -> erlang:atom_to_list(KeyT);
+                binary -> erlang:atom_to_binary(KeyT)
+            end,
+
+        ?assert(is_sensitive_key(Key)),
+
+        %% direct
+        ?assertEqual({Key, ?REDACT_VAL}, redact({Key, foo})),
+        ?assertEqual(#{Key => ?REDACT_VAL}, redact(#{Key => foo})),
+        ?assertEqual({Key, Key, Key}, redact({Key, Key, Key})),
+        ?assertEqual({[{Key, ?REDACT_VAL}], bar}, redact({[{Key, foo}], bar})),
+
+        %% 1 level nested
+        ?assertEqual([{Key, ?REDACT_VAL}], redact([{Key, foo}])),
+        ?assertEqual([#{Key => ?REDACT_VAL}], redact([#{Key => foo}])),
+
+        %% 2 level nested
+        ?assertEqual(#{opts => [{Key, ?REDACT_VAL}]}, redact(#{opts => [{Key, foo}]})),
+        ?assertEqual(#{opts => #{Key => ?REDACT_VAL}}, redact(#{opts => #{Key => foo}})),
+        ?assertEqual({opts, [{Key, ?REDACT_VAL}]}, redact({opts, [{Key, foo}]})),
+
+        %% 3 level nested
+        ?assertEqual([#{opts => [{Key, ?REDACT_VAL}]}], redact([#{opts => [{Key, foo}]}])),
+        ?assertEqual([{opts, [{Key, ?REDACT_VAL}]}], redact([{opts, [{Key, foo}]}])),
+        ?assertEqual([{opts, [#{Key => ?REDACT_VAL}]}], redact([{opts, [#{Key => foo}]}]))
+    end,
+
+    Types = [atom, string, binary],
+    Keys = [
+        account_key,
+        access_token,
+        api_secret,
+        aws_secret_access_key,
+        client_secret,
+        credentials_file_content,
+        passcode,
+        passwd,
+        password,
+        nkey_seed,
+        private_key,
+        secret,
+        secret_key,
+        secret_access_key,
+        security_token,
+        sentinel_password,
+        token,
+        bind_password
+    ],
+    [{case_name(Type, Key), fun() -> Case(Type, Key) end} || Key <- Keys, Type <- Types].
+
+redact2_test_() ->
+    Case = fun(Key, Checker) ->
+        ?assertEqual({Key, ?REDACT_VAL}, redact({Key, foo}, Checker)),
+        ?assertEqual(#{Key => ?REDACT_VAL}, redact(#{Key => foo}, Checker)),
+        ?assertEqual({Key, Key, Key}, redact({Key, Key, Key}, Checker)),
+        ?assertEqual({[{Key, ?REDACT_VAL}], bar}, redact({[{Key, foo}], bar}, Checker))
+    end,
+
+    Checker = fun(E) -> E =:= passcode end,
+
+    Keys = [secret, passcode],
+    [{case_name(atom, Key), fun() -> Case(Key, Checker) end} || Key <- Keys].
+
+redact_improper_list_test_() ->
+    %% improper lists: check that we don't crash
+    %% may arise when we redact process states with pending `gen' requests
+    [
+        ?_assertEqual([alias | foo], redact([alias | foo])),
+        ?_assertEqual([1, 2 | foo], redact([1, 2 | foo]))
+    ].
+
+jose_jwk_redact_test_() ->
+    %% The kty_oct binary is the raw HMAC key material; it must never survive redaction.
+    Secret = <<"abcd1234">>,
+    JWK = {jose_jwk, undefined, {jose_jwk_kty_oct, Secret}, #{}},
+    NoLeak = fun(Term) ->
+        Rendered = iolist_to_binary(io_lib:format("~p", [redact(Term)])),
+        nomatch =:= binary:match(Rendered, Secret)
+    end,
+    [
+        %% Record-shape redaction (Layer 1): matched anywhere the record is walked,
+        %% e.g. under a non-sensitive key, the whole record is replaced.
+        ?_assertEqual({jose_jwk, '******'}, redact(JWK)),
+        ?_assertMatch(
+            #{current_jwk := {jose_jwk, '******'}, other := <<"value">>},
+            redact(#{current_jwk => JWK, other => <<"value">>})
+        ),
+        ?_assert(NoLeak(JWK)),
+        %% Deeply nested inside a config-update style state map.
+        ?_assert(
+            NoLeak(#{
+                emqx_authn_config => #{
+                    state => #{
+                        jwk => JWK,
+                        disconnect_after_expire => true
+                    }
+                }
+            })
+        ),
+        %% Map-key redaction (Layer 1b): a `jwk' key has its value replaced wholesale,
+        %% covering non-record values too (e.g. a plain map from a JWKS endpoint).
+        ?_assertEqual(#{jwk => ?REDACT_VAL}, redact(#{jwk => #{<<"k">> => Secret}})),
+        ?_assert(NoLeak(#{jwk => #{<<"k">> => Secret}}))
+    ].
+
+deobfuscate_test() ->
+    NewConf0 = #{foo => <<"bar0">>, password => <<"123456">>},
+    ?assertEqual(NewConf0, deobfuscate(NewConf0, #{foo => <<"bar">>, password => <<"654321">>})),
+
+    NewConf1 = #{foo => <<"bar1">>, password => <<?REDACT_VAL>>},
+    ?assertEqual(
+        #{foo => <<"bar1">>, password => <<"654321">>},
+        deobfuscate(NewConf1, #{foo => <<"bar">>, password => <<"654321">>})
+    ),
+
+    %% Don't have password before and ignore to put redact_val into new config
+    NewConf2 = #{foo => <<"bar2">>, password => ?REDACT_VAL},
+    ?assertEqual(#{foo => <<"bar2">>}, deobfuscate(NewConf2, #{foo => <<"bar">>})),
+
+    %% Don't have password before and should allow put non-redact-val into new config
+    NewConf3 = #{foo => <<"bar3">>, password => <<"123456">>},
+    ?assertEqual(NewConf3, deobfuscate(NewConf3, #{foo => <<"bar">>})),
+
+    HeaderConf1 = #{<<"headers">> => #{<<"Authorization">> => <<"Bearer token">>}},
+    HeaderConf1Obs = #{<<"headers">> => #{<<"Authorization">> => ?REDACT_VAL}},
+    ?assertEqual(HeaderConf1, deobfuscate(HeaderConf1Obs, HeaderConf1)),
+
+    HeaderConf2 = #{<<"headers">> => #{<<"authorization">> => <<"Bearer token">>}},
+    HeaderConf2Obs = #{<<"headers">> => #{<<"Authorization">> => ?REDACT_VAL}},
+    ?assertEqual(
+        #{<<"headers">> => #{<<"Authorization">> => <<"Bearer token">>}},
+        deobfuscate(HeaderConf2Obs, HeaderConf2)
+    ),
+
+    AtomHeaderConf = #{
+        <<"headers">> => #{authorization => <<"Bearer token">>}
+    },
+    AtomHeaderConfObs = #{
+        <<"headers">> => #{<<"Authorization">> => ?REDACT_VAL}
+    },
+    ?assertEqual(
+        #{<<"headers">> => #{<<"Authorization">> => <<"Bearer token">>}},
+        deobfuscate(AtomHeaderConfObs, AtomHeaderConf)
+    ),
+
+    DuplicateHeaders = #{
+        <<"headers">> => #{
+            <<"Authorization">> => <<"upper-secret">>,
+            <<"authorization">> => <<"lower-secret">>
+        }
+    },
+    DuplicateHeadersObs = #{
+        <<"headers">> => #{
+            <<"Authorization">> => ?REDACT_VAL,
+            <<"authorization">> => ?REDACT_VAL
+        }
+    },
+    ?assertEqual(DuplicateHeaders, deobfuscate(DuplicateHeadersObs, DuplicateHeaders)),
+
+    AmbiguousHeadersObs = #{
+        <<"headers">> => #{<<"AUTHORIZATION">> => ?REDACT_VAL}
+    },
+    ?assertEqual(
+        #{<<"headers">> => #{}},
+        deobfuscate(AmbiguousHeadersObs, DuplicateHeaders)
+    ),
+
+    EqualDuplicateHeaders = #{
+        <<"headers">> => #{
+            <<"Authorization">> => <<"same-secret">>,
+            <<"authorization">> => <<"same-secret">>
+        }
+    },
+    EqualDuplicateHeadersObs = #{
+        <<"headers">> => #{<<"AUTHORIZATION">> => ?REDACT_VAL}
+    },
+    ?assertEqual(
+        #{<<"headers">> => #{<<"AUTHORIZATION">> => <<"same-secret">>}},
+        deobfuscate(EqualDuplicateHeadersObs, EqualDuplicateHeaders)
+    ),
+
+    HeaderConf3 = #{<<"headers">> => #{<<"authorization">> => <<"Bearer token">>}},
+    HeaderConf3Obs = #{<<"headers">> => #{<<" Authorization ">> => ?REDACT_VAL}},
+    ?assertEqual(
+        HeaderConf3Obs,
+        deobfuscate(HeaderConf3Obs, HeaderConf3)
+    ),
+
+    NestedHeaderConf = #{
+        <<"headers">> => #{<<"X-Meta">> => #{<<"Token">> => <<"old-token">>}}
+    },
+    NestedHeaderConfObs = #{
+        <<"headers">> => #{<<"x-meta">> => #{<<"token">> => ?REDACT_VAL}}
+    },
+    ?assertEqual(
+        #{<<"headers">> => #{<<"x-meta">> => #{}}},
+        deobfuscate(NestedHeaderConfObs, NestedHeaderConf)
+    ),
+
+    ok.
+
+noncanonical_header_name_is_not_redacted_test() ->
+    HeaderConf = #{
+        <<"headers">> => #{<<" Authorization ">> => <<"secret">>}
+    },
+    ?assertEqual(HeaderConf, redact(HeaderConf)).
+
+redact_header_test_() ->
+    Types = [string, binary, atom],
+    Keys = [
+        "api-key",
+        "auThorization",
+        "Authorization",
+        "authorizaTion",
+        "cookie",
+        "proxy-authorizaTion",
+        "proXy-authoriZaTion",
+        "x-api-key",
+        "x-auth-token"
+    ],
+
+    Case = fun(Type, Key0) ->
+        Converter =
+            case Type of
+                binary ->
+                    fun erlang:list_to_binary/1;
+                atom ->
+                    fun erlang:list_to_atom/1;
+                _ ->
+                    fun(Any) -> Any end
+            end,
+
+        Name = Converter("headers"),
+        Key = Converter(Key0),
+        Value = Converter("value"),
+        Value1 = redact_v(Value),
+        ?assertMatch(
+            {Name, [{Key, Value1}]},
+            redact({Name, [{Key, Value}]})
+        ),
+
+        ?assertMatch(
+            #{Name := #{Key := Value1}},
+            redact(#{Name => #{Key => Value}})
+        )
+    end,
+
+    [{case_name(Type, Key), fun() -> Case(Type, Key) end} || Key <- Keys, Type <- Types].
+
+case_name(Type, Key) ->
+    lists:concat([Type, "-", Key]).
+
+-endif.

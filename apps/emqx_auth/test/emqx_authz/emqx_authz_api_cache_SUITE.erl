@@ -1,0 +1,182 @@
+%%--------------------------------------------------------------------
+%% Copyright (c) 2020-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
+%%--------------------------------------------------------------------
+
+-module(emqx_authz_api_cache_SUITE).
+
+-compile(nowarn_export_all).
+-compile(export_all).
+
+-import(emqx_mgmt_api_test_util, [request/2, request/3, uri/1]).
+
+-include_lib("eunit/include/eunit.hrl").
+-include_lib("common_test/include/ct.hrl").
+-include_lib("emqx/include/emqx_placeholder.hrl").
+
+-define(SOURCE_HTTP, #{
+    <<"type">> => <<"http">>,
+    <<"enable">> => true,
+    <<"url">> => <<"https://127.0.0.1:443/acl?username=", ?PH_USERNAME/binary>>,
+    <<"ssl">> => #{<<"enable">> => true},
+    <<"headers">> => #{},
+    <<"method">> => <<"get">>,
+    <<"request_timeout">> => <<"5s">>
+}).
+
+suite() -> [{timetrap, {seconds, 60}}].
+
+all() ->
+    [{group, legacy}, {group, hardened}].
+
+groups() ->
+    Tests = emqx_common_test_helpers:all(?MODULE),
+    [{legacy, [], Tests}, {hardened, [], Tests}].
+
+init_per_suite(Config) ->
+    emqx_common_test_helpers:clear_security_profile(),
+    Config.
+
+end_per_suite(_Config) ->
+    emqx_common_test_helpers:clear_security_profile().
+
+init_per_group(Profile, Config) when Profile =:= legacy; Profile =:= hardened ->
+    ok = emqx_common_test_helpers:set_security_profile(Profile),
+    Apps = emqx_cth_suite:start(
+        [
+            {emqx_conf,
+                emqx_authz_test_lib:emqx_appspec(#{
+                    config => #{
+                        authorization =>
+                            #{
+                                cache => #{enable => true},
+                                no_match => deny,
+                                sources => []
+                            }
+                    }
+                })},
+            {emqx_auth, #{after_start => fun() -> ok end}},
+            emqx_bridge_http,
+            emqx_management,
+            emqx_mgmt_api_test_util:emqx_dashboard()
+        ],
+        #{work_dir => emqx_cth_suite:work_dir(Profile, Config)}
+    ),
+    [{apps, Apps}, {security_profile, Profile} | Config].
+
+end_per_group(Profile, Config) when Profile =:= legacy; Profile =:= hardened ->
+    emqx_cth_suite:stop(?config(apps, Config)),
+    emqx_common_test_helpers:clear_security_profile().
+
+init_per_testcase(_Case, Config) ->
+    Config.
+
+end_per_testcase(t_node_cache, _Config) ->
+    {ok, 204, _} = request(
+        delete,
+        uri(["authorization", "sources", "http"]),
+        []
+    ),
+    ok = emqx_authz_source_registry:unregister(http),
+    emqx_common_test_helpers:call_janitor(),
+    ok;
+end_per_testcase(_, _Config) ->
+    emqx_common_test_helpers:call_janitor(),
+    ok.
+
+t_clean_cache(_) ->
+    {ok, C} = emqtt:start_link([{clientid, <<"emqx0">>}, {username, <<"emqx0">>}]),
+    {ok, _} = emqtt:connect(C),
+    {ok, _, _} = emqtt:subscribe(C, <<"a/b/c">>, 0),
+    ok = emqtt:publish(C, <<"a/b/c">>, <<"{\"x\":1,\"y\":1}">>, 0),
+    %% wait for async publish to be processed and cached
+    ct:sleep(100),
+    %% only publish is cached now (subscribe is not cached)
+    {ok, 200, Result3} = request(get, uri(["clients", "emqx0", "authorization", "cache"])),
+    ?assertEqual(1, length(emqx_utils_json:decode(Result3))),
+
+    request(delete, uri(["authorization", "cache"])),
+
+    {ok, 200, Result4} = request(get, uri(["clients", "emqx0", "authorization", "cache"])),
+    ?assertEqual(0, length(emqx_utils_json:decode(Result4))),
+
+    ok.
+
+t_node_cache(_) ->
+    {ok, 200, CacheData0} = request(
+        get,
+        uri(["authorization", "node_cache"])
+    ),
+    ?assertMatch(
+        #{<<"enable">> := true},
+        emqx_utils_json:decode(CacheData0)
+    ),
+    {ok, 200, MetricsData0} = request(
+        get,
+        uri(["authorization", "node_cache", "status"])
+    ),
+    ?assertMatch(
+        #{<<"metrics">> := #{<<"count">> := 0}},
+        emqx_utils_json:decode(MetricsData0)
+    ),
+    {ok, 204, _} = request(
+        put,
+        uri(["authorization", "node_cache"]),
+        #{
+            <<"enable">> => true
+        }
+    ),
+    {ok, 200, CacheData1} = request(
+        get,
+        uri(["authorization", "node_cache"])
+    ),
+    ok = emqx_authz_source_registry:register(http, emqx_authz_http),
+    ?assertMatch(
+        #{<<"enable">> := true},
+        emqx_utils_json:decode(CacheData1)
+    ),
+    {ok, 204, _} = request(post, uri(["authorization", "sources"]), ?SOURCE_HTTP),
+
+    %% We enabled authz cache, let's create client and make a subscription
+    %% to touch the cache
+    {ok, Client} = emqtt:start_link([
+        {username, <<"user">>},
+        {password, <<"pass">>}
+    ]),
+    ?assertMatch(
+        {ok, _},
+        emqtt:connect(Client)
+    ),
+    {ok, _, _} = emqtt:subscribe(Client, <<"test/topic">>, 1),
+    ok = emqtt:disconnect(Client),
+
+    %% Now check the metrics, the cache should have been populated
+    {ok, 200, MetricsData2} = request(
+        get,
+        uri(["authorization", "node_cache", "status"])
+    ),
+    ?assertMatch(
+        #{<<"metrics">> := #{<<"misses">> := #{<<"value">> := 1}}},
+        emqx_utils_json:decode(MetricsData2)
+    ),
+    ok.
+
+%% Check that some default values are provided even if the config is not set
+t_node_cache_get(_Config) ->
+    RawConfig0 = emqx:get_raw_config([authorization]),
+    RawConfig1 = maps:without([<<"node_cache">>], RawConfig0),
+    {ok, _} = emqx:update_config([authorization], RawConfig1),
+
+    {ok, 200, CacheData0} = request(
+        get,
+        uri(["authorization", "node_cache"])
+    ),
+    ?assertMatch(
+        #{<<"enable">> := true},
+        emqx_utils_json:decode(CacheData0)
+    ).
+
+t_node_cache_reset(_) ->
+    {ok, 204, _} = request(
+        post,
+        uri(["authorization", "node_cache", "reset"])
+    ).

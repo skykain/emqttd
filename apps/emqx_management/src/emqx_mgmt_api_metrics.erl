@@ -1,42 +1,186 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_mgmt_api_metrics).
 
--rest_api(#{name   => list_all_metrics,
-            method => 'GET',
-            path   => "/metrics",
-            func   => list,
-            descr  => "A list of metrics of all nodes in the cluster"}).
+-behaviour(minirest_api).
 
--rest_api(#{name   => list_node_metrics,
-            method => 'GET',
-            path   => "/nodes/:atom:node/metrics",
-            func   => list,
-            descr  => "A list of metrics of a node"}).
+-include_lib("typerefl/include/types.hrl").
+-include_lib("hocon/include/hocon_types.hrl").
+-include_lib("emqx/include/logger.hrl").
+-include_lib("emqx_utils/include/emqx_api_key_scopes.hrl").
 
--export([list/2]).
+-import(hoconsc, [mk/2, ref/2]).
 
-list(Bindings, _Params) when map_size(Bindings) == 0 ->
-    minirest:return({ok, [#{node => Node, metrics => maps:from_list(Metrics)}
-                              || {Node, Metrics} <- emqx_mgmt:get_metrics()]});
+%% minirest/dashboard_swagger behaviour callbacks
+-export([
+    api_spec/0,
+    paths/0,
+    schema/1,
+    namespace/0
+]).
 
-list(#{node := Node}, _Params) ->
-    case emqx_mgmt:get_metrics(Node) of
-        {error, Reason} -> minirest:return({error, Reason});
-        Metrics         -> minirest:return({ok, maps:from_list(Metrics)})
+-export([
+    roots/0,
+    fields/1
+]).
+
+%% http handlers
+-export([metrics/2]).
+
+%% test
+-export([cluster_metrics/1]).
+-export([scopes/0]).
+
+%%--------------------------------------------------------------------
+%% minirest behaviour callbacks
+%%--------------------------------------------------------------------
+
+namespace() -> undefined.
+
+api_spec() ->
+    emqx_dashboard_swagger:spec(?MODULE, #{check_schema => true}).
+
+scopes() -> ?SCOPE_MONITORING.
+
+paths() ->
+    ["/metrics"].
+
+%%--------------------------------------------------------------------
+%% http handlers
+
+metrics(get, #{query_string := Qs}) ->
+    case maps:get(<<"aggregate">>, Qs, false) of
+        true ->
+            %% sum counters from all nodes into one single map
+            {200, emqx_mgmt:get_metrics()};
+        false ->
+            Node = parse_node(maps:get(<<"node">>, Qs, no_value)),
+            %% return metrics for individual nodes
+            %% make a remote call to make test easier
+            Data = ?MODULE:cluster_metrics(Node),
+            {200, Data}
     end.
 
+parse_node(no_value) ->
+    no_value;
+parse_node(Node) ->
+    try
+        binary_to_existing_atom(Node)
+    catch
+        _:_ ->
+            invalid
+    end.
+
+%% if no success (unlikely to happen though), log error level
+%% otherwise warning.
+badrpc_log_level([]) -> error;
+badrpc_log_level(_) -> warning.
+
+cluster_metrics(no_value) ->
+    cluster_metrics(emqx:running_nodes());
+cluster_metrics(invalid) ->
+    %% invalid node name is equivalent to a node running but rpc failed
+    [];
+cluster_metrics(Node) when is_atom(Node) ->
+    cluster_metrics([Node]);
+cluster_metrics(Nodes) when is_list(Nodes) ->
+    %% each call has 5 seconds timeout, so it's ok to use infinity here
+    L1 = emqx_utils:pmap(
+        fun(Node) ->
+            case emqx_mgmt:get_metrics(Node) of
+                {error, Reason} ->
+                    #{node => Node, reason => Reason};
+                Result when is_list(Result) ->
+                    [{node, Node} | Result]
+            end
+        end,
+        Nodes,
+        infinity
+    ),
+    {OK, Failed} =
+        lists:partition(
+            fun
+                (R) when is_list(R) ->
+                    true;
+                (E) when is_map(E) ->
+                    false
+            end,
+            L1
+        ),
+    Failed =/= [] andalso
+        ?SLOG(
+            badrpc_log_level(OK),
+            #{msg => "failed_to_fetch_metrics", errors => Failed},
+            #{tag => "MGMT"}
+        ),
+    lists:map(fun maps:from_list/1, OK).
+
+%%--------------------------------------------------------------------
+%% swagger defines
+%%--------------------------------------------------------------------
+
+schema("/metrics") ->
+    #{
+        'operationId' => metrics,
+        get =>
+            #{
+                description => ?DESC(emqx_metrics),
+                tags => [<<"Metrics">>],
+                parameters =>
+                    [
+                        {aggregate,
+                            mk(
+                                boolean(),
+                                #{
+                                    in => query,
+                                    required => false,
+                                    default => false,
+                                    desc => ?DESC("aggregate_parameter")
+                                }
+                            )},
+                        {node,
+                            mk(
+                                binary(),
+                                #{
+                                    in => query,
+                                    required => false,
+                                    desc => ?DESC("node_parameter")
+                                }
+                            )}
+                    ],
+                responses =>
+                    #{
+                        200 => hoconsc:union(
+                            [
+                                %% aggregate=true
+                                ref(?MODULE, aggregated_metrics),
+                                %% aggregate=false
+                                hoconsc:array(ref(?MODULE, node_metrics))
+                            ]
+                        )
+                    }
+            }
+    }.
+
+roots() ->
+    [].
+
+fields(aggregated_metrics) ->
+    properties();
+fields(node_metrics) ->
+    [{node, mk(binary(), #{desc => ?DESC("node_name")})}] ++ properties().
+
+properties() ->
+    Metrics = emqx_metrics:all_metrics(),
+    lists:foldl(
+        fun({_Type, MetricName, Desc}, Acc) ->
+            [m(MetricName, Desc) | Acc]
+        end,
+        [],
+        Metrics
+    ).
+
+m(K, Desc) ->
+    {K, mk(non_neg_integer(), #{desc => Desc})}.

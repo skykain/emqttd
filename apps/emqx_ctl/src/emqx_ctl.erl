@@ -1,0 +1,504 @@
+%%--------------------------------------------------------------------
+%% Copyright (c) 2017-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
+%%
+%% Licensed under the Apache License, Version 2.0 (the "License");
+%% you may not use this file except in compliance with the License.
+%% You may obtain a copy of the License at
+%%
+%%     http://www.apache.org/licenses/LICENSE-2.0
+%%
+%% Unless required by applicable law or agreed to in writing, software
+%% distributed under the License is distributed on an "AS IS" BASIS,
+%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+%% See the License for the specific language governing permissions and
+%% limitations under the License.
+%%--------------------------------------------------------------------
+
+-module(emqx_ctl).
+
+-behaviour(gen_server).
+
+-callback load() -> ok.
+-callback unload() -> ok.
+
+-include_lib("kernel/include/logger.hrl").
+
+-export([start_link/0, stop/0]).
+
+-export([
+    register_command/2,
+    register_command/3,
+    unregister_command/1
+]).
+
+-export([
+    run_command/1,
+    run_command/2,
+    lookup_command/1,
+    get_commands/0,
+    eval_erl/1,
+    eval_erl_audit_args/1
+]).
+
+-export([
+    print/1,
+    print/2,
+    warning/1,
+    warning/2,
+    usage/1,
+    usage/2
+]).
+
+%% Exports mainly for test cases
+-export([
+    format/2,
+    format_usage/1,
+    format_usage/2
+]).
+
+%% gen_server callbacks
+-export([
+    init/1,
+    handle_call/3,
+    handle_cast/2,
+    handle_info/2,
+    terminate/2,
+    code_change/3
+]).
+
+-record(state, {seq = 0}).
+
+-type cmd() :: atom().
+-type cmd_params() :: string().
+-type cmd_descr() :: string().
+-type cmd_usage() :: {cmd_params(), cmd_descr()}.
+
+-define(SERVER, ?MODULE).
+-define(CMD_TAB, emqx_command).
+
+%% Set by usage/1,2 to tell execute_command/4 not to audit the command:
+%% it only printed its help. Both run in the same process.
+-define(USAGE_PRINT_NO_AUDIT, '$emqx_ctl_usage_no_audit').
+
+-spec start_link() -> {ok, pid()}.
+start_link() ->
+    gen_server:start_link({local, ?SERVER}, ?MODULE, [], []).
+
+-spec stop() -> ok.
+stop() ->
+    try
+        gen_server:stop(?SERVER)
+    catch
+        exit:R when R =:= noproc orelse R =:= timeout ->
+            ok
+    end.
+
+-spec register_command(cmd(), {module(), atom()}) -> ok.
+register_command(Cmd, MF) when is_atom(Cmd) ->
+    register_command(Cmd, MF, []).
+
+-spec register_command(cmd(), {module(), atom()}, list()) -> ok.
+register_command(Cmd, MF, Opts) when is_atom(Cmd) ->
+    call({register_command, Cmd, MF, Opts}).
+
+-spec unregister_command(cmd()) -> ok.
+unregister_command(Cmd) when is_atom(Cmd) ->
+    cast({unregister_command, Cmd}).
+
+call(Req) -> gen_server:call(?SERVER, Req, 5000).
+
+cast(Msg) -> gen_server:cast(?SERVER, Msg).
+
+-spec run_command(list(string())) -> ok | {ok, term()} | {error, term()}.
+run_command([]) ->
+    run_command(help, []);
+run_command([Cmd | Args]) ->
+    case safe_to_existing_atom(Cmd) of
+        {ok, Cmd1} ->
+            run_command(Cmd1, Args);
+        _ ->
+            help(),
+            {error, cmd_not_found}
+    end.
+
+-spec run_command(cmd(), list(string())) -> ok | {ok, term()} | {error, term()}.
+run_command(help, []) ->
+    help();
+run_command(Cmd, Args) when is_atom(Cmd) ->
+    Start = erlang:monotonic_time(),
+    case lookup_command(Cmd) of
+        {ok, CliHandler} ->
+            execute_command(Cmd, Args, CliHandler, Start);
+        {error, Reason} ->
+            help(),
+            {error, Reason}
+    end.
+
+execute_command(Cmd, Args, {Mod, Fun} = CliHandler, Start) ->
+    _ = erase(?USAGE_PRINT_NO_AUDIT),
+    Result =
+        try
+            normalize_result(apply(Mod, Fun, [Args]))
+        catch
+            _:Reason:Stacktrace ->
+                ?LOG_ERROR(#{
+                    msg => "ctl_command_crashed",
+                    stacktrace => Stacktrace,
+                    reason => Reason,
+                    module => Mod,
+                    function => Fun
+                }),
+                {error, Reason}
+        end,
+    Duration = erlang:convert_time_unit(erlang:monotonic_time() - Start, native, millisecond),
+    case erase(?USAGE_PRINT_NO_AUDIT) of
+        true ->
+            %% The command only printed its usage, no operation to audit.
+            ok;
+        _ ->
+            audit_log(
+                audit_level(Result, Duration),
+                cli,
+                CliHandler,
+                #{duration_ms => Duration, cmd => Cmd, args => Args, node => node()}
+            )
+    end,
+    Result.
+
+-spec lookup_command(cmd()) -> {module(), atom()} | {error, any()}.
+lookup_command(eval_erl) ->
+    %% So far 'emqx ctl eval_erl Expr' is a undocumented hidden command.
+    %% For backward compatibility,
+    %% the documented command 'emqx eval Expr' has the expression parsed
+    %% in the remsh node (nodetool).
+    %%
+    %% 'eval_erl' is added for two purposes
+    %% 1. 'emqx eval Expr' can be audited
+    %% 2. 'emqx ctl eval_erl Expr' simplifies the scripting part
+    {ok, {?MODULE, eval_erl}};
+lookup_command(Cmd) when is_atom(Cmd) ->
+    case is_initialized() of
+        true ->
+            case ets:match(?CMD_TAB, {{'_', Cmd}, '$1', '_'}) of
+                [[{M, F}]] -> {ok, {M, F}};
+                [] -> {error, cmd_not_found}
+            end;
+        false ->
+            {error, cmd_is_initializing}
+    end.
+
+-spec get_commands() -> list({cmd(), module(), atom()}).
+get_commands() ->
+    [{Cmd, M, F} || {{_Seq, Cmd}, {M, F}, _Opts} <- ets:tab2list(?CMD_TAB)].
+
+help() ->
+    case is_initialized() of
+        true ->
+            case ets:tab2list(?CMD_TAB) of
+                [] ->
+                    print("No commands available.~n");
+                Cmds ->
+                    print("Usage: ~ts~n", ["emqx ctl"]),
+                    lists:foreach(fun print_usage/1, Cmds)
+            end;
+        false ->
+            print("Command table is initializing.~n")
+    end.
+
+print_usage({_, {Mod, Cmd}, Opts}) ->
+    case proplists:get_bool(hidden, Opts) of
+        true ->
+            ok;
+        false ->
+            print("~110..-s~n", [""]),
+            apply(Mod, Cmd, [usage])
+    end.
+
+-spec print(io:format()) -> ok.
+print(Msg) ->
+    io:format("~ts", [format(Msg, [])]).
+
+-spec print(io:format(), [term()]) -> ok.
+print(Format, Args) ->
+    io:format("~ts", [format(Format, Args)]).
+
+-spec warning(io:format()) -> ok.
+warning(Format) ->
+    warning(Format, []).
+
+-spec warning(io:format(), [term()]) -> ok.
+warning(Format, Args) ->
+    io:format("\e[31m~ts\e[0m", [format(Format, Args)]).
+
+-spec usage([cmd_usage()]) -> ok.
+usage(UsageList) ->
+    mark_no_audit(),
+    io:format(format_usage(UsageList)).
+
+-spec usage(cmd_params(), cmd_descr()) -> ok.
+usage(CmdParams, Desc) ->
+    mark_no_audit(),
+    io:format(format_usage(CmdParams, Desc)).
+
+-spec format(io:format(), [term()]) -> string().
+format(Format, Args) ->
+    lists:flatten(io_lib:format(Format, Args)).
+
+-spec format_usage([cmd_usage()]) -> [string()].
+format_usage(UsageList) ->
+    Width = lists:foldl(
+        fun({CmdStr, _}, W) ->
+            max(cmd_str_width(CmdStr), W)
+        end,
+        0,
+        UsageList
+    ),
+    lists:map(
+        fun({CmdParams, Desc}) ->
+            format_usage(CmdParams, Desc, Width)
+        end,
+        UsageList
+    ).
+
+-spec cmd_str_width(string()) -> integer().
+cmd_str_width(CmdStr) ->
+    lists:foldl(
+        fun(Line, W) ->
+            max(iolist_size(Line), W)
+        end,
+        0,
+        split_cmd(CmdStr)
+    ).
+
+-spec format_usage(cmd_params(), cmd_descr()) -> string().
+format_usage(CmdParams, Desc) ->
+    format_usage(CmdParams, Desc, 0).
+
+format_usage(CmdParams, Desc, 0) ->
+    format_usage(CmdParams, Desc, iolist_size(CmdParams));
+format_usage(CmdParams, Desc, Width) ->
+    CmdLines = split_cmd(CmdParams),
+    DescLines = split_cmd(Desc),
+    Zipped = zip_cmd(CmdLines, DescLines),
+    Fmt = "~-" ++ integer_to_list(Width + 1) ++ "s# ~ts~n",
+    lists:foldl(
+        fun({CmdStr, DescStr}, Usage) ->
+            Usage ++ format(Fmt, [CmdStr, DescStr])
+        end,
+        "",
+        Zipped
+    ).
+
+%%--------------------------------------------------------------------
+%% gen_server callbacks
+%%--------------------------------------------------------------------
+
+init([]) ->
+    _ = ets:new(?CMD_TAB, [named_table, protected, ordered_set]),
+    {ok, #state{seq = 0}}.
+
+handle_call({register_command, Cmd, MF, Opts}, _From, State = #state{seq = Seq}) ->
+    case ets:match(?CMD_TAB, {{'$1', Cmd}, '_', '_'}) of
+        [] ->
+            ets:insert(?CMD_TAB, {{Seq, Cmd}, MF, Opts}),
+            {reply, ok, next_seq(State)};
+        [[OriginSeq] | _] ->
+            ?LOG_INFO(#{msg => "CMD_overridden", cmd => Cmd, mf => MF}),
+            true = ets:insert(?CMD_TAB, {{OriginSeq, Cmd}, MF, Opts}),
+            {reply, ok, State}
+    end;
+handle_call(Req, _From, State) ->
+    ?LOG_ERROR(#{msg => "unexpected_call", call => Req}),
+    {reply, ignored, State}.
+
+handle_cast({unregister_command, Cmd}, State) ->
+    ets:match_delete(?CMD_TAB, {{'_', Cmd}, '_', '_'}),
+    noreply(State);
+handle_cast(Msg, State) ->
+    ?LOG_ERROR(#{msg => "unexpected_cast", cast => Msg}),
+    noreply(State).
+
+handle_info(Info, State) ->
+    ?LOG_ERROR(#{msg => "unexpected_info", info => Info}),
+    noreply(State).
+
+terminate(_Reason, _State) ->
+    ok.
+
+code_change(_OldVsn, State, _Extra) ->
+    {ok, State}.
+
+%%------------------------------------------------------------------------------
+%% Internal Function
+%%------------------------------------------------------------------------------
+
+noreply(State) ->
+    {noreply, State, hibernate}.
+
+next_seq(State = #state{seq = Seq}) ->
+    State#state{seq = Seq + 1}.
+
+split_cmd(CmdStr) ->
+    Lines = string:split(CmdStr, "\n", all),
+    [L || L <- Lines, L =/= []].
+
+zip_cmd([X | Xs], [Y | Ys]) -> [{X, Y} | zip_cmd(Xs, Ys)];
+zip_cmd([X | Xs], []) -> [{X, ""} | zip_cmd(Xs, [])];
+zip_cmd([], [Y | Ys]) -> [{"", Y} | zip_cmd([], Ys)];
+zip_cmd([], []) -> [].
+
+safe_to_existing_atom(Str) ->
+    try
+        {ok, list_to_existing_atom(Str)}
+    catch
+        _:badarg ->
+            undefined
+    end.
+
+is_initialized() ->
+    ets:info(?CMD_TAB) =/= undefined.
+
+mark_no_audit() ->
+    _ = put(?USAGE_PRINT_NO_AUDIT, true),
+    ok.
+
+audit_log(Level, From, CliHandler, Log) ->
+    case lookup_command(audit) of
+        {error, _} ->
+            ignore;
+        {ok, {Mod, Fun}} ->
+            Log1 = apply_audit_args_callback(CliHandler, Log),
+            case prune_unnecessary_log(Log1) of
+                false ->
+                    ok;
+                {ok, Log2} ->
+                    apply_audit_command(Log2, Mod, Fun, Level, From)
+            end
+    end.
+
+apply_audit_args_callback({CliModule, CliFunction} = CliHandler, Log = #{args := Args}) ->
+    case audit_args_function(CliModule, CliFunction) of
+        undefined ->
+            Log#{args => emqx_cli_redact:redact_all(Args)};
+        AuditArgsFunction ->
+            try apply(CliModule, AuditArgsFunction, [Args]) of
+                RedactedArgs when is_list(RedactedArgs) ->
+                    case valid_audit_args(Log, RedactedArgs) of
+                        true -> Log#{args => RedactedArgs};
+                        false -> redact_all_args(Log, CliHandler, invalid_return)
+                    end;
+                _ ->
+                    redact_all_args(Log, CliHandler, invalid_return)
+            catch
+                Class:_Reason:_Stacktrace ->
+                    ?LOG_ERROR(#{
+                        msg => "cli_audit_redaction_failed",
+                        exception => Class,
+                        module => CliModule,
+                        function => CliFunction
+                    }),
+                    Log#{args => emqx_cli_redact:redact_all(Args)}
+            end
+    end.
+
+audit_args_function(CliModule, CliFunction) ->
+    Name = atom_to_list(CliFunction) ++ "_audit_args",
+    try list_to_existing_atom(Name) of
+        AuditArgsFunction ->
+            case erlang:function_exported(CliModule, AuditArgsFunction, 1) of
+                true -> AuditArgsFunction;
+                false -> undefined
+            end
+    catch
+        error:badarg -> undefined
+    end.
+
+valid_audit_args(#{cmd := eval_erl}, [Parsed | _]) when is_tuple(Parsed) ->
+    true;
+valid_audit_args(_Log, Args) ->
+    lists:all(fun(Arg) -> is_list(Arg) orelse is_binary(Arg) end, Args).
+
+redact_all_args(Log = #{args := Args}, {CliModule, CliFunction}, Reason) ->
+    ?LOG_ERROR(#{
+        msg => "cli_audit_redaction_failed",
+        reason => Reason,
+        module => CliModule,
+        function => CliFunction
+    }),
+    Log#{args => emqx_cli_redact:redact_all(Args)}.
+
+apply_audit_command(Log, Mod, Fun, Level, From) ->
+    try
+        apply(Mod, Fun, [Level, From, Log])
+    catch
+        _:{aborted, {no_exists, emqx_audit}} ->
+            case Log of
+                #{cmd := cluster, args := [<<"leave">>]} ->
+                    ok;
+                _ ->
+                    ?LOG_ERROR(#{
+                        msg => "ctl_command_crashed",
+                        reason => "emqx_audit table not found",
+                        log => Log,
+                        from => From
+                    })
+            end;
+        _:Reason:Stacktrace ->
+            ?LOG_ERROR(#{
+                msg => "ctl_command_crashed",
+                stacktrace => Stacktrace,
+                reason => Reason,
+                log => Log,
+                from => From
+            })
+    end.
+
+prune_unnecessary_log(Log) ->
+    case normalize_audit_log_args(Log) of
+        #{args := [<<"emqx:is_running()">>]} -> false;
+        Log1 -> {ok, Log1}
+    end.
+
+%% A command handler must return `ok` or `{error, Reason}`.
+%% `{ok, Value}` is kept because `bin/nodetool eval` prints `Value`.
+%% Any other value is a handler bug, so `bin/nodetool` exits 1.
+normalize_result(ok) -> ok;
+normalize_result({ok, _} = Result) -> Result;
+normalize_result({error, _} = Result) -> Result;
+normalize_result(Other) -> {error, {bad_cli_return, Other}}.
+
+audit_level(ok, _Duration) -> info;
+audit_level({ok, _}, _Duration) -> info;
+audit_level(_, _) -> error.
+
+normalize_audit_log_args(Log = #{args := [Parsed | _] = Exprs, cmd := eval_erl}) when
+    is_tuple(Parsed)
+->
+    String = erl_pp:exprs(Exprs, [{linewidth, 10000}]),
+    Log#{args => [unicode:characters_to_binary(String)]};
+normalize_audit_log_args(Log = #{args := Args}) ->
+    Log#{args => [unicode:characters_to_binary(A) || A <- Args]}.
+
+eval_erl([Parsed | _] = Expr) when is_tuple(Parsed) ->
+    eval_expr(Expr);
+eval_erl([String]) ->
+    % convenience to users, if they forgot a trailing
+    % '.' add it for them.
+    Normalized =
+        case lists:reverse(String) of
+            [$. | _] -> String;
+            R -> lists:reverse([$. | R])
+        end,
+    % then scan and parse the string
+    {ok, Scanned, _} = erl_scan:string(Normalized),
+    {ok, Parsed} = erl_parse:parse_exprs(Scanned),
+    {ok, Value} = eval_expr(Parsed),
+    print("~p~n", [Value]).
+
+eval_erl_audit_args(Args) ->
+    %% Intentionally do not redact eval expressions: auditing requires the exact code executed.
+    Args.
+
+eval_expr(Parsed) ->
+    {value, Value, _} = erl_eval:exprs(Parsed, []),
+    {ok, Value}.

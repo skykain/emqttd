@@ -1,0 +1,365 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>EMQX Agent</title>
+<link rel="stylesheet" href="assets/index.css">
+<script type="module" src="assets/app.js"></script>
+</head>
+<body>
+<div id="app">
+
+  <!-- ── Header ── -->
+  <header>
+    <div class="logo">EMQX <span>Agent</span></div>
+    <span id="status-pill" class="pill">○ disconnected</span>
+    <div class="spacer"></div>
+    <span class="endpoint" id="endpoint-label"></span>
+  </header>
+
+  <!-- ── Tab nav ── -->
+  <nav>
+    <button class="active" onclick="showTab('tools',this)">Tools<span class="cnt" id="cnt-tools">—</span></button>
+    <button onclick="showTab('connections',this)">Connections<span class="cnt" id="cnt-connections">—</span></button>
+    <button onclick="showTab('profiles',this)">AI Providers<span class="cnt" id="cnt-profiles">—</span></button>
+    <button onclick="showTab('pipelines',this)">Pipelines<span class="cnt" id="cnt-pipelines">—</span></button>
+  </nav>
+
+  <!-- ── Main content ── -->
+  <main>
+
+    <!-- Tools -->
+    <section id="tab-tools" class="active">
+      <h2>Tools</h2>
+      <table class="tbl" id="tools-table">
+        <thead><tr><th>ID</th><th>Type</th><th>Description</th><th></th></tr></thead>
+        <tbody id="tools-body"><tr class="empty"><td colspan="4">Not connected</td></tr></tbody>
+      </table>
+
+      <div class="card">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">
+          <h3 id="tool-card-title">New Tool</h3>
+          <button id="tool-cancel-btn" class="btn sm" style="display:none" onclick="resetToolEditor()">✕ Cancel edit</button>
+        </div>
+        <div class="row">
+          <div class="field">
+            <label>Type</label>
+            <select id="tool-type" onchange="updateToolForm()">
+              <option value="message__publish">message__publish</option>
+              <option value="message__request">message__request</option>
+              <option value="http">http</option>
+              <option value="image__fetch">image__fetch</option>
+              <option value="postgresql__query">postgresql__query</option>
+              <option value="stream__write">stream__write</option>
+              <option value="stream__read">stream__read</option>
+              <option value="stream__del">stream__del</option>
+              <option value="kv__write">kv__write</option>
+              <option value="kv__read">kv__read</option>
+              <option value="kv__read_all">kv__read_all</option>
+              <option value="kv__del">kv__del</option>
+              <option value="kv__clear">kv__clear</option>
+            </select>
+          </div>
+          <div class="field">
+            <label>ID</label>
+            <input id="tool-id" type="text" placeholder="my-tool-1">
+          </div>
+        </div>
+        <div class="field">
+          <label>Description</label>
+          <input id="tool-desc" type="text" placeholder="Human-readable description for the LLM">
+        </div>
+
+        <!-- message__publish fields -->
+        <div id="f-publish">
+          <div class="field">
+            <label>Topic Prefix</label>
+            <input id="tool-prefix" type="text" placeholder="out/devices/">
+            <div class="hint">All publishes are restricted to this prefix.</div>
+          </div>
+          <div class="field">
+            <label>Payload schema</label>
+            <div id="se-tool-publish-input"></div>
+            <div class="hint">Optional payload schema. Topic/from/qos are fixed wrapper fields. Output schema is fixed by backend.</div>
+          </div>
+        </div>
+
+        <!-- message__request fields -->
+        <div id="f-request" style="display:none">
+          <div class="field">
+            <label>Topic Prefix</label>
+            <input id="tool-request-prefix" type="text" placeholder="devices/room1/">
+            <div class="hint">Request is published to this prefix + the agent-supplied topic suffix. Responses arrive on a unique temporary topic set via the MQTT 5 Response-Topic property.</div>
+          </div>
+          <div class="field">
+            <label>Request payload schema</label>
+            <div id="se-tool-request-payload-schema"></div>
+            <div class="hint">Schema describing the payload the LLM should send in the request. Leave blank for untyped.</div>
+          </div>
+          <div class="row">
+            <div class="field">
+              <label>Response payload type</label>
+              <select id="tool-request-payload-type">
+                <option value="json">json</option>
+                <option value="binary">binary</option>
+              </select>
+            </div>
+            <div class="field">
+              <label style="display:flex;align-items:center;gap:6px;cursor:pointer;padding-top:24px">
+                <input type="checkbox" id="tool-request-autodiscover-images" checked style="accent-color:var(--accent2);width:14px;height:14px">
+                Autodiscover images
+              </label>
+            </div>
+          </div>
+          <div class="field">
+            <label>Image paths</label>
+            <div id="tool-request-images"></div>
+            <div class="hint">Optional JSON paths to extract as image attachments, one per line. Use . for binary root.</div>
+          </div>
+        </div>
+
+        <!-- http fields -->
+        <div id="f-http" style="display:none">
+          <div class="row">
+            <div class="field">
+              <label>Method</label>
+              <select id="tool-method">
+                <option>post</option><option>get</option>
+                <option>put</option><option>patch</option><option>delete</option>
+              </select>
+            </div>
+            <div class="field">
+              <label>URL</label>
+              <input id="tool-url" type="text" placeholder="http://service:8080/api">
+            </div>
+          </div>
+          <div class="row">
+            <div class="field">
+              <label>Input schema</label>
+              <div id="se-tool-input-schema"></div>
+            </div>
+          </div>
+          <div class="row">
+            <div class="field">
+              <label>Response payload type</label>
+              <select id="tool-http-payload-type">
+                <option value="json">json</option>
+                <option value="binary">binary</option>
+              </select>
+            </div>
+            <div class="field">
+              <label style="display:flex;align-items:center;gap:6px;cursor:pointer;padding-top:24px">
+                <input type="checkbox" id="tool-http-autodiscover-images" checked style="accent-color:var(--accent2);width:14px;height:14px">
+                Autodiscover images
+              </label>
+            </div>
+          </div>
+          <div class="field">
+            <label>Image paths</label>
+            <div id="tool-http-images"></div>
+            <div class="hint">Optional JSON paths to extract as image attachments, one per line. Use . for binary root.</div>
+          </div>
+        </div>
+
+        <!-- image__fetch fields -->
+        <div id="f-image-fetch" style="display:none">
+          <div class="field">
+            <label>Base URL</label>
+            <input id="tool-image-fetch-url" type="text" placeholder="https://example.com/images">
+            <div class="hint">Invoked image URLs must be full URLs under this base URL. The tool validates the URL and does not fetch it.</div>
+          </div>
+        </div>
+
+        <!-- postgresql fields -->
+        <div id="f-ch" style="display:none">
+          <div class="field">
+            <label>Connection</label>
+            <select id="tool-resource"></select>
+            <div class="hint">Select the PostgreSQL connection used by this tool. Disabled connections can be selected.</div>
+          </div>
+          <div class="field">
+            <label>SQL query template</label>
+            <textarea id="tool-query" placeholder="SELECT metric, value FROM agent_tool_metrics WHERE device_id = ${device_id}"></textarea>
+            <div class="hint">Use ${var} placeholders. Names are extracted automatically and the input schema is generated from them.</div>
+          </div>
+        </div>
+
+        <!-- stream / kv fields -->
+        <div id="f-stream" style="display:none">
+          <div class="field">
+            <label>Stream</label>
+            <input id="tool-stream" type="text" placeholder="stream-name">
+            <div class="hint">Name of the EMQX stream used by this tool. KV tools require a last-value stream.</div>
+          </div>
+        </div>
+
+        <!-- stream / kv read-write format -->
+        <div id="f-format" style="display:none">
+          <div class="field">
+            <label>Format *</label>
+            <select id="tool-format" required>
+              <option value="json">json</option>
+              <option value="binary">binary</option>
+            </select>
+            <div class="hint">json encodes write bodies and tries to decode read payloads. binary reads and writes payloads as-is.</div>
+          </div>
+        </div>
+
+        <div class="form-actions">
+          <button class="btn primary" id="tool-submit-btn" onclick="saveTool()">Create</button>
+          <span id="tool-msg" class="msg"></span>
+        </div>
+      </div>
+    </section>
+
+    <!-- Connections -->
+    <section id="tab-connections">
+      <h2>Connections</h2>
+      <table class="tbl">
+        <thead><tr><th>ID</th><th>Type</th><th>Status</th><th>Server</th><th></th></tr></thead>
+        <tbody id="connections-body"><tr class="empty"><td colspan="5">Not connected</td></tr></tbody>
+      </table>
+
+      <div class="card">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">
+          <h3 id="conn-card-title">New Connection</h3>
+          <button id="conn-cancel-btn" class="btn sm" style="display:none" onclick="resetConnectionEditor()">Cancel edit</button>
+        </div>
+        <div class="row">
+          <div class="field">
+            <label>Connection ID</label>
+            <input id="conn-id" type="text" placeholder="pg-main">
+          </div>
+          <div class="field">
+            <label>Type</label>
+            <input type="text" value="postgresql" readonly style="opacity:0.7">
+          </div>
+          <div class="field" style="max-width:110px">
+            <label>Enabled</label>
+            <label style="display:flex;align-items:center;gap:6px;padding-top:6px;cursor:pointer">
+              <input type="checkbox" id="conn-enable" style="accent-color:var(--accent2);width:14px;height:14px">
+              <span style="font-size:12px;color:var(--muted)">start</span>
+            </label>
+          </div>
+        </div>
+        <div class="row">
+          <div class="field">
+            <label>Server</label>
+            <input id="conn-server" type="text" value="pgsql:5432" placeholder="host:5432">
+          </div>
+          <div class="field">
+            <label>Database</label>
+            <input id="conn-database" type="text" value="mqtt">
+          </div>
+        </div>
+        <div class="row">
+          <div class="field">
+            <label>Username</label>
+            <input id="conn-username" type="text" value="root">
+          </div>
+          <div class="field">
+            <label>Password</label>
+            <input id="conn-password" type="password" value="public">
+          </div>
+        </div>
+        <div class="row">
+          <div class="field">
+            <label>Pool Size</label>
+            <input id="conn-pool-size" type="number" min="1" value="1">
+          </div>
+          <div class="field">
+            <label>Connect Timeout (ms)</label>
+            <input id="conn-connect-timeout" type="number" min="1" value="5000">
+          </div>
+        </div>
+        <div class="row">
+          <div class="field">
+            <label style="display:flex;align-items:center;gap:6px;cursor:pointer">
+              <input type="checkbox" id="conn-disable-prepared" checked style="accent-color:var(--accent2);width:14px;height:14px">
+              Disable prepared statements
+            </label>
+          </div>
+          <div class="field">
+            <label style="display:flex;align-items:center;gap:6px;cursor:pointer">
+              <input type="checkbox" id="conn-ssl" style="accent-color:var(--accent2);width:14px;height:14px">
+              Enable SSL
+            </label>
+          </div>
+        </div>
+        <div class="form-actions">
+          <button id="conn-save-btn" class="btn primary" onclick="saveConnection()">Create Connection</button>
+          <span id="conn-msg" class="msg"></span>
+        </div>
+      </div>
+    </section>
+
+    <!-- AI Providers -->
+    <section id="tab-profiles">
+      <h2>AI Providers</h2>
+      <table class="tbl">
+        <thead><tr><th>Name</th><th>Type</th><th>Base URL</th></tr></thead>
+        <tbody id="profiles-body"><tr class="empty"><td colspan="3">Not connected</td></tr></tbody>
+      </table>
+
+      <div class="card">
+        <h3>Provider Credentials</h3>
+        <p style="color:var(--muted);line-height:1.5;margin-top:8px">
+          AI providers are managed in the EMQX AI Completion configuration. Create or edit credentials there,
+          then reference the provider by <code>provider_name</code> in agent pipelines.
+        </p>
+      </div>
+    </section>
+
+    <!-- Pipelines -->
+    <section id="tab-pipelines">
+      <h2>Pipelines</h2>
+      <table class="tbl">
+        <thead><tr><th>ID</th><th>Trigger topic</th><th>Steps</th><th>Status</th><th></th></tr></thead>
+        <tbody id="pipelines-body"><tr class="empty"><td colspan="5">Not connected</td></tr></tbody>
+      </table>
+
+      <div class="card">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">
+          <h3 id="pipe-card-title">New Pipeline</h3>
+          <button id="pipe-cancel-btn" class="btn sm" style="display:none" onclick="resetPipelineEditor()">Cancel edit</button>
+        </div>
+        <div class="row">
+          <div class="field">
+            <label>Pipeline ID</label>
+            <input id="pipe-id" type="text" placeholder="hvac-anomaly-response">
+          </div>
+          <div class="field">
+            <label>Trigger topic</label>
+            <input id="pipe-topic" type="text" placeholder="$evt/hvac/anomaly">
+          </div>
+          <div class="field" style="max-width:110px">
+            <label>Active</label>
+            <label style="display:flex;align-items:center;gap:6px;padding-top:6px;cursor:pointer">
+              <input type="checkbox" id="pipe-active" checked style="accent-color:var(--accent2);width:14px;height:14px">
+              <span style="font-size:12px;color:var(--muted)">enabled</span>
+            </label>
+          </div>
+        </div>
+
+        <div class="field">
+          <label>Steps</label>
+          <div id="pipe-steps-list"></div>
+          <button class="step-add-btn" onclick="addStep()">+ Add Step</button>
+        </div>
+
+        <div class="form-actions">
+          <button id="pipe-save-btn" class="btn primary" onclick="savePipeline()">Create Pipeline</button>
+          <span id="pipe-msg" class="msg"></span>
+        </div>
+      </div>
+    </section>
+
+  </main>
+</div>
+
+<div id="toast"></div>
+
+
+</body>
+</html>

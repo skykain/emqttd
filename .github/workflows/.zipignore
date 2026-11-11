@@ -1,0 +1,5 @@
+*/.github/*
+deps/*/.git/objects/pack/*
+deps/*/_build/*
+deps/*/_packages/*
+deps/*/target/*

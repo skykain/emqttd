@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_exhook).
@@ -19,118 +7,159 @@
 -include("emqx_exhook.hrl").
 -include_lib("emqx/include/logger.hrl").
 
--logger_header("[ExHook]").
+-export([
+    cast/2,
+    call_fold/3
+]).
 
-%% Mgmt APIs
--export([ enable/2
-        , disable/1
-        , disable_all/0
-        , list/0
-        ]).
-
--export([ cast/2
-        , call_fold/3
-        ]).
+%% exported for `emqx_telemetry'
+-export([get_basic_usage_info/0]).
 
 %%--------------------------------------------------------------------
-%% Mgmt APIs
-%%--------------------------------------------------------------------
-
-%% XXX: Only return the running servers
--spec list() -> [emqx_exhook_server:server()].
-list() ->
-    [server(Name) || Name <- running()].
-
--spec enable(atom()|string(), list()) -> ok | {error, term()}.
-enable(Name, Opts) ->
-    case lists:member(Name, running()) of
-        true ->
-            {error, already_started};
-        _ ->
-            case emqx_exhook_server:load(Name, Opts) of
-                {ok, ServiceState} ->
-                    save(Name, ServiceState);
-                {error, Reason} ->
-                    ?LOG(error, "Load server ~p failed: ~p", [Name, Reason]),
-                    {error, Reason}
-            end
-    end.
-
--spec disable(atom()|string()) -> ok | {error, term()}.
-disable(Name) ->
-    case server(Name) of
-        undefined -> {error, not_running};
-        Service ->
-            ok = emqx_exhook_server:unload(Service),
-            unsave(Name)
-    end.
-
--spec disable_all() -> ok.
-disable_all() ->
-    lists:foreach(fun disable/1, running()).
-
-%%----------------------------------------------------------
 %% Dispatch APIs
-%%----------------------------------------------------------
+%%--------------------------------------------------------------------
 
 -spec cast(atom(), map()) -> ok.
 cast(Hookpoint, Req) ->
-    cast(Hookpoint, Req, running()).
+    cast(Hookpoint, Req, emqx_exhook_mgr:running()).
 
 cast(_, _, []) ->
     ok;
-cast(Hookpoint, Req, [ServiceName|More]) ->
+cast(Hookpoint, Req, [ServerName | More]) ->
     %% XXX: Need a real asynchronous running
-    _ = emqx_exhook_server:call(Hookpoint, Req, server(ServiceName)),
+    _ = emqx_exhook_server:call(
+        Hookpoint,
+        Req,
+        emqx_exhook_mgr:service(ServerName)
+    ),
     cast(Hookpoint, Req, More).
 
--spec call_fold(atom(), term(), function())
-  -> {ok, term()}
-   | {stop, term()}.
+-spec call_fold(atom(), term(), function()) ->
+    {ok, term()}
+    | {stop, term()}
+    | ignore.
 call_fold(Hookpoint, Req, AccFun) ->
-    call_fold(Hookpoint, Req, AccFun, running()).
-
-call_fold(_, Req, _, []) ->
-    {ok, Req};
-call_fold(Hookpoint, Req, AccFun, [ServiceName|More]) ->
-    case emqx_exhook_server:call(Hookpoint, Req, server(ServiceName)) of
-        {ok, Resp} ->
-            case AccFun(Req, Resp) of
-                {stop, NReq} -> {stop, NReq};
-                {ok, NReq} -> call_fold(Hookpoint, NReq, AccFun, More);
-                _ -> call_fold(Hookpoint, Req, AccFun, More)
-            end;
-        _ ->
-            call_fold(Hookpoint, Req, AccFun, More)
+    case emqx_exhook_mgr:running() of
+        [] ->
+            no_running_server_result(Hookpoint, Req);
+        ServerNames ->
+            call_fold(true, Hookpoint, Req, AccFun, ServerNames)
     end.
 
-%%----------------------------------------------------------
-%% Storage
+no_running_server_result(Hookpoint, Req) ->
+    case no_running_server_action() of
+        ignore ->
+            ignore;
+        deny ->
+            {stop, deny_action_result(Hookpoint, Req)}
+    end.
 
--compile({inline, [save/2]}).
-save(Name, ServiceState) ->
-    Saved = persistent_term:get(?APP, []),
-    persistent_term:put(?APP, lists:reverse([Name | Saved])),
-    persistent_term:put({?APP, Name}, ServiceState).
+no_running_server_action() ->
+    case emqx_security_profile:policy(exhook_server_unavailable) of
+        deny ->
+            deny;
+        honor_failed_action ->
+            configured_failed_action()
+    end.
 
--compile({inline, [unsave/1]}).
-unsave(Name) ->
-    case persistent_term:get(?APP, []) of
-        [] ->
-            persistent_term:erase(?APP);
-        Saved ->
-            persistent_term:put(?APP, lists:delete(Name, Saved))
-    end,
-    persistent_term:erase({?APP, Name}),
-    ok.
+configured_failed_action() ->
+    Servers = emqx:get_config([exhook, servers], []),
+    case
+        lists:any(
+            fun(#{enable := Enable, failed_action := FailedAction}) ->
+                Enable andalso FailedAction =:= deny
+            end,
+            Servers
+        )
+    of
+        true -> deny;
+        false -> ignore
+    end.
 
--compile({inline, [running/0]}).
-running() ->
-    persistent_term:get(?APP, []).
+call_fold(true, _, _Req, _, []) ->
+    ignore;
+call_fold(false, _, Req, _, []) ->
+    {ok, Req};
+call_fold(IsIgnore, Hookpoint, Req, AccFun, [ServerName | More]) ->
+    Server = emqx_exhook_mgr:service(ServerName),
+    case emqx_exhook_server:call(Hookpoint, Req, Server) of
+        {ok, Resp} ->
+            case AccFun(Req, Resp) of
+                {stop, NReq} ->
+                    {stop, NReq};
+                {ok, NReq} ->
+                    call_fold(false, Hookpoint, NReq, AccFun, More);
+                ignore ->
+                    call_fold(IsIgnore, Hookpoint, Req, AccFun, More)
+            end;
+        _ ->
+            case emqx_exhook_server:failed_action(Server) of
+                ignore ->
+                    call_fold(IsIgnore, Hookpoint, Req, AccFun, More);
+                deny ->
+                    {stop, deny_action_result(Hookpoint, Req)}
+            end
+    end.
 
--compile({inline, [server/1]}).
-server(Name) ->
-    case catch persistent_term:get({?APP, Name}) of
-        {'EXIT', {badarg,_}} -> undefined;
-        Service -> Service
+%% XXX: Hard-coded the deny response
+deny_action_result('client.authenticate', _) ->
+    #{result => false};
+deny_action_result('client.authorize', _) ->
+    #{result => false};
+deny_action_result('message.ingress', _) ->
+    #{result => false};
+deny_action_result('message.publish', Req) ->
+    case emqx_security_profile:policy(exhook_message_publish_failure) of
+        ignore ->
+            Req;
+        deny ->
+            #{message := Message} = Req,
+            Headers = maps:get(headers, Message, #{}),
+            Req#{message := Message#{headers => Headers#{<<"allow_publish">> => <<"false">>}}}
+    end.
+
+%%--------------------------------------------------------------------
+%% APIs for `emqx_telemetry'
+%%--------------------------------------------------------------------
+
+-spec get_basic_usage_info() ->
+    #{
+        num_servers => non_neg_integer(),
+        servers =>
+            [
+                #{
+                    driver => Driver,
+                    hooks => [emqx_exhook_server:hookpoint()]
+                }
+            ]
+    }
+when
+    Driver :: grpc.
+get_basic_usage_info() ->
+    try
+        Servers = emqx_exhook_mgr:running(),
+        NumServers = length(Servers),
+        ServerInfo =
+            lists:map(
+                fun(ServerName) ->
+                    Hooks = emqx_exhook_mgr:hooks(ServerName),
+                    HookNames = lists:map(fun(#{name := Name}) -> Name end, Hooks),
+                    #{
+                        hooks => HookNames,
+                        %% currently, only grpc driver exists.
+                        driver => grpc
+                    }
+                end,
+                Servers
+            ),
+        #{
+            num_servers => NumServers,
+            servers => ServerInfo
+        }
+    catch
+        _:_ ->
+            #{
+                num_servers => 0,
+                servers => []
+            }
     end.

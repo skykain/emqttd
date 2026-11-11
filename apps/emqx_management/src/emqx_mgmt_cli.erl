@@ -1,721 +1,2008 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_mgmt_cli).
 
+-behaviour(emqx_ctl).
+
 -include_lib("emqx/include/emqx.hrl").
+-include_lib("emqx/include/emqx_cm.hrl").
+-include_lib("emqx/include/emqx_router.hrl").
 -include_lib("emqx/include/emqx_mqtt.hrl").
+-include_lib("emqx/include/emqx_channel.hrl").
+-include_lib("emqx/include/logger.hrl").
 
--include("emqx_mgmt.hrl").
+-define(DATA_BACKUP_OPTS, #{print_fun => fun emqx_ctl:print/2}).
+-define(EXCLUSIVE_TAB, emqx_exclusive_subscription).
+-define(LOG_UPDATE_OPTS, #{rawconf_with_defaults => true, override_to => cluster}).
+-define(DUMP_CHUNK_SIZE, 100).
 
--define(PRINT_CMD(Cmd, Descr), io:format("~-48s# ~s~n", [Cmd, Descr])).
+-export([load/0, unload/0]).
 
--export([load/0]).
+-export([
+    status/1,
+    status_audit_args/1,
+    broker/1,
+    broker_audit_args/1,
+    cluster/1,
+    cluster_audit_args/1,
+    clients/1,
+    clients_audit_args/1,
+    'session-top'/1,
+    'session-top_audit_args'/1,
+    topics/1,
+    topics_audit_args/1,
+    subscriptions/1,
+    subscriptions_audit_args/1,
+    listeners/1,
+    listeners_audit_args/1,
+    vm/1,
+    vm_audit_args/1,
+    mnesia/1,
+    mnesia_audit_args/1,
+    trace/1,
+    trace_audit_args/1,
+    traces/1,
+    traces_audit_args/1,
+    log/1,
+    log_audit_args/1,
+    authz/1,
+    authz_audit_args/1,
+    pem_cache/1,
+    pem_cache_audit_args/1,
+    olp/1,
+    olp_audit_args/1,
+    data/1,
+    data_audit_args/1,
+    ds/1,
+    ds_audit_args/1,
+    exclusive/1,
+    exclusive_audit_args/1,
+    node_dump/1,
+    node_dump_audit_args/1
+]).
 
--export([ status/1
-        , broker/1
-        , cluster/1
-        , clients/1
-        , routes/1
-        , subscriptions/1
-        , plugins/1
-        , listeners/1
-        , vm/1
-        , mnesia/1
-        , trace/1
-        , log/1
-        , mgmt/1
-        , data/1
-        , acl/1
-        ]).
+-export([
+    cluster_info/0
+]).
 
--define(PROC_INFOKEYS, [status,
-                        memory,
-                        message_queue_len,
-                        total_heap_size,
-                        heap_size,
-                        stack_size,
-                        reductions]).
+-define(COMMANDS, [
+    authz,
+    broker,
+    clients,
+    cluster,
+    data,
+    ds,
+    exclusive,
+    listeners,
+    log,
+    mnesia,
+    node_dump,
+    olp,
+    pem_cache,
+    'session-top',
+    status,
+    subscriptions,
+    topics,
+    trace,
+    traces,
+    vm
+]).
 
--define(MAX_LIMIT, 10000).
-
--define(APP, emqx).
-
--spec(load() -> ok).
+-spec load() -> ok.
 load() ->
-    Cmds = [Fun || {Fun, _} <- ?MODULE:module_info(exports), is_cmd(Fun)],
-    lists:foreach(fun(Cmd) -> emqx_ctl:register_command(Cmd, {?MODULE, Cmd}, []) end, Cmds).
+    lists:foreach(fun(Cmd) -> emqx_ctl:register_command(Cmd, {?MODULE, Cmd}, []) end, ?COMMANDS).
 
-is_cmd(Fun) ->
-    not lists:member(Fun, [init, load, module_info]).
-
-mgmt(["insert", AppId, Name]) ->
-    case emqx_mgmt_auth:add_app(list_to_binary(AppId), list_to_binary(Name)) of
-        {ok, Secret} ->
-            emqx_ctl:print("AppSecret: ~s~n", [Secret]);
-        {error, already_existed} ->
-            emqx_ctl:print("Error: already existed~n");
-        {error, Reason} ->
-            emqx_ctl:print("Error: ~p~n", [Reason])
-    end;
-
-mgmt(["lookup", AppId]) ->
-    case emqx_mgmt_auth:lookup_app(list_to_binary(AppId)) of
-        {AppId1, AppSecret, Name, Desc, Status, Expired} ->
-            emqx_ctl:print("app_id: ~s~nsecret: ~s~nname: ~s~ndesc: ~s~nstatus: ~s~nexpired: ~p~n",
-                           [AppId1, AppSecret, Name, Desc, Status, Expired]);
-        undefined ->
-            emqx_ctl:print("Not Found.~n")
-    end;
-
-mgmt(["update", AppId, Status]) ->
-    case emqx_mgmt_auth:update_app(list_to_binary(AppId), list_to_atom(Status)) of
-        ok ->
-            emqx_ctl:print("update successfully.~n");
-        {error, Reason} ->
-            emqx_ctl:print("Error: ~p~n", [Reason])
-    end;
-
-mgmt(["delete", AppId]) ->
-    case emqx_mgmt_auth:del_app(list_to_binary(AppId)) of
-        ok -> emqx_ctl:print("ok~n");
-        {error, not_found} ->
-            emqx_ctl:print("Error: app not found~n");
-        {error, Reason} ->
-            emqx_ctl:print("Error: ~p~n", [Reason])
-    end;
-
-mgmt(["list"]) ->
-    lists:foreach(fun({AppId, AppSecret, Name, Desc, Status, Expired}) ->
-                      emqx_ctl:print("app_id: ~s, secret: ~s, name: ~s, desc: ~s, status: ~s, expired: ~p~n",
-                                    [AppId, AppSecret, Name, Desc, Status, Expired])
-                  end, emqx_mgmt_auth:list_apps());
-
-mgmt(_) ->
-    emqx_ctl:usage([{"mgmt list",                    "List Applications"},
-                    {"mgmt insert <AppId> <Name>",   "Add Application of REST API"},
-                    {"mgmt update <AppId> <status>", "Update Application of REST API"},
-                    {"mgmt lookup <AppId>",          "Get Application of REST API"},
-                    {"mgmt delete <AppId>",          "Delete Application of REST API"}]).
+-spec unload() -> ok.
+unload() ->
+    lists:foreach(fun emqx_ctl:unregister_command/1, ?COMMANDS).
 
 %%--------------------------------------------------------------------
 %% @doc Node status
 
 status([]) ->
     {InternalStatus, _ProvidedStatus} = init:get_status(),
-    emqx_ctl:print("Node ~p ~s is ~p~n", [node(), emqx_app:get_release(), InternalStatus]),
-    case lists:keysearch(?APP, 1, application:which_applications()) of
-        false ->
-            emqx_ctl:print("Application ~s is not running~n", [?APP]);
-        {value, {?APP, _Desc, Vsn}} ->
-            emqx_ctl:print("Application ~s ~s is running~n", [?APP, Vsn])
-    end;
+    emqx_ctl:print("Node ~p ~ts is ~p~n", [node(), emqx_app:get_release(), InternalStatus]);
 status(_) ->
-     emqx_ctl:usage("status", "Show broker status").
+    emqx_ctl:usage("status", "Show broker status").
+
+status_audit_args(Args) -> Args.
 
 %%--------------------------------------------------------------------
 %% @doc Query broker
 
 broker([]) ->
-    Funs = [sysdescr, version, uptime, datetime],
-    [emqx_ctl:print("~-10s: ~s~n", [Fun, emqx_sys:Fun()]) || Fun <- Funs];
-
+    lists:foreach(
+        fun({Name, Value}) -> emqx_ctl:print("~-10s: ~ts~n", [Name, Value]) end,
+        [
+            {sysdescr, emqx_sys:sysdescr()},
+            {version, emqx_sys:version()},
+            {datetime, emqx_sys:datetime()}
+        ]
+    ),
+    emqx_ctl:print("~-10s: ~ts~n", [
+        uptime, emqx_utils_calendar:human_readable_duration_string(emqx_sys:uptime())
+    ]);
 broker(["stats"]) ->
-    [emqx_ctl:print("~-30s: ~w~n", [Stat, Val]) || {Stat, Val} <- lists:sort(emqx_stats:getstats())];
-
+    lists:foreach(
+        fun({Stat, Val}) -> emqx_ctl:print("~-30s: ~w~n", [Stat, Val]) end,
+        lists:sort(emqx_stats:getstats())
+    );
 broker(["metrics"]) ->
-    [emqx_ctl:print("~-30s: ~w~n", [Metric, Val]) || {Metric, Val} <- lists:sort(emqx_metrics:all())];
-
+    lists:foreach(
+        fun({Metric, Val}) -> emqx_ctl:print("~-30s: ~w~n", [Metric, Val]) end,
+        lists:sort(emqx_metrics:all_global())
+    );
 broker(_) ->
-    emqx_ctl:usage([{"broker",         "Show broker version, uptime and description"},
-                    {"broker stats",   "Show broker statistics of clients, topics, subscribers"},
-                    {"broker metrics", "Show broker metrics"}]).
+    emqx_ctl:usage([
+        {"broker", "Show broker version, uptime and description"},
+        {"broker stats", "Show broker statistics of clients, topics, subscribers"},
+        {"broker metrics", "Show broker metrics"}
+    ]).
+
+broker_audit_args(Args) -> Args.
 
 %%-----------------------------------------------------------------------------
 %% @doc Cluster with other nodes
 
 cluster(["join", SNode]) ->
-    case ekka:join(ekka_node:parse_name(SNode)) of
+    case emqx_cluster:join(ekka_node:parse_name(SNode)) of
         ok ->
             emqx_ctl:print("Join the cluster successfully.~n"),
-            cluster(["status"]);
+            %% FIXME: running status on the replicant immediately
+            %% after join produces stale output
+            mria_rlog:role() =:= core andalso
+                cluster(["status"]),
+            ok;
         ignore ->
             emqx_ctl:print("Ignore.~n");
-        {error, Error} ->
-            emqx_ctl:print("Failed to join the cluster: ~0p~n", [Error])
+        {error, Reason} = Error ->
+            emqx_ctl:print("Failed to join the cluster: ~0p~n", [Reason]),
+            Error
     end;
-
 cluster(["leave"]) ->
-    case ekka:leave() of
-        ok ->
-            emqx_ctl:print("Leave the cluster successfully.~n"),
-            cluster(["status"]);
-        {error, Error} ->
-            emqx_ctl:print("Failed to leave the cluster: ~0p~n", [Error])
+    Safeguards = cluster_leave_safeguards(),
+    case Safeguards of
+        [] ->
+            _ = maybe_disable_autocluster(),
+            case emqx_cluster:leave() of
+                ok ->
+                    emqx_ctl:print("Leave the cluster successfully.~n"),
+                    cluster(["status"]);
+                {error, Reason} = Error ->
+                    emqx_ctl:print("Failed to leave the cluster: ~0p~n", [Reason]),
+                    Error
+            end;
+        _ ->
+            lists:foreach(
+                fun
+                    (nonempty_ds_site) ->
+                        emqx_ctl:warning(
+                            "Operation is unsafe: "
+                            "Node is still responsible for one or more DS shard replicas. "
+                            "Consult `emqx ctl ds info' for details.~n"
+                        );
+                    (Reason) ->
+                        emqx_ctl:warning("Operation is unsafe: ~p.~n", [Reason])
+                end,
+                Safeguards
+            ),
+            {error, Safeguards}
     end;
-
 cluster(["force-leave", SNode]) ->
-    case ekka:force_leave(ekka_node:parse_name(SNode)) of
+    Node = ekka_node:parse_name(SNode),
+    case emqx_cluster:force_leave(Node) of
         ok ->
-            emqx_ctl:print("Remove the node from cluster successfully.~n"),
-            cluster(["status"]);
+            case emqx_cluster_rpc:force_leave_clean(Node) of
+                ok ->
+                    emqx_ctl:print("Remove the node from cluster successfully.~n"),
+                    cluster(["status"]);
+                {error, Reason} = Error ->
+                    emqx_ctl:print("Failed to remove the node from cluster: ~0p~n", [Reason]),
+                    Error
+            end;
         ignore ->
             emqx_ctl:print("Ignore.~n");
         {error, Error} ->
             emqx_ctl:print("Failed to remove the node from cluster: ~0p~n", [Error])
     end;
-
 cluster(["status"]) ->
-    emqx_ctl:print("Cluster status: ~p~n", [ekka_cluster:info()]);
-
+    emqx_ctl:print("Cluster status: ~p~n", [cluster_info()]);
+cluster(["status", "--json"]) ->
+    Info = sort_map_list_fields(cluster_info()),
+    emqx_ctl:print("~ts~n", [emqx_utils_json:best_effort_json(Info)]);
+cluster(["discovery", "enable"]) ->
+    enable_autocluster();
+cluster(["core", "rebalance", "plan"]) ->
+    Result = mria_rebalance:start(),
+    emqx_ctl:print("~p~n", [Result]);
+cluster(["core", "rebalance", "status"]) ->
+    Result = mria_rebalance:status(),
+    emqx_ctl:print("~p~n", [Result]);
+cluster(["core", "rebalance", "confirm"]) ->
+    Result = mria_rebalance:confirm(),
+    emqx_ctl:print("~p~n", [Result]);
+cluster(["core", "rebalance", "abort"]) ->
+    Result = mria_rebalance:abort(),
+    emqx_ctl:print("~p~n", [Result]);
 cluster(_) ->
-    emqx_ctl:usage([{"cluster join <Node>",       "Join the cluster"},
-                    {"cluster leave",             "Leave the cluster"},
-                    {"cluster force-leave <Node>","Force the node leave from cluster"},
-                    {"cluster status",            "Cluster status"}]).
+    emqx_ctl:usage([
+        {"cluster join <Node>", "Join the cluster"},
+        {"cluster leave", "Leave the cluster"},
+        {"cluster force-leave <Node>", "Force the node leave from cluster"},
+        {"cluster status [--json]", "Cluster status"},
+        {"cluster discovery enable", "Enable and run automatic cluster discovery (if configured)"},
+        {"cluster core rebalance plan", "Plan rebalancing of replicants against cores"},
+        {"cluster core rebalance status", "Check status of replicant rebalance"},
+        {"cluster core rebalance confirm", "Execute the planned rebalance"},
+        {"cluster core rebalance abort", "Abort the ongoing rebalance"}
+    ]).
+
+cluster_audit_args(Args) -> Args.
+
+cluster_leave_safeguards() ->
+    ds_cluster_leave_safeguards().
+
+%% sort lists for deterministic output
+sort_map_list_fields(Map) when is_map(Map) ->
+    lists:foldl(
+        fun sort_map_list_field/2,
+        Map,
+        maps:keys(Map)
+    ).
+
+sort_map_list_field(Field, Map) ->
+    case maps:get(Field, Map) of
+        [_ | _] = L -> Map#{Field := lists:sort(L)};
+        _ -> Map
+    end.
+
+enable_autocluster() ->
+    ok = ekka:enable_autocluster(),
+    _ = ekka:autocluster(emqx),
+    emqx_ctl:print("Automatic cluster discovery enabled.~n").
+
+maybe_disable_autocluster() ->
+    case ekka:autocluster_enabled() of
+        true ->
+            ok = ekka:disable_autocluster(),
+            emqx_ctl:print(
+                "Automatic cluster discovery is disabled on this node: ~p to avoid"
+                " re-joining the same cluster again, if the node is not stopped soon."
+                " To enable it run: 'emqx ctl cluster discovery enable' or restart the node.~n",
+                [node()]
+            );
+        false ->
+            ok
+    end.
 
 %%--------------------------------------------------------------------
 %% @doc Query clients
 
 clients(["list"]) ->
-    dump(emqx_channel, client);
-
+    case ets:info(?CHAN_TAB, size) of
+        0 -> emqx_ctl:print("No clients.~n");
+        _ -> dump(?CHAN_TAB, client)
+    end;
+clients(["stats", FilePath | Args]) ->
+    maybe
+        {ok, Opts} ?= parse_dump_stats_args(Args),
+        BatchSize = maps:get(batch_size, Opts, 1000),
+        SleepMs = maps:get(sleep_ms, Opts, 10),
+        dump_client_stats(FilePath, BatchSize, SleepMs)
+    else
+        {error, Msg} ->
+            emqx_ctl:print("[error] ~s~n", [Msg])
+    end;
 clients(["show", ClientId]) ->
     if_client(ClientId, fun print/1);
-
 clients(["kick", ClientId]) ->
-    case emqx_cm:kick_session(bin(ClientId)) of
-        ok -> emqx_ctl:print("ok~n");
-        _ -> emqx_ctl:print("Not Found.~n")
-    end;
-
+    ok = emqx_cm:kick_session(bin(ClientId)),
+    emqx_ctl:print("ok~n");
 clients(_) ->
-    emqx_ctl:usage([{"clients list",            "List all clients"},
-                    {"clients show <ClientId>", "Show a client"},
-                    {"clients kick <ClientId>", "Kick out a client"}]).
+    emqx_ctl:usage([
+        {"clients list", "List all clients"},
+        {"clients stats <File> [--batch <Size>] [--sleep <Ms>]\n",
+            "Dump statistic data for all clients in csv format to the given file.\n"
+            "--batch controls processing speed (default: 1000),\n"
+            "--sleep controls delay between batches (default: 10ms).\n"},
+        {"clients show <ClientId>", "Show a client"},
+        {"clients kick <ClientId>", "Kick out a client"}
+    ]).
+
+clients_audit_args(Args) -> Args.
+
+'session-top'(["status"]) ->
+    print_session_top_status(emqx_session_top_collector:status());
+'session-top'(["cancel"]) ->
+    case emqx_session_top_collector:cancel() of
+        {ok, cancelled} ->
+            emqx_ctl:print("Session top scan cancelled.~n");
+        {error, not_running} ->
+            emqx_ctl:print("[error] No session-top scan is running.~n")
+    end;
+'session-top'(Args) ->
+    case parse_session_top_args(Args) of
+        {ok, Opts} ->
+            run_session_top(Opts);
+        {error, Msg} ->
+            maybe_print_session_top_arg_error(Msg),
+            session_top_usage()
+    end.
+
+'session-top_audit_args'(Args) -> Args.
+
+maybe_print_session_top_arg_error(Msg) ->
+    case iolist_to_binary(Msg) of
+        <<"Invalid ", _/binary>> ->
+            emqx_ctl:print("[error] ~s~n", [Msg]);
+        _ ->
+            ok
+    end.
+
+session_top_usage() ->
+    emqx_ctl:usage([
+        {
+            "session-top status",
+            "Show the running scan or the latest finished scan.\n"
+            "The latest finished status is kept until the next scan starts."
+        },
+        {
+            "session-top cancel",
+            "Cancel the running session-top scan."
+        },
+        {
+            "session-top --out <File>\n"
+            "  [--count <K>]\n"
+            "  [--sort <SortBy>]\n"
+            "  [--batch <Size>]\n"
+            "  [--sleep <Ms>]",
+            "Write cluster top sessions to a new CSV file.\n"
+            "Result row limit, default: 10, max: 1000.\n"
+            "SortBy: mqueue_length | total_payload_bytes.\n"
+            "Rows per local scan batch, default: 1000.\n"
+            "Delay between batches, default: 1ms."
+        }
+    ]).
+
+run_session_top(Opts) ->
+    OutFile = maps:get(out, Opts),
+    case ensure_out_file_absent(OutFile) of
+        ok ->
+            Completion = fun(Rows) -> complete_session_top(OutFile, Rows) end,
+            case emqx_session_top_collector:run(maps:remove(out, Opts), Completion) of
+                {ok, _Pid} ->
+                    print_session_top_started(Opts);
+                {error, busy} ->
+                    emqx_ctl:print("[error] A session-top scan is already running.~n");
+                {error, {busy, Collector}} ->
+                    emqx_ctl:print(
+                        "[error] A session-top scan initiated on ~p is already running "
+                        "on this node.~n",
+                        [Collector]
+                    )
+            end;
+        {error, eexist} ->
+            emqx_ctl:print("[error] Output file already exists: ~ts~n", [OutFile]);
+        {error, Reason} ->
+            emqx_ctl:print("[error] Failed to check output file: ~p~n", [Reason])
+    end.
+
+complete_session_top(OutFile, Rows) ->
+    case write_session_top_csv(OutFile, Rows) of
+        ok ->
+            ?SLOG(info, #{
+                msg => session_top_written,
+                file => OutFile,
+                rows => length(Rows)
+            }),
+            ok;
+        {error, Reason} = Error ->
+            ?SLOG(error, #{
+                msg => session_top_write_failed,
+                file => OutFile,
+                reason => Reason
+            }),
+            Error
+    end.
+
+write_session_top_csv(OutFile, Rows) ->
+    case file:open(OutFile, [write, exclusive, raw, binary]) of
+        {ok, IoDev} ->
+            try
+                write_session_top_csv_chunks(IoDev, [
+                    <<"clientid,node,mqueue_length,total_payload_bytes,inflight_count\n">>,
+                    session_top_csv_rows(Rows)
+                ])
+            after
+                _ = file:close(IoDev)
+            end;
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+write_session_top_csv_chunks(_IoDev, []) ->
+    ok;
+write_session_top_csv_chunks(IoDev, [Chunk | More]) ->
+    case file:write(IoDev, Chunk) of
+        ok -> write_session_top_csv_chunks(IoDev, More);
+        {error, Reason} -> {error, Reason}
+    end.
+
+session_top_csv_rows(Rows) ->
+    [session_top_csv_row(Row) || Row <- Rows].
+
+session_top_csv_row(Row) ->
+    [
+        session_top_csv_cell(maps:get(clientid, Row)),
+        <<",">>,
+        session_top_csv_cell(maps:get(node, Row)),
+        <<",">>,
+        integer_to_binary(maps:get(mqueue_length, Row)),
+        <<",">>,
+        integer_to_binary(maps:get(total_payload_bytes, Row)),
+        <<",">>,
+        integer_to_binary(maps:get(inflight_count, Row)),
+        $\n
+    ].
+
+session_top_csv_cell(Value) when is_binary(Value) ->
+    quote_session_top_csv_cell(Value);
+session_top_csv_cell(Value) when is_atom(Value) ->
+    quote_session_top_csv_cell(atom_to_binary(Value, utf8)).
+
+quote_session_top_csv_cell(Bin) ->
+    case
+        lists:any(
+            fun(Pattern) -> binary:match(Bin, Pattern) =/= nomatch end,
+            [<<",">>, <<"\"">>, <<"\n">>, <<"\r">>]
+        )
+    of
+        true -> [$", binary:replace(Bin, <<"\"">>, <<"\"\"">>, [global]), $"];
+        false -> Bin
+    end.
+
+print_session_top_started(Opts) ->
+    emqx_ctl:print(
+        "Session top scan started.~n"
+        "Status: running~n"
+        "Output: ~ts~n"
+        "Batch size: ~B~n"
+        "Sleep: ~B ms~n"
+        "Run 'emqx ctl session-top status' to check progress.~n",
+        [
+            maps:get(out, Opts),
+            maps:get(batch_size, Opts, 1000),
+            maps:get(sleep_ms, Opts, 1)
+        ]
+    ).
+
+print_session_top_status(#{status := idle}) ->
+    emqx_ctl:print("Status: idle~nNo session-top scan is running.~n");
+print_session_top_status(
+    #{
+        status := running,
+        count := Count,
+        sort := Sort,
+        batch_size := BatchSize,
+        sleep_ms := SleepMs,
+        cluster_nodes := ClusterNodes
+    } = Status
+) ->
+    emqx_ctl:print(
+        "Status: running~n"
+        "Limit: ~B~n"
+        "Sort by: ~s~n"
+        "Batch size: ~B~n"
+        "Sleep: ~B ms~n"
+        "Cluster nodes: ~B~n",
+        [Count, atom_to_list(Sort), BatchSize, SleepMs, ClusterNodes]
+    ),
+    maybe_print_session_top_bad_replies(Status);
+print_session_top_status(#{
+    status := cancelled,
+    reason := Reason
+}) ->
+    emqx_ctl:print(
+        "Status: cancelled~n"
+        "Reason: ~p~n",
+        [Reason]
+    );
+print_session_top_status(Status = #{status := completed, rows := Rows}) ->
+    emqx_ctl:print(
+        "Status: completed~n"
+        "Result rows: ~B~n",
+        [Rows]
+    ),
+    maybe_print_session_top_bad_replies(Status);
+print_session_top_status(Status = #{status := failed, reason := Reason}) ->
+    emqx_ctl:print(
+        "Status: failed~n"
+        "Reason: ~p~n",
+        [Reason]
+    ),
+    maybe_print_session_top_bad_replies(Status).
+
+maybe_print_session_top_bad_replies(#{bad_replies := BadReplies}) ->
+    emqx_ctl:print("Bad replies: ~p~n", [BadReplies]);
+maybe_print_session_top_bad_replies(_Status) ->
+    ok.
+
+%%--------------------------------------------------------------------
+%% @private Dump client statistics to CSV file
+
+dump_client_stats(FilePath, BatchSize, SleepMs) ->
+    try
+        case ets:info(?CHAN_INFO_TAB, size) of
+            0 ->
+                emqx_ctl:print("No clients found.~n");
+            TotalRows ->
+                emqx_ctl:print(
+                    "Found ~w clients. Starting dump with batch size ~w, sleep ~wms...~n", [
+                        TotalRows, BatchSize, SleepMs
+                    ]
+                ),
+                write_client_stats_csv(FilePath, TotalRows, BatchSize, SleepMs)
+        end
+    catch
+        Error:Reason:Stack ->
+            emqx_ctl:print("[error] Failed to dump client stats: ~p:~p~n", [Error, Reason]),
+            ?SLOG(error, #{
+                msg => "dump_client_stats_failed",
+                error => Error,
+                reason => Reason,
+                stacktrace => Stack
+            })
+    end.
+
+write_client_stats_csv(FilePath, TotalRows, BatchSize, SleepMs) ->
+    CsvHeader =
+        "timestamp,clientid,recv_oct,recv_cnt,send_oct,send_cnt,"
+        "subscriptions_cnt,awaiting_rel_cnt,mqueue_len,mqueue_dropped\n",
+
+    case file:open(FilePath, [write, raw]) of
+        {ok, FileHandle} ->
+            try
+                ok = file:write(FileHandle, CsvHeader),
+                Config = #{
+                    file_handle => FileHandle,
+                    total_rows => TotalRows,
+                    batch_size => BatchSize,
+                    sleep_ms => SleepMs
+                },
+                ok = traverse_chain_info(Config),
+                emqx_ctl:print("Client statistics dumped to ~s~n", [FilePath])
+            after
+                file:close(FileHandle)
+            end;
+        {error, Reason} ->
+            emqx_ctl:print("[error] Failed to open file ~s: ~p~n", [FilePath, Reason])
+    end.
+
+%% @doc Traverse ETS table using ets:first/ets:next with configurable delays
+traverse_chain_info(Config) ->
+    traverse_chain_info(Config, 0, 0, ets:first(?CHAN_INFO_TAB)).
+
+traverse_chain_info(Config, ProcessedCount, _BatchCount, '$end_of_table') ->
+    #{total_rows := TotalRows} = Config,
+    % Print final progress
+    emqx_ctl:print("Progress: ~w/~w (100%) - Completed~n", [ProcessedCount, TotalRows]),
+    ok;
+traverse_chain_info(Config, ProcessedCount, BatchCount, Key) ->
+    #{
+        file_handle := FileHandle,
+        total_rows := TotalRows,
+        batch_size := BatchSize,
+        sleep_ms := SleepMs
+    } = Config,
+    %% The table is an ordered_set, so ets:next/2 works even when `Key'
+    %% was deleted while this batch slept.
+    case ets:lookup(?CHAN_INFO_TAB, Key) of
+        [{Key, Info, Stats}] ->
+            _ = write_client_stats_row({Key, Info, Stats}, FileHandle),
+            NewProcessedCount = ProcessedCount + 1,
+            NewBatchCount = BatchCount + 1,
+            case NewBatchCount >= BatchSize of
+                true ->
+                    %% Clients may connect during the dump, so cap the
+                    %% progress at 100%.
+                    ProgressPercent = min(100, (NewProcessedCount * 100) div TotalRows),
+                    emqx_ctl:print("Progress: ~w/~w (~w%)~n", [
+                        NewProcessedCount, TotalRows, ProgressPercent
+                    ]),
+                    %% Sleep between batches to reduce CPU load
+                    timer:sleep(SleepMs),
+                    NextKey = ets:next(?CHAN_INFO_TAB, Key),
+                    traverse_chain_info(Config, NewProcessedCount, 0, NextKey);
+                false ->
+                    NextKey = ets:next(?CHAN_INFO_TAB, Key),
+                    traverse_chain_info(Config, NewProcessedCount, NewBatchCount, NextKey)
+            end;
+        [] ->
+            %% Key not found, skip to next
+            NextKey = ets:next(?CHAN_INFO_TAB, Key),
+            traverse_chain_info(Config, ProcessedCount, BatchCount, NextKey)
+    end.
+
+write_client_stats_row({{ClientId, _Pid}, _Info, StatsRef}, FileHandle) ->
+    Timestamp = erlang:system_time(millisecond),
+
+    % Extract stats from the stats array of the channel
+    StatsMap = maps:from_list(emqx_chan_stats:to_list(StatsRef)),
+    RecvOct = maps:get(recv_oct, StatsMap, 0),
+    %% The `recv_cnt` and `send_cnt` columns hold the packet counters.
+    RecvCnt = maps:get(recv_pkt, StatsMap, 0),
+    SendOct = maps:get(send_oct, StatsMap, 0),
+    SendCnt = maps:get(send_pkt, StatsMap, 0),
+
+    % Extract session info from Stats (these are available in the stats)
+    SubscriptionsCnt = maps:get(subscriptions_cnt, StatsMap, 0),
+    AwaitingRelCnt = maps:get(awaiting_rel_cnt, StatsMap, 0),
+    MqueueLen = maps:get(mqueue_len, StatsMap, 0),
+    MqueueDropped = maps:get(mqueue_dropped, StatsMap, 0),
+
+    % Escape the clientid for CSV
+    EscapedClientId = emqx_utils_csv:escape_field(ClientId),
+
+    % Format CSV row
+    CsvRow = io_lib:format("~w,~ts,~w,~w,~w,~w,~w,~w,~w,~w\n", [
+        Timestamp,
+        EscapedClientId,
+        % recv_oct
+        RecvOct,
+        % recv_cnt
+        RecvCnt,
+        % send_oct
+        SendOct,
+        % send_cnt
+        SendCnt,
+        SubscriptionsCnt,
+        AwaitingRelCnt,
+        MqueueLen,
+        MqueueDropped
+    ]),
+
+    _ = file:write(FileHandle, CsvRow),
+    FileHandle.
 
 if_client(ClientId, Fun) ->
-    case ets:lookup(emqx_channel, (bin(ClientId))) of
+    case ets:lookup(?CHAN_TAB, (bin(ClientId))) of
         [] -> emqx_ctl:print("Not Found.~n");
-        [Channel]    -> Fun({client, Channel})
+        [Channel] -> Fun({client, Channel})
     end.
 
 %%--------------------------------------------------------------------
-%% @doc Routes Command
+%% @doc Topics Command
 
-routes(["list"]) ->
-    dump(emqx_route);
+topics(["list"]) ->
+    Res =
+        emqx_router:foldr_routes(
+            fun(Route, Acc) -> [print({emqx_topic, Route}) | Acc] end,
+            []
+        ),
+    case Res of
+        [] -> emqx_ctl:print("No topics.~n");
+        _ -> ok
+    end;
+topics(["show", Topic]) ->
+    Routes = emqx_router:lookup_routes(bin(Topic)),
+    lists:foreach(fun(Route) -> print({emqx_topic, Route}) end, Routes);
+topics(_) ->
+    emqx_ctl:usage([
+        {"topics list", "List all topics"},
+        {"topics show <Topic>", "Show a topic"}
+    ]).
 
-routes(["show", Topic]) ->
-    Routes = ets:lookup(emqx_route, bin(Topic)),
-    [print({emqx_route, Route}) || Route <- Routes];
-
-routes(_) ->
-    emqx_ctl:usage([{"routes list",         "List all routes"},
-                    {"routes show <Topic>", "Show a route"}]).
+topics_audit_args(Args) -> Args.
 
 subscriptions(["list"]) ->
-    lists:foreach(fun(Suboption) ->
-                        print({emqx_suboption, Suboption})
-                  end, ets:tab2list(emqx_suboption));
-
-subscriptions(["show", ClientId]) ->
-    case ets:lookup(emqx_subid, bin(ClientId)) of
+    case ets:info(?SUBOPTION, size) of
+        0 ->
+            emqx_ctl:print("No subscriptions.~n");
+        _ ->
+            lists:foreach(
+                fun(SubOption) ->
+                    print({?SUBOPTION, SubOption})
+                end,
+                ets:tab2list(?SUBOPTION)
+            )
+    end;
+subscriptions(["show", ClientId0]) ->
+    ClientId = bin(ClientId0),
+    case emqx_broker:subopts_by_clientid(ClientId) of
         [] ->
             emqx_ctl:print("Not Found.~n");
-        [{_, Pid}] ->
-            case ets:match_object(emqx_suboption, {{Pid, '_'}, '_'}) of
-                [] -> emqx_ctl:print("Not Found.~n");
-                Suboption ->
-                    [print({emqx_suboption, Sub}) || Sub <- Suboption]
-            end
+        Subs ->
+            lists:foreach(
+                fun({Topic, Options}) -> print_subopts(ClientId, Topic, Options) end, Subs
+            )
     end;
-
 subscriptions(["add", ClientId, Topic, QoS]) ->
-   if_valid_qos(QoS, fun(IntQos) ->
-                        case ets:lookup(emqx_channel, bin(ClientId)) of
-                            [] -> emqx_ctl:print("Error: Channel not found!");
-                            [{_, Pid}] ->
-                                {Topic1, Options} = emqx_topic:parse(bin(Topic)),
-                                Pid ! {subscribe, [{Topic1, Options#{qos => IntQos}}]},
-                                emqx_ctl:print("ok~n")
-                        end
-                     end);
-
+    if_valid_qos(QoS, fun(IntQos) ->
+        case ets:lookup(?CHAN_TAB, bin(ClientId)) of
+            [] ->
+                emqx_ctl:print("Error: Channel not found!");
+            [{_, Pid}] ->
+                {Topic1, Options} = emqx_topic:parse(bin(Topic)),
+                Pid ! {force_subscribe, [{Topic1, Options#{qos => IntQos}}]},
+                emqx_ctl:print("ok~n")
+        end
+    end);
 subscriptions(["del", ClientId, Topic]) ->
-    case ets:lookup(emqx_channel, bin(ClientId)) of
-        [] -> emqx_ctl:print("Error: Channel not found!");
+    case ets:lookup(?CHAN_TAB, bin(ClientId)) of
+        [] ->
+            emqx_ctl:print("Error: Channel not found!");
         [{_, Pid}] ->
             Pid ! {unsubscribe, [emqx_topic:parse(bin(Topic))]},
             emqx_ctl:print("ok~n")
     end;
-
 subscriptions(_) ->
-    emqx_ctl:usage([{"subscriptions list",                         "List all subscriptions"},
-                    {"subscriptions show <ClientId>",              "Show subscriptions of a client"},
-                    {"subscriptions add <ClientId> <Topic> <QoS>", "Add a static subscription manually"},
-                    {"subscriptions del <ClientId> <Topic>",       "Delete a static subscription manually"}]).
+    emqx_ctl:usage(
+        [
+            {"subscriptions list", "List all subscriptions"},
+            {"subscriptions show <ClientId>", "Show subscriptions of a client"},
+            {"subscriptions add <ClientId> <Topic> <QoS>", "Add a static subscription manually"},
+            {"subscriptions del <ClientId> <Topic>", "Delete a static subscription manually"}
+        ]
+    ).
+
+subscriptions_audit_args(Args) -> Args.
 
 if_valid_qos(QoS, Fun) ->
     try list_to_integer(QoS) of
         Int when ?IS_QOS(Int) -> Fun(Int);
         _ -> emqx_ctl:print("QoS should be 0, 1, 2~n")
-    catch _:_ ->
-        emqx_ctl:print("QoS should be 0, 1, 2~n")
-    end.
-
-plugins(["list"]) ->
-    lists:foreach(fun print/1, emqx_plugins:list());
-
-plugins(["load", Name]) ->
-    case emqx_plugins:load(list_to_atom(Name)) of
-        ok ->
-            emqx_ctl:print("Plugin ~s loaded successfully.~n", [Name]);
-        {error, Reason}   ->
-            emqx_ctl:print("Load plugin ~s error: ~p.~n", [Name, Reason])
-    end;
-
-plugins(["unload", "emqx_management"])->
-    emqx_ctl:print("Plugin emqx_management can not be unloaded.~n");
-
-plugins(["unload", Name]) ->
-    case emqx_plugins:unload(list_to_atom(Name)) of
-        ok ->
-            emqx_ctl:print("Plugin ~s unloaded successfully.~n", [Name]);
-        {error, Reason} ->
-            emqx_ctl:print("Unload plugin ~s error: ~p.~n", [Name, Reason])
-    end;
-
-plugins(["reload", Name]) ->
-    try list_to_existing_atom(Name) of
-        PluginName ->
-            case emqx_mgmt:reload_plugin(node(), PluginName) of
-                ok ->
-                    emqx_ctl:print("Plugin ~s reloaded successfully.~n", [Name]);
-                {error, Reason} ->
-                    emqx_ctl:print("Reload plugin ~s error: ~p.~n", [Name, Reason])
-            end
     catch
-        error:badarg ->
-            emqx_ctl:print("Reload plugin ~s error: The plugin doesn't exist.~n", [Name])
-    end;
-
-plugins(_) ->
-    emqx_ctl:usage([{"plugins list",            "Show loaded plugins"},
-                    {"plugins load <Plugin>",   "Load plugin"},
-                    {"plugins unload <Plugin>", "Unload plugin"},
-                    {"plugins reload <Plugin>", "Reload plugin"}
-                   ]).
+        _:_ ->
+            emqx_ctl:print("QoS should be 0, 1, 2~n")
+    end.
 
 %%--------------------------------------------------------------------
 %% @doc vm command
 
 vm([]) ->
     vm(["all"]);
-
 vm(["all"]) ->
-    [vm([Name]) || Name <- ["load", "memory", "process", "io", "ports"]];
-
+    lists:foreach(fun(Name) -> vm([Name]) end, ["load", "memory", "process", "io", "ports"]);
 vm(["load"]) ->
-    [emqx_ctl:print("cpu/~-20s: ~s~n", [L, V]) || {L, V} <- emqx_vm:loads()];
-
+    lists:foreach(
+        fun({L, V}) -> emqx_ctl:print("cpu/~-20s: ~w~n", [L, V]) end,
+        emqx_vm:loads()
+    );
 vm(["memory"]) ->
-    [emqx_ctl:print("memory/~-17s: ~w~n", [Cat, Val]) || {Cat, Val} <- erlang:memory()];
-
+    lists:foreach(
+        fun({Cat, Val}) -> emqx_ctl:print("memory/~-17s: ~w~n", [Cat, Val]) end,
+        erlang:memory()
+    );
 vm(["process"]) ->
-    [emqx_ctl:print("process/~-16s: ~w~n", [Name, erlang:system_info(Key)]) || {Name, Key} <- [{limit, process_limit}, {count, process_count}]];
-
+    lists:foreach(
+        fun({Name, Key}) ->
+            emqx_ctl:print("process/~-16s: ~w~n", [Name, erlang:system_info(Key)])
+        end,
+        [{limit, process_limit}, {count, process_count}]
+    );
 vm(["io"]) ->
     IoInfo = lists:usort(lists:flatten(erlang:system_info(check_io))),
-    [emqx_ctl:print("io/~-21s: ~w~n", [Key, proplists:get_value(Key, IoInfo)]) || Key <- [max_fds, active_fds]];
-
+    lists:foreach(
+        fun(Key) ->
+            emqx_ctl:print("io/~-21s: ~w~n", [Key, proplists:get_value(Key, IoInfo)])
+        end,
+        [max_fds, active_fds]
+    );
 vm(["ports"]) ->
-    [emqx_ctl:print("ports/~-16s: ~w~n", [Name, erlang:system_info(Key)]) || {Name, Key} <- [{count, port_count}, {limit, port_limit}]];
-
+    lists:foreach(
+        fun({Name, Key}) ->
+            emqx_ctl:print("ports/~-18s: ~w~n", [Name, erlang:system_info(Key)])
+        end,
+        [{count, port_count}, {limit, port_limit}]
+    );
 vm(_) ->
-    emqx_ctl:usage([{"vm all",     "Show info of Erlang VM"},
-                    {"vm load",    "Show load of Erlang VM"},
-                    {"vm memory",  "Show memory of Erlang VM"},
-                    {"vm process", "Show process of Erlang VM"},
-                    {"vm io",      "Show IO of Erlang VM"},
-                    {"vm ports",   "Show Ports of Erlang VM"}]).
+    emqx_ctl:usage([
+        {"vm all", "Show info of Erlang VM"},
+        {"vm load", "Show load of Erlang VM"},
+        {"vm memory", "Show memory of Erlang VM"},
+        {"vm process", "Show process of Erlang VM"},
+        {"vm io", "Show IO of Erlang VM"},
+        {"vm ports", "Show Ports of Erlang VM"}
+    ]).
+
+vm_audit_args(Args) -> Args.
 
 %%--------------------------------------------------------------------
 %% @doc mnesia Command
 
 mnesia([]) ->
-    mnesia:system_info();
-
+    _ = mnesia:system_info(),
+    ok;
 mnesia(_) ->
     emqx_ctl:usage([{"mnesia", "Mnesia system info"}]).
+
+mnesia_audit_args(Args) -> Args.
 
 %%--------------------------------------------------------------------
 %% @doc Logger Command
 
 log(["set-level", Level]) ->
-    case emqx_logger:set_log_level(list_to_atom(Level)) of
-        ok -> emqx_ctl:print("~s~n", [Level]);
-        Error -> emqx_ctl:print("[error] set overall log level failed: ~p~n", [Error])
+    case emqx_utils:safe_to_existing_atom(Level) of
+        {ok, Level1} ->
+            case emqx_logger:set_log_level(Level1) of
+                ok -> emqx_ctl:print("~ts~n", [Level]);
+                Error -> emqx_ctl:print("[error] set overall log level failed: ~p~n", [Error])
+            end;
+        _ ->
+            emqx_ctl:print("[error] invalid level: ~p~n", [Level])
     end;
-
 log(["primary-level"]) ->
     Level = emqx_logger:get_primary_log_level(),
-    emqx_ctl:print("~s~n", [Level]);
-
+    emqx_ctl:print("~ts~n", [Level]);
 log(["primary-level", Level]) ->
-    _ = emqx_logger:set_primary_log_level(list_to_atom(Level)),
-    emqx_ctl:print("~s~n", [emqx_logger:get_primary_log_level()]);
-
-log(["handlers", "list"]) ->
-    _ = [emqx_ctl:print("LogHandler(id=~s, level=~s, destination=~s, status=~s)~n", [Id, Level, Dst, Status])
-        || #{id := Id, level := Level, dst := Dst, status := Status} <- emqx_logger:get_log_handlers()],
+    case emqx_utils:safe_to_existing_atom(Level) of
+        {ok, Level1} ->
+            _ = emqx_logger:set_primary_log_level(Level1),
+            ok;
+        _ ->
+            emqx_ctl:print("[error] invalid level: ~p~n", [Level])
+    end,
+    emqx_ctl:print("~ts~n", [emqx_logger:get_primary_log_level()]);
+log(["outputs", "list"]) ->
+    LogConf = emqx_conf:get_raw([log], #{}),
+    lists:foreach(fun print_log_output/1, log_outputs(LogConf)),
     ok;
-
+log(["outputs", "set-level", Name, Level]) ->
+    case emqx_utils:safe_to_existing_atom(Level) of
+        {ok, _} ->
+            case log_output_path(Name, <<"level">>, emqx_conf:get_raw([log], #{})) of
+                {ok, Path, OutputName} ->
+                    update_log_output_level(Path, unicode:characters_to_binary(Level), OutputName);
+                {error, Reason} ->
+                    emqx_ctl:print("[error] ~ts~n", [Reason])
+            end;
+        _ ->
+            emqx_ctl:print("[error] invalid level: ~p~n", [Level])
+    end;
+log(["outputs", "enable", Name]) ->
+    case log_output_path(Name, <<"enable">>, emqx_conf:get_raw([log], #{})) of
+        {ok, Path, OutputName} ->
+            update_log_output(Path, true, OutputName);
+        {error, Reason} ->
+            emqx_ctl:print("[error] ~ts~n", [Reason])
+    end;
+log(["outputs", "disable", Name]) ->
+    case log_output_path(Name, <<"enable">>, emqx_conf:get_raw([log], #{})) of
+        {ok, Path, OutputName} ->
+            update_log_output(Path, false, OutputName);
+        {error, Reason} ->
+            emqx_ctl:print("[error] ~ts~n", [Reason])
+    end;
+log(["handlers", "list"]) ->
+    _ = [
+        emqx_ctl:print(
+            "LogHandler(id=~ts, level=~ts, destination=~ts, status=~ts)~n",
+            [Id, Level, Dst, Status]
+        )
+     || #{
+            id := Id,
+            level := Level,
+            dst := Dst,
+            status := Status
+        } <- emqx_logger:get_log_handlers()
+    ],
+    ok;
 log(["handlers", "start", HandlerId]) ->
-    case emqx_logger:start_log_handler(list_to_atom(HandlerId)) of
-        ok -> emqx_ctl:print("log handler ~s started~n", [HandlerId]);
-        {error, Reason} ->
-            emqx_ctl:print("[error] failed to start log handler ~s: ~p~n", [HandlerId, Reason])
+    case emqx_utils:safe_to_existing_atom(HandlerId) of
+        {ok, HandlerId1} ->
+            case emqx_logger:start_log_handler(HandlerId1) of
+                ok ->
+                    emqx_ctl:print("log handler ~ts started~n", [HandlerId]);
+                {error, Reason} ->
+                    emqx_ctl:print("[error] failed to start log handler ~ts: ~p~n", [
+                        HandlerId, Reason
+                    ])
+            end;
+        _ ->
+            emqx_ctl:print("[error] invalid handler:~ts~n", [HandlerId])
     end;
-
 log(["handlers", "stop", HandlerId]) ->
-    case emqx_logger:stop_log_handler(list_to_atom(HandlerId)) of
-        ok -> emqx_ctl:print("log handler ~s stopped~n", [HandlerId]);
-        {error, Reason} ->
-            emqx_ctl:print("[error] failed to stop log handler ~s: ~p~n", [HandlerId, Reason])
+    case emqx_utils:safe_to_existing_atom(HandlerId) of
+        {ok, HandlerId1} ->
+            case emqx_logger:stop_log_handler(HandlerId1) of
+                ok ->
+                    emqx_ctl:print("log handler ~ts stopped~n", [HandlerId1]);
+                {error, Reason} ->
+                    emqx_ctl:print("[error] failed to stop log handler ~ts: ~p~n", [
+                        HandlerId1, Reason
+                    ])
+            end;
+        _ ->
+            emqx_ctl:print("[error] invalid handler:~ts~n", [HandlerId])
     end;
-
 log(["handlers", "set-level", HandlerId, Level]) ->
-    case emqx_logger:set_log_handler_level(list_to_atom(HandlerId), list_to_atom(Level)) of
-        ok ->
-            #{level := NewLevel} = emqx_logger:get_log_handler(list_to_atom(HandlerId)),
-            emqx_ctl:print("~s~n", [NewLevel]);
-        {error, Error} ->
-            emqx_ctl:print("[error] ~p~n", [Error])
+    case emqx_utils:safe_to_existing_atom(HandlerId) of
+        {ok, HandlerId1} ->
+            case emqx_utils:safe_to_existing_atom(Level) of
+                {ok, Level1} ->
+                    case emqx_logger:set_log_handler_level(HandlerId1, Level1) of
+                        ok ->
+                            #{level := NewLevel} = emqx_logger:get_log_handler(HandlerId1),
+                            emqx_ctl:print("~ts~n", [NewLevel]);
+                        {error, Error} ->
+                            emqx_ctl:print("[error] ~p~n", [Error])
+                    end;
+                _ ->
+                    emqx_ctl:print("[error] invalid level:~p~n", [Level])
+            end;
+        _ ->
+            emqx_ctl:print("[error] invalid handler:~ts~n", [HandlerId])
     end;
-
 log(_) ->
-    emqx_ctl:usage([{"log set-level <Level>", "Set the overall log level"},
-                    {"log primary-level", "Show the primary log level now"},
-                    {"log primary-level <Level>","Set the primary log level"},
-                    {"log handlers list", "Show log handlers"},
-                    {"log handlers start <HandlerId>", "Start a log handler"},
-                    {"log handlers stop  <HandlerId>", "Stop a log handler"},
-                    {"log handlers set-level <HandlerId> <Level>", "Set log level of a log handler"}]).
+    emqx_ctl:usage(
+        [
+            {"log set-level <Level>", "Set the overall log level"},
+            {"log primary-level", "Show the primary log level now"},
+            {"log primary-level <Level>", "Set the primary log level"},
+            {"log outputs list", "Show configured log outputs"},
+            {"log outputs enable <name>", "Enable console, file, or a file handler name"},
+            {"log outputs disable <name>", "Disable console, file, or a file handler name"},
+            {"log outputs set-level <name> <Level>",
+                "Set log level for console, file, or a file handler name"}
+        ]
+    ).
+
+log_audit_args(Args) -> Args.
+
+log_outputs(LogConf) ->
+    Console = maps:get(<<"console">>, LogConf, #{}),
+    Files = maps:get(<<"file">>, LogConf, #{}),
+    [
+        #{
+            name => <<"console">>,
+            level => maps:get(<<"level">>, Console, undefined),
+            destination => <<"console">>,
+            status => output_status(Console)
+        }
+        | [
+            #{
+                name => log_file_output_name(Name),
+                level => maps:get(<<"level">>, FileConf, undefined),
+                destination => maps:get(<<"path">>, FileConf, <<>>),
+                status => output_status(FileConf)
+            }
+         || {Name, FileConf} <- lists:sort(maps:to_list(Files))
+        ]
+    ].
+
+log_file_output_name(<<"default">>) ->
+    <<"file">>;
+log_file_output_name(Name) ->
+    Name.
+
+output_status(#{<<"enable">> := true}) ->
+    <<"enabled">>;
+output_status(_) ->
+    <<"disabled">>.
+
+print_log_output(#{
+    name := Name,
+    level := Level,
+    destination := Destination,
+    status := Status
+}) ->
+    emqx_ctl:print(
+        "LogOutput(name=~ts, level=~ts, destination=~ts, status=~ts)~n",
+        [Name, fmt_cli(Level), fmt_cli(Destination), Status]
+    ).
+
+log_output_path("console", Field, _LogConf) ->
+    {ok, [<<"console">>, Field], <<"console">>};
+log_output_path("file", Field, _LogConf) ->
+    {ok, [<<"file">>, <<"default">>, Field], <<"file">>};
+log_output_path("default", Field, _LogConf) ->
+    {ok, [<<"file">>, <<"default">>, Field], <<"file">>};
+log_output_path(Name, Field, LogConf) ->
+    NameBin = unicode:characters_to_binary(Name),
+    Files = maps:get(<<"file">>, LogConf, #{}),
+    case maps:is_key(NameBin, Files) of
+        true ->
+            {ok, [<<"file">>, NameBin, Field], NameBin};
+        false ->
+            {error, iolist_to_binary(io_lib:format("unknown log output: ~ts", [Name]))}
+    end.
+
+update_log_output(Path, Enable, OutputName) ->
+    LogConf0 = emqx_conf:get_raw([log], #{}),
+    LogConf = emqx_utils_maps:deep_put(Path, LogConf0, Enable),
+    case emqx_conf:update([log], LogConf, ?LOG_UPDATE_OPTS) of
+        {ok, _} ->
+            emqx_ctl:print("log output ~ts ~ts~n", [
+                OutputName,
+                case Enable of
+                    true -> <<"enabled">>;
+                    false -> <<"disabled">>
+                end
+            ]),
+            ok;
+        {error, Reason} = Error ->
+            emqx_ctl:print("[error] failed to update log output ~ts: ~0p~n", [OutputName, Reason]),
+            Error
+    end.
+
+update_log_output_level(Path, Level, OutputName) ->
+    LogConf0 = emqx_conf:get_raw([log], #{}),
+    LogConf = emqx_utils_maps:deep_put(Path, LogConf0, Level),
+    case emqx_conf:update([log], LogConf, ?LOG_UPDATE_OPTS) of
+        {ok, _} ->
+            emqx_ctl:print("log output ~ts level set to ~ts~n", [OutputName, Level]),
+            ok;
+        {error, Reason} = Error ->
+            emqx_ctl:print("[error] failed to update log output ~ts level: ~0p~n", [
+                OutputName, Reason
+            ]),
+            Error
+    end.
+
+fmt_cli(undefined) ->
+    <<"">>;
+fmt_cli(Value) when is_binary(Value) ->
+    Value;
+fmt_cli(Value) when is_atom(Value) ->
+    atom_to_binary(Value, utf8);
+fmt_cli(Value) ->
+    iolist_to_binary(io_lib:format("~0p", [Value])).
 
 %%--------------------------------------------------------------------
 %% @doc Trace Command
 
 trace(["list"]) ->
-    lists:foreach(fun({{Who, Name}, {Level, LogFile}}) ->
-                emqx_ctl:print("Trace(~s=~s, level=~s, destination=~p)~n", [Who, Name, Level, LogFile])
-            end, emqx_tracer:lookup_traces());
-
-trace(["stop", "client", ClientId]) ->
-    trace_off(clientid, ClientId);
-
-trace(["start", "client", ClientId, LogFile]) ->
-    trace_on(clientid, ClientId, all, LogFile);
-
-trace(["start", "client", ClientId, LogFile, Level]) ->
-    trace_on(clientid, ClientId, list_to_atom(Level), LogFile);
-
-trace(["stop", "topic", Topic]) ->
-    trace_off(topic, Topic);
-
-trace(["start", "topic", Topic, LogFile]) ->
-    trace_on(topic, Topic, all, LogFile);
-
-trace(["start", "topic", Topic, LogFile, Level]) ->
-    trace_on(topic, Topic, list_to_atom(Level), LogFile);
-
+    case emqx_trace_handler:running() of
+        [] ->
+            emqx_ctl:print("Trace is empty~n", []);
+        Traces ->
+            lists:foreach(
+                fun(#{filter := {Type, Filter}, level := Level, dst := Dst}) ->
+                    emqx_ctl:print("Trace(~s=~s, level=~s, destination=~0p)~n", [
+                        Type, Filter, Level, Dst
+                    ])
+                end,
+                Traces
+            )
+    end;
+trace(["stop", Operation, Filter0]) ->
+    case trace_type(Operation, Filter0, text) of
+        {ok, Filter, _} -> trace_off(Filter);
+        error -> trace([])
+    end;
+trace(["start", Operation, ClientId, LogFile]) ->
+    trace(["start", Operation, ClientId, LogFile, "all"]);
+trace(["start", Operation, Filter0, LogFile, Level]) ->
+    trace(["start", Operation, Filter0, LogFile, Level, text]);
+trace(["start", Operation, Filter0, LogFile, Level, Formatter0]) ->
+    case trace_type(Operation, Filter0, Formatter0) of
+        {ok, Filter, Formatter} ->
+            trace_on(Filter, list_to_existing_atom(Level), LogFile, Formatter);
+        error ->
+            trace([])
+    end;
 trace(_) ->
-    emqx_ctl:usage([{"trace list", "List all traces started"},
-                    {"trace start client <ClientId> <File> [<Level>]", "Traces for a client"},
-                    {"trace stop  client <ClientId>", "Stop tracing for a client"},
-                    {"trace start topic  <Topic>    <File> [<Level>] ", "Traces for a topic"},
-                    {"trace stop  topic  <Topic> ", "Stop tracing for a topic"}]).
+    emqx_ctl:usage([
+        {"trace list", "List all traces started on local node"},
+        {"trace start client <ClientId> <File> [<Level>] [<Formatter>]",
+            "Traces for a client on local node (Formatter=text|json)"},
+        {"trace stop  client <ClientId>", "Stop tracing for a client on local node"},
+        {"trace start topic  <Topic>    <File> [<Level>] [<Formatter>]",
+            "Traces for a topic on local node (Formatter=text|json)"},
+        {"trace stop  topic  <Topic> ", "Stop tracing for a topic on local node"},
+        {"trace start ip_address  <IP>    <File> [<Level>] [<Formatter>]",
+            "Traces for a client ip on local node (Formatter=text|json)"},
+        {"trace stop  ip_address  <IP> ", "Stop tracing for a client ip on local node"},
+        {"trace start ruleid  <RuleID>    <File> [<Level>] [<Formatter>]",
+            "Traces for a rule ID on local node (Formatter=text|json)"},
+        {"trace stop  ruleid  <RuleID> ", "Stop tracing for a rule ID on local node"}
+    ]).
 
-trace_on(Who, Name, Level, LogFile) ->
-    case emqx_tracer:start_trace({Who, iolist_to_binary(Name)}, Level, LogFile) of
+trace_audit_args(Args) -> Args.
+
+trace_on(Filter = {Type, Value}, Level, LogFile, Formatter) ->
+    Name = trace_name(Filter),
+    HandlerId = emqx_trace_handler:fallback_handler_id(?MODULE_STRING, Name),
+    case emqx_trace_handler:install(HandlerId, Name, Filter, Level, LogFile, Formatter) of
         ok ->
-            emqx_ctl:print("trace ~s ~s successfully~n", [Who, Name]);
+            emqx_trace:check(),
+            emqx_ctl:print("trace ~s ~s successfully~n", [Type, Value]);
         {error, Error} ->
-            emqx_ctl:print("[error] trace ~s ~s: ~p~n", [Who, Name, Error])
+            emqx_ctl:print("[error] trace ~s ~s: ~p~n", [Type, Value, Error])
     end.
 
-trace_off(Who, Name) ->
-    case emqx_tracer:stop_trace({Who, iolist_to_binary(Name)}) of
+trace_off(Filter = {Type, Value}) ->
+    Name = trace_name(Filter),
+    HandlerId = emqx_trace_handler:fallback_handler_id(?MODULE_STRING, Name),
+    ?TRACE("CLI", "trace_stopping", #{Type => Value}),
+    case emqx_trace_handler:uninstall(HandlerId) of
         ok ->
-            emqx_ctl:print("stop tracing ~s ~s successfully~n", [Who, Name]);
+            emqx_trace:check(),
+            emqx_ctl:print("stop tracing ~s ~s successfully~n", [Type, Value]);
         {error, Error} ->
-            emqx_ctl:print("[error] stop tracing ~s ~s: ~p~n", [Who, Name, Error])
+            emqx_ctl:print("[error] stop tracing ~s ~s: ~p~n", [Type, Value, Error])
     end.
+
+trace_name({_Type, Filter}) ->
+    %% NOTE: Asserting the resulting name is valid UTF-8, not expected to fail.
+    Name = iolist_to_binary(["CLI-", Filter]),
+    Name = unicode:characters_to_binary(Name, utf8).
+
+%%--------------------------------------------------------------------
+%% @doc Trace Cluster Command
+-define(DEFAULT_TRACE_DURATION, "1800").
+
+traces(["list"]) ->
+    %% The CLI runs as global administrator; an empty request map signals
+    %% the global namespace to the handler (no auth_meta = global).
+    {200, List} = emqx_mgmt_api_trace:trace(get, #{}),
+    case List of
+        [] ->
+            emqx_ctl:print("Cluster Trace is empty~n", []);
+        _ ->
+            lists:foreach(
+                fun(Trace) ->
+                    #{
+                        type := Type,
+                        name := Name,
+                        status := Status,
+                        log_size := LogSize
+                    } = Trace,
+                    emqx_ctl:print(
+                        "Trace(~s: ~s=~s, ~s, LogSize:~0p)~n",
+                        [Name, Type, maps:get(Type, Trace), Status, LogSize]
+                    )
+                end,
+                List
+            )
+    end;
+traces(["stop", Name]) ->
+    trace_cluster_off(Name);
+traces(["delete", Name]) ->
+    trace_cluster_del(Name);
+traces(["start", Name, Operation, Filter]) ->
+    traces(["start", Name, Operation, Filter, ?DEFAULT_TRACE_DURATION]);
+traces(["start", Name, Operation, Filter, DurationS]) ->
+    traces(["start", Name, Operation, Filter, DurationS, text]);
+traces(["start", Name, Operation, Filter0, DurationS, Formatter0]) ->
+    case trace_type(Operation, Filter0, Formatter0) of
+        {ok, Filter, Formatter} -> trace_cluster_on(Name, Filter, DurationS, Formatter);
+        error -> traces([])
+    end;
+traces(_) ->
+    emqx_ctl:usage([
+        {"traces list", "List all cluster traces started"},
+        {"traces start <Name> client <ClientId> [<Duration>] [<Formatter>]",
+            "Traces for a client in cluster (Formatter=text|json)"},
+        {"traces start <Name> topic <Topic> [<Duration>] [<Formatter>]",
+            "Traces for a topic in cluster (Formatter=text|json)"},
+        {"traces start <Name> ruleid <RuleID> [<Duration>] [<Formatter>]",
+            "Traces for a rule ID in cluster (Formatter=text|json)"},
+        {"traces start <Name> ip_address <IPAddr> [<Duration>] [<Formatter>]",
+            "Traces for a client IP in cluster\n"
+            "Trace will start immediately on all nodes, including the core and replicant,\n"
+            "and will end after <Duration> seconds. The default value for <Duration> is "
+            ?DEFAULT_TRACE_DURATION
+            " seconds. (Formatter=text|json)"},
+        {"traces stop <Name>", "Stop trace in cluster"},
+        {"traces delete <Name>", "Delete trace in cluster"}
+    ]).
+
+traces_audit_args(Args) -> Args.
+
+trace_cluster_on(Name, Filter = {Type, Value}, DurationS0, Formatter) ->
+    Now = emqx_trace:now_second(),
+    DurationS = list_to_integer(DurationS0),
+    Trace = #{
+        name => bin(Name),
+        filter => Filter,
+        start_at => Now,
+        end_at => Now + DurationS,
+        formatter => Formatter
+    },
+    case emqx_trace:create(Trace) of
+        {ok, _} ->
+            emqx_ctl:print("cluster_trace ~p ~s ~s successfully~n", [Type, Value, Name]);
+        {error, Error} ->
+            emqx_ctl:print(
+                "[error] cluster_trace ~s ~s=~s ~p~n",
+                [Name, Type, Value, Error]
+            )
+    end.
+
+trace_cluster_del(Name) ->
+    case emqx_trace:delete(bin(Name)) of
+        ok -> emqx_ctl:print("Del cluster_trace ~s successfully~n", [Name]);
+        {error, Error} -> emqx_ctl:print("[error] Del cluster_trace ~s: ~p~n", [Name, Error])
+    end.
+
+trace_cluster_off(Name) ->
+    case emqx_trace:update(bin(Name), false) of
+        ok -> emqx_ctl:print("Stop cluster_trace ~s successfully~n", [Name]);
+        {error, Error} -> emqx_ctl:print("[error] Stop cluster_trace ~s: ~p~n", [Name, Error])
+    end.
+
+trace_type(Op, Match, "text") -> trace_type(Op, Match, text);
+trace_type(Op, Match, "json") -> trace_type(Op, Match, json);
+trace_type("client", ClientId, Formatter) -> {ok, {clientid, bin(ClientId)}, Formatter};
+trace_type("topic", Topic, Formatter) -> {ok, {topic, bin(Topic)}, Formatter};
+trace_type("ip_address", IP, Formatter) -> {ok, {ip_address, bin(IP)}, Formatter};
+trace_type("ruleid", RuleId, Formatter) -> {ok, {ruleid, bin(RuleId)}, Formatter};
+trace_type(_, _, _) -> error.
 
 %%--------------------------------------------------------------------
 %% @doc Listeners Command
 
 listeners([]) ->
-    lists:foreach(fun({{Protocol, ListenOn}, _Pid}) ->
-                Info = [{listen_on,      {string, emqx_listeners:format_listen_on(ListenOn)}},
-                        {acceptors,      esockd:get_acceptors({Protocol, ListenOn})},
-                        {max_conns,      esockd:get_max_connections({Protocol, ListenOn})},
-                        {current_conn,   esockd:get_current_connections({Protocol, ListenOn})},
-                        {shutdown_count, esockd:get_shutdown_count({Protocol, ListenOn})}
-                       ],
-                    emqx_ctl:print("~s~n", [listener_identifier(Protocol, ListenOn)]),
-                lists:foreach(fun indent_print/1, Info)
-            end, esockd:listeners()),
-    lists:foreach(fun({Protocol, Opts}) ->
-                Port = proplists:get_value(port, Opts),
-                Info = [{listen_on,      {string, emqx_listeners:format_listen_on(Port)}},
-                        {acceptors,      maps:get(num_acceptors, proplists:get_value(transport_options, Opts, #{}), 0)},
-                        {max_conns,      proplists:get_value(max_connections, Opts)},
-                        {current_conn,   proplists:get_value(all_connections, Opts)},
-                        {shutdown_count, []}],
-                    emqx_ctl:print("~s~n", [listener_identifier(Protocol, Port)]),
-                lists:foreach(fun indent_print/1, Info)
-            end, ranch:info());
-
-listeners(["stop",  Name = "http" ++ _N | _MaybePort]) ->
-    %% _MaybePort is to be backward compatible, to stop http listener, there is no need for the port number
-    case minirest:stop_http(list_to_atom(Name)) of
-        ok ->
-            emqx_ctl:print("Stop ~s listener successfully.~n", [Name]);
-        {error, Error} ->
-            emqx_ctl:print("Failed to stop ~s listener: ~0p~n", [Name, Error])
+    lists:foreach(
+        fun({Id, Conf}) ->
+            Bind = maps:get(bind, Conf),
+            ResolvedAddress = maps:get(resolved_address, Conf),
+            ResolvedAddressFrom = maps:get(resolved_address_from, Conf),
+            Enable = maps:get(enable, Conf),
+            Acceptors = maps:get(acceptors, Conf),
+            ProxyProtocol = maps:get(proxy_protocol, Conf, undefined),
+            Running = maps:get(running, Conf),
+            case Running of
+                true ->
+                    CurrentConns =
+                        case emqx_listeners:current_conns(Id, Bind) of
+                            {error, _} -> [];
+                            CC -> [{current_conn, CC}]
+                        end,
+                    MaxConn =
+                        case emqx_listeners:max_conns(Id, Bind) of
+                            {error, _} -> [];
+                            MC -> [{max_conns, MC}]
+                        end,
+                    ShutdownCount =
+                        case emqx_listeners:shutdown_count(Id, Bind) of
+                            {error, _} -> [];
+                            SC -> [{shutdown_count, {counters, 27, lists:sort(SC)}}]
+                        end,
+                    AcceptStats =
+                        case emqx_listeners:accept_stats(Id, Bind) of
+                            {error, _} -> [];
+                            AS -> [{accept_stats, {counters, 20, AS}}]
+                        end;
+                false ->
+                    CurrentConns = [],
+                    MaxConn = [],
+                    ShutdownCount = [],
+                    AcceptStats = []
+            end,
+            %% `running` must stay the 5th line after the listener id: some
+            %% scripts (e.g. .ci/docker-compose-file/scripts/run-emqx.sh,
+            %% scripts/test/essential-auth-smoke/run.sh) grep a fixed number
+            %% of lines after the id to find it. Append new fields after
+            %% `running`, never insert them before it.
+            Info =
+                [
+                    {listen_on, {string, emqx_listeners:format_bind(Bind)}},
+                    {acceptors, Acceptors},
+                    {proxy_protocol, ProxyProtocol},
+                    {enable, Enable},
+                    {running, Running},
+                    {resolved_address, {string, ResolvedAddress}},
+                    {resolved_address_from, {string, ResolvedAddressFrom}}
+                ] ++ CurrentConns ++ MaxConn ++ ShutdownCount ++ AcceptStats,
+            emqx_ctl:print("~ts~n", [Id]),
+            lists:foreach(fun indent_print/1, Info)
+        end,
+        emqx_listeners:list()
+    );
+listeners(["stop", ListenerId]) ->
+    case emqx_utils:safe_to_existing_atom(ListenerId) of
+        {ok, ListenerId1} ->
+            case emqx_listeners:stop_listener(ListenerId1) of
+                ok ->
+                    emqx_ctl:print("Stop ~ts listener successfully.~n", [ListenerId]);
+                {error, Error} ->
+                    emqx_ctl:print("Failed to stop ~ts listener: ~0p~n", [ListenerId, Error])
+            end;
+        _ ->
+            emqx_ctl:print("Invalid listener: ~0p~n", [ListenerId])
     end;
-
-listeners(["stop", "mqtt:" ++ _ = Identifier]) ->
-    stop_listener(emqx_listeners:find_by_id(Identifier), Identifier);
-
-listeners(["stop", _Proto, ListenOn]) ->
-    %% this clause is kept to be backward compatible
-    ListenOn1 = case string:tokens(ListenOn, ":") of
-        [Port]     -> list_to_integer(Port);
-        [IP, Port] -> {IP, list_to_integer(Port)}
-    end,
-    stop_listener(emqx_listeners:find_by_listen_on(ListenOn1), ListenOn1);
-
-listeners(["restart", "http:management"]) ->
-    restart_http_listener(http, emqx_management);
-
-listeners(["restart", "https:management"]) ->
-    restart_http_listener(https, emqx_management);
-
-listeners(["restart", "http:dashboard"]) ->
-    restart_http_listener(http, emqx_dashboard);
-
-listeners(["restart", "https:dashboard"]) ->
-    restart_http_listener(https, emqx_dashboard);
-
-listeners(["restart", Identifier]) ->
-    case emqx_listeners:restart_listener(Identifier) of
-        ok ->
-            emqx_ctl:print("Restarted ~s listener successfully.~n", [Identifier]);
-        {error, Error} ->
-            emqx_ctl:print("Failed to restart ~s listener: ~0p~n", [Identifier, Error])
+listeners(["start", ListenerId]) ->
+    case emqx_utils:safe_to_existing_atom(ListenerId) of
+        {ok, ListenerId1} ->
+            case emqx_listeners:start_listener(ListenerId1) of
+                ok ->
+                    emqx_ctl:print("Started ~ts listener successfully.~n", [ListenerId]);
+                {error, Error} ->
+                    emqx_ctl:print("Failed to start ~ts listener: ~0p~n", [ListenerId, Error])
+            end;
+        _ ->
+            emqx_ctl:print("Invalid listener: ~0p~n", [ListenerId])
     end;
-
-listeners(_) ->
-    emqx_ctl:usage([{"listeners",                        "List listeners"},
-                    {"listeners stop    <Identifier>",   "Stop a listener"},
-                    {"listeners stop    <Proto> <Port>", "Stop a listener"},
-                    {"listeners restart <Identifier>",   "Restart a listener"}
-                   ]).
-
-stop_listener(false, Input) ->
-    emqx_ctl:print("No such listener ~p~n", [Input]);
-stop_listener(#{listen_on := ListenOn} = Listener, _Input) ->
-    ID = emqx_listeners:identifier(Listener),
-    ListenOnStr = emqx_listeners:format_listen_on(ListenOn),
-    case emqx_listeners:stop_listener(Listener) of
-        ok ->
-            emqx_ctl:print("Stop ~s listener on ~s successfully.~n", [ID, ListenOnStr]);
+listeners(["restart", ListenerId]) ->
+    case emqx_utils:safe_to_existing_atom(ListenerId) of
+        {ok, ListenerId1} ->
+            case emqx_listeners:restart_listener(ListenerId1) of
+                ok ->
+                    emqx_ctl:print("Restarted ~ts listener successfully.~n", [ListenerId]);
+                {error, Error} ->
+                    emqx_ctl:print("Failed to restart ~ts listener: ~0p~n", [ListenerId, Error])
+            end;
+        _ ->
+            emqx_ctl:print("Invalid listener: ~0p~n", [ListenerId])
+    end;
+listeners(["enable", ListenerId, Enable0]) ->
+    maybe
+        {ok, Enable, Action} ?=
+            case Enable0 of
+                "true" ->
+                    {ok, true, start};
+                "false" ->
+                    {ok, false, stop};
+                _ ->
+                    {error, badarg}
+            end,
+        {ok, #{type := Type, name := Name}} ?= emqx_listeners:parse_listener_id(ListenerId),
+        #{<<"enable">> := OldEnable} ?= RawConf = emqx_conf:get_raw(
+            [listeners, Type, Name], {error, not_found}
+        ),
+        {ok, AtomId} = emqx_utils:safe_to_existing_atom(ListenerId),
+        ok ?=
+            case Enable of
+                OldEnable ->
+                    %% `enable` and `running` may lose synchronization due to the start/stop commands
+                    case Action of
+                        start ->
+                            emqx_listeners:start_listener(AtomId);
+                        stop ->
+                            emqx_listeners:stop_listener(AtomId)
+                    end;
+                _ ->
+                    Conf = RawConf#{<<"enable">> := Enable},
+                    case emqx_mgmt_listeners_conf:action(Type, Name, Action, Conf) of
+                        {ok, _} ->
+                            ok;
+                        Error ->
+                            Error
+                    end
+            end,
+        emqx_ctl:print("Updated 'enable' to: '~0p' successfully.~n", [Enable])
+    else
+        {error, badarg} ->
+            emqx_ctl:print("Invalid bool argument: ~0p~n", [Enable0]);
+        {error, {invalid_listener_id, _Id}} ->
+            emqx_ctl:print("Invalid listener: ~0p~n", [ListenerId]);
+        {error, not_found} ->
+            emqx_ctl:print("Listener not found: ~0p~n", [ListenerId]);
+        {error, {already_started, _Pid}} ->
+            emqx_ctl:print("Updated 'enable' to: '~0p' successfully.~n", [Enable0]);
         {error, Reason} ->
-            emqx_ctl:print("Failed to stop ~s listener on ~s: ~0p~n",
-                           [ID, ListenOnStr, Reason])
-    end.
+            emqx_ctl:print("Update listener: ~0p failed, Reason: ~0p~n", [
+                ListenerId, Reason
+            ])
+    end;
+listeners(_) ->
+    emqx_ctl:usage([
+        {"listeners", "List listeners"},
+        {"listeners stop    <Identifier>", "Stop a listener"},
+        {"listeners start   <Identifier>", "Start a listener"},
+        {"listeners restart <Identifier>", "Restart a listener"},
+        {"listeners enable <Identifier> <true/false>", "Enable or disable a listener"}
+    ]).
+
+listeners_audit_args(Args) -> Args.
+
+%%--------------------------------------------------------------------
+%% @doc authz Command
+
+authz(["cache-clean", "node", Node]) ->
+    Msg = io_lib:format("Authorization cache drain started on node ~ts", [Node]),
+    with_log(fun() -> for_node(fun emqx_mgmt:clean_authz_cache_all/1, Node) end, Msg);
+authz(["cache-clean", "all"]) ->
+    Msg = "Authorization cache drain started on all nodes",
+    with_log(fun emqx_mgmt:clean_authz_cache_all/0, Msg);
+authz(["cache-clean", ClientId]) ->
+    Msg = io_lib:format("Drain ~ts authz cache", [ClientId]),
+    with_log(fun() -> emqx_mgmt:clean_authz_cache(iolist_to_binary(ClientId)) end, Msg);
+authz(_) ->
+    emqx_ctl:usage(
+        [
+            {"authz cache-clean all", "Clears authorization cache on all nodes"},
+            {"authz cache-clean node <Node>", "Clears authorization cache on given node"},
+            {"authz cache-clean <ClientId>", "Clears authorization cache for given client"}
+        ]
+    ).
+
+authz_audit_args(Args) -> Args.
+
+pem_cache(["clean", "all"]) ->
+    with_log(fun emqx_mgmt:clean_pem_cache_all/0, "PEM cache clean");
+pem_cache(["clean", "node", Node]) ->
+    Msg = io_lib:format("~ts PEM cache clean", [Node]),
+    with_log(fun() -> for_node(fun emqx_mgmt:clean_pem_cache_all/1, Node) end, Msg);
+pem_cache(_) ->
+    emqx_ctl:usage([
+        {"pem_cache clean all", "Clears x509 certificate cache on all nodes"},
+        {"pem_cache clean node <Node>", "Clears x509 certificate cache on given node"}
+    ]).
+
+pem_cache_audit_args(Args) -> Args.
+
+%%--------------------------------------------------------------------
+%% @doc OLP (Overload Protection related)
+olp(["status"]) ->
+    S =
+        case emqx_olp:is_overloaded() of
+            true -> "overloaded";
+            false -> "not overloaded"
+        end,
+    emqx_ctl:print("~p is ~s ~n", [node(), S]);
+olp(["disable"]) ->
+    Res = emqx_olp:disable(),
+    emqx_ctl:print("Disable overload protetion ~p : ~p ~n", [node(), Res]);
+olp(["enable"]) ->
+    Res = emqx_olp:enable(),
+    emqx_ctl:print("Enable overload protection ~p : ~p ~n", [node(), Res]);
+olp(_) ->
+    emqx_ctl:usage([
+        {"olp status", "Return OLP status if system is overloaded"},
+        {"olp enable", "Enable overload protection"},
+        {"olp disable", "Disable overload protection"}
+    ]).
+
+olp_audit_args(Args) -> Args.
 
 %%--------------------------------------------------------------------
 %% @doc data Command
 
-data(["export"]) ->
-    case emqx_mgmt_data_backup:export() of
-        {ok, #{filename := Filename}} ->
-            emqx_ctl:print("The emqx data has been successfully exported to ~s.~n", [Filename]);
+data(["export" | Args]) ->
+    maybe
+        {ok, Opts0} ?= parse_data_export_args(Args),
+        Opts = maps:merge(?DATA_BACKUP_OPTS, Opts0),
+        {ok, #{filename := Filename}} ?= emqx_mgmt_data_backup:export(Opts),
+        emqx_ctl:print("Data has been successfully exported to ~s.~n", [Filename])
+    else
+        {error, {unknown_root_keys, UnknownKeys}} ->
+            Msg = iolist_to_binary([
+                <<"Invalid root keys: ">>,
+                lists:join(<<", ">>, UnknownKeys)
+            ]),
+            emqx_ctl:print([Msg, $\n]);
+        {error, {bad_table_sets, InvalidSetNames}} ->
+            Msg = iolist_to_binary([
+                <<"Invalid table sets: ">>,
+                lists:join(<<", ">>, InvalidSetNames)
+            ]),
+            emqx_ctl:print([Msg, $\n]);
         {error, Reason} ->
-            emqx_ctl:print("The emqx data export failed due to ~p.~n", [Reason])
+            Reason1 = emqx_mgmt_data_backup:format_error(Reason),
+            emqx_ctl:print("[error] Data export failed, reason: ~p.~n", [Reason1])
     end;
-
+data(["import", Filename, "--allow-security-profile-mismatch"]) ->
+    Opts = maps:merge(?DATA_BACKUP_OPTS, #{allow_security_profile_mismatch => true}),
+    do_import_cli(Filename, Opts);
 data(["import", Filename]) ->
-    data(["import", Filename, "--env", "{}"]);
-data(["import", Filename, "--env", Env]) ->
-    case emqx_mgmt_data_backup:import(Filename, Env) of
-        ok ->
-            emqx_ctl:print("The emqx data has been imported successfully.~n");
-        {error, import_failed} ->
-            emqx_ctl:print("The emqx data import failed.~n");
-        {error, unsupported_version} ->
-            emqx_ctl:print("The emqx data import failed: Unsupported version.~n");
-        {error, Reason} ->
-            emqx_ctl:print("The emqx data import failed: ~0p while reading ~s.~n", [Reason, Filename])
-    end;
-
+    do_import_cli(Filename, ?DATA_BACKUP_OPTS);
 data(_) ->
-    emqx_ctl:usage([{"data import <File> [--env '<json>']",
-                     "Import data from the specified file, possibly with overrides"},
-                    {"data export", "Export data"}]).
+    emqx_ctl:usage([
+        {"data import <File> [--allow-security-profile-mismatch]",
+            "Import data from the specified tar archive file"},
+        {
+            "data export \\\n"
+            "  [--root-keys key1,key2,key3] \\\n"
+            "  [--table-sets set1,set2,set3] \\\n"
+            "  [--dir out_dir]",
+            "Export data"
+        }
+    ]).
+
+do_import_cli(Filename, Opts) ->
+    case emqx_mgmt_data_backup:import_local(Filename, Opts) of
+        {ok, #{db_errors := DbErrs, config_errors := ConfErrs}} when
+            map_size(DbErrs) =:= 0, map_size(ConfErrs) =:= 0
+        ->
+            emqx_ctl:print("Data has been imported successfully.~n");
+        {ok, _} ->
+            emqx_ctl:print(
+                "Data has been imported, but some errors occurred, see the log above.~n"
+            );
+        {error, Reason} ->
+            Reason1 = emqx_mgmt_data_backup:format_error(Reason),
+            emqx_ctl:print("[error] Data import failed, reason: ~p.~n", [Reason1])
+    end.
+
+data_audit_args(Args) -> Args.
+
+parse_data_export_args(Args) ->
+    maybe
+        {ok, Collected} ?= collect_data_export_args(Args, #{}),
+        ok ?= emqx_mgmt_data_backup:validate_export_root_keys(Collected),
+        emqx_mgmt_data_backup:parse_export_request(Collected)
+    end.
+
+collect_data_export_args([], Acc) ->
+    {ok, Acc};
+collect_data_export_args(["--root-keys", RootKeysJoined | Rest], Acc) ->
+    RootKeysStr = string:tokens(RootKeysJoined, [$,]),
+    RootKeys = lists:map(fun list_to_binary/1, RootKeysStr),
+    collect_data_export_args(Rest, Acc#{<<"root_keys">> => RootKeys});
+collect_data_export_args(["--table-sets", TableSetsJoined | Rest], Acc) ->
+    TableSetsStr = string:tokens(TableSetsJoined, [$,]),
+    TableSets = lists:map(fun list_to_binary/1, TableSetsStr),
+    collect_data_export_args(Rest, Acc#{<<"table_sets">> => TableSets});
+collect_data_export_args(["--dir", OutDir | Rest], Acc) ->
+    collect_data_export_args(Rest, Acc#{<<"out_dir">> => OutDir});
+collect_data_export_args(Args, _Acc) ->
+    {error, io_lib:format("unknown arguments: ~p", [Args])}.
 
 %%--------------------------------------------------------------------
-%% @doc acl Command
+%% @doc Parse dump stats arguments
 
-acl(["cache-clean", "node", Node]) ->
-    case emqx_mgmt:clean_acl_cache_all(erlang:list_to_existing_atom(Node)) of
-        ok ->
-            emqx_ctl:print("ACL cache drain started on node ~s.~n", [Node]);
-        {error, Reason} ->
-            emqx_ctl:print("ACL drain failed on node ~s: ~0p.~n", [Node, Reason])
+parse_dump_stats_args(Args) ->
+    maybe
+        {ok, Collected} ?= collect_dump_stats_args(Args, #{}),
+        ok ?= validate_dump_stats_args(Collected),
+        {ok, Collected}
+    end.
+
+collect_dump_stats_args([], Acc) ->
+    {ok, Acc};
+collect_dump_stats_args(["--batch", BatchSizeStr | Rest], Acc) ->
+    case string:to_integer(BatchSizeStr) of
+        {BatchSize, []} when BatchSize > 0 ->
+            collect_dump_stats_args(Rest, Acc#{batch_size => BatchSize});
+        _ ->
+            {error,
+                io_lib:format("Invalid batch size: ~s. Must be a positive integer.", [BatchSizeStr])}
     end;
-
-acl(["cache-clean", "all"]) ->
-    case emqx_mgmt:clean_acl_cache_all() of
-        ok ->
-            emqx_ctl:print("Started ACL cache drain in all nodes~n");
-        {error, Reason} ->
-            emqx_ctl:print("ACL cache-clean failed: ~p.~n", [Reason])
+collect_dump_stats_args(["--sleep", SleepStr | Rest], Acc) ->
+    case string:to_integer(SleepStr) of
+        {SleepMs, []} when SleepMs >= 0 ->
+            collect_dump_stats_args(Rest, Acc#{sleep_ms => SleepMs});
+        _ ->
+            {error,
+                io_lib:format("Invalid sleep value: ~s. Must be a non-negative integer.", [SleepStr])}
     end;
+collect_dump_stats_args(Args, _Acc) ->
+    {error, io_lib:format("unknown arguments: ~p", [Args])}.
 
-acl(["cache-clean", ClientId]) ->
-    emqx_mgmt:clean_acl_cache(ClientId);
+validate_dump_stats_args(Opts) ->
+    BatchSize = maps:get(batch_size, Opts, 1000),
+    SleepMs = maps:get(sleep_ms, Opts, 10),
+    case BatchSize > 0 andalso SleepMs >= 0 of
+        true ->
+            ok;
+        false ->
+            {error, "Invalid parameters"}
+    end.
 
-acl(_) ->
-    emqx_ctl:usage([{"acl cache-clean all",             "Clears acl cache on all nodes"},
-                    {"acl cache-clean node <Node>",     "Clears acl cache on given node"},
-                    {"acl cache-clean <ClientId>",      "Clears acl cache for given client"}
-                   ]).
+parse_session_top_args(Args) ->
+    maybe
+        {ok, Opts} ?=
+            collect_session_top_args(Args, #{
+                count => 10,
+                sort => total_payload_bytes,
+                batch_size => 1000,
+                sleep_ms => 1
+            }),
+        ok ?= validate_session_top_args(Opts),
+        {ok, Opts}
+    end.
+
+collect_session_top_args([], Acc) ->
+    {ok, Acc};
+collect_session_top_args(["--out", Out | Rest], Acc) ->
+    collect_session_top_args(Rest, Acc#{out => Out});
+collect_session_top_args(["--count", CountStr | Rest], Acc) ->
+    case string:to_integer(CountStr) of
+        {Count, []} when Count > 0, Count =< 1000 ->
+            collect_session_top_args(Rest, Acc#{count => Count});
+        {Count, []} when Count > 1000 ->
+            {error, "Invalid count: maximum is 1000."};
+        _ ->
+            {error, io_lib:format("Invalid count: ~s. Must be a positive integer.", [CountStr])}
+    end;
+collect_session_top_args(["--sort", SortStr | Rest], Acc) ->
+    case parse_session_top_sort(SortStr) of
+        {ok, Sort} ->
+            collect_session_top_args(Rest, Acc#{sort => Sort});
+        error ->
+            {error, "Invalid sort key. Supported values are mqueue_length and total_payload_bytes."}
+    end;
+collect_session_top_args(["--batch", BatchSizeStr | Rest], Acc) ->
+    case string:to_integer(BatchSizeStr) of
+        {BatchSize, []} when BatchSize > 0 ->
+            collect_session_top_args(Rest, Acc#{batch_size => BatchSize});
+        _ ->
+            {error,
+                io_lib:format("Invalid batch size: ~s. Must be a positive integer.", [
+                    BatchSizeStr
+                ])}
+    end;
+collect_session_top_args(["--sleep", SleepStr | Rest], Acc) ->
+    case string:to_integer(SleepStr) of
+        {SleepMs, []} when SleepMs >= 0 ->
+            collect_session_top_args(Rest, Acc#{sleep_ms => SleepMs});
+        _ ->
+            {error,
+                io_lib:format("Invalid sleep value: ~s. Must be a non-negative integer.", [
+                    SleepStr
+                ])}
+    end;
+collect_session_top_args(Args, _Acc) ->
+    {error, io_lib:format("unknown arguments: ~p", [Args])}.
+
+parse_session_top_sort("mqueue_length") ->
+    {ok, mqueue_length};
+parse_session_top_sort("total_payload_bytes") ->
+    {ok, total_payload_bytes};
+parse_session_top_sort(_) ->
+    error.
+
+validate_session_top_args(#{out := _Out}) ->
+    ok;
+validate_session_top_args(_Opts) ->
+    {error, "--out <File> is required."}.
+
+ensure_out_file_absent(OutFile) ->
+    case file:read_file_info(OutFile) of
+        {ok, _Info} -> {error, eexist};
+        {error, enoent} -> ok;
+        {error, Reason} -> {error, Reason}
+    end.
+
+%%--------------------------------------------------------------------
+%% @doc Durable storage
+
+ds(Cmd) ->
+    case emqx_mgmt_api_ds:is_enabled() of
+        true ->
+            do_ds(Cmd);
+        false ->
+            emqx_ctl:usage([{"ds", "Durable storage is disabled"}])
+    end.
+
+ds_audit_args(Args) -> Args.
+
+do_ds(["info"]) ->
+    emqx_ds_builtin_raft_meta:print_status(),
+    ok;
+do_ds(["set-replicas", DBStr | SitesStr]) ->
+    case string_to_ds_dbs(DBStr) of
+        [] ->
+            emqx_ctl:warning("Unknown durable storage");
+        DBs ->
+            Sites = lists:map(fun list_to_binary/1, SitesStr),
+            lists:foreach(
+                fun(DB) ->
+                    case emqx_mgmt_api_ds:update_db_sites(DB, Sites, cli) of
+                        {ok, _} ->
+                            emqx_ctl:print("ok~n");
+                        {error, Description} ->
+                            emqx_ctl:warning("Unable to update replicas: ~s~n", [Description])
+                    end
+                end,
+                DBs
+            )
+    end;
+do_ds(["set_replicas" | Args]) ->
+    do_ds(["set-replicas" | Args]);
+do_ds(["join", DBStr, Site]) ->
+    case string_to_ds_dbs(DBStr) of
+        [] ->
+            emqx_ctl:warning("Unknown durable storage~n");
+        DBs ->
+            lists:foreach(
+                fun(DB) ->
+                    case emqx_mgmt_api_ds:join(DB, list_to_binary(Site), cli) of
+                        {ok, unchanged} ->
+                            emqx_ctl:print("unchanged~n");
+                        {ok, _} ->
+                            emqx_ctl:print("ok~n");
+                        {error, Description} ->
+                            emqx_ctl:warning("Unable to update replicas: ~s~n", [Description])
+                    end
+                end,
+                DBs
+            )
+    end;
+do_ds(["leave", DBStr, Site]) ->
+    case string_to_ds_dbs(DBStr) of
+        [] ->
+            emqx_ctl:warning("Unknown durable storage~n");
+        DBs ->
+            lists:foreach(
+                fun(DB) ->
+                    case emqx_mgmt_api_ds:leave(DB, list_to_binary(Site), cli) of
+                        {ok, unchanged} ->
+                            emqx_ctl:print("unchanged~n");
+                        {ok, _} ->
+                            emqx_ctl:print("ok~n");
+                        {error, Description} ->
+                            emqx_ctl:warning("Unable to update replicas: ~s~n", [Description])
+                    end
+                end,
+                DBs
+            )
+    end;
+do_ds(["forget", Site]) ->
+    case emqx_mgmt_api_ds:forget(list_to_binary(Site), cli) of
+        ok ->
+            emqx_ctl:print("ok~n");
+        {error, Description} ->
+            emqx_ctl:warning("Unable to forget site: ~s~n", [Description])
+    end;
+do_ds(_) ->
+    emqx_ctl:usage([
+        {"ds info", "Show overview of the embedded durable storage state"},
+        {"ds set-replicas <storage>|all <site1> <site2> ...",
+            "Change the replica set of the durable storage(s)"},
+        {"ds join <storage>|all <site>", "Add site to the replica set of the storage(s)"},
+        {"ds leave <storage>|all <site>", "Remove site from the replica set of the storage(s)"},
+        {"ds forget <site>", "Remove a site from the list of known sites"}
+    ]).
+
+ds_cluster_leave_safeguards() ->
+    case emqx_mgmt_api_ds:is_enabled() andalso emqx_mgmt_api_ds:shards_of_this_site() of
+        [_ | _] -> [nonempty_ds_site];
+        [] -> [];
+        false -> []
+    end.
+
+string_to_ds_dbs("all") ->
+    [DB || {DB, builtin_raft} <- emqx_ds:which_dbs()];
+string_to_ds_dbs(DBStr) ->
+    case emqx_utils:safe_to_existing_atom(DBStr) of
+        {ok, DB} ->
+            [DB];
+        {error, _} ->
+            []
+    end.
 
 %%--------------------------------------------------------------------
 %% Dump ETS
 %%--------------------------------------------------------------------
 
-dump(Table) ->
-    dump(Table, Table, ets:first(Table), []).
-
+-doc """
+Print every object in `Table`. The walk reads the table in chunks with an
+`ets:select/3` continuation, so it does not fail when objects are inserted
+or deleted during the walk. Such objects may be printed or skipped.
+""".
 dump(Table, Tag) ->
-    dump(Table, Tag, ets:first(Table), []).
+    dump_chunk(Tag, ets:select(Table, [{'_', [], ['$_']}], ?DUMP_CHUNK_SIZE)).
 
-dump(_Table, _, '$end_of_table', Result) ->
-    lists:reverse(Result);
-
-dump(Table, Tag, Key, Result) ->
-    PrintValue = [print({Tag, Record}) || Record <- ets:lookup(Table, Key)],
-    dump(Table, Tag, ets:next(Table, Key), [PrintValue | Result]).
-
-print({_, []}) ->
+dump_chunk(_Tag, '$end_of_table') ->
     ok;
+dump_chunk(Tag, {Records, Cont}) ->
+    lists:foreach(fun(Record) -> print({Tag, Record}) end, Records),
+    dump_chunk(Tag, ets:select(Cont)).
 
-print({client, {ClientId, ChanPid}}) ->
-    Attrs = case emqx_cm:get_chan_info(ClientId, ChanPid) of
-                undefined -> #{};
-                Attrs0 -> Attrs0
-            end,
-    Stats = case emqx_cm:get_chan_stats(ClientId, ChanPid) of
-                undefined -> #{};
-                Stats0 -> maps:from_list(Stats0)
-            end,
+print_client(ClientId, ChanPid, Attrs) ->
+    Stats =
+        case emqx_cm:get_chan_stats(ClientId, ChanPid) of
+            undefined -> #{};
+            Stats0 -> maps:from_list(Stats0)
+        end,
     ClientInfo = maps:get(clientinfo, Attrs, #{}),
     ConnInfo = maps:get(conninfo, Attrs, #{}),
     Session = maps:get(session, Attrs, #{}),
-    Connected = case maps:get(conn_state, Attrs) of
-                    connected -> true;
-                    _ -> false
-                end,
-    Info = lists:foldl(fun(Items, Acc) ->
-                               maps:merge(Items, Acc)
-                       end, #{connected => Connected},
-                       [maps:with([subscriptions_cnt, inflight_cnt, awaiting_rel_cnt,
-                                   mqueue_len, mqueue_dropped, send_msg], Stats),
-                        maps:with([clientid, username], ClientInfo),
-                        maps:with([peername, clean_start, keepalive, expiry_interval,
-                                   connected_at, disconnected_at], ConnInfo),
-                        maps:with([created_at], Session)]),
-    InfoKeys = [clientid, username, peername,
-                clean_start, keepalive, expiry_interval,
-                subscriptions_cnt, inflight_cnt, awaiting_rel_cnt, send_msg, mqueue_len, mqueue_dropped,
-                connected, created_at, connected_at] ++ case maps:is_key(disconnected_at, Info) of
-                                                            true  -> [disconnected_at];
-                                                            false -> []
-                                                        end,
-    emqx_ctl:print("Client(~s, username=~s, peername=~s, "
-                    "clean_start=~s, keepalive=~w, session_expiry_interval=~w, "
-                    "subscriptions=~w, inflight=~w, awaiting_rel=~w, delivered_msgs=~w, enqueued_msgs=~w, dropped_msgs=~w, "
-                    "connected=~s, created_at=~w, connected_at=~w" ++ case maps:is_key(disconnected_at, Info) of
-                                                                          true  -> ", disconnected_at=~w)~n";
-                                                                          false -> ")~n"
-                                                                      end,
-                    [format(K, maps:get(K, Info)) || K <- InfoKeys]);
+    Connected =
+        case maps:get(conn_state, Attrs) of
+            connected -> true;
+            _ -> false
+        end,
+    Info = lists:foldl(
+        fun maps:merge/2,
+        #{connected => Connected},
+        [
+            maps:with(
+                [
+                    subscriptions_cnt,
+                    inflight_cnt,
+                    awaiting_rel_cnt,
+                    mqueue_len,
+                    mqueue_dropped,
+                    send_msg
+                ],
+                Stats
+            ),
+            maps:with([clientid, username], ClientInfo),
+            maps:with(
+                [
+                    peername,
+                    clean_start,
+                    keepalive,
+                    expiry_interval,
+                    connected_at,
+                    disconnected_at
+                ],
+                ConnInfo
+            ),
+            maps:with([created_at], Session)
+        ]
+    ),
+    InfoKeys =
+        [
+            clientid,
+            username,
+            peername,
+            clean_start,
+            keepalive,
+            expiry_interval,
+            subscriptions_cnt,
+            inflight_cnt,
+            awaiting_rel_cnt,
+            send_msg,
+            mqueue_len,
+            mqueue_dropped,
+            connected,
+            created_at,
+            connected_at
+        ] ++
+            case maps:is_key(disconnected_at, Info) of
+                true -> [disconnected_at];
+                false -> []
+            end,
+    Info1 = Info#{expiry_interval => maps:get(expiry_interval, Info) div 1000},
+    emqx_ctl:print(
+        "Client(~ts, username=~ts, peername=~ts, clean_start=~ts, "
+        "keepalive=~w, session_expiry_interval=~w, subscriptions=~w, "
+        "inflight=~w, awaiting_rel=~w, delivered_msgs=~w, enqueued_msgs=~w, "
+        "dropped_msgs=~w, connected=~ts, created_at=~w, connected_at=~w" ++
+            case maps:is_key(disconnected_at, Info1) of
+                true -> ", disconnected_at=~w)~n";
+                false -> ")~n"
+            end,
+        [format(K, maps:get(K, Info1)) || K <- InfoKeys]
+    ).
 
-print({emqx_route, #route{topic = Topic, dest = {_, Node}}}) ->
-    emqx_ctl:print("~s -> ~s~n", [Topic, Node]);
-print({emqx_route, #route{topic = Topic, dest = Node}}) ->
-    emqx_ctl:print("~s -> ~s~n", [Topic, Node]);
+print({_, []}) ->
+    ok;
+print({client, {ClientId, ChanPid}}) ->
+    %% The channel is gone when it has no info. Print nothing for it.
+    case emqx_cm:get_chan_info(ClientId, ChanPid) of
+        undefined -> ok;
+        Attrs -> print_client(ClientId, ChanPid, Attrs)
+    end;
+print({emqx_topic, #route{topic = Topic, dest = {_, Node}}}) ->
+    emqx_ctl:print("~ts -> ~ts~n", [Topic, Node]);
+print({emqx_topic, #route{topic = Topic, dest = Node}}) ->
+    emqx_ctl:print("~ts -> ~ts~n", [Topic, Node]);
+print({?SUBOPTION, {{Topic, Pid}, Options}}) when is_pid(Pid) ->
+    print_subopts(maps:get(subid, Options), Topic, Options);
+print({exclusive, {exclusive_subscription, Topic, ClientId}}) ->
+    emqx_ctl:print("topic:~ts -> ClientId:~ts~n", [Topic, ClientId]).
 
-print(#plugin{name = Name, descr = Descr, active = Active}) ->
-    emqx_ctl:print("Plugin(~s, description=~s, active=~s)~n",
-                  [Name, Descr, Active]);
-
-print({emqx_suboption, {{Pid, Topic}, Options}}) when is_pid(Pid) ->
-    emqx_ctl:print("~s -> ~s~n", [maps:get(subid, Options), Topic]).
+print_subopts(SubId, Topic, Options) ->
+    QoS = maps:get(qos, Options, 0),
+    NL = maps:get(nl, Options, 0),
+    RH = maps:get(rh, Options, 0),
+    RAP = maps:get(rap, Options, 0),
+    emqx_ctl:print("~ts -> topic:~ts qos:~p nl:~p rh:~p rap:~p~n", [
+        SubId, emqx_topic:maybe_format_share(Topic), QoS, NL, RH, RAP
+    ]).
 
 format(_, undefined) ->
     undefined;
-
 format(peername, {IPAddr, Port}) ->
     IPStr = emqx_mgmt_util:ntoa(IPAddr),
-    io_lib:format("~s:~p", [IPStr, Port]);
-
+    io_lib:format("~ts:~p", [IPStr, Port]);
 format(_, Val) ->
     Val.
 
 bin(S) -> iolist_to_binary(S).
 
+%% The field width must fit the longest key printed through this function
+%% (currently `resolved_address_from`, 21 characters) or `~s` silently
+%% truncates it instead of just skipping the padding.
 indent_print({Key, {string, Val}}) ->
-    emqx_ctl:print("  ~-16s: ~s~n", [Key, Val]);
+    emqx_ctl:print("  ~-22s: ~ts~n", [Key, Val]);
+indent_print({Key, {counters, Width, Counters}}) ->
+    emqx_ctl:print("  ~-22s:~n", [Key]),
+    lists:foreach(
+        fun(Counter) -> indent_print_counter(Width, Counter) end,
+        [C || {_, Count} = C <- Counters, Count =/= 0]
+    );
 indent_print({Key, Val}) ->
-    emqx_ctl:print("  ~-16s: ~w~n", [Key, Val]).
+    emqx_ctl:print("  ~-22s: ~w~n", [Key, Val]).
 
-listener_identifier(Protocol, ListenOn) ->
-    case emqx_listeners:find_id_by_listen_on(ListenOn) of
-        false ->
-            atom_to_list(Protocol);
-        ID ->
-            ID
+%% Nested counters are indented two more spaces than their parent. Zero
+%% counters are not printed. Each block has its own key width: 27 fits the
+%% longest shutdown reason (`client_identifier_not_valid`), 20 fits the longest
+%% accept stat (`closed_other_reasons`). A longer key is padded, not truncated.
+indent_print_counter(Width, {Key, Count}) ->
+    emqx_ctl:print("    ~ts: ~w~n", [string:pad(counter_key(Key), Width), Count]).
+
+counter_key(Key) when is_atom(Key) -> atom_to_list(Key);
+counter_key(Key) -> io_lib:format("~0p", [Key]).
+
+for_node(Fun, Node) ->
+    try list_to_existing_atom(Node) of
+        NodeAtom ->
+            Fun(NodeAtom)
+    catch
+        error:badarg ->
+            {error, unknown_node}
     end.
 
-restart_http_listener(Scheme, AppName) ->
-    Listeners = application:get_env(AppName, listeners, []),
-    case lists:keyfind(Scheme, 1, Listeners) of
-        false ->
-            emqx_ctl:print("Listener ~s not exists!~n", [AppName]);
-        {Scheme, Port, Options} ->
-            ModName = http_mod_name(AppName),
-            ModName:stop_listener({Scheme, Port, Options}),
-            ModName:start_listener({Scheme, Port, Options})
-    end.
+with_log(Fun, Msg) ->
+    Res = Fun(),
+    case Res of
+        ok ->
+            emqx_ctl:print("~s OK~n", [Msg]);
+        {error, Reason} ->
+            emqx_ctl:print("~s FAILED~n~p~n", [Msg, Reason])
+    end,
+    Res.
 
-http_mod_name(emqx_management) -> emqx_mgmt_http;
-http_mod_name(Name) -> Name.
+cluster_info() ->
+    RunningNodes = safe_call_mria(running_nodes, [], []),
+    StoppedNodes = safe_call_mria(cluster_nodes, [stopped], []),
+    #{
+        running_nodes => RunningNodes,
+        stopped_nodes => StoppedNodes
+    }.
+
+%% CLI starts before mria, so we should handle errors gracefully:
+safe_call_mria(Fun, Args, OnFail) ->
+    try
+        apply(mria, Fun, Args)
+    catch
+        EC:Err:Stack ->
+            ?SLOG(warning, #{
+                msg => "call_to_mria_failed",
+                call => {mria, Fun, Args},
+                EC => Err,
+                stacktrace => Stack
+            }),
+            OnFail
+    end.
+%%--------------------------------------------------------------------
+%% @doc Exclusive topics
+exclusive(["list"]) ->
+    case ets:info(?EXCLUSIVE_TAB, size) of
+        0 -> emqx_ctl:print("No topics.~n");
+        _ -> dump(?EXCLUSIVE_TAB, exclusive)
+    end;
+exclusive(["delete", Topic0]) ->
+    Topic = erlang:iolist_to_binary(Topic0),
+    case emqx_exclusive_subscription:dirty_lookup_clientid(Topic) of
+        undefined ->
+            ok;
+        ClientId ->
+            case emqx_mgmt:unsubscribe(ClientId, Topic) of
+                {unsubscribe, _} ->
+                    ok;
+                {error, channel_not_found} ->
+                    emqx_exclusive_subscription:unsubscribe(Topic, #{is_exclusive => true})
+            end
+    end,
+    emqx_ctl:print("ok~n");
+exclusive(_) ->
+    emqx_ctl:usage([
+        {"exclusive list", "List all exclusive topics"},
+        {"exclusive delete <Topic>", "Delete an exclusive topic"}
+    ]).
+
+exclusive_audit_args(Args) -> Args.
+
+%%--------------------------------------------------------------------
+%% @doc node_dump Command
+%%
+%% CLI front-end for `bin/node_dump`. `sys_info/0` and `app_env_dump/0`
+%% return terms instead of printing, so render them here as `emqx eval`
+%% used to via nodetool.
+
+node_dump(["sys_info"]) ->
+    emqx_ctl:print("~p~n", [emqx_node_dump:sys_info()]);
+node_dump(["app_env"]) ->
+    emqx_ctl:print("~p~n", [emqx_node_dump:app_env_dump()]);
+node_dump(["conf"]) ->
+    emqx_node_dump:print_conf_dump();
+node_dump(_) ->
+    emqx_ctl:usage([
+        {"node_dump sys_info", "Print node release and OTP version"},
+        {"node_dump app_env", "Print the application environment (censored)"},
+        {"node_dump conf", "Print the raw configuration tree (redacted)"}
+    ]).
+
+%% No secrets among the sub-command names; pass them through unredacted.
+node_dump_audit_args(Args) -> Args.

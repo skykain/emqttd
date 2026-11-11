@@ -1,0 +1,750 @@
+%%--------------------------------------------------------------------
+%% Copyright (c) 2022-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
+%%--------------------------------------------------------------------
+
+-module(emqx_bridge_datalayers_arrow_flight_connector).
+
+-include("emqx_bridge_datalayers.hrl").
+
+-include_lib("emqx/include/logger.hrl").
+-include_lib("emqx_connector/include/emqx_connector.hrl").
+-include_lib("emqx_resource/include/emqx_resource.hrl").
+
+-include_lib("hocon/include/hoconsc.hrl").
+-include_lib("typerefl/include/types.hrl").
+-include_lib("snabbkaffe/include/snabbkaffe.hrl").
+
+%% callbacks of behaviour emqx_resource
+-export([
+    resource_type/0,
+    callback_mode/0,
+    on_start/2,
+    on_stop/2,
+    on_add_channel/4,
+    on_remove_channel/3,
+    on_get_channels/1,
+    on_get_status/2,
+    on_get_channel_status/3,
+    on_query/3,
+    on_batch_query/3,
+    on_query_async/4,
+    on_batch_query_async/4
+]).
+
+%% ecpool callback
+-export([
+    connect/1,
+    call_driver/4,
+    prepare_sql_to_conn/3,
+    get_reconnect_callback_signature/1
+]).
+
+-ifdef(TEST).
+-export([prune_dead_refs/2, ssl_opts/3]).
+-endif.
+
+-type state() :: #{
+    driver_type := atom(),
+    channels => #{channel_id() := channel_state()},
+    enable_prepared => boolean()
+}.
+
+-type channel_state() ::
+    #{
+        pool_name := resource_id(),
+        enable_prepared => boolean(),
+        query_templates := #{
+            prepstmt := {emqx_template_sql:statement(), emqx_template_sql:row_template()},
+            batch := tuple()
+        },
+        prepared_refs := #{Client :: pid() := datalayers:prepared_statement()}
+    }.
+
+-type channel_config() ::
+    #{
+        parameters := #{
+            sql := binary()
+        }
+    }.
+
+-define(sync, sync).
+-define(async, async).
+
+-define(prepare, true).
+-define(no_prepare, false).
+
+-define(null, null).
+
+resource_type() -> datalayers.
+
+callback_mode() -> async_if_possible.
+
+%% ================================================================================
+on_start(
+    InstId,
+    Config = #{
+        server := Server,
+        parameters := Parameters,
+        ssl := SSL
+    }
+) ->
+    Username = maps:get(username, Parameters, <<>>),
+    Password = maps:get(password, Parameters, <<>>),
+    Database = maps:get(database, Parameters, <<>>),
+    #{hostname := Host, port := Port} = emqx_schema:parse_server(
+        Server, ?DATALAYERS_HOST_ARROW_OPTIONS
+    ),
+    ?SLOG(info, #{
+        msg => "starting_datalayers_arrow_flight_connector",
+        connector => InstId,
+        config => emqx_utils:redact(Config)
+    }),
+    case ssl_opts(InstId, bin(Host), SSL) of
+        SslOpts when is_map(SslOpts) ->
+            ?SLOG(debug, #{
+                msg => "ssl_options_for_datalayers_arrow_flight_connector",
+                ssl_opts => SslOpts
+            }),
+            ConnConfig = SslOpts#{
+                host => bin(Host),
+                port => Port,
+                username => bin(Username),
+                password => Password,
+                database => Database
+            },
+            do_start(InstId, ConnConfig, Config);
+        {error, _Reason} = Err ->
+            Err
+    end.
+
+do_start(
+    InstId,
+    ConnConfig,
+    Config = #{
+        parameters := #{
+            enable_prepared := EnablePrepared
+        } = _Parameters,
+        pool_size := PoolSize
+    }
+) ->
+    PoolOpts = [
+        {conn_config, ConnConfig},
+        {auto_reconnect, ?AUTO_RECONNECT_INTERVAL},
+        {pool_size, PoolSize}
+    ],
+    InitState = #{
+        health_check_timeout => emqx_resource:get_health_check_timeout(Config),
+        channels => #{},
+        enable_prepared => EnablePrepared
+    },
+    case emqx_resource_pool:start(InstId, ?MODULE, PoolOpts) of
+        ok ->
+            {ok, InitState};
+        {error, {start_pool_failed, _, Reason}} ->
+            ?SLOG(error, #{
+                msg => "datalayers_arrow_flight_connector_start_failed",
+                reason => Reason,
+                config => emqx_utils:redact(Config)
+            }),
+            {error, Reason}
+    end.
+
+on_stop(InstId, _State) ->
+    ?SLOG(info, #{
+        msg => "stopping_datalayers_arrow_flight_connector",
+        connector => InstId
+    }),
+    %% TODO: close all channels prepared statements
+    lists:foreach(
+        fun({_Name, Worker}) ->
+            case ecpool_worker:client(Worker) of
+                %% Close prepare
+                {ok, Conn} -> datalayers:stop(Conn);
+                _ -> ok
+            end
+        end,
+        ecpool:workers(InstId)
+    ),
+    ?tp("arrow_flight_sql_client_stopped", #{instance_id => InstId}),
+    emqx_resource_pool:stop(InstId).
+
+-spec on_add_channel(
+    InstId :: resource_id(),
+    State :: state(),
+    ChannelId :: channel_id(),
+    ChannelConfig :: channel_config()
+) -> {ok, state()} | {error, term()}.
+on_add_channel(_InstId, #{channels := Channels} = _State, ChannelId, _ChannelConfig) when
+    is_map_key(ChannelId, Channels)
+->
+    {error, already_exists};
+on_add_channel(
+    InstId,
+    #{channels := Channels} = State,
+    ChannelId,
+    ChannelConfig
+) ->
+    {ok, ChannelState} = create_channel_state(InstId, ChannelId, State, ChannelConfig),
+    {ok, State#{channels := Channels#{ChannelId => ChannelState}}}.
+
+on_remove_channel(_InstId, #{channels := Channels} = _State, ChannelId) when
+    not is_map_key(ChannelId, Channels)
+->
+    {error, not_found};
+on_remove_channel(
+    _InstId, #{channels := Channels} = State, ChannelId
+) ->
+    ChannelState = maps:get(ChannelId, Channels),
+    ok = destory_channel_state(ChannelState, ChannelId),
+    NewState = State#{channels => maps:remove(ChannelId, Channels)},
+    {ok, NewState}.
+
+create_channel_state(
+    InstId,
+    ChannelId,
+    #{enable_prepared := EnablePrepared} = _State,
+    #{parameters := ActionParameters} = _ChannelConfig
+) ->
+    ChannelState0 = parse_sql_template(ChannelId, ActionParameters),
+    NChannelState = ChannelState0#{
+        pool_name => InstId,
+        enable_prepared => EnablePrepared
+    },
+    {ok, init_prepare(ChannelId, NChannelState)}.
+
+destory_channel_state(#{enable_prepared := false} = _ChannelState, _ChanResId) ->
+    ok;
+destory_channel_state(#{prepared_refs := PrepStatements} = _ChannelState, _ChanResId) when
+    map_size(PrepStatements) == 0
+->
+    ok;
+destory_channel_state(#{prepared_refs := PrepStatements} = ChannelState, ChanResId) when
+    is_map(PrepStatements)
+->
+    #{pool_name := ConnResId} = ChannelState,
+    lists:foreach(
+        fun({_, WorkerPid}) ->
+            ecpool_worker:remove_reconnect_callback_by_signature(WorkerPid, ChanResId)
+        end,
+        ecpool:workers(ConnResId)
+    ),
+    maps:foreach(
+        fun(Client, PrepRef) ->
+            _ = close_statement_on_conn(Client, PrepRef)
+        end,
+        PrepStatements
+    );
+destory_channel_state(_ChannelState, _ChanResId) ->
+    ok.
+
+on_get_channels(InstId) ->
+    emqx_bridge_v2:get_channels_for_connector(InstId).
+
+on_get_status(InstId, State) ->
+    health_check(InstId, State).
+
+on_get_channel_status(InstId, _ChannelId, State) ->
+    %% TODO: Check the status for each channel.
+    %% e.g.
+    %% - check the prepared statements
+    %% - check sql database/table existed
+    health_check(InstId, State).
+
+health_check(InstId, #{health_check_timeout := Timeout} = _State) ->
+    case do_health_check(InstId, Timeout) of
+        ok -> ?status_connected;
+        {error, Reason} -> {?status_disconnected, Reason}
+    end.
+
+do_health_check(InstId, Timeout) ->
+    Workers = [Worker || {_WorkerName, Worker} <- ecpool:workers(InstId)],
+    Fn = fun(Conn) -> datalayers:execute(Conn, <<"SELECT VERSION()">>) end,
+    DoPerWorker =
+        fun(Worker) ->
+            case ecpool_worker:exec(Worker, Fn, Timeout) of
+                {ok, _} ->
+                    ok;
+                {error, Reason} = Error ->
+                    ?SLOG(error, #{
+                        msg => "datalayers_arrow_flight__connector_get_status_failed",
+                        reason => Reason,
+                        worker => Worker
+                    }),
+                    Error
+            end
+        end,
+    try emqx_utils:pmap(DoPerWorker, Workers, Timeout) of
+        Results ->
+            case [E || {error, _} = E <- Results] of
+                [] ->
+                    ok;
+                Errors ->
+                    hd(Errors)
+            end
+    catch
+        exit:timeout ->
+            ?SLOG(error, #{
+                msg => "datalayers_arrow_flight_connector_pmap_failed",
+                reason => timeout
+            }),
+            {error, timeout}
+    end.
+
+on_query(InstId, {_ChannelId, _} = Query, State) ->
+    ?TRACE("QUERY", "datalayers_arrow_flight_connector_do_query", #{
+        instance_id => InstId,
+        query => Query,
+        state => emqx_utils:redact(State)
+    }),
+    ?tp(datalayers_arrow_flight_connector_on_query, #{instance_id => InstId}),
+    do_query(InstId, ?sync, [Query], State, []).
+
+on_batch_query(InstId, [{_ChannelId, _} | _] = Querys, State) ->
+    ?TRACE("QUERY", "datalayers_arrow_flight_connector_do_batch_query", #{
+        instance_id => InstId,
+        querys => Querys,
+        state => emqx_utils:redact(State)
+    }),
+    ?tp(datalayers_arrow_flight_connector_on_batch_query, #{instance_id => InstId}),
+    do_query(InstId, ?sync, Querys, State, []).
+
+on_query_async(InstId, {_ChannelId, _Message} = Query, ResCallback, State) ->
+    ?TRACE("QUERY", "datalayers_arrow_flight_connector_do_async_query", #{
+        instance_id => InstId,
+        query => Query,
+        state => emqx_utils:redact(State)
+    }),
+    ?tp(datalayers_arrow_flight_connector_on_query_async, #{instance_id => InstId}),
+    do_query(InstId, ?async, [Query], State, [ResCallback]).
+
+on_batch_query_async(InstId, Querys, ResCallback, State) ->
+    ?TRACE("QUERY", "datalayers_arrow_flight_connector_do_async_batch_query", #{
+        instance_id => InstId,
+        querys => Querys,
+        state => emqx_utils:redact(State)
+    }),
+    ?tp(datalayers_arrow_flight_connector_on_batch_query_async, #{instance_id => InstId}),
+    do_query(InstId, ?async, Querys, State, [ResCallback]).
+
+-spec do_query(
+    InstId :: resource_id(),
+    QueryMode :: ?sync | ?async,
+    Querys :: [{channel_id(), term()}],
+    State :: state(),
+    InitArgs :: [term()]
+) ->
+    {ok, _Result} | {error, _Reason}.
+do_query(
+    InstId, QueryMode, [{ChannelId, _Data} | _] = Querys, #{channels := Channels} = State, InitArgs
+) ->
+    ChannelState = maps:get(ChannelId, Channels),
+    EnablePrepared = enable_prepared(State, ChannelState),
+    case get_template(EnablePrepared, ChannelState) of
+        undefined ->
+            {error, {unrecoverable_error, no_template_found}};
+        Template ->
+            DriverFunArgs = proc_sql_params(
+                {EnablePrepared, Template},
+                Querys,
+                ChannelState,
+                InitArgs
+            ),
+            FuncMode = {QueryMode, EnablePrepared},
+            pick_and_do(InstId, ChannelId, FuncMode, DriverFunArgs)
+    end.
+
+pick_and_do(InstId, ChanResId, FuncMode, DriverFunArgs) ->
+    try
+        ecpool:pick_and_do(
+            InstId, {?MODULE, call_driver, [ChanResId, FuncMode, DriverFunArgs]}, no_handover
+        )
+    catch
+        _:_:_ ->
+            {error, {unrecoverable_error, invalid_request}}
+    end.
+
+proc_sql_params(
+    {?prepare, PrepStmtTemplate},
+    [{ChannelId, _} | _] = Querys,
+    ChannelState,
+    InitArgs
+) ->
+    RenderedRows = [
+        render_prepare_sql_row(PrepStmtTemplate, Query)
+     || {_, Query} <- Querys
+    ],
+    emqx_trace:rendered_action_template(ChannelId, #{record_rows => RenderedRows}),
+    [
+        maps:get(prepared_refs, ChannelState),
+        PrepStmtTemplate,
+        RenderedRows
+        | InitArgs
+    ];
+proc_sql_params(
+    {?no_prepare, BatchTemplate},
+    [{ChannelId, _} | _] = Querys,
+    ChannelState,
+    InitArgs
+) ->
+    RenderedSql = bin(render_batch_sql_row(BatchTemplate, Querys, ChannelState)),
+    emqx_trace:rendered_action_template(ChannelId, #{rendered_sql => RenderedSql}),
+    [
+        RenderedSql
+        | InitArgs
+    ].
+
+get_template(?prepare, #{query_templates := QueryTemplates} = _ChannelState) ->
+    maps:get(prepstmt, QueryTemplates, undefined);
+get_template(?no_prepare, #{query_templates := QueryTemplates} = _ChannelState) ->
+    maps:get(batch, QueryTemplates, undefined).
+
+enable_prepared(#{enable_prepared := ?no_prepare} = _State, _ChannelState) ->
+    ?no_prepare;
+enable_prepared(
+    #{enable_prepared := ?prepare},
+    #{query_templates := #{prepstmt := _PrepStmt}, prepared_refs := PreparedRefs}
+) when
+    is_map(PreparedRefs)
+->
+    ?prepare;
+enable_prepared(_, _) ->
+    ?no_prepare.
+
+render_prepare_sql_row({_InsertPart, RowTemplate}, Querys) ->
+    % NOTE: ignoring errors here, missing variables will be replaced with `null`.
+    {Row, _Errors} = emqx_template_sql:render_prepstmt(RowTemplate, {emqx_jsonish, Querys}),
+    Row.
+
+render_batch_sql_row({InsertPart, RowTemplate, OnClause}, Querys, ChannelState) ->
+    Rows = [render_row(RowTemplate, Msg, ChannelState) || {_, Msg} <- Querys],
+    Query = [InsertPart, <<" values ">> | lists:join($,, Rows)] ++ [<<" on ">>, OnClause],
+    Query;
+render_batch_sql_row({InsertPart, RowTemplate}, Querys, ChannelState) ->
+    Rows = [render_row(RowTemplate, Msg, ChannelState) || {_, Msg} <- Querys],
+    Query = [InsertPart, <<" values ">> | lists:join($,, Rows)],
+    Query.
+
+render_row(RowTemplate, Data, _ChannelState) ->
+    %% undefined values are always replaced with `null`
+    RenderOpts = #{escaping => mysql, undefined => ?null},
+    {Row, _Errors} = emqx_template_sql:render(RowTemplate, {emqx_jsonish, Data}, RenderOpts),
+    Row.
+
+%% =================================================================
+%% ecpool callback
+
+connect(Opts) ->
+    #{password := Password} = Config = proplists:get_value(conn_config, Opts),
+    Database = maps:get(database, Config),
+    ClientOpts = (maps:remove(database, Config))#{
+        password => bin(emqx_secret:unwrap(Password))
+    },
+    case datalayers:connect(ClientOpts) of
+        {ok, Pid} ->
+            case datalayers:use_database(Pid, Database) of
+                {ok, _} ->
+                    {ok, Pid};
+                {error, Reason} ->
+                    datalayers:stop(Pid),
+                    {error, {use_database_failed, Database, Reason}}
+            end;
+        {error, Reason} = Err ->
+            ?SLOG(error, #{
+                msg => "datalayers_arrow_flight_connector_connect_failed",
+                reason => Reason
+            }),
+            Err
+    end.
+
+call_driver(Client, ChanResId, {_QueryMode, true} = FuncMode, Args0) ->
+    [PreparedRefs, {SqlStatement0, _RowTemplates} | Args] = Args0,
+    PreparedRef =
+        case maps:find(Client, PreparedRefs) of
+            {ok, Ref} ->
+                Ref;
+            error ->
+                SqlStatement = bin(SqlStatement0),
+                {ok, Ref0} = prepare_sql_to_conn(Client, ChanResId, SqlStatement),
+                Ref0
+        end,
+    %% Clean up dead pids from the local PreparedRefs copy.
+    %% Worker pids that are no longer alive still hold prepared statement
+    %% handles on the Datalayers server (no Close action was sent).
+    %% They will be cleaned up by the server-side TTL (~1 day).
+    _ = prune_dead_refs(Client, PreparedRefs),
+    do_call_driver(Client, driver_fun_name(FuncMode), [PreparedRef | Args]);
+call_driver(Client, _ChanResId, {_QueryMode, false} = FuncMode, Args) ->
+    do_call_driver(Client, driver_fun_name(FuncMode), Args).
+
+do_call_driver(Client, FuncName, Args) ->
+    case erlang:apply(datalayers, FuncName, [Client | Args]) of
+        ok when FuncName =:= async_execute; FuncName =:= async_execute_prepare ->
+            {ok, Client};
+        ok ->
+            ok;
+        {ok, _Res} = Ok ->
+            Ok;
+        {error, Reason} = Err ->
+            ?SLOG(error, #{
+                msg => "datalayers_arrow_flight_connector_call_driver_failed",
+                reason => Reason,
+                driver_function => FuncName,
+                args => emqx_utils:redact(Args)
+            }),
+            Err
+    end.
+
+driver_fun_name({?sync, ?no_prepare}) ->
+    execute;
+driver_fun_name({?sync, ?prepare}) ->
+    execute_prepare;
+driver_fun_name({?async, ?no_prepare}) ->
+    async_execute;
+driver_fun_name({?async, ?prepare}) ->
+    async_execute_prepare.
+
+%% =================================================================
+%% Helper functions
+
+parse_sql_template(
+    ChannelId,
+    #{sql := SQLTemplate} = _ActionParameters
+) ->
+    AccIn = #{},
+    Templates = maps:fold(
+        fun parse_sql_template/3,
+        AccIn,
+        #{ChannelId => SQLTemplate}
+    ),
+    #{query_templates => Templates}.
+
+parse_sql_template(ChannelId, SQLTemplate, AccIn) ->
+    Template = emqx_template_sql:parse_prepstmt(SQLTemplate, #{parameters => '?'}),
+    AccOut = AccIn#{prepstmt => Template},
+    parse_batch_sql(ChannelId, SQLTemplate, AccOut).
+
+parse_batch_sql(ChannelId, SQLTemplate, AccIn) ->
+    case emqx_utils_sql:get_statement_type(SQLTemplate) of
+        insert ->
+            case emqx_utils_sql:split_insert(SQLTemplate) of
+                {ok, SplitedInsert} ->
+                    AccIn#{batch => parse_splited_sql(SplitedInsert)};
+                {error, Reason} ->
+                    ?SLOG(error, #{
+                        msg => "parse_insert_sql_statement_failed",
+                        sql => SQLTemplate,
+                        reason => Reason
+                    }),
+                    AccIn
+            end;
+        select ->
+            AccIn;
+        Type ->
+            ?SLOG(error, #{
+                msg => "invalid_sql_statement_type",
+                sql => SQLTemplate,
+                type => Type,
+                channel => ChannelId
+            }),
+            AccIn
+    end.
+
+parse_splited_sql({Insert, Values, OnClause}) ->
+    RowTemplate = emqx_template_sql:parse(Values),
+    {Insert, RowTemplate, OnClause};
+parse_splited_sql({Insert, Values}) ->
+    RowTemplate = emqx_template_sql:parse(Values),
+    {Insert, RowTemplate}.
+
+init_prepare(_ChanResId, ChannelState = #{enable_prepared := false}) ->
+    ChannelState;
+init_prepare(_ChanResId, ChannelState = #{query_templates := Templates}) when
+    %% No `batch` or `prepstmt`
+    map_size(Templates) == 0
+->
+    ChannelState;
+init_prepare(ChanResId, ChannelState = #{}) ->
+    case prepare_sql(ChanResId, ChannelState) of
+        {ok, PrepStatements} when is_map(PrepStatements) ->
+            %% each client holds a prepared statements reference
+            ChannelState#{prepared_refs => PrepStatements};
+        {error, Reason} ->
+            ChannelState#{prepared_refs => {error, Reason}}
+    end.
+
+prepare_sql(ChanResId, #{pool_name := PoolName, query_templates := #{prepstmt := PrepStmt}}) ->
+    prepare_sql(PoolName, ChanResId, PrepStmt).
+
+prepare_sql(PoolName, ChanResId, {SqlStatement0, _RowTemplates}) ->
+    SqlStatement = bin(SqlStatement0),
+    case do_prepare_sql(PoolName, ChanResId, SqlStatement) of
+        {ok, _PrepStatements} = Ok ->
+            %% prepare for reconnect
+            ecpool:add_reconnect_callback(
+                PoolName, {?MODULE, prepare_sql_to_conn, [ChanResId, SqlStatement]}
+            ),
+            Ok;
+        Error ->
+            Error
+    end.
+
+%% for ecpool to deduplicate callbacks.
+get_reconnect_callback_signature([ChanResId | _]) ->
+    ChanResId.
+
+do_prepare_sql(PoolName, ChanResId, SqlStatement) ->
+    do_prepare_to_conns(
+        ecpool:workers(PoolName),
+        ChanResId,
+        SqlStatement,
+        _InitPrepStatements = #{}
+    ).
+
+do_prepare_to_conns([{_Name, Worker} | Rest], ChanResId, SqlStatement, AccIn) ->
+    {ok, Client} = ecpool_worker:client(Worker),
+    case prepare_sql_to_conn(Client, ChanResId, SqlStatement) of
+        {ok, PrepareRef} when is_reference(PrepareRef) ->
+            do_prepare_to_conns(Rest, ChanResId, SqlStatement, AccIn#{Client => PrepareRef});
+        Error ->
+            Error
+    end;
+do_prepare_to_conns([], _ChanResId, _SqlStatement, AccOut) ->
+    {ok, AccOut}.
+
+%% Prepare SQL statement on a specific connection
+prepare_sql_to_conn(Client, _ChanResId, SqlStatement) ->
+    datalayers:prepare(Client, SqlStatement, #{auto_rebuild => true}).
+
+close_statement_on_conn(Client, PrepareRef) ->
+    datalayers:close_prepared(Client, PrepareRef).
+
+prune_dead_refs(CurrentClient, PreparedRefs) ->
+    maps:filter(
+        fun(Client, _Ref) ->
+            Client =:= CurrentClient orelse is_process_alive(Client)
+        end,
+        PreparedRefs
+    ).
+
+ssl_opts(InstId, Host, #{enable := true} = SSL) ->
+    case make_tls_opts(Host, SSL) of
+        {ok, TLSOpts} ->
+            TLSOpts;
+        {error, Reason} ->
+            ?SLOG(error, #{
+                msg => "datalayers_arrow_flight_invalid_ssl_options",
+                reason => Reason,
+                connector => InstId
+            }),
+            {error, Reason}
+    end;
+ssl_opts(_InstId, _Host, _) ->
+    #{}.
+
+make_tls_opts(Host, SSL) ->
+    maybe
+        ok ?= validate_tls_opts(SSL),
+        {ok, CacertFile} ?= ssl_cacertfile(SSL),
+        {ok, ServerName} ?= tls_server_name(Host, SSL),
+        {ok, #{
+            tls_enable => true,
+            tls_cacertfile => CacertFile,
+            verify => verify_peer,
+            tls_server_name => ServerName
+        }}
+    else
+        {error, _} = Error ->
+            Error
+    end.
+
+validate_tls_opts(SSL) ->
+    case maps:get(verify, SSL, verify_none) of
+        verify_peer ->
+            validate_client_certificates(SSL);
+        _ ->
+            {error, verify_none_not_supported}
+    end.
+
+validate_client_certificates(SSL) ->
+    case [Key || Key <- [certfile, keyfile, managed_certs], has_nonempty_value(Key, SSL)] of
+        [] -> ok;
+        [_ | _] -> {error, tls_client_certificates_not_supported}
+    end.
+
+ssl_cacertfile(SSL) ->
+    CacertFile0 = maps:get(cacertfile, SSL, undefined),
+    case emqx_tls_lib:resolve_cacertfile_path(CacertFile0) of
+        undefined ->
+            {error, ssl_cacertfile_is_required};
+        CacertFile ->
+            validate_ssl_cacertfile(CacertFile)
+    end.
+
+validate_ssl_cacertfile(Path0) ->
+    case to_utf8_binary(Path0) of
+        {ok, Path} when byte_size(Path) > 0 ->
+            InterpolatedPath = emqx_schema:naive_env_interpolation(Path),
+            AbsolutePath = filename:absname(InterpolatedPath),
+            validate_cacertfile_file(unicode:characters_to_binary(AbsolutePath));
+        _ ->
+            {error, ssl_cacertfile_is_required}
+    end.
+
+validate_cacertfile_file(Path) ->
+    case emqx_tls_lib:ensure_ssl_files(filename:dirname(Path), #{cacertfile => Path}) of
+        {ok, _} ->
+            {ok, Path};
+        {error, Reason} ->
+            {error, ssl_cacertfile_error(Reason)}
+    end.
+
+ssl_cacertfile_error(#{pem_check := Reason}) when Reason =/= not_pem ->
+    ssl_cacertfile_is_not_readable;
+ssl_cacertfile_error(_) ->
+    ssl_cacertfile_is_not_pem.
+
+tls_server_name(Host, SSL) ->
+    case maps:get(server_name_indication, SSL, undefined) of
+        undefined ->
+            {ok, Host};
+        disable ->
+            {error, ssl_server_name_indication_disabled};
+        ServerName ->
+            case to_utf8_binary(ServerName) of
+                {ok, <<"disable">>} ->
+                    {error, ssl_server_name_indication_disabled};
+                {ok, Name} when byte_size(Name) > 0 ->
+                    {ok, Name};
+                _ ->
+                    {error, ssl_server_name_is_required}
+            end
+    end.
+
+has_nonempty_value(Key, Map) ->
+    case maps:get(Key, Map, undefined) of
+        undefined -> false;
+        null -> false;
+        <<>> -> false;
+        [] -> false;
+        _ -> true
+    end.
+
+to_utf8_binary(Value) when is_binary(Value) ->
+    case unicode:characters_to_binary(Value) of
+        Binary when is_binary(Binary) -> {ok, Binary};
+        _ -> error
+    end;
+to_utf8_binary(Value) when is_list(Value) ->
+    case unicode:characters_to_binary(Value) of
+        Binary when is_binary(Binary) -> {ok, Binary};
+        _ -> error
+    end;
+to_utf8_binary(_) ->
+    error.
+
+bin(Bin) when is_binary(Bin) ->
+    Bin;
+bin(List) when is_list(List) ->
+    iolist_to_binary(List);
+bin(Atom) when is_atom(Atom) ->
+    erlang:atom_to_binary(Atom).

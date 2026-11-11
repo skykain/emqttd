@@ -1,0 +1,436 @@
+%%--------------------------------------------------------------------
+%% Copyright (c) 2019-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
+%%
+%% Licensed under the Apache License, Version 2.0 (the "License");
+%% you may not use this file except in compliance with the License.
+%% You may obtain a copy of the License at
+%%
+%%     http://www.apache.org/licenses/LICENSE-2.0
+%%
+%% Unless required by applicable law or agreed to in writing, software
+%% distributed under the License is distributed on an "AS IS" BASIS,
+%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+%% See the License for the specific language governing permissions and
+%% limitations under the License.
+%%--------------------------------------------------------------------
+
+-module(emqx_ctl_SUITE).
+
+-compile(export_all).
+-compile(nowarn_export_all).
+
+-include_lib("eunit/include/eunit.hrl").
+-include_lib("common_test/include/ct.hrl").
+
+all() -> emqx_common_test_helpers:all(?MODULE).
+
+init_per_suite(Config) ->
+    application:stop(emqx_ctl),
+    Config.
+
+end_per_suite(_Config) ->
+    ok.
+
+%%--------------------------------------------------------------------
+%% Test cases
+%%--------------------------------------------------------------------
+
+t_reg_unreg_command(_) ->
+    with_ctl_server(
+        fun(_CtlSrv) ->
+            emqx_ctl:register_command(cmd1, {?MODULE, cmd1_fun}),
+            emqx_ctl:register_command(cmd2, {?MODULE, cmd2_fun}),
+            ?assertEqual({?MODULE, cmd1_fun}, lookup_command(cmd1)),
+            ?assertEqual({?MODULE, cmd2_fun}, lookup_command(cmd2)),
+            ?assertEqual(
+                [{cmd1, ?MODULE, cmd1_fun}, {cmd2, ?MODULE, cmd2_fun}],
+                emqx_ctl:get_commands()
+            ),
+            emqx_ctl:unregister_command(cmd1),
+            emqx_ctl:unregister_command(cmd2),
+            ct:sleep(100),
+            ?assertEqual({error, cmd_not_found}, lookup_command(cmd1)),
+            ?assertEqual({error, cmd_not_found}, lookup_command(cmd2)),
+            ?assertEqual([], emqx_ctl:get_commands())
+        end
+    ).
+
+t_run_commands(_) ->
+    with_ctl_server(
+        fun(_CtlSrv) ->
+            ?assertEqual({error, cmd_not_found}, emqx_ctl:run_command(["cmd", "arg"])),
+            emqx_ctl:register_command(cmd1, {?MODULE, cmd1_fun}),
+            emqx_ctl:register_command(cmd2, {?MODULE, cmd2_fun}),
+            ok = emqx_ctl:run_command(["cmd1", "arg"]),
+            {error, badarg} = emqx_ctl:run_command(["cmd1", "badarg"]),
+            ok = emqx_ctl:run_command(["cmd2", "arg1", "arg2"]),
+            {error, badarg} = emqx_ctl:run_command(["cmd2", "arg1", "badarg"])
+        end
+    ).
+
+t_audit_redaction(_) ->
+    with_ctl_server(
+        fun(_CtlSrv) ->
+            emqx_ctl:register_command(audit, {?MODULE, audit_fun}),
+            emqx_ctl:register_command(cmd3, {?MODULE, cmd3_fun}),
+            emqx_ctl:register_command(cmd4, {?MODULE, cmd4_fun}),
+
+            ?assertEqual(
+                {error, cmd_not_found},
+                emqx_ctl:run_command(unregistered_cmd, ["secret", "value"])
+            ),
+            ?assertEqual(undefined, get(audit_log)),
+            ?assertEqual(
+                {error, cmd_not_found},
+                emqx_ctl:run_command(
+                    ["unknown_cli_command_7f42d9", "secret", "value"]
+                )
+            ),
+            ?assertEqual(undefined, get(audit_log)),
+
+            ok = emqx_ctl:run_command(["cmd3", "secret", "value"]),
+            ?assertEqual(["secret", "value"], get(command_args)),
+            ?assertEqual(["secret", "value"], get(callback_args)),
+            ?assertMatch(
+                #{args := [<<"secret">>, <<"******">>]},
+                get(audit_log)
+            ),
+
+            ok = emqx_ctl:run_command(["cmd4", "value"]),
+            ?assertMatch(
+                #{args := [<<"selected-audit-callback">>]},
+                get(audit_log)
+            ),
+
+            emqx_ctl:register_command(missing_callback, {lists, reverse}),
+            {error, {bad_cli_return, ["value", "plain"]}} =
+                emqx_ctl:run_command(["missing_callback", "plain", "value"]),
+            ?assertMatch(
+                #{args := [<<"******">>, <<"******">>]},
+                get(audit_log)
+            ),
+
+            ok = emqx_ctl:run_command(["cmd3", "crash", "value"]),
+            ?assertEqual(["crash", "value"], get(command_args)),
+            ?assertMatch(
+                #{args := [<<"******">>, <<"******">>]},
+                get(audit_log)
+            ),
+
+            ok = emqx_ctl:run_command(["cmd3", "invalid", "value"]),
+            ?assertEqual(["invalid", "value"], get(command_args)),
+            ?assertMatch(
+                #{args := [<<"******">>, <<"******">>]},
+                get(audit_log)
+            ),
+
+            EvalExprs = parse_exprs("node()."),
+            {ok, _} = emqx_ctl:run_command(eval_erl, EvalExprs),
+            ExpectedEval = unicode:characters_to_binary(
+                erl_pp:exprs(EvalExprs, [{linewidth, 10000}])
+            ),
+            ?assertMatch(
+                #{args := [ExpectedEval]},
+                get(audit_log)
+            ),
+
+            erase(audit_log),
+            {ok, _} = emqx_ctl:run_command(eval_erl, parse_exprs("emqx:is_running().")),
+            ?assertEqual(undefined, get(audit_log))
+        end
+    ).
+
+-doc """
+Commands which only print their usage are not audited, every other command is,
+and the "usage printed" marker of one command does not leak into the next one.
+""".
+t_usage_is_not_audited(_) ->
+    with_ctl_server(
+        fun(_CtlSrv) ->
+            emqx_ctl:register_command(audit, {?MODULE, audit_fun}),
+            emqx_ctl:register_command(cmd3, {?MODULE, cmd3_fun}),
+            emqx_ctl:register_command(cmd5, {?MODULE, cmd5_fun}),
+
+            erase(audit_log),
+            ok = emqx_ctl:run_command(["cmd5"]),
+            ?assertEqual(undefined, get(audit_log)),
+
+            ok = emqx_ctl:run_command(["cmd5", "usage2"]),
+            ?assertEqual(undefined, get(audit_log)),
+
+            %% The marker is cleared, the next command is audited
+            ok = emqx_ctl:run_command(["cmd3", "secret", "value"]),
+            ?assertMatch(#{cmd := cmd3}, get(audit_log)),
+
+            %% A command without arguments which does not print usage is audited
+            erase(audit_log),
+            ok = emqx_ctl:run_command(["cmd3"]),
+            ?assertMatch(#{cmd := cmd3, args := []}, get(audit_log))
+        end
+    ).
+
+-doc """
+A handler which returns a value other than `ok`, `{ok, _}` or `{error, _}`,
+such as the list from a print comprehension, breaks the handler contract.
+`run_command/2` returns `{error, {bad_cli_return, Value}}` for it, so
+`bin/nodetool` exits 1, and audits it at `error` level.
+""".
+t_bad_return_is_error(_) ->
+    with_ctl_server(
+        fun(_CtlSrv) ->
+            emqx_ctl:register_command(audit, {?MODULE, audit_fun}),
+            emqx_ctl:register_command(print_list, {?MODULE, print_list_fun}),
+            ?assertEqual(
+                {error, {bad_cli_return, [ok, ok]}},
+                emqx_ctl:run_command(["print_list", "arg"])
+            ),
+            ?assertEqual(error, get(audit_level))
+        end
+    ).
+
+-doc """
+A handler which returns `{error, Reason}` keeps that result, so `bin/nodetool`
+exits 1, and is audited at `error` level.
+""".
+t_error_result_is_kept(_) ->
+    with_ctl_server(
+        fun(_CtlSrv) ->
+            emqx_ctl:register_command(audit, {?MODULE, audit_fun}),
+            emqx_ctl:register_command(error_cmd, {?MODULE, error_fun}),
+            ?assertEqual({error, failed}, emqx_ctl:run_command(["error_cmd", "arg"])),
+            ?assertEqual(error, get(audit_level))
+        end
+    ).
+
+-doc """
+`eval_erl` with parsed expressions returns `{ok, Value}`, which `bin/nodetool eval`
+prints. `run_command/2` keeps that value and audits it at `info` level.
+""".
+t_eval_ok_value_is_kept(_) ->
+    with_ctl_server(
+        fun(_CtlSrv) ->
+            emqx_ctl:register_command(audit, {?MODULE, audit_fun}),
+            ?assertEqual({ok, 3}, emqx_ctl:run_command(eval_erl, parse_exprs("1 + 2."))),
+            ?assertEqual(info, get(audit_level))
+        end
+    ).
+
+-doc "An unknown command returns `{error, cmd_not_found}`, so `bin/nodetool` exits 1.".
+t_unknown_command(_) ->
+    with_ctl_server(
+        fun(_CtlSrv) ->
+            ?assertEqual(
+                {error, cmd_not_found},
+                emqx_ctl:run_command(["pr18794_unknown_command"])
+            )
+        end
+    ).
+
+%% Verify:
+%% `emqx_*_cli` modules implement `emqx_ctl`
+%% `emqx_ctl` implementations are named `emqx_*_cli`, or are helper modules
+%% which declare the behaviour (e.g. `emqx_plugins_cli_utils`)
+%% Registered commands have callbacks for audit logging
+t_cli_provider_contract(_) ->
+    with_ctl_server(
+        fun(_CtlSrv) ->
+            AvailableModules = lists:usort([
+                module_name(Module)
+             || {Module, _Path, _Loaded} <- code:all_available()
+            ]),
+            CliModules = [Module || Module <- AvailableModules, is_cli_module(Module)],
+            CtlModules = [
+                Module
+             || Module <- AvailableModules,
+                implements_behaviour(Module, emqx_ctl)
+            ],
+            %% Pin successful discovery
+            ?assert(length(CliModules) >= 10),
+            %% Every name-matched CLI module must declare the behaviour; the
+            %% behaviour also covers CLI handler modules whose names do not end
+            %% in `_cli'.
+            ?assertEqual([], CliModules -- CtlModules),
+            CliHandlerModules = lists:usort(CliModules ++ CtlModules),
+            lists:foreach(fun(Module) -> ok = Module:load() end, CliHandlerModules),
+            Commands = [
+                Command
+             || {Cmd, _Module, _Fun} = Command <- emqx_ctl:get_commands(),
+                Cmd =/= audit
+            ],
+            HandlerModules = lists:usort([Module || {_Cmd, Module, _Fun} <- Commands]),
+            ?assertEqual([], CliHandlerModules -- HandlerModules),
+            ?assertEqual(
+                [],
+                [
+                    {Cmd, Module, Fun}
+                 || {Cmd, Module, Fun} <- Commands,
+                    not has_audit_args_callback(Module, Fun)
+                ]
+            ),
+            ?assert(has_audit_args_callback(emqx_ctl, eval_erl)),
+            lists:foreach(
+                fun(Module) -> ok = Module:unload() end, lists:reverse(CliHandlerModules)
+            ),
+            %% Syncronize, wait till unload's are processed
+            _ = sys:get_state(emqx_ctl),
+            ?assertEqual([], emqx_ctl:get_commands())
+        end
+    ).
+
+t_print(_) ->
+    ok = emqx_ctl:print("help"),
+    ok = emqx_ctl:print("~ts", [help]),
+    ok = emqx_ctl:print("~ts", [<<"~!@#$%^&*()">>]),
+    % - check the output of the usage
+    mock_print(),
+    ?assertEqual("help", emqx_ctl:print("help")),
+    ?assertEqual("help", emqx_ctl:print("~ts", [help])),
+    ?assertEqual("~!@#$%^&*()", emqx_ctl:print("~ts", [<<"~!@#$%^&*()">>])),
+    unmock_print().
+
+t_eval_erl(_) ->
+    Expected = iolist_to_binary(io_lib:format("~p~n", [node()])),
+    ?assertEqual(
+        {ok, [Expected]},
+        emqx_common_test_helpers:capture_io_format(fun() ->
+            ok = emqx_ctl:run_command(["eval_erl", "node()"])
+        end)
+    ).
+
+t_usage(_) ->
+    CmdParams1 = "emqx_cmd_1 param1 param2",
+    CmdDescr1 = "emqx_cmd_1 is a test command means nothing",
+    % - usage/1,2 should return ok
+    ok = emqx_ctl:usage([{CmdParams1, CmdDescr1}, {CmdParams1, CmdDescr1}]),
+    ok = emqx_ctl:usage(CmdParams1, CmdDescr1).
+
+t_unexpected(_) ->
+    with_ctl_server(
+        fun(CtlSrv) ->
+            ignored = gen_server:call(CtlSrv, unexpected_call),
+            ok = gen_server:cast(CtlSrv, unexpected_cast),
+            CtlSrv ! unexpected_info,
+            ?assert(is_process_alive(CtlSrv))
+        end
+    ).
+
+%%--------------------------------------------------------------------
+%% Cmds for test
+%%--------------------------------------------------------------------
+
+cmd1_fun(["arg"]) -> ok;
+cmd1_fun(["badarg"]) -> error(badarg).
+
+cmd2_fun(["arg1", "arg2"]) -> ok;
+cmd2_fun(["arg1", "badarg"]) -> error(badarg).
+
+cmd3_fun(Args) ->
+    put(command_args, Args),
+    ok.
+
+cmd3_fun_audit_args(["secret", _Value] = Args) ->
+    put(callback_args, Args),
+    ["secret", "******"];
+cmd3_fun_audit_args(["crash" | _]) ->
+    error({redaction_failed, <<"raw-secret">>});
+cmd3_fun_audit_args(["invalid" | _]) ->
+    invalid_return;
+cmd3_fun_audit_args(Args) ->
+    Args.
+
+cmd4_fun(_Args) ->
+    ok.
+
+cmd4_fun_audit_args(_Args) ->
+    ["selected-audit-callback"].
+
+cmd5_fun(["usage2"]) ->
+    emqx_ctl:usage("cmd5", "cmd5 prints usage");
+cmd5_fun(_Args) ->
+    emqx_ctl:usage([{"cmd5", "cmd5 prints usage"}]).
+
+cmd5_fun_audit_args(Args) ->
+    Args.
+
+print_list_fun(_Args) ->
+    [emqx_ctl:print("~p~n", [I]) || I <- [1, 2]].
+
+print_list_fun_audit_args(Args) ->
+    Args.
+
+error_fun(_Args) ->
+    {error, failed}.
+
+error_fun_audit_args(Args) ->
+    Args.
+
+audit_fun(usage) ->
+    ok.
+
+audit_fun(Level, _From, Log) ->
+    put(audit_level, Level),
+    put(audit_log, Log),
+    ok.
+
+parse_exprs(String) ->
+    {ok, Scanned, _} = erl_scan:string(String),
+    {ok, Exprs} = erl_parse:parse_exprs(Scanned),
+    Exprs.
+
+is_cli_module(Module) ->
+    Name = atom_to_list(Module),
+    lists:prefix("emqx_", Name) andalso lists:suffix("_cli", Name).
+
+module_name(Module) when is_atom(Module) -> Module;
+module_name(Module) when is_list(Module) -> list_to_atom(Module).
+
+implements_behaviour(Module, Behaviour) ->
+    try Module:module_info(attributes) of
+        Attributes ->
+            Behaviours =
+                proplists:get_all_values(behaviour, Attributes) ++
+                    proplists:get_all_values(behavior, Attributes),
+            lists:member(Behaviour, lists:flatten(Behaviours))
+    catch
+        _:_ -> false
+    end.
+
+has_audit_args_callback(Module, Fun) ->
+    CallbackName = atom_to_list(Fun) ++ "_audit_args",
+    lists:any(
+        fun
+            ({Export, 1}) -> atom_to_list(Export) =:= CallbackName;
+            (_) -> false
+        end,
+        Module:module_info(exports)
+    ).
+
+with_ctl_server(Fun) ->
+    ok = emqx_ctl:stop(),
+    {ok, Pid} = emqx_ctl:start_link(),
+    try
+        _ = Fun(Pid),
+        ok
+    after
+        ok = emqx_ctl:stop()
+    end.
+
+mock_print() ->
+    %% proxy usage/1,2 and print/1,2 to format_xx/1,2 funcs
+    catch meck:unload(emqx_ctl),
+    meck:new(emqx_ctl, [non_strict, passthrough]),
+    meck:expect(emqx_ctl, print, fun(Arg) -> emqx_ctl:format(Arg, []) end),
+    meck:expect(emqx_ctl, print, fun(Msg, Arg) -> emqx_ctl:format(Msg, Arg) end),
+    meck:expect(emqx_ctl, usage, fun(Usages) -> emqx_ctl:format_usage(Usages) end),
+    meck:expect(emqx_ctl, usage, fun(CmdParams, CmdDescr) ->
+        emqx_ctl:format_usage(CmdParams, CmdDescr)
+    end).
+
+unmock_print() ->
+    meck:unload(emqx_ctl).
+
+lookup_command(Cmd) ->
+    case emqx_ctl:lookup_command(Cmd) of
+        {ok, {Mod, Fun}} -> {Mod, Fun};
+        Error -> Error
+    end.

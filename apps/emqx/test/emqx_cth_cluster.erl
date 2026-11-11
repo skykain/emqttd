@@ -1,0 +1,722 @@
+%%--------------------------------------------------------------------
+%% Copyright (c) 2023-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
+%%--------------------------------------------------------------------
+
+%% @doc Common Test Helper / Running tests in a cluster
+%%
+%% This module allows setting up and tearing down clusters of EMQX nodes with
+%% the purpose of running integration tests in a distributed environment, but
+%% with the same isolation measures that `emqx_cth_suite` provides.
+%%
+%% Additionally to what `emqx_cth_suite` does with respect to isolation, each
+%% node in the cluster is started with a separate, unique working directory.
+%%
+%% What should be started on each node is defined by the same appspecs that are
+%% used by `emqx_cth_suite` to start applications on the CT node. However, there
+%% are additional set of defaults applied to appspecs to make sure that the
+%% cluster is started in a consistent, interconnected state, with no conflicts
+%% between applications.
+%%
+%% Most of the time, you just need to:
+%% 1. Describe the cluster with one or more _nodespecs_.
+%% 2. Call `emqx_cth_cluster:start/2` before the testrun (e.g. in `init_per_suite/1`
+%%    or `init_per_group/2`), providing unique work dir (e.g.
+%%    `emqx_cth_suite:work_dir/1`). Save the result in a context.
+%% 3. Call `emqx_cth_cluster:stop/1` after the testrun concludes (e.g.
+%%    in `end_per_suite/1` or `end_per_group/2`) with the result from step 2.
+-module(emqx_cth_cluster).
+
+-export([start/1, start/2, restart/1]).
+-export([stop/1, stop_node/1]).
+
+-export([join_cluster/2]).
+
+-export([share_load_module/2]).
+-export([node_name/1, mk_nodespecs/2]).
+-export([start_apps/2]).
+-export([sync_routes/1, sync_routes/2, setup_logging/1, get_tcp_mqtt_port/1]).
+-export([when_cover_enabled/1]).
+
+-include_lib("stdlib/include/assert.hrl").
+-include_lib("snabbkaffe/include/test_macros.hrl").
+
+-define(APPS_CLUSTERING, [gen_rpc, mria, ekka]).
+
+-define(TIMEOUT_NODE_START_MS, 15000).
+-define(TIMEOUT_APPS_START_MS, 30000).
+-define(TIMEOUT_NODE_STOP_S, 15).
+-define(TIMEOUT_CLUSTER_WAIT_MS, timer:seconds(10)).
+
+%%
+
+-type nodespec() :: {_ShortName :: atom(), #{
+    % DB Role
+    % Default: `core`
+    role => core | replicant,
+
+    % Obsolete, has no effect:
+    db_backend => mnesia | rlog,
+
+    % Applications to start on the node
+    % Default: only applications needed for clustering are started
+    %
+    % NOTES
+    % 1. Apps needed for clustering started unconditionally.
+    %  * It's not possible to redefine their startup order.
+    %  * It's possible to add `{ekka, #{start => false}}` appspec though.
+    % 2. There are defaults applied to some appspecs if they present.
+    %  * We try to keep `emqx_conf` config consistent with default configuration of
+    %    clustering applications.
+    apps => [emqx_cth_suite:appspec()],
+
+    base_port => inet:port_number(),
+
+    % Node to join to in clustering phase
+    % If set to `undefined` this node won't try to join the cluster
+    % Default: no (first core node is used to join to by default)
+    join_to => node() | undefined,
+
+    %% Options that may affect `emqx_cth_peer:start{,_link}', such as `shutdown'.
+    start_opts => #{},
+
+    %% Environment variables for this node only.
+    %% Merged over the cluster-wide `env_vars`; an entry with the same name wins.
+    %% Default: `[]`.
+    env_vars => [{string(), string()}],
+
+    %% Working directory
+    %% If this directory is not empty, starting up the node applications will fail
+    %% Default: "${ClusterOpts.work_dir}/${nodename}"
+    work_dir => file:name()
+}}.
+
+-type opts() :: #{
+    %% Working directory
+    %% Everything a test produces should go here. Each node's stuff should go in its
+    %% own directory.
+    work_dir := file:name(),
+    %% Environment variables
+    %% Defaults to `[]`.
+    env_vars => [{string(), string()}]
+}.
+
+-type bakedspec() :: #{atom() => _}.
+
+-spec start([nodespec()], opts()) -> [node()].
+start(Nodes, ClusterOpts) ->
+    NodeSpecs = mk_nodespecs(Nodes, ClusterOpts),
+    StartOpts = get_start_opts(ClusterOpts),
+    emqx_common_test_helpers:clear_screen(),
+    perform(start, NodeSpecs, StartOpts).
+
+-spec start(Complete :: [nodespec()]) -> [node()].
+start(NodeSpecs) ->
+    emqx_common_test_helpers:clear_screen(),
+    perform(start, NodeSpecs, _StartOpts = #{}).
+
+perform(Act, NodeSpecs, Opts) ->
+    ct:pal("~ping nodes: ~p", [Act, NodeSpecs]),
+    try
+        do_perform(Act, NodeSpecs, Opts)
+    catch
+        Kind:Reason:Stacktrace ->
+            %% A failure partway through startup leaves the already-started peer
+            %% control processes registered locally (by their node name). If we
+            %% leak them, a retry of the same test case (e.g. via the flaky-test
+            %% hook, `emqx_cth_ct_hook_flaky`) reuses the same node names and
+            %% `emqx_cth_peer:do_start/6`'s `erlang:register/2` would crash with
+            %% `badarg`. Best-effort cleanup before re-raising so a retry starts
+            %% from scratch.
+            Nodes = [Node || #{name := Node} <- NodeSpecs],
+            ct:pal("cleaning up partially started nodes after ~p:~p: ~p", [Kind, Reason, Nodes]),
+            catch stop(Nodes),
+            erlang:raise(Kind, Reason, Stacktrace)
+    end.
+
+do_perform(Act, NodeSpecs, Opts) ->
+    % 1. Start bare nodes with only basic applications running
+    ok = start_nodes_init(NodeSpecs, ?TIMEOUT_NODE_START_MS, Opts),
+    % 2. Start applications needed to enable clustering
+    % Generally, this causes some applications to restart, but we deliberately don't
+    % start them yet.
+    case Act of
+        start ->
+            ShouldAppearInRunningNodes = [run_node_phase_cluster(Act, NS) || NS <- NodeSpecs],
+            WaitClustered = lists:member(true, ShouldAppearInRunningNodes);
+        restart ->
+            Timeout = ?TIMEOUT_APPS_START_MS,
+            _ = emqx_utils:pmap(fun(NS) -> run_node_phase_cluster(Act, NS) end, NodeSpecs, Timeout),
+            WaitClustered = false
+    end,
+    % 3. Start applications after cluster is formed
+    % Cluster-joins are complete, so they shouldn't restart in the background anymore.
+    StartTimeout = maps:get(start_apps_timeout, Opts, ?TIMEOUT_APPS_START_MS),
+    _ = emqx_utils:pmap(fun run_node_phase_apps/1, NodeSpecs, StartTimeout),
+    Nodes = [Node || #{name := Node} <- NodeSpecs],
+    %% 4. Wait for the nodes to cluster
+    _Ok = WaitClustered andalso wait_clustered(Nodes, ?TIMEOUT_CLUSTER_WAIT_MS),
+    Nodes.
+
+%% Wait until all nodes see all nodes as mria running nodes
+wait_clustered(Nodes, Timeout) ->
+    Check = fun(Node) ->
+        Running = erpc:call(Node, mria, running_nodes, []),
+        case Nodes -- Running of
+            [] ->
+                true;
+            NotRunning ->
+                {false, NotRunning}
+        end
+    end,
+    wait_clustered(Nodes, Check, deadline(Timeout)).
+
+wait_clustered([], _Check, _Deadline) ->
+    ok;
+wait_clustered([Node | Nodes] = All, Check, Deadline) ->
+    IsOverdue = is_overdue(Deadline),
+    case Check(Node) of
+        true ->
+            wait_clustered(Nodes, Check, Deadline);
+        {false, NodesNotRunnging} when IsOverdue ->
+            error(
+                {timeout, #{
+                    checking_from_node => Node,
+                    nodes_not_running => NodesNotRunnging
+                }}
+            );
+        {false, _Nodes} ->
+            timer:sleep(100),
+            wait_clustered(All, Check, Deadline)
+    end.
+
+-spec restart(Complete :: [bakedspec()] | bakedspec()) -> [node()].
+restart(NodeSpecs = [_ | _]) ->
+    Nodes = [maps:get(name, Spec) || Spec <- NodeSpecs],
+    Cores = [maps:get(name, Spec) || Spec = #{role := core} <- NodeSpecs],
+    %% The default `shutdown` option that we currently pass to `peer` does not allow
+    %% `mnesia` to correctly sync its log and shutdown properly, even when using `shutdown
+    %% => 5_000` in some situations.  Since we are restarting the cluster in our test
+    %% here, it's expected that we don't lose the data in mnesia.  So we explicitly flush
+    %% it here.
+    ct:pal("Flushing mnesia in cores: ~p", [Cores]),
+    emqx_utils:pforeach(
+        fun(N) ->
+            maybe
+                Pid = whereis(N),
+                true ?= is_pid(Pid),
+                erpc:call(N, fun mnesia:sync_log/0)
+            end
+        end,
+        Cores
+    ),
+    ct:pal("Stopping peer nodes: ~p", [Nodes]),
+    ok = stop(Nodes),
+    perform(restart, NodeSpecs, _Opts = #{});
+restart(NodeSpec = #{}) ->
+    restart([NodeSpec]).
+
+get_start_opts(ClusterOpts) ->
+    maps:with([start_apps_timeout, env_vars], ClusterOpts).
+
+-spec mk_nodespecs([nodespec()], opts()) -> [bakedspec()].
+mk_nodespecs(Nodes, ClusterOpts) ->
+    NodeSpecs = lists:zipwith(
+        fun(N, {Name, Opts}) -> mk_init_nodespec(N, Name, Opts, ClusterOpts) end,
+        lists:seq(1, length(Nodes)),
+        Nodes
+    ),
+    CoreNodes = [Node || #{name := Node, role := core} <- NodeSpecs],
+    Backend =
+        case length(CoreNodes) of
+            L when L == length(NodeSpecs) ->
+                mnesia;
+            _ ->
+                rlog
+        end,
+    lists:map(
+        fun(Spec0) ->
+            Spec1 = maps:merge(#{core_nodes => CoreNodes, db_backend => Backend}, Spec0),
+            Spec2 = merge_default_appspecs(Spec1, NodeSpecs),
+            Spec3 = merge_clustering_appspecs(Spec2, NodeSpecs),
+            Spec3
+        end,
+        NodeSpecs
+    ).
+
+mk_init_nodespec(N, Name, NodeOpts, ClusterOpts) ->
+    Node = node_name(Name),
+    BasePort = base_port(N),
+    WorkDir = maps:get(work_dir, ClusterOpts),
+    Defaults = #{
+        name => Node,
+        role => core,
+        apps => [],
+        base_port => BasePort,
+        start_opts => maps:get(start_opts, ClusterOpts, #{}),
+        work_dir => filename:join([WorkDir, Node])
+    },
+    maps:merge(Defaults, NodeOpts).
+
+merge_default_appspecs(#{apps := Apps} = Spec, NodeSpecs) ->
+    Spec#{apps => [mk_node_appspec(App, Spec, NodeSpecs) || App <- Apps]}.
+
+merge_clustering_appspecs(#{apps := Apps} = Spec, NodeSpecs) ->
+    AppsClustering = lists:map(
+        fun(App) ->
+            case lists:keyfind(App, 1, Apps) of
+                AppSpec = {App, _} ->
+                    AppSpec;
+                false ->
+                    {App, default_appspec(App, Spec, NodeSpecs)}
+            end
+        end,
+        ?APPS_CLUSTERING
+    ),
+    AppsRest = [AppSpec || AppSpec = {App, _} <- Apps, not lists:member(App, ?APPS_CLUSTERING)],
+    Spec#{apps => AppsClustering ++ AppsRest}.
+
+mk_node_appspec({App, Opts}, Spec, NodeSpecs) ->
+    {App, emqx_cth_suite:merge_appspec(default_appspec(App, Spec, NodeSpecs), Opts)};
+mk_node_appspec(App, Spec, NodeSpecs) ->
+    {App, default_appspec(App, Spec, NodeSpecs)}.
+
+default_appspec(gen_rpc, #{name := Node}, NodeSpecs) ->
+    NodePorts = lists:foldl(
+        fun(#{name := CNode, base_port := Port}, Acc) ->
+            Acc#{CNode => {tcp, gen_rpc_port(Port)}}
+        end,
+        #{},
+        NodeSpecs
+    ),
+    {tcp, Port} = maps:get(Node, NodePorts),
+    #{
+        override_env => [
+            % NOTE
+            % This is needed to make sure `gen_rpc` peers will find each other.
+            {port_discovery, manual},
+            {tcp_server_port, Port},
+            {client_config_per_node, {internal, NodePorts}}
+        ]
+    };
+default_appspec(mria, #{role := Role, db_backend := Backend}, _NodeSpecs) ->
+    #{
+        override_env => [
+            {node_role, Role},
+            {db_backend, Backend}
+        ]
+    };
+default_appspec(ekka, Spec, _NodeSpecs) ->
+    Overrides =
+        case get_cluster_seeds(Spec) of
+            [_ | _] = Seeds ->
+                % NOTE
+                % Presumably, this is needed for replicants to find core nodes.
+                [{cluster_discovery, {static, [{seeds, Seeds}]}}];
+            [] ->
+                []
+        end,
+    #{
+        override_env => Overrides
+    };
+default_appspec(emqx_conf, Spec, _NodeSpecs) ->
+    % NOTE
+    % This usually sets up a lot of `gen_rpc` / `mria` / `ekka` application envs in
+    % `emqx_config:init_load/2` during configuration mapping, so we need to keep them
+    % in sync with the values we set up here.
+    #{
+        name := Node,
+        role := Role,
+        db_backend := Backend,
+        base_port := BasePort,
+        work_dir := WorkDir
+    } = Spec,
+    Cluster =
+        case get_cluster_seeds(Spec) of
+            [_ | _] = Seeds ->
+                % NOTE
+                % Presumably, this is needed for replicants to find core nodes.
+                #{discovery_strategy => static, static => #{seeds => Seeds}};
+            [] ->
+                #{}
+        end,
+    #{
+        config => #{
+            node => #{
+                name => Node,
+                role => Role,
+                cookie => erlang:get_cookie(),
+                % TODO: will it be synced to the same value eventually?
+                data_dir => unicode:characters_to_binary(WorkDir),
+                db_backend => Backend
+            },
+            cluster => Cluster,
+            rpc => #{
+                % NOTE
+                % This (along with `gen_rpc` env overrides) is needed to make sure `gen_rpc`
+                % peers will find each other.
+                protocol => tcp,
+                tcp_server_port => gen_rpc_port(BasePort),
+                port_discovery => manual
+            },
+            listeners => allocate_listener_ports([tcp, ssl, ws, wss], Spec)
+        }
+    };
+default_appspec(emqx, Spec, _NodeSpecs) ->
+    #{config => #{listeners => allocate_listener_ports([tcp, ssl, ws, wss], Spec)}};
+default_appspec(_App, _, _) ->
+    #{}.
+
+get_cluster_seeds(#{join_to := undefined}) ->
+    [];
+get_cluster_seeds(#{join_to := Node}) ->
+    [Node];
+get_cluster_seeds(#{core_nodes := CoreNodes}) ->
+    CoreNodes.
+
+allocate_listener_port(Type, #{base_port := BasePort}) ->
+    Port = listener_port(BasePort, Type),
+    #{Type => #{default => #{bind => format("127.0.0.1:~p", [Port])}}}.
+
+allocate_listener_ports(Types, Spec) ->
+    lists:foldl(fun maps:merge/2, #{}, [allocate_listener_port(Type, Spec) || Type <- Types]).
+
+start_nodes_init(Specs, Timeout, StartOpts) ->
+    _Nodes = start_bare_nodes(Specs, Timeout, StartOpts),
+    lists:foreach(fun node_init/1, Specs).
+
+start_bare_nodes(Specs, Timeout, StartOpts) ->
+    Args = erl_flags(),
+    ClusterEnvs = maps:get(env_vars, StartOpts, []),
+    Waits = lists:map(
+        fun(#{name := Name} = Spec) ->
+            WaitTag = {boot_complete, Name},
+            WaitBoot = {self(), WaitTag},
+            Opts = peer_start_opts(Spec),
+            Envs = merge_env_vars(ClusterEnvs, maps:get(env_vars, Spec, [])),
+            {ok, _} = emqx_cth_peer:start(Name, Args, Envs, WaitBoot, Opts),
+            WaitTag
+        end,
+        Specs
+    ),
+    Deadline = deadline(Timeout),
+    Nodes = wait_boot_complete(Waits, Deadline),
+    lists:foreach(fun(Node) -> pong = net_adm:ping(Node) end, Nodes),
+    Nodes.
+
+merge_env_vars(ClusterEnvs, NodeEnvs) ->
+    lists:foldl(
+        fun({Name, _} = Env, Acc) -> lists:keystore(Name, 1, Acc, Env) end,
+        ClusterEnvs,
+        NodeEnvs
+    ).
+
+peer_start_opts(Spec) ->
+    maps:get(start_opts, Spec, #{}).
+
+deadline(Timeout) ->
+    erlang:monotonic_time() + erlang:convert_time_unit(Timeout, millisecond, native).
+
+is_overdue(Deadline) ->
+    erlang:monotonic_time() > Deadline.
+
+wait_boot_complete([], _) ->
+    [];
+wait_boot_complete(Waits, Deadline) ->
+    case is_overdue(Deadline) of
+        true ->
+            error({timeout, Waits});
+        false ->
+            ok
+    end,
+    receive
+        {{boot_complete, _Name} = Wait, {started, Node, _Pid}} ->
+            ct:pal("~p", [Wait]),
+            [Node | wait_boot_complete(Waits -- [Wait], Deadline)];
+        {{boot_complete, _Name}, Otherwise} ->
+            error({unexpected, Otherwise})
+    after 100 ->
+        wait_boot_complete(Waits, Deadline)
+    end.
+
+node_init(#{name := Node, work_dir := WorkDir}) ->
+    %% Create exclusive current directory for the node.  Some configurations, like plugin
+    %% installation directory, are the same for the whole cluster, and nodes on the same
+    %% machine will step on each other's toes...
+    ok = filelib:ensure_path(WorkDir),
+    ok = erpc:call(Node, file, set_cwd, [WorkDir]),
+    %% Make it possible to call `ct:pal` and friends (if running under rebar3)
+    _ = share_load_module(Node, cthr),
+    %% Enable snabbkaffe trace forwarding
+    ok = snabbkaffe:forward_trace(Node),
+    when_cover_enabled(fun() ->
+        case cover:start([Node]) of
+            {ok, _} ->
+                ok;
+            {error, {already_started, _}} ->
+                ok
+        end
+    end),
+    ok.
+
+%% Helper function that sets up logging on remote node to a temporary
+%% files. Useful for debugging. Note: this function is NOT used by
+%% default for nodes started using functions from this module.
+setup_logging(Node) ->
+    LogFile = filename:join(
+        "/tmp", atom_to_list(Node) ++ ".erlang.log." ++ integer_to_list(os:system_time())
+    ),
+    ct:pal("Logs for ~p go into ~s", [Node, LogFile]),
+    Level = debug,
+    HandlerConf = #{
+        level => Level,
+        filter_default => log,
+        config => #{
+            type => file,
+            file => LogFile
+        },
+        formatter =>
+            {logger_formatter, #{
+                single_line => false,
+                legacy_header => true
+            }}
+    },
+    ok = erpc:call(
+        Node,
+        logger,
+        update_primary_config,
+        [#{level => Level}]
+    ),
+    ok = erpc:call(
+        Node,
+        logger,
+        add_handler,
+        [?MODULE, logger_std_h, HandlerConf]
+    ),
+    ok.
+
+-spec get_tcp_mqtt_port(node()) -> pos_integer().
+get_tcp_mqtt_port(Node) ->
+    {_Host, Port} = erpc:call(Node, emqx_config, get, [[listeners, tcp, default, bind]]),
+    Port.
+
+%% Returns 'true' if this node should appear in running nodes list.
+run_node_phase_cluster(Act, Spec = #{name := Node}) ->
+    ok = load_apps(Node, Spec),
+    ok = start_apps_clustering(Act, Node, Spec),
+    maybe_join_cluster(Act, Node, Spec).
+
+run_node_phase_apps(Spec = #{name := Node}) ->
+    ok = start_apps(Node, Spec),
+    ok.
+
+load_apps(Node, #{apps := Apps}) ->
+    erpc:call(Node, emqx_cth_suite, load_apps, [Apps]).
+
+start_apps_clustering(Act, Node, #{apps := Apps} = Spec) ->
+    SuiteOpts = suite_opts(Act, Spec),
+    AppsClustering = [lists:keyfind(App, 1, Apps) || App <- ?APPS_CLUSTERING],
+    _Started = erpc:call(Node, emqx_cth_suite, start, [AppsClustering, SuiteOpts]),
+    ok.
+
+start_apps(Node, #{apps := Apps} = Spec) ->
+    SuiteOpts = suite_opts(Spec),
+    AppsRest = [AppSpec || AppSpec = {App, _} <- Apps, not lists:member(App, ?APPS_CLUSTERING)],
+    try
+        _Started = erpc:call(Node, emqx_cth_suite, start_apps, [AppsRest, SuiteOpts])
+    catch
+        K:E:S ->
+            ct:pal("failure while starting apps on node ~s:\n  ~p:~p\n  ~p", [Node, K, E, S]),
+            erlang:raise(K, E, S)
+    end,
+    ok.
+
+-spec sync_routes([node()]) -> ok.
+sync_routes(Nodes) ->
+    sync_routes(Nodes, 15_000).
+
+%% @doc Wait until routing tables on the given set of nodes converge
+%% to the same value.
+%%
+%% Since routing tables use mria merge tables, propagation of routes
+%% to peers is async, even between the cores. Therefore, tests are
+%% advised to call this function after creating a subscription if they
+%% expect effects of that subscription to be seen on other nodes.
+-spec sync_routes([node()], pos_integer()) -> ok.
+sync_routes([], _) ->
+    ok;
+sync_routes(Nodes, Timeout) ->
+    NRetries = 10,
+    ?retry(
+        Timeout div NRetries,
+        NRetries,
+        begin
+            %% Compare full route entries (topic + destination), not just
+            %% topic names. With the v3 schema's merge-table propagation,
+            %% multiple nodes can each have their own local subscription
+            %% to the same topic and `emqx_router:topics/0` returns the
+            %% same single-element list on all of them before
+            %% cross-propagation has actually delivered the remote
+            %% routes. Folding the route table waits until each node has
+            %% merged in every peer's destinations.
+            Routes = erpc:multicall(
+                Nodes,
+                emqx_router,
+                foldl_routes,
+                [fun(R, Acc) -> [R | Acc] end, []],
+                Timeout
+            ),
+            Diff = lists:uniq(
+                fun({Node, Resp}) ->
+                    case Resp of
+                        {ok, L} -> lists:sort(L);
+                        _Error -> {error, Node}
+                    end
+                end,
+                lists:zip(Nodes, Routes)
+            ),
+            Diagnostic = erpc:multicall(
+                Nodes,
+                fun() ->
+                    #{
+                        node => node(),
+                        mria_route_m_peers => mria_rlog_replica:ls(route_shard_m),
+                        cluster => mria:cluster_nodes(all),
+                        peers => nodes()
+                    }
+                end
+            ),
+            ?assertMatch(
+                [{_, {ok, _}}],
+                Diff,
+                #{
+                    msg => routes_did_not_converge,
+                    nodes => nodes(),
+                    diagnostic => Diagnostic
+                }
+            )
+        end
+    ).
+
+suite_opts(restart, Spec) ->
+    maps:merge(#{work_dir_dirty => true}, suite_opts(Spec));
+suite_opts(_, Spec) ->
+    suite_opts(Spec).
+
+suite_opts(Spec) ->
+    maps:with([work_dir, work_dir_dirty], Spec).
+
+%% Returns 'true' if this node should appear in the cluster.
+maybe_join_cluster(restart, _Node, #{}) ->
+    %% when restart, the node should already be in the cluster
+    %% hence no need to (re)join
+    true;
+maybe_join_cluster(_Act, _Node, #{role := replicant}) ->
+    true;
+maybe_join_cluster(start, Node, Spec) ->
+    case get_cluster_seeds(Spec) of
+        [JoinTo | _] ->
+            ok = join_cluster(Node, JoinTo),
+            true;
+        [] ->
+            false
+    end.
+
+join_cluster(Node, JoinTo) ->
+    case erpc:call(Node, ekka, join, [JoinTo]) of
+        ok ->
+            ok;
+        ignore ->
+            ok;
+        Error ->
+            error({failed_to_join_cluster, #{node => Node, error => Error}})
+    end.
+
+%%
+
+stop(Nodes) ->
+    _ = emqx_utils:pmap(fun stop_node/1, Nodes, ?TIMEOUT_NODE_STOP_S * 1000),
+    ok.
+
+stop_node(Name) when is_atom(Name) ->
+    Node = node_name(Name),
+    when_cover_enabled(fun() -> ok = cover:flush([Node]) end),
+    ok = emqx_cth_peer:stop(Node);
+stop_node(#{name := Name}) ->
+    stop_node(Name).
+
+%% Ports
+
+base_port(Number) ->
+    10000 + Number * 100.
+
+gen_rpc_port(BasePort) ->
+    BasePort - 1.
+
+listener_port(BasePort, tcp) ->
+    BasePort;
+listener_port(BasePort, ssl) ->
+    BasePort + 1;
+listener_port(BasePort, quic) ->
+    BasePort + 2;
+listener_port(BasePort, ws) ->
+    BasePort + 3;
+listener_port(BasePort, wss) ->
+    BasePort + 4.
+
+%%
+
+erl_flags() ->
+    %% One core
+    ["+S", "1:1"] ++ ebin_path().
+
+ebin_path() ->
+    ["-pa" | lists:filter(fun is_lib/1, code:get_path())].
+
+is_lib(Path) ->
+    string:prefix(Path, code:lib_dir()) =:= nomatch andalso
+        string:str(Path, "_build/default/plugins") =:= 0.
+
+share_load_module(Node, Module) ->
+    case code:get_object_code(Module) of
+        {Module, Code, Filename} ->
+            {module, Module} = erpc:call(Node, code, load_binary, [Module, Filename, Code]),
+            ok;
+        error ->
+            error
+    end.
+
+-spec node_name(atom()) -> node().
+node_name(Name) ->
+    case string:tokens(atom_to_list(Name), "@") of
+        [_Name, _Host] ->
+            %% the name already has a @
+            Name;
+        _ ->
+            list_to_atom(atom_to_list(Name) ++ "@" ++ host())
+    end.
+
+host() ->
+    [_, Host] = string:tokens(atom_to_list(node()), "@"),
+    Host.
+
+%%
+
+format(Format, Args) ->
+    unicode:characters_to_binary(io_lib:format(Format, Args)).
+
+is_cover_enabled() ->
+    case os:getenv("ENABLE_COVER_COMPILE") of
+        "1" -> true;
+        "true" -> true;
+        _ -> false
+    end.
+
+when_cover_enabled(Fun) ->
+    %% We need to check if cover is enabled to avoid crashes when attempting to start it
+    %% on the peer.
+    case is_cover_enabled() of
+        true ->
+            Fun();
+        false ->
+            ok
+    end.

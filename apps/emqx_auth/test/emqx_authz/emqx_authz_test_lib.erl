@@ -1,0 +1,172 @@
+%%--------------------------------------------------------------------
+%% Copyright (c) 2021-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
+%%--------------------------------------------------------------------
+
+-module(emqx_authz_test_lib).
+
+-include("emqx_authz.hrl").
+-include_lib("eunit/include/eunit.hrl").
+
+-compile(nowarn_export_all).
+-compile(export_all).
+
+reset_authorizers() ->
+    reset_authorizers(deny, default, false, []).
+
+restore_authorizers() ->
+    reset_authorizers(allow, true, []).
+
+reset_authorizers(Nomatch, CacheEnabled, Source) ->
+    reset_authorizers(Nomatch, default, CacheEnabled, Source).
+
+reset_authorizers(Nomatch, DenyAction, CacheEnabled, Source) ->
+    {ok, _} = emqx:update_config(
+        [authorization],
+        maps:merge(
+            #{
+                <<"no_match">> => atom_to_binary(Nomatch),
+                <<"cache">> => #{<<"enable">> => CacheEnabled},
+                <<"sources">> => Source
+            },
+            case DenyAction of
+                disconnect -> #{<<"deny_action">> => <<"disconnect">>};
+                default -> #{}
+            end
+        )
+    ),
+    ok.
+
+%% Don't reset sources
+reset_authorizers(Nomatch, CacheEnabled) ->
+    {ok, _} = emqx:update_config([<<"authorization">>, <<"no_match">>], Nomatch),
+    {ok, _} = emqx:update_config([<<"authorization">>, <<"cache">>, <<"enable">>], CacheEnabled),
+    ok.
+
+setup_config(BaseConfig, SpecialParams) ->
+    Config = maps:merge(BaseConfig, SpecialParams),
+    maybe
+        {ok, _} ?= emqx_authz:update(?CMD_REPLACE, [Config]),
+        ok
+    end.
+
+register_fake_sources(SourceTypes) ->
+    lists:foreach(
+        fun(Type) ->
+            emqx_authz_source_registry:register(Type, emqx_authz_fake_source)
+        end,
+        SourceTypes
+    ).
+
+deregister_sources() ->
+    {BuiltInTypes, _} = lists:unzip(?BUILTIN_SOURCES),
+    SourceTypes = emqx_authz_source_registry:registered_types(),
+    lists:foreach(
+        fun(Type) ->
+            emqx_authz_source_registry:unregister(Type)
+        end,
+        SourceTypes -- BuiltInTypes
+    ).
+
+enable_node_cache(Enable) ->
+    {ok, _} = emqx:update_config(
+        [authorization, node_cache],
+        #{<<"enable">> => Enable}
+    ),
+    ok.
+
+reset_node_cache() ->
+    emqx_auth_cache:reset(?AUTHZ_CACHE).
+
+emqx_appspec() ->
+    emqx_appspec(#{}).
+
+emqx_appspec(AppSpec) ->
+    Config = emqx_utils_maps:deep_merge(
+        emqx_cth_suite:emqx_config_authn(false),
+        emqx_cth_suite:emqx_config_authz(deny)
+    ),
+    emqx_cth_suite:merge_appspec(#{config => Config}, AppSpec).
+
+%%--------------------------------------------------------------------
+%% Table-based test helpers
+%%--------------------------------------------------------------------
+
+all_with_table_case(Mod, TableCase, Cases) ->
+    (emqx_common_test_helpers:all(Mod) -- [TableCase]) ++
+        [{group, Name} || Name <- case_names(Cases)].
+
+table_groups(TableCase, Cases) ->
+    [{Name, [], [TableCase]} || Name <- case_names(Cases)].
+
+case_names(Cases) ->
+    lists:map(fun(#{name := Name}) -> Name end, Cases).
+
+get_case(Name, Cases) ->
+    [Case] = [C || C <- Cases, maps:get(name, C) =:= Name],
+    Case.
+
+setup_default_permission(Case) ->
+    DefaultPermission = maps:get(default_permission, Case, deny),
+    emqx_authz_test_lib:reset_authorizers(DefaultPermission, false).
+
+base_client_info() ->
+    #{
+        clientid => <<"clientid">>,
+        username => <<"username">>,
+        peerhost => {127, 0, 0, 1},
+        peername => {{127, 0, 0, 1}, 1883},
+        sockport => 1883,
+        protocol => mqtt,
+        mountpoint => undefined,
+        is_bridge => false,
+        is_superuser => false,
+        zone => default,
+        listener => 'tcp:default'
+    }.
+
+client_info(Overrides) ->
+    maps:merge(base_client_info(), Overrides).
+
+run_table_checks(Case) ->
+    with_security_profiles(Case, fun run_checks/1).
+
+with_security_profiles(Case, Fun) ->
+    Profiles =
+        case Case of
+            #{security_profile := Profile} -> [Profile];
+            #{} -> [legacy, hardened]
+        end,
+    lists:foreach(
+        fun(Profile) ->
+            Name = maps:get(name, Case, undefined),
+            ct:pal("table case ~p security profile: ~p", [Name, Profile]),
+            Fun(Case#{security_profile => Profile})
+        end,
+        Profiles
+    ).
+
+run_checks(#{checks := Checks} = Case) ->
+    SecurityProfile = atom_to_list(maps:get(security_profile, Case, legacy)),
+    emqx_common_test_helpers:with_security_profile(SecurityProfile, fun() ->
+        _ = setup_default_permission(Case),
+        ClientInfoOverrides = maps:get(client_info, Case, #{}),
+        ClientInfo = client_info(ClientInfoOverrides),
+        lists:foreach(
+            fun(Check) ->
+                run_check(ClientInfo, Check)
+            end,
+            Checks
+        )
+    end).
+
+run_check(ClientInfo, Fun) when is_function(Fun, 0) ->
+    run_check(ClientInfo, Fun());
+run_check(ClientInfo, {ExpectedPermission, Action, Topic}) ->
+    ?assertEqual(
+        ExpectedPermission,
+        emqx_access_control:authorize(
+            emqx_authz_context:make(ClientInfo),
+            Action,
+            Topic
+        )
+    ).

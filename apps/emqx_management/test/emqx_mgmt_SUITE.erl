@@ -1,367 +1,659 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2022-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
-
 -module(emqx_mgmt_SUITE).
 
 -compile(export_all).
 -compile(nowarn_export_all).
 
--include_lib("emqx/include/emqx.hrl").
--include_lib("emqx/include/emqx_mqtt.hrl").
 -include_lib("eunit/include/eunit.hrl").
-
 -include_lib("common_test/include/ct.hrl").
 
--define(LOG_LEVELS, ["debug", "error", "info"]).
--define(LOG_HANDLER_ID, [file, default]).
+-export([ident/1]).
+
+-define(FORMATFUN, {?MODULE, ident}).
 
 all() ->
-    [{group, manage_apps},
-     {group, check_cli}].
+    [
+        {group, persistence_disabled},
+        {group, persistence_enabled},
+        {group, cm_registry_enabled},
+        {group, cm_registry_disabled}
+    ].
 
 groups() ->
-    [{manage_apps, [sequence],
-      [t_app
-      ]},
-      {check_cli, [sequence],
-       [t_cli,
-        t_log_cmd,
-        t_mgmt_cmd,
-        t_status_cmd,
-        t_clients_cmd,
-        t_vm_cmd,
-        t_plugins_cmd,
-        t_trace_cmd,
-        t_broker_cmd,
-        t_router_cmd,
-        t_subscriptions_cmd,
-        t_listeners_cmd_old,
-        t_listeners_cmd_new
-       ]}].
+    CMRegistryTCs = [t_call_client_cluster],
+    TCs = emqx_common_test_helpers:all(?MODULE) -- CMRegistryTCs,
+    [
+        {persistence_disabled, [], TCs},
+        {persistence_enabled, [], [t_persist_list_subs]},
+        {cm_registry_enabled, CMRegistryTCs},
+        {cm_registry_disabled, CMRegistryTCs}
+    ].
 
-apps() ->
-    [emqx_management, emqx_auth_mnesia, emqx_modules].
+init_per_group(persistence_disabled, Config) ->
+    Apps = emqx_cth_suite:start(
+        [
+            {emqx, "durable_sessions { enable = false }"},
+            emqx_management
+        ],
+        #{work_dir => emqx_cth_suite:work_dir(Config)}
+    ),
+    [
+        {apps, Apps}
+        | Config
+    ];
+init_per_group(persistence_enabled, Config) ->
+    DurableSessionsOpts = #{
+        <<"enable">> => true,
+        <<"checkpoint_interval">> => <<"0ms">>
+    },
+    Opts = #{durable_sessions_opts => DurableSessionsOpts},
+    ExtraApps = [emqx_management],
+    emqx_common_test_helpers:start_apps_ds(Config, ExtraApps, Opts);
+init_per_group(cm_registry_enabled, Config) ->
+    [{emqx_config, "broker.enable_session_registry = true"} | Config];
+init_per_group(cm_registry_disabled, Config) ->
+    [{emqx_config, "broker.enable_session_registry = false"} | Config].
+
+end_per_group(persistence_enabled, Config) ->
+    emqx_common_test_helpers:run_cleanups(Config);
+end_per_group(_Grp, Config) ->
+    case ?config(apps, Config) of
+        undefined -> ok;
+        Apps -> emqx_cth_suite:stop(Apps)
+    end.
 
 init_per_suite(Config) ->
-    ekka_mnesia:start(),
-    emqx_mgmt_auth:mnesia(boot),
-    emqx_ct_helpers:start_apps(apps()),
     Config.
 
-end_per_suite(_Config) ->
-    emqx_ct_helpers:stop_apps(apps()).
-
-t_app(_Config) ->
-    {ok, AppSecret} = emqx_mgmt_auth:add_app(<<"app_id">>, <<"app_name">>),
-    ?assert(emqx_mgmt_auth:is_authorized(<<"app_id">>, AppSecret)),
-    ?assertEqual(AppSecret, emqx_mgmt_auth:get_appsecret(<<"app_id">>)),
-    ?assertEqual({<<"app_id">>, AppSecret,
-                  <<"app_name">>, <<"Application user">>,
-                  true, undefined},
-                 lists:keyfind(<<"app_id">>, 1, emqx_mgmt_auth:list_apps())),
-    emqx_mgmt_auth:del_app(<<"app_id">>),
-    %% Use the default application secret
-    application:set_env(emqx_management, application, [{default_secret, <<"public">>}]),
-    {ok, AppSecret1} = emqx_mgmt_auth:add_app(
-                         <<"app_id">>, <<"app_name">>, <<"app_desc">>, true, undefined),
-    ?assert(emqx_mgmt_auth:is_authorized(<<"app_id">>, AppSecret1)),
-    ?assertEqual(AppSecret1, emqx_mgmt_auth:get_appsecret(<<"app_id">>)),
-    ?assertEqual(AppSecret1, <<"public">>),
-    ?assertEqual({<<"app_id">>, AppSecret1, <<"app_name">>, <<"app_desc">>, true, undefined},
-                 lists:keyfind(<<"app_id">>, 1, emqx_mgmt_auth:list_apps())),
-    emqx_mgmt_auth:del_app(<<"app_id">>),
-    application:set_env(emqx_management, application, []),
-    %% Specify the application secret
-    {ok, AppSecret2} = emqx_mgmt_auth:add_app(
-                         <<"app_id">>, <<"app_name">>, <<"secret">>,
-                         <<"app_desc">>, true, undefined),
-    ?assert(emqx_mgmt_auth:is_authorized(<<"app_id">>, AppSecret2)),
-    ?assertEqual(AppSecret2, emqx_mgmt_auth:get_appsecret(<<"app_id">>)),
-    ?assertEqual({<<"app_id">>, AppSecret2, <<"app_name">>, <<"app_desc">>, true, undefined},
-                 lists:keyfind(<<"app_id">>, 1, emqx_mgmt_auth:list_apps())),
-    emqx_mgmt_auth:del_app(<<"app_id">>),
+end_per_suite(_) ->
     ok.
 
-t_log_cmd(_) ->
-    mock_print(),
-    lists:foreach(fun(Level) ->
-                      emqx_mgmt_cli:log(["primary-level", Level]),
-                      ?assertEqual(Level ++ "\n", emqx_mgmt_cli:log(["primary-level"]))
-                  end, ?LOG_LEVELS),
-    lists:foreach(fun(Level) ->
-                     emqx_mgmt_cli:log(["set-level", Level]),
-                     ?assertEqual(Level ++ "\n", emqx_mgmt_cli:log(["primary-level"]))
-                  end, ?LOG_LEVELS),
-    [lists:foreach(fun(Level) ->
-                         ?assertEqual(Level ++ "\n", emqx_mgmt_cli:log(["handlers", "set-level",
-                                                                      atom_to_list(Id), Level]))
-                      end, ?LOG_LEVELS)
-        || #{id := Id} <- emqx_logger:get_log_handlers()],
-    meck:unload().
+init_per_testcase(TestCase, Config) ->
+    meck:expect(emqx, running_nodes, 0, [node()]),
+    emqx_common_test_helpers:init_per_testcase(?MODULE, TestCase, Config).
 
-t_mgmt_cmd(_) ->
-    % ct:pal("start testing the mgmt command"),
-    mock_print(),
-    ?assertMatch({match, _}, re:run(emqx_mgmt_cli:mgmt(
-                                      ["lookup", "emqx_appid"]), "Not Found.")),
-    ?assertMatch({match, _}, re:run(emqx_mgmt_cli:mgmt(
-                                      ["insert", "emqx_appid", "emqx_name"]), "AppSecret:")),
-    ?assertMatch({match, _}, re:run(emqx_mgmt_cli:mgmt(
-                                      ["insert", "emqx_appid", "emqx_name"]), "Error:")),
-    ?assertMatch({match, _}, re:run(emqx_mgmt_cli:mgmt(
-                                      ["lookup", "emqx_appid"]), "app_id:")),
-    ?assertMatch({match, _}, re:run(emqx_mgmt_cli:mgmt(
-                                      ["update", "emqx_appid", "ts"]), "update successfully")),
-    ?assertMatch({match, _}, re:run(emqx_mgmt_cli:mgmt(
-                                      ["delete", "emqx_appid"]), "ok")),
-    ok = emqx_mgmt_cli:mgmt(["list"]),
-    meck:unload().
+end_per_testcase(TestCase, Config) ->
+    meck:unload(emqx),
+    emqx_common_test_helpers:end_per_testcase(?MODULE, TestCase, Config).
 
-t_status_cmd(_) ->
-    % ct:pal("start testing status command"),
-    mock_print(),
-    ?assertMatch({match, _}, re:run(emqx_mgmt_cli:status([]), "is running")),
-    meck:unload().
+t_list_nodes(init, Config) ->
+    meck:expect(
+        emqx,
+        cluster_nodes,
+        fun
+            (running) -> [node()];
+            (stopped) -> ['stopped@node']
+        end
+    ),
+    Config;
+t_list_nodes('end', _Config) ->
+    ok.
 
-t_broker_cmd(_) ->
-    % ct:pal("start testing the broker command"),
-    mock_print(),
-    ?assertMatch({match, _}, re:run(emqx_mgmt_cli:broker([]), "sysdescr")),
-    ?assertMatch({match, _}, re:run(emqx_mgmt_cli:broker(["stats"]), "subscriptions.shared")),
-    ?assertMatch({match, _}, re:run(emqx_mgmt_cli:broker(["metrics"]), "bytes.sent")),
-    ?assertMatch({match, _}, re:run(emqx_mgmt_cli:broker([undefined]), "broker")),
-    meck:unload().
+t_list_nodes(_) ->
+    NodeInfos = emqx_mgmt:list_nodes(),
+    Node = node(),
+    ?assertMatch(
+        [
+            {Node, #{node := Node, node_status := 'running'}},
+            {'stopped@node', #{node := 'stopped@node', node_status := 'stopped'}}
+        ],
+        NodeInfos
+    ).
 
-t_clients_cmd(_) ->
-    % ct:pal("start testing the client command"),
-    mock_print(),
-    process_flag(trap_exit, true),
-    {ok, T} = emqtt:start_link([{clientid, <<"client12">>},
-                                {username, <<"testuser1">>},
-                                {password, <<"pass1">>}
-                               ]),
-    {ok, _} = emqtt:connect(T),
-    timer:sleep(300),
-    emqx_mgmt_cli:clients(["list"]),
-    ?assertMatch({match, _}, re:run(emqx_mgmt_cli:clients(["show", "client12"]), "client12")),
-    ?assertEqual((emqx_mgmt_cli:clients(["kick", "client12"])), "ok~n"),
-    timer:sleep(500),
-    ?assertMatch({match, _}, re:run(emqx_mgmt_cli:clients(["show", "client12"]), "Not Found")),
-    receive
-        {'EXIT', T, _} ->
-            ok
-            % ct:pal("Connection closed: ~p~n", [Reason])
+%% A node that `cluster_nodes(running)` reported but whose `node_info` RPC did
+%% not answer used to be filtered out by the `#{node := Node} = Info` generator
+%% in `list_nodes/0`, so it vanished from `GET /nodes` entirely. A vanished row
+%% is indistinguishable from a removed node, which is the condition the view
+%% exists to show, so it is reported as `unreachable` instead.
+t_list_nodes_reports_unreachable(init, Config) ->
+    meck:expect(
+        emqx,
+        cluster_nodes,
+        fun
+            (running) -> [node(), 'silent@node'];
+            (stopped) -> []
+        end
+    ),
+    meck:new(emqx_management_proto_v5, [passthrough, no_history]),
+    %% `erpc:multicall/5` answers in request order; the second node times out.
+    %% The first answer is synthetic: this suite starts no applications, so the
+    %% real `emqx_mgmt:node_info/0` has no ETS tables to read.
+    meck:expect(emqx_management_proto_v5, node_info, fun([Self, 'silent@node']) ->
+        [
+            {ok, #{node => Self, node_status => 'running', role => core}},
+            {error, {erpc, timeout}}
+        ]
+    end),
+    Config;
+t_list_nodes_reports_unreachable('end', _Config) ->
+    meck:unload(emqx_management_proto_v5),
+    ok.
+
+t_list_nodes_reports_unreachable(_) ->
+    Node = node(),
+    ?assertMatch(
+        [
+            {Node, #{node := Node, node_status := 'running'}},
+            {'silent@node', #{node := 'silent@node', node_status := 'unreachable'}}
+        ],
+        emqx_mgmt:list_nodes()
+    ),
+    %% `role` is the node's own `mria_rlog:role()`, so it is left out rather
+    %% than guessed. Unlike a stopped node, an unreachable one may be either.
+    [_, {_, Unreachable}] = emqx_mgmt:list_nodes(),
+    ?assertNot(maps:is_key(role, Unreachable)).
+
+%% The comprehension this replaced dropped anything it could not match, so an
+%% unexpected answer cost one row. Matching only `{error, _}` would make the
+%% same surprise a 500 for the whole endpoint instead.
+t_list_nodes_tolerates_an_unexpected_answer(init, Config) ->
+    meck:expect(
+        emqx,
+        cluster_nodes,
+        fun
+            (running) -> [node(), 'odd@node'];
+            (stopped) -> []
+        end
+    ),
+    meck:new(emqx_management_proto_v5, [passthrough, no_history]),
+    meck:expect(emqx_management_proto_v5, node_info, fun([Self, 'odd@node']) ->
+        [
+            {ok, #{node => Self, node_status => 'running', role => core}},
+            %% a map, but not a node report
+            {ok, #{unexpected => shape}}
+        ]
+    end),
+    Config;
+t_list_nodes_tolerates_an_unexpected_answer('end', _Config) ->
+    meck:unload(emqx_management_proto_v5),
+    ok.
+
+t_list_nodes_tolerates_an_unexpected_answer(_) ->
+    ?assertMatch(
+        [{_, #{node_status := 'running'}}, {'odd@node', #{node_status := 'unreachable'}}],
+        emqx_mgmt:list_nodes()
+    ).
+
+%% `GET /nodes/:node` reaches its handler for any node in `mria:running_nodes/0`,
+%% which is the same set the list endpoint fans out to, so it has the same
+%% window. `emqx_mgmt:lookup_node/1` answers `{error, Reason}` there and
+%% `format/1` takes a map only, which reached the client as a 500.
+t_get_node_reports_unreachable(init, Config) ->
+    meck:new(emqx_management_proto_v5, [passthrough, no_history]),
+    meck:expect(emqx_management_proto_v5, node_info, fun([_]) ->
+        [{error, {erpc, timeout}}]
+    end),
+    meck:new(mria, [passthrough, no_history]),
+    meck:expect(mria, running_nodes, 0, [node()]),
+    Config;
+t_get_node_reports_unreachable('end', _Config) ->
+    meck:unload(mria),
+    meck:unload(emqx_management_proto_v5),
+    ok.
+
+t_get_node_reports_unreachable(_) ->
+    Node = node(),
+    ?assertMatch(
+        {200, #{node := Node, node_status := 'unreachable'}},
+        emqx_mgmt_api_nodes:node(get, #{bindings => #{node => atom_to_binary(Node, utf8)}})
+    ).
+
+t_lookup_node(init, Config) ->
+    meck:new(emqx_mgmt, [passthrough]),
+    meck:expect(emqx_mgmt, os_type, 0, {win32, winME}),
+    Config;
+t_lookup_node('end', _Config) ->
+    meck:unload(),
+    ok.
+
+t_lookup_node(_) ->
+    Node = node(),
+    ?assertMatch(
+        #{node := Node, node_status := 'running', memory_total := 0},
+        emqx_mgmt:lookup_node(node())
+    ),
+    ?assertMatch(
+        {error, _},
+        emqx_mgmt:lookup_node('fake@nohost')
+    ),
+    ok.
+
+t_list_brokers(_) ->
+    Node = node(),
+    ?assertMatch(
+        [{Node, #{node := Node, node_status := running, uptime := _}}],
+        emqx_mgmt:list_brokers()
+    ).
+
+t_lookup_broker(_) ->
+    Node = node(),
+    ?assertMatch(
+        #{node := Node, node_status := running, uptime := _},
+        emqx_mgmt:lookup_broker(Node)
+    ).
+
+t_get_metrics(_) ->
+    Metrics = emqx_mgmt:get_metrics(),
+    ?assert(maps:size(Metrics) > 0),
+    ?assertMatch(
+        Metrics, maps:from_list(emqx_mgmt:get_metrics(node()))
+    ).
+
+t_lookup_client(init, Config) ->
+    setup_clients(Config);
+t_lookup_client('end', Config) ->
+    disconnect_clients(Config).
+
+t_lookup_client(_Config) ->
+    [{Chan, Info, Stats}] = emqx_mgmt:lookup_client({clientid, <<"client1">>}, ?FORMATFUN),
+    %% The process stats are read from the process on each lookup.
+    [{Chan, Info, Stats1}] = emqx_mgmt:lookup_client({username, <<"user1">>}, ?FORMATFUN),
+    ?assertEqual(without_process_stats(Stats), without_process_stats(Stats1)),
+    ?assertEqual([], emqx_mgmt:lookup_client({clientid, <<"notfound">>}, ?FORMATFUN)),
+    meck:expect(emqx, running_nodes, 0, [node(), 'fake@nonode']),
+    try
+        emqx:update_config([broker, enable_session_registry], false),
+        ?assertMatch(
+            [_ | {error, nodedown}], emqx_mgmt:lookup_client({clientid, <<"client1">>}, ?FORMATFUN)
+        )
     after
-        500 ->
-            erlang:error("Client is not kick")
+        emqx:update_config([broker, enable_session_registry], true)
+    end.
+
+t_kickout_client(init, Config) ->
+    process_flag(trap_exit, true),
+    setup_clients(Config);
+t_kickout_client('end', _Config) ->
+    ok.
+
+t_kickout_client(Config) ->
+    [C | _] = ?config(clients, Config),
+    ok = emqx_mgmt:kickout_client(<<"client1">>),
+    receive
+        {'EXIT', C, Reason} ->
+            ?assertEqual({shutdown, tcp_closed}, Reason);
+        Foo ->
+            error({unexpected, Foo})
+    after 1000 ->
+        error(timeout)
     end,
-    WS = rfc6455_client:new("ws://127.0.0.1:8083" ++ "/mqtt", self()),
-    {ok, _} = rfc6455_client:open(WS),
-    Packet = raw_send_serialize(?CONNECT_PACKET(#mqtt_packet_connect{
-                                                   clientid = <<"client13">>})),
-    ok = rfc6455_client:send_binary(WS, Packet),
-    Connack = ?CONNACK_PACKET(?CONNACK_ACCEPT),
-    {binary, Bin} = rfc6455_client:recv(WS),
-    {ok, Connack, <<>>, _} = raw_recv_pase(Bin),
-    timer:sleep(300),
-    ?assertMatch({match, _}, re:run(emqx_mgmt_cli:clients(["show", "client13"]), "client13")),
-    meck:unload().
-    % emqx_mgmt_cli:clients(["kick", "client13"]),
-    % timer:sleep(500),
-    % ?assertMatch({match, _}, re:run(emqx_mgmt_cli:clients(["show", "client13"]), "Not Found")).
+    ?assertEqual({error, not_found}, emqx_mgmt:kickout_client(<<"notfound">>)).
 
-raw_recv_pase(Packet) ->
-    emqx_frame:parse(Packet).
+t_list_authz_cache(init, Config) ->
+    setup_clients(Config);
+t_list_authz_cache('end', Config) ->
+    disconnect_clients(Config).
 
-raw_send_serialize(Packet) ->
-    emqx_frame:serialize(Packet).
+t_list_authz_cache(_) ->
+    ?assertNotMatch({error, _}, emqx_mgmt:list_authz_cache(<<"client1">>)),
+    ?assertMatch({error, not_found}, emqx_mgmt:list_authz_cache(<<"notfound">>)).
 
-t_vm_cmd(_) ->
-    % ct:pal("start testing the vm command"),
-    mock_print(),
-    [[?assertMatch({match, _}, re:run(Result, Name))
-      || Result <- emqx_mgmt_cli:vm([Name])]
-     || Name <- ["load", "memory", "process", "io", "ports"]],
-    [?assertMatch({match, _}, re:run(Result, "load"))
-     || Result <- emqx_mgmt_cli:vm(["load"])],
-    [?assertMatch({match, _}, re:run(Result, "memory"))
-     || Result <- emqx_mgmt_cli:vm(["memory"])],
-    [?assertMatch({match, _}, re:run(Result, "process"))
-     || Result <- emqx_mgmt_cli:vm(["process"])],
-    [?assertMatch({match, _}, re:run(Result, "io"))
-     || Result <- emqx_mgmt_cli:vm(["io"])],
-    [?assertMatch({match, _}, re:run(Result, "ports"))
-     || Result <- emqx_mgmt_cli:vm(["ports"])],
-    unmock_print().
+t_list_client_subscriptions(init, Config) ->
+    setup_clients(Config);
+t_list_client_subscriptions('end', Config) ->
+    disconnect_clients(Config).
 
-t_trace_cmd(_) ->
-    % ct:pal("start testing the trace command"),
-    mock_print(),
-    logger:set_primary_config(level, debug),
-    {ok, T} = emqtt:start_link([{clientid, <<"client">>},
-                                 {username, <<"testuser">>},
-                                 {password, <<"pass">>}
-                                ]),
-    emqtt:connect(T),
-    emqtt:subscribe(T, <<"a/b/c">>),
-    Trace1 = emqx_mgmt_cli:trace(["start", "client", "client",
-                                  "log/clientid_trace.log"]),
-    ?assertMatch({match, _}, re:run(Trace1, "successfully")),
-    Trace2 = emqx_mgmt_cli:trace(["stop", "client", "client"]),
-    ?assertMatch({match, _}, re:run(Trace2, "successfully")),
-    Trace3 = emqx_mgmt_cli:trace(["start", "client", "client",
-                                  "log/clientid_trace.log",
-                                  "error"]),
-    ?assertMatch({match, _}, re:run(Trace3, "successfully")),
-    Trace4 = emqx_mgmt_cli:trace(["stop", "client", "client"]),
-    ?assertMatch({match, _}, re:run(Trace4, "successfully")),
-    Trace5 = emqx_mgmt_cli:trace(["start", "topic", "a/b/c",
-                                  "log/clientid_trace.log"]),
-    ?assertMatch({match, _}, re:run(Trace5, "successfully")),
-    Trace6 = emqx_mgmt_cli:trace(["stop", "topic", "a/b/c"]),
-    ?assertMatch({match, _}, re:run(Trace6, "successfully")),
-    Trace7 = emqx_mgmt_cli:trace(["start", "topic", "a/b/c",
-                                  "log/clientid_trace.log", "error"]),
-    ?assertMatch({match, _}, re:run(Trace7, "successfully")),
-    logger:set_primary_config(level, error),
-    unmock_print().
+t_list_client_subscriptions(Config) ->
+    [Client | _] = ?config(clients, Config),
+    ?assertEqual([], emqx_mgmt:list_client_subscriptions(<<"client1">>)),
+    emqtt:subscribe(Client, <<"t/#">>),
+    ?assertMatch({_, [{<<"t/#">>, _Opts}]}, emqx_mgmt:list_client_subscriptions(<<"client1">>)),
+    ?assertEqual({error, not_found}, emqx_mgmt:list_client_subscriptions(<<"notfound">>)).
 
-t_router_cmd(_) ->
-    % ct:pal("start testing the router command"),
-    mock_print(),
-    {ok, T} = emqtt:start_link([{clientid, <<"client1">>},
-                                 {username, <<"testuser1">>},
-                                 {password, <<"pass1">>}
-                                ]),
-    emqtt:connect(T),
-    emqtt:subscribe(T, <<"a/b/c">>),
-    {ok, T1} = emqtt:start_link([{clientid, <<"client2">>},
-                                  {username, <<"testuser2">>},
-                                  {password, <<"pass2">>}
-                                 ]),
+t_clean_cache(init, Config) ->
+    setup_clients(Config);
+t_clean_cache('end', Config) ->
+    disconnect_clients(Config).
 
-    emqtt:connect(T1),
-    emqtt:subscribe(T1, <<"a/b/c/d">>),
-    ?assertMatch({match, _}, re:run(emqx_mgmt_cli:routes(["list"]), "a/b/c | a/b/c")),
-    ?assertMatch({match, _}, re:run(emqx_mgmt_cli:routes(["show", "a/b/c"]), "a/b/c")),
-    unmock_print().
+t_clean_cache(_Config) ->
+    ?assertNotMatch(
+        {error, _},
+        emqx_mgmt:clean_authz_cache(<<"client1">>)
+    ),
+    ?assertNotMatch(
+        {error, _},
+        emqx_mgmt:clean_authz_cache_all()
+    ),
+    ?assertNotMatch(
+        {error, _},
+        emqx_mgmt:clean_pem_cache_all()
+    ),
+    meck:expect(emqx, running_nodes, 0, [node(), 'fake@nonode']),
+    ?assertMatch(
+        {error, [{'fake@nonode', {error, _}}]},
+        emqx_mgmt:clean_authz_cache_all()
+    ),
+    ?assertMatch(
+        {error, [{'fake@nonode', {error, _}}]},
+        emqx_mgmt:clean_pem_cache_all()
+    ).
 
-t_subscriptions_cmd(_) ->
-    % ct:pal("Start testing the subscriptions command"),
-    mock_print(),
-    {ok, T3} = emqtt:start_link([{clientid, <<"client">>},
-                                 {username, <<"testuser">>},
-                                 {password, <<"pass">>}
-                                ]),
-    {ok, _} = emqtt:connect(T3),
-    {ok, _, _} = emqtt:subscribe(T3, <<"b/b/c">>),
-    timer:sleep(300),
-    [?assertMatch({match, _} , re:run(Result, "b/b/c"))
-     || Result <- emqx_mgmt_cli:subscriptions(["show", <<"client">>])],
-    ?assertEqual(emqx_mgmt_cli:subscriptions(["add", "client", "b/b/c", "0"]), "ok~n"),
-    ?assertEqual(emqx_mgmt_cli:subscriptions(["del", "client", "b/b/c"]), "ok~n"),
-    unmock_print().
+t_set_client_props(init, Config) ->
+    setup_clients(Config);
+t_set_client_props('end', Config) ->
+    disconnect_clients(Config).
 
-t_listeners_cmd_old(_) ->
-    ok = emqx_listeners:ensure_all_started(),
-    mock_print(),
-    ?assertEqual(emqx_mgmt_cli:listeners([]), ok),
+t_set_client_props(_Config) ->
     ?assertEqual(
-       "Stop mqtt:wss:external listener on 0.0.0.0:8084 successfully.\n",
-       emqx_mgmt_cli:listeners(["stop", "wss", "8084"])
-      ),
-    unmock_print().
+        % [FIXME] not implemented at this point?
+        ignored,
+        emqx_mgmt:set_ratelimit_policy(<<"client1">>, foo)
+    ),
+    ?assertEqual(
+        {error, not_found},
+        emqx_mgmt:set_ratelimit_policy(<<"notfound">>, foo)
+    ),
+    ?assertEqual(
+        % [FIXME] not implemented at this point?
+        ignored,
+        emqx_mgmt:set_quota_policy(<<"client1">>, foo)
+    ),
+    ?assertEqual(
+        {error, not_found},
+        emqx_mgmt:set_quota_policy(<<"notfound">>, foo)
+    ),
+    ?assertEqual(
+        ok,
+        emqx_mgmt:set_keepalive(<<"client1">>, 3600)
+    ),
+    ?assertMatch(
+        {error, _},
+        emqx_mgmt:set_keepalive(<<"client1">>, true)
+    ),
+    ?assertEqual(
+        {error, not_found},
+        emqx_mgmt:set_keepalive(<<"notfound">>, 3600)
+    ),
+    ok.
 
-t_listeners_cmd_new(_) ->
-    ok = emqx_listeners:ensure_all_started(),
-    mock_print(),
-    ?assertEqual(emqx_mgmt_cli:listeners([]), ok),
-    ?assertEqual(
-       "Stop mqtt:wss:external listener on 0.0.0.0:8084 successfully.\n",
-       emqx_mgmt_cli:listeners(["stop", "mqtt:wss:external"])
-      ),
-    ?assertEqual(
-       emqx_mgmt_cli:listeners(["restart", "mqtt:tcp:external"]),
-       "Restarted mqtt:tcp:external listener successfully.\n"
-      ),
-    ?assertEqual(
-       emqx_mgmt_cli:listeners(["restart", "mqtt:ssl:external"]),
-       "Restarted mqtt:ssl:external listener successfully.\n"
-      ),
-    ?assertEqual(
-       emqx_mgmt_cli:listeners(["restart", "bad:listener:identifier"]),
-       "Failed to restart bad:listener:identifier listener: {no_such_listener,\"bad:listener:identifier\"}\n"
-      ),
-    unmock_print().
+t_list_subscriptions_via_topic(init, Config) ->
+    setup_clients(Config);
+t_list_subscriptions_via_topic('end', Config) ->
+    disconnect_clients(Config).
 
-t_plugins_cmd(_) ->
-    mock_print(),
-    meck:new(emqx_plugins, [non_strict, passthrough]),
-    meck:expect(emqx_plugins, load, fun(_) -> ok end),
-    meck:expect(emqx_plugins, unload, fun(_) -> ok end),
-    meck:expect(emqx_plugins, reload, fun(_) -> ok end),
-    ?assertEqual(emqx_mgmt_cli:plugins(["list"]), ok),
-    ?assertEqual(
-       emqx_mgmt_cli:plugins(["unload", "emqx_auth_mnesia"]),
-       "Plugin emqx_auth_mnesia unloaded successfully.\n"
-      ),
-    ?assertEqual(
-       emqx_mgmt_cli:plugins(["load", "emqx_auth_mnesia"]),
-       "Plugin emqx_auth_mnesia loaded successfully.\n"
-      ),
-    ?assertEqual(
-       emqx_mgmt_cli:plugins(["unload", "emqx_management"]),
-       "Plugin emqx_management can not be unloaded.~n"
-      ),
-    unmock_print().
+t_list_subscriptions_via_topic(Config) ->
+    [Client | _] = ?config(clients, Config),
+    ?assertEqual([], emqx_mgmt:list_subscriptions_via_topic(<<"t/#">>, ?FORMATFUN)),
+    emqtt:subscribe(Client, <<"t/#">>),
+    ?assertMatch(
+        [{{<<"t/#">>, _SubPid}, _Opts}],
+        emqx_mgmt:list_subscriptions_via_topic(<<"t/#">>, ?FORMATFUN)
+    ).
 
-t_cli(_) ->
-    mock_print(),
-    ?assertMatch({match, _}, re:run(emqx_mgmt_cli:status([""]), "status")),
-    [?assertMatch({match, _}, re:run(Value, "broker"))
-     || Value <- emqx_mgmt_cli:broker([""])],
-    [?assertMatch({match, _}, re:run(Value, "cluster"))
-     || Value <- emqx_mgmt_cli:cluster([""])],
-    [?assertMatch({match, _}, re:run(Value, "clients"))
-     || Value <- emqx_mgmt_cli:clients([""])],
-    [?assertMatch({match, _}, re:run(Value, "routes"))
-     || Value <- emqx_mgmt_cli:routes([""])],
-    [?assertMatch({match, _}, re:run(Value, "subscriptions"))
-     || Value <- emqx_mgmt_cli:subscriptions([""])],
-    [?assertMatch({match, _}, re:run(Value, "plugins"))
-     || Value <- emqx_mgmt_cli:plugins([""])],
-    [?assertMatch({match, _}, re:run(Value, "listeners"))
-     || Value <- emqx_mgmt_cli:listeners([""])],
-    [?assertMatch({match, _}, re:run(Value, "vm"))
-     || Value <- emqx_mgmt_cli:vm([""])],
-    [?assertMatch({match, _}, re:run(Value, "mnesia"))
-     || Value <- emqx_mgmt_cli:mnesia([""])],
-    [?assertMatch({match, _}, re:run(Value, "trace"))
-     || Value <- emqx_mgmt_cli:trace([""])],
-    [?assertMatch({match, _}, re:run(Value, "mgmt"))
-     || Value <- emqx_mgmt_cli:mgmt([""])],
-    unmock_print().
+t_pubsub_api(init, Config) ->
+    setup_clients(Config);
+t_pubsub_api('end', Config) ->
+    disconnect_clients(Config).
 
-mock_print() ->
-    catch meck:unload(emqx_ctl),
-    meck:new(emqx_ctl, [non_strict, passthrough]),
-    meck:expect(emqx_ctl, print, fun(Arg) -> emqx_ctl:format(Arg) end),
-    meck:expect(emqx_ctl, print, fun(Msg, Arg) -> emqx_ctl:format(Msg, Arg) end),
-    meck:expect(emqx_ctl, usage, fun(Usages) -> emqx_ctl:format_usage(Usages) end),
-    meck:expect(emqx_ctl, usage, fun(Cmd, Descr) -> emqx_ctl:format_usage(Cmd, Descr) end).
+-define(TT(Topic), {Topic, #{qos => 0}}).
 
-unmock_print() ->
-    meck:unload(emqx_ctl).
+t_pubsub_api(Config) ->
+    [Client | _] = ?config(clients, Config),
+    ?assertEqual([], emqx_mgmt:list_subscriptions_via_topic(<<"t/#">>, ?FORMATFUN)),
+    ?assertMatch(
+        {subscribe, _, _},
+        emqx_mgmt:subscribe(<<"client1">>, [?TT(<<"t/#">>), ?TT(<<"t1/#">>), ?TT(<<"t2/#">>)])
+    ),
+    timer:sleep(100),
+    ?assertMatch(
+        [{{<<"t/#">>, _SubPid}, _Opts}],
+        emqx_mgmt:list_subscriptions_via_topic(<<"t/#">>, ?FORMATFUN)
+    ),
+    Message = emqx_message:make(?MODULE, 0, <<"t/foo">>, <<"helloworld">>, #{}, #{}),
+    emqx_mgmt:publish(Message),
+    Recv =
+        receive
+            {publish, #{client_pid := Client, payload := <<"helloworld">>}} ->
+                ok
+        after 100 ->
+            timeout
+        end,
+    ?assertEqual(ok, Recv),
+    ?assertEqual({error, channel_not_found}, emqx_mgmt:subscribe(<<"notfound">>, [?TT(<<"t/#">>)])),
+    ?assertNotMatch({error, _}, emqx_mgmt:unsubscribe(<<"client1">>, <<"t/#">>)),
+    ?assertEqual({error, channel_not_found}, emqx_mgmt:unsubscribe(<<"notfound">>, <<"t/#">>)),
+    Node = node(),
+    ?assertMatch(
+        {Node, [{<<"t1/#">>, _}, {<<"t2/#">>, _}]},
+        emqx_mgmt:list_client_subscriptions(<<"client1">>)
+    ),
+    ?assertMatch(
+        {unsubscribe, [{<<"t1/#">>, _}, {<<"t2/#">>, _}]},
+        emqx_mgmt:unsubscribe_batch(<<"client1">>, [<<"t1/#">>, <<"t2/#">>])
+    ),
+    timer:sleep(100),
+    ?assertMatch([], emqx_mgmt:list_client_subscriptions(<<"client1">>)),
+    ?assertEqual(
+        {error, channel_not_found},
+        emqx_mgmt:unsubscribe_batch(<<"notfound">>, [<<"t1/#">>, <<"t2/#">>])
+    ).
+
+t_alarms(init, Config) ->
+    [
+        emqx_mgmt:deactivate(Node, Name)
+     || {Node, ActiveAlarms} <- emqx_mgmt:get_alarms(activated), #{name := Name} <- ActiveAlarms
+    ],
+    emqx_mgmt:delete_all_deactivated_alarms(),
+    Config;
+t_alarms('end', Config) ->
+    Config.
+
+t_alarms(_) ->
+    Node = node(),
+    ?assertEqual(
+        [{node(), []}],
+        emqx_mgmt:get_alarms(all)
+    ),
+    emqx_alarm:activate(foo),
+    ?assertMatch(
+        [{Node, [#{name := foo, activated := true, duration := _}]}],
+        emqx_mgmt:get_alarms(all)
+    ),
+    emqx_alarm:activate(bar),
+    ?assertMatch(
+        [{Node, [#{name := foo, activated := true}, #{name := bar, activated := true}]}],
+        sort_alarms(emqx_mgmt:get_alarms(all))
+    ),
+    ?assertEqual(
+        ok,
+        emqx_mgmt:deactivate(node(), bar)
+    ),
+    ?assertMatch(
+        [{Node, [#{name := foo, activated := true}, #{name := bar, activated := false}]}],
+        sort_alarms(emqx_mgmt:get_alarms(all))
+    ),
+    ?assertMatch(
+        [{Node, [#{name := foo, activated := true}]}],
+        emqx_mgmt:get_alarms(activated)
+    ),
+    ?assertMatch(
+        [{Node, [#{name := bar, activated := false}]}],
+        emqx_mgmt:get_alarms(deactivated)
+    ),
+    ?assertEqual(
+        [ok],
+        emqx_mgmt:delete_all_deactivated_alarms()
+    ),
+    ?assertMatch(
+        [{Node, [#{name := foo, activated := true}]}],
+        emqx_mgmt:get_alarms(all)
+    ),
+    ?assertEqual(
+        {error, not_found},
+        emqx_mgmt:deactivate(node(), bar)
+    ).
+
+t_banned(_) ->
+    Banned = #{
+        who => {clientid, <<"TestClient">>},
+        by => <<"banned suite">>,
+        reason => <<"test">>,
+        at => erlang:system_time(second),
+        until => erlang:system_time(second) + 1
+    },
+    ?assertMatch(
+        {ok, _},
+        emqx_mgmt:create_banned(Banned)
+    ),
+    ?assertEqual(
+        ok,
+        emqx_mgmt:delete_banned({clientid, <<"TestClient">>})
+    ).
+
+%% This testcase verifies the behavior of various read-only functions
+%% used by REST API via `emqx_mgmt' module:
+t_persist_list_subs(_) ->
+    ClientId = <<"persistent_client">>,
+    Topics = lists:sort([<<"foo/bar">>, <<"/a/+//+/#">>, <<"foo">>]),
+    VerifySubs =
+        fun() ->
+            {Node, Ret} = emqx_mgmt:list_client_subscriptions(ClientId),
+            ?assert(Node =:= node() orelse Node =:= undefined, Node),
+            {TopicsL, SubProps} = lists:unzip(Ret),
+            ?assertEqual(Topics, lists:sort(TopicsL)),
+            [?assertMatch(#{rh := _, rap := _, nl := _, qos := _}, I) || I <- SubProps]
+        end,
+    %% 0. Verify that management functions work for missing clients:
+    ?assertMatch(
+        {error, not_found},
+        emqx_mgmt:list_client_subscriptions(ClientId)
+    ),
+    %% 1. Connect the client and subscribe to topics:
+    {ok, Client} = emqtt:start_link([
+        {clientid, ClientId},
+        {proto_ver, v5},
+        {properties, #{'Session-Expiry-Interval' => 30}}
+    ]),
+    {ok, _} = emqtt:connect(Client),
+    [{ok, _, _} = emqtt:subscribe(Client, I, qos2) || I <- Topics],
+    %% 2. Verify that management functions work for the connected
+    %% clients:
+    VerifySubs(),
+    %% 3. Disconnect the client:
+    emqtt:disconnect(Client),
+    %% 4. Verify that management functions work for the offline
+    %% clients:
+    VerifySubs().
+
+t_call_client_cluster(Config) ->
+    [Node1, Node2] = ?config(cluster, Config),
+    [Node1ClientId, Node2ClientId] = ?config(client_ids, Config),
+    ?assertMatch(
+        {[], #{}}, rpc:call(Node1, emqx_mgmt, list_client_msgs, client_msgs_args(Node1ClientId))
+    ),
+    ?assertMatch(
+        {[], #{}}, rpc:call(Node2, emqx_mgmt, list_client_msgs, client_msgs_args(Node2ClientId))
+    ),
+    ?assertMatch(
+        {[], #{}}, rpc:call(Node1, emqx_mgmt, list_client_msgs, client_msgs_args(Node2ClientId))
+    ),
+    ?assertMatch(
+        {[], #{}}, rpc:call(Node2, emqx_mgmt, list_client_msgs, client_msgs_args(Node1ClientId))
+    ),
+
+    case proplists:get_value(name, ?config(tc_group_properties, Config)) of
+        cm_registry_disabled ->
+            %% Simulating crashes that must be handled by erpc multicall
+            ?assertMatch(
+                {error, _},
+                rpc:call(Node1, emqx_mgmt, list_client_msgs, client_msgs_bad_args(Node2ClientId))
+            ),
+            ?assertMatch(
+                {error, _},
+                rpc:call(Node2, emqx_mgmt, list_client_msgs, client_msgs_bad_args(Node1ClientId))
+            );
+        cm_registry_enabled ->
+            %% Direct call to remote pid is expected to crash
+            ?assertMatch(
+                {badrpc, {'EXIT', _}},
+                rpc:call(Node1, emqx_mgmt, list_client_msgs, client_msgs_bad_args(Node1ClientId))
+            ),
+            ?assertMatch(
+                {badrpc, {'EXIT', _}},
+                rpc:call(Node2, emqx_mgmt, list_client_msgs, client_msgs_bad_args(Node2ClientId))
+            );
+        _ ->
+            ok
+    end,
+
+    NotFoundClientId = <<"no_such_client_id">>,
+    ?assertEqual(
+        {error, not_found},
+        rpc:call(Node2, emqx_mgmt, list_client_msgs, client_msgs_args(NotFoundClientId))
+    ),
+    ?assertEqual(
+        {error, not_found},
+        rpc:call(Node2, emqx_mgmt, list_client_msgs, client_msgs_args(NotFoundClientId))
+    ).
+
+t_call_client_cluster(init, Config) ->
+    Apps = [{emqx, ?config(emqx_config, Config)}, emqx_management],
+    [Node1, Node2] =
+        Cluster = emqx_cth_cluster:start(
+            [
+                {list_to_atom(atom_to_list(?MODULE) ++ "1"), #{role => core, apps => Apps}},
+                {list_to_atom(atom_to_list(?MODULE) ++ "2"), #{role => core, apps => Apps}}
+            ],
+            #{work_dir => emqx_cth_suite:work_dir(?FUNCTION_NAME, Config)}
+        ),
+    {ok, Node1Client, Node1ClientId} = connect_client(Node1),
+    {ok, Node2Client, Node2ClientId} = connect_client(Node2),
+    %% They may exit during the test due to simulated crashes
+    unlink(Node1Client),
+    unlink(Node2Client),
+    [
+        {cluster, Cluster},
+        {client_ids, [Node1ClientId, Node2ClientId]},
+        {client_pids, [Node1Client, Node2Client]}
+        | Config
+    ];
+t_call_client_cluster('end', Config) ->
+    emqx_cth_cluster:stop(?config(cluster, Config)),
+    [exit(ClientPid, kill) || ClientPid <- ?config(client_pids, Config)],
+    ok.
+
+%%% helpers
+ident(Arg) ->
+    Arg.
+
+without_process_stats(Stats) ->
+    [
+        KV
+     || {K, _} = KV <- Stats,
+        not lists:member(K, [mailbox_len, heap_size, total_heap_size, reductions, memory])
+    ].
+
+sort_alarms([{Node, Alarms}]) ->
+    [{Node, lists:sort(fun(#{activate_at := A}, #{activate_at := B}) -> A < B end, Alarms)}].
+
+setup_clients(Config) ->
+    {ok, C} = emqtt:start_link([{clientid, <<"client1">>}, {username, <<"user1">>}]),
+    {ok, _} = emqtt:connect(C),
+    [{clients, [C]} | Config].
+
+disconnect_clients(Config) ->
+    Clients = ?config(clients, Config),
+    lists:foreach(fun emqtt:disconnect/1, Clients).
+
+get_mqtt_port(Node) ->
+    {_IP, Port} = erpc:call(Node, emqx_config, get, [[listeners, tcp, default, bind]]),
+    Port.
+
+connect_client(Node) ->
+    Port = get_mqtt_port(Node),
+    ClientId = <<(atom_to_binary(Node))/binary, "_client">>,
+    {ok, Client} = emqtt:start_link([
+        {port, Port},
+        {proto_ver, v5},
+        {clientid, ClientId}
+    ]),
+    {ok, _} = emqtt:connect(Client),
+    {ok, Client, ClientId}.
+
+client_msgs_args(ClientId) ->
+    [mqueue_msgs, ClientId, #{limit => 10, continuation => none}].
+
+client_msgs_bad_args(ClientId) ->
+    [mqueue_msgs, ClientId, "bad_page_params"].

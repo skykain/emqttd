@@ -1,0 +1,883 @@
+%%--------------------------------------------------------------------
+%% Copyright (c) 2022-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
+%%--------------------------------------------------------------------
+
+-module(emqx_bpapi_static_checks).
+
+-export([
+    run/0,
+    dump/1,
+    dump/0,
+    check_compat/1,
+    versions_file/0,
+    dumps_dir/0,
+    dump_file_extension/0,
+    dump_files/0
+]).
+-export([owner_applications_file/0]).
+
+%% Using an undocumented API here :(
+-include_lib("dialyzer/src/dialyzer.hrl").
+
+-type api_dump() :: #{
+    {emqx_bpapi:api(), emqx_bpapi:api_version()} =>
+        #{
+            calls := [emqx_bpapi:rpc()],
+            casts := [emqx_bpapi:rpc()]
+        }
+}.
+
+-type dialyzer_spec() :: {_Type, [_Type]}.
+
+-type dialyzer_dump() :: #{mfa() => dialyzer_spec()}.
+
+-type fulldump() :: #{
+    api => api_dump(),
+    signatures => dialyzer_dump(),
+    release => string()
+}.
+
+-type dump_options() :: #{
+    reldir := file:name(),
+    plt := file:name()
+}.
+
+-type param_types() :: #{emqx_bpapi:var_name() => _Type}.
+
+%% Applications and modules we wish to ignore in the analysis:
+-define(IGNORED_APPS,
+    "gen_rpc, recon, redbug, observer_cli, snabbkaffe,"
+    " ekka, mria, amqp_client, rabbit_common, esaml, ra,"
+    " proper, ranch"
+).
+-define(IGNORED_MODULES, "emqx_rpc").
+-define(FORCE_DELETED_MODULES, [
+    emqx_persistent_session_ds_proto_v1,
+    emqx_ds_proto_v4,
+    emqx_ds_proto_v5,
+    emqx_ds_otx_proto_v1,
+    emqx_ds_beamsplitter_proto_v1,
+    emqx_ds_beamsplitter_proto_v2,
+    emqx_ds_shared_sub_proto_v1,
+    emqx_ds_shared_sub_proto_v2,
+    emqx_bridge_proto_v1,
+    emqx_bridge_proto_v2,
+    emqx_bridge_proto_v3,
+    emqx_bridge_proto_v4,
+    emqx_bridge_proto_v5,
+    emqx_bridge_proto_v6,
+    emqx_bridge_proto_v7,
+    emqx_license_proto_v1,
+    emqx_mgmt_trace_proto_v1,
+    emqx_mgmt_api_relup_proto_v1,
+    %% Superseded before 5.8.0. Version negotiation never selects these
+    %% versions, but released call sites can still name the deleted proto
+    %% modules directly, so their RPC targets must stay exported.
+    %% `check_targets_exported/1' checks that they do:
+    emqx_cm_proto_v1,
+    emqx_cm_proto_v2,
+    emqx_conf_proto_v1,
+    emqx_conf_proto_v2,
+    emqx_conf_proto_v3,
+    emqx_delayed_proto_v1,
+    emqx_delayed_proto_v2,
+    emqx_eviction_agent_proto_v1,
+    emqx_eviction_agent_proto_v2,
+    emqx_management_proto_v1,
+    emqx_management_proto_v2,
+    emqx_management_proto_v3,
+    emqx_management_proto_v4,
+    emqx_metrics_proto_v1,
+    emqx_mgmt_api_plugins_proto_v1,
+    emqx_mgmt_api_plugins_proto_v2,
+    emqx_mgmt_cluster_proto_v1,
+    emqx_node_rebalance_proto_v1,
+    emqx_node_rebalance_proto_v2,
+    emqx_node_rebalance_api_proto_v1,
+    emqx_node_rebalance_status_proto_v1,
+    emqx_plugins_proto_v1,
+    emqx_prometheus_proto_v1,
+    emqx_resource_proto_v1
+]).
+-define(FORCE_DELETED_APIS, [
+    {emqx_persistent_session_ds, 1},
+    {emqx_ds, 4},
+    {emqx_ds, 5},
+    {emqx_ds_otx, 1},
+    {emqx_ds_beamsplitter, 1},
+    {emqx_ds_beamsplitter, 2},
+    {emqx_ds_shared_sub, 1},
+    {emqx_ds_shared_sub, 2},
+    {emqx_retainer, 1},
+    {emqx_bridge, 1},
+    {emqx_bridge, 2},
+    {emqx_bridge, 3},
+    {emqx_bridge, 4},
+    {emqx_bridge, 5},
+    {emqx_bridge, 6},
+    {emqx_bridge, 7},
+    {emqx_license, 1},
+    {emqx_mgmt_trace, 1},
+    {emqx_mgmt_api_relup, 1},
+    %% Superseded before 5.8.0. Version negotiation never selects these
+    %% versions, but released call sites can still name the deleted proto
+    %% modules directly, so their RPC targets must stay exported.
+    %% `check_targets_exported/1' checks that they do:
+    {emqx_cm, 1},
+    {emqx_cm, 2},
+    {emqx_conf, 1},
+    {emqx_conf, 2},
+    {emqx_conf, 3},
+    {emqx_delayed, 1},
+    {emqx_delayed, 2},
+    {emqx_eviction_agent, 1},
+    {emqx_eviction_agent, 2},
+    {emqx_management, 1},
+    {emqx_management, 2},
+    {emqx_management, 3},
+    {emqx_management, 4},
+    {emqx_metrics, 1},
+    {emqx_mgmt_api_plugins, 1},
+    {emqx_mgmt_api_plugins, 2},
+    {emqx_mgmt_cluster, 1},
+    {emqx_node_rebalance, 1},
+    {emqx_node_rebalance, 2},
+    {emqx_node_rebalance_api, 1},
+    {emqx_node_rebalance_status, 1},
+    {emqx_plugins, 1},
+    {emqx_prometheus, 1},
+    {emqx_resource, 1}
+]).
+%% List of known RPC backend modules:
+-define(RPC_MODULES, "gen_rpc, erpc, rpc, emqx_rpc").
+%% List of known functions also known to do RPC:
+-define(RPC_FUNCTIONS,
+    "emqx_cluster_rpc:multicall/3, emqx_cluster_rpc:multicall/5"
+).
+%% List of functions in the RPC backend modules that we can ignore:
+
+% TODO: handle pmap
+-define(IGNORED_RPC_CALLS, "gen_rpc:set_logger/1, gen_rpc:nodes/0, emqx_rpc:unwrap_erpc/1").
+%% List of business-layer functions that are exempt from the checks:
+%% erlfmt-ignore
+-define(EXEMPTIONS,
+    % Reason: legacy code. A fun and a QC query are
+    % passed in the args, it's futile to try to statically
+    % check it
+    "emqx_mgmt_api:do_query/2, emqx_mgmt_api:collect_total_from_tail_nodes/2,"
+    %% Reason: `emqx_machine' should not depend on `emqx', where the `bpapi' modules live.
+    " emqx_machine_replicant_health_probe:get_core_custom_infos/0,"
+    %% Reason: avoid requiring the user to do manual intervention on older (pre-6.0) nodes
+    %% before rolling upgrade.
+    " emqx_conf_app:upgrade_remote_raw_config/2"
+).
+
+%% APIs of a dump whose RPC targets may be missing from this tree. A released
+%% node calls the targets of a dump by name, so every entry states why no
+%% released node can reach the missing targets.
+-define(REMOVED_TARGET_APIS, [
+    %% 6.0 removed bridges V1 (#15864). 5.x nodes call these targets only from
+    %% the REST handlers `emqx_bridge_api' and `emqx_bridge_v2_api'.
+    {emqx_bridge, 1},
+    {emqx_bridge, 2},
+    {emqx_bridge, 3},
+    {emqx_bridge, 4},
+    {emqx_bridge, 5},
+    {emqx_bridge, 6},
+    {emqx_bridge, 7},
+    %% A cluster that ran durable sessions on 5.x must be recreated to upgrade
+    %% to 6.0 (6.0.0 release notes). It cannot roll, so no 5.x node calls a
+    %% 6.x node through these APIs.
+    {emqx_ds, 4},
+    {emqx_ds, 5},
+    {emqx_ds_otx, 1},
+    {emqx_ds_beamsplitter, 2},
+    {emqx_persistent_session_ds, 1},
+    %% The relup REST API was removed (#17244). Only that REST handler calls
+    %% these targets.
+    {emqx_mgmt_api_relup, 1},
+    %% No released code calls `start/1' or `stop/1' of these proto modules, so
+    %% no node reaches `emqx_prometheus:do_start/0' or `do_stop/0'.
+    {emqx_prometheus, 1},
+    {emqx_prometheus, 2}
+]).
+
+%% Only the APIs for the features that haven't reached General
+%% Availability can be added here:
+-define(EXPERIMENTAL_APIS, [
+    {emqx_ds, 4},
+    {emqx_ds_beamformer, 1}
+]).
+
+%% Layout of the union tuple as OTP27 and older wrote it: the opaque slot sits
+%% between the tuple and map slots and OTP28 no longer has it.
+-define(OTP27_UNION_SIZE, 9).
+-define(OTP27_UNION_OPAQUE_SLOT, 8).
+
+%% APIs that two release lines independently gave the same version number with
+%% different contents. Neither side can be corrected: both have shipped. Every
+%% entry states why it cannot cause a bad call -- either a run-time guard, or
+%% that no node on this branch can reach the other side's version.
+-define(DIVERGED_APIS, [
+    %% 5.8.11 and 6.0.0 both created `emqx_mgmt_data_backup_proto_v2'. The 5.x
+    %% module wraps `maybe_copy_and_import/2' and the 6.x one
+    %% `maybe_copy_and_import/3'. `emqx_mgmt_api_data_backup' refuses an import
+    %% unless every running node reports the same major.minor version, so the
+    %% two contracts are never reached from one another.
+    {emqx_mgmt_data_backup, 2},
+    %% 6.3.0 dropped `start/1' and `stop/1' from `emqx_prometheus_proto_v2' and
+    %% their targets `emqx_prometheus:do_start/0' and `do_stop/0' (a314325677).
+    %% The 5.8, 5.9 and 5.10 lines still declare the wrappers but no code on any
+    %% of them calls one, so no peer can reach the removed targets.
+    {emqx_prometheus, 2}
+]).
+
+-define(XREF, myxref).
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% Functions related to BPAPI compatibility checking
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+-spec run() -> boolean().
+run() ->
+    case dump() of
+        true ->
+            Dumps = dump_files(),
+            case Dumps of
+                [] ->
+                    logger:error("No BPAPI dumps are found in ~s, abort", [dumps_dir()]),
+                    false;
+                _ ->
+                    logger:notice("Running API compatibility checks for ~p", [Dumps]),
+                    check_compat(Dumps)
+            end;
+        false ->
+            logger:critical("Backplane API violations found on the current branch.", []),
+            false
+    end.
+
+-spec check_compat([file:filename()]) -> boolean().
+check_compat(DumpFilenames) ->
+    put(bpapi_ok, true),
+    Dumps = lists:map(
+        fun(FN) ->
+            {ok, [Dump0]} = file:consult(FN),
+            Dump = upgrade_dump(filename:extension(FN), Dump0),
+            check_release_field(FN, Dump),
+            Dump#{release => filename_to_release(FN)}
+        end,
+        DumpFilenames
+    ),
+    check_no_stale_exemptions(Dumps),
+    check_targets_exported(Dumps),
+    [check_compat(I, J) || I <- Dumps, J <- Dumps],
+    erase(bpapi_ok).
+
+%% A dump is compared as the release its file name states, so the `release'
+%% field it carries is never read. A baseline copied from another file keeps
+%% the source's field, which is the only trace left of the copy. (sets nok flag)
+-spec check_release_field(file:filename(), fulldump()) -> ok.
+check_release_field(FN, Dump) ->
+    Expected = filename:rootname(filename:basename(FN)),
+    case maps:get(release, Dump, undefined) of
+        Expected ->
+            ok;
+        Found ->
+            setnok(),
+            logger:error(
+                "~s states release \"~s\". The file name says \"~s\".~n"
+                "A dump copied from another release keeps the field it was copied with.",
+                [FN, Found, Expected]
+            )
+    end,
+    ok.
+
+%% An entry in the force-deleted lists only ever suppresses an error about an
+%% API or a module that some dump still describes. One that matches no dump
+%% suppresses nothing, and it hides the fact that the deletion it was written
+%% for is no longer covered. (sets nok flag)
+-spec check_no_stale_exemptions([fulldump()]) -> ok.
+check_no_stale_exemptions(Dumps) ->
+    Keys = lists:usort(lists:append([maps:keys(API) || #{api := API} <- Dumps])),
+    Modules = lists:usort(
+        lists:append([
+            [Mf, Mt]
+         || #{api := API} <- Dumps,
+            #{calls := Calls, casts := Casts} <- maps:values(API),
+            {{Mf, _, _}, {Mt, _, _}} <- Calls ++ Casts
+        ])
+    ),
+    report_stale("FORCE_DELETED_APIS", ?FORCE_DELETED_APIS -- Keys),
+    report_stale("DIVERGED_APIS", ?DIVERGED_APIS -- Keys),
+    report_stale("FORCE_DELETED_MODULES", ?FORCE_DELETED_MODULES -- Modules),
+    report_stale("REMOVED_TARGET_APIS", ?REMOVED_TARGET_APIS -- Keys),
+    ok.
+
+%% A proto module may be deleted, because it only wraps the local side of a
+%% call. Its RPC targets may not: a released node calls them by name, and some
+%% call sites name the proto module without negotiating a version. So every
+%% target of a released dump must be exported by this tree, unless its API is
+%% in `?REMOVED_TARGET_APIS'. (sets nok flag)
+-spec check_targets_exported([fulldump()]) -> ok.
+check_targets_exported(Dumps) ->
+    Missing = maps:groups_from_list(
+        fun({Key, To, _Release}) -> {Key, To} end,
+        fun({_Key, _To, Release}) -> Release end,
+        [
+            {Key, call_to_mfa(To), Release}
+         || #{release := Release, api := API} <- Dumps,
+            Release =/= [master],
+            {Key, #{calls := Calls, casts := Casts}} <- maps:to_list(API),
+            not lists:member(Key, ?REMOVED_TARGET_APIS),
+            {_From, To} <- Calls ++ Casts,
+            not is_exported(call_to_mfa(To))
+        ]
+    ),
+    maps:foreach(
+        fun({{API, Vsn}, {M, F, A}}, Releases) ->
+            setnok(),
+            logger:error(
+                "API ~p v~p of release(s) ~s calls ~p:~p/~p, which is not exported.~n"
+                "A node of that release gets `undef` during a rolling upgrade. "
+                "Restore the export, or add the API to REMOVED_TARGET_APIS "
+                "with the reason no released node can reach it.",
+                [API, Vsn, format_releases(Releases), M, F, A]
+            )
+        end,
+        Missing
+    ).
+
+is_exported({M, F, A}) ->
+    _ = code:ensure_loaded(M),
+    erlang:function_exported(M, F, A).
+
+format_releases(Releases) ->
+    lists:join(", ", [
+        lists:join(".", [integer_to_list(I) || I <- R])
+     || R <- lists:usort(Releases)
+    ]).
+
+report_stale(_List, []) ->
+    ok;
+report_stale(List, Stale) ->
+    setnok(),
+    logger:error(
+        "Stale ~s entries: ~p.~n"
+        "No dump describes them, so they suppress nothing. Remove them.",
+        [List, Stale]
+    ).
+
+filename_to_release(FN) ->
+    Basename = filename:basename(FN),
+    lists:flatmap(
+        fun
+            ("master") -> [master];
+            ("bpapi" ++ _) -> [];
+            (VsnComp) -> [list_to_integer(VsnComp)]
+        end,
+        string:split(Basename, ".", all)
+    ).
+
+%% Note: sets nok flag
+-spec check_compat(fulldump(), fulldump()) -> ok.
+check_compat(Dump1 = #{release := Rel1}, Dump2 = #{release := Rel2}) when Rel2 >= Rel1 ->
+    check_api_immutability(Dump1, Dump2),
+    typecheck_apis(Dump1, Dump2);
+check_compat(_, _) ->
+    ok.
+
+%% It's not allowed to change BPAPI modules. Check that no changes
+%% have been made. (sets nok flag)
+-spec check_api_immutability(fulldump(), fulldump()) -> ok.
+check_api_immutability(#{release := Rel1, api := APIs1}, #{release := Rel2, api := APIs2}) ->
+    %% TODO: Handle API deprecation
+    _ = maps:map(
+        fun(Key, Val) ->
+            case lists:member(Key, ?EXPERIMENTAL_APIS ++ ?DIVERGED_APIS) of
+                true ->
+                    ok;
+                false ->
+                    do_check_api_immutability(Rel1, Rel2, APIs2, Key, Val)
+            end
+        end,
+        APIs1
+    ),
+    ok.
+
+do_check_api_immutability(Rel1, Rel2, APIs2, Key = {API, Version}, Val) ->
+    case maps:get(Key, APIs2, undefined) of
+        Val ->
+            ok;
+        undefined ->
+            case lists:member(Key, ?FORCE_DELETED_APIS) of
+                true ->
+                    ok;
+                false ->
+                    setnok(),
+                    logger:error(
+                        "API ~p v~p was removed in release ~p without being deprecated. "
+                        "Old release: ~p",
+                        [API, Version, Rel2, Rel1]
+                    )
+            end;
+        Rel2Val ->
+            setnok(),
+            logger:error(
+                "API ~p v~p was changed between ~p and ~p. Backplane API should be immutable.",
+                [API, Version, Rel1, Rel2]
+            ),
+            %% `Val' is the entry of the older release `Rel1', so name each list
+            %% after the release that has it. Labelling them added and removed
+            %% states the two the wrong way round, and a wrong label here sent one
+            %% reader looking for the change on the wrong branch.
+            Only1 = maps:get(calls, Val) -- maps:get(calls, Rel2Val),
+            Only2 = maps:get(calls, Rel2Val) -- maps:get(calls, Val),
+            logger:error("Calls only in ~p:~n  ~p", [Rel1, Only1]),
+            logger:error("Calls only in ~p:~n  ~p", [Rel2, Only2])
+    end.
+
+filter_calls(Calls) ->
+    F = fun({{Mf, _, _}, {Mt, _, _}}) ->
+        (not lists:member(Mf, ?FORCE_DELETED_MODULES)) andalso
+            (not lists:member(Mt, ?FORCE_DELETED_MODULES))
+    end,
+    lists:filter(F, Calls).
+
+%% Note: sets nok flag
+-spec typecheck_apis(fulldump(), fulldump()) -> ok.
+typecheck_apis(
+    #{release := CallerRelease, api := CallerAPIs, signatures := CallerSigs},
+    #{release := CalleeRelease, signatures := CalleeSigs}
+) ->
+    AllCalls0 = lists:flatten([
+        [Calls, Casts]
+     || #{calls := Calls, casts := Casts} <- maps:values(
+            maps:without(?EXPERIMENTAL_APIS ++ ?DIVERGED_APIS, CallerAPIs)
+        )
+    ]),
+    AllCalls = filter_calls(AllCalls0),
+    lists:foreach(
+        fun({From, To}) ->
+            Caller = get_param_types(CallerSigs, From, From),
+            Callee = get_param_types(CalleeSigs, From, To),
+            %% TODO: check return types
+            case typecheck_rpc(Caller, Callee) of
+                [] ->
+                    ok;
+                TypeErrors ->
+                    setnok(),
+                    [
+                        logger:error(
+                            "Incompatible RPC call: "
+                            "type of the parameter ~p of RPC call ~s in release ~p "
+                            "is not a subtype of the target function ~s in release ~p.~n"
+                            "Caller type: ~s~nCallee type: ~s~n",
+                            [
+                                Var,
+                                format_call(From),
+                                CallerRelease,
+                                format_call(To),
+                                CalleeRelease,
+                                erl_types:t_to_string(CallerType),
+                                erl_types:t_to_string(CalleeType)
+                            ]
+                        )
+                     || {Var, CallerType, CalleeType} <- TypeErrors
+                    ]
+            end
+        end,
+        AllCalls
+    ).
+
+-spec typecheck_rpc(param_types(), param_types()) -> [{emqx_bpapi:var_name(), _Type, _Type}].
+typecheck_rpc(Caller, Callee) ->
+    maps:fold(
+        fun(Var, CalleeType, Acc) ->
+            #{Var := CallerType} = Caller,
+            case erl_types:t_is_subtype(CallerType, CalleeType) of
+                true -> Acc;
+                false -> [{Var, CallerType, CalleeType} | Acc]
+            end
+        end,
+        [],
+        Callee
+    ).
+
+%%-spec get_param_types(dialyzer_dump(), emqx_bpapi:call()) -> param_types().
+get_param_types(Signatures, From, {M, F, A}) ->
+    Arity = length(A),
+    case Signatures of
+        #{{M, F, Arity} := {_RetType, AttrTypes}} ->
+            % assert
+            Arity = length(AttrTypes),
+            maps:from_list(lists:zip(A, AttrTypes));
+        _ ->
+            logger:critical("Call ~p:~p/~p from ~p is not found in PLT~n", [M, F, Arity, From]),
+            error({badkey, {M, F, A}})
+    end.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% Functions related to BPAPI dumping
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+dump() ->
+    RootDir = project_root_dir(),
+    BuildProfile = os:getenv("BPAPI_BUILD_PROFILE", "check"),
+    TryRelDir = filename:join([RootDir, "_build", BuildProfile, "lib"]),
+    PLT = plt_file(RootDir),
+    case {filelib:is_regular(PLT), filelib:wildcard(TryRelDir)} of
+        {true, [RelDir | _]} ->
+            dump(#{
+                plt => PLT,
+                reldir => RelDir
+            });
+        {false, _} ->
+            logger:error(
+                "No PLT for the running OTP at \"~s\", abort ~n"
+                "Found: ~p~n"
+                "Try running `rebar3 as check dialyzer` at least once first",
+                [PLT, filelib:wildcard(RootDir ++ "/*_plt")]
+            ),
+            error(run_failed);
+        {_, []} ->
+            logger:error(
+                "No built applications found in \"~s\", abort ~n"
+                "Try running `rebar3 as check compile` at least once first",
+                [TryRelDir]
+            ),
+            error(run_failed)
+    end.
+
+%% The PLT `mix emqx.dialyzer' writes for the OTP running now. A checkout can
+%% hold several, one per OTP it has been built with, and a PLT that describes
+%% other code answers `none' for every lookup: the dump then either crashes in
+%% `enrich/2' or, worse, records the wrong signatures.
+-spec plt_file(file:filename()) -> file:filename().
+plt_file(RootDir) ->
+    filename:join(RootDir, "emqx_dialyzer_" ++ otp_version() ++ "_plt").
+
+%% Mirrors `EMQXUmbrella.MixProject.otp_release/0', which names the file.
+-spec otp_version() -> string().
+otp_version() ->
+    Major = erlang:system_info(otp_release),
+    File = filename:join([code:root_dir(), "releases", Major, "OTP_VERSION"]),
+    case file:read_file(File) of
+        {ok, Bin} ->
+            hd(string:split(string:trim(binary_to_list(Bin)), "**"));
+        {error, _} ->
+            Major
+    end.
+
+%% Collect the local BPAPI modules to a dump file
+-spec dump(dump_options()) -> boolean().
+dump(Opts) ->
+    put(bpapi_ok, true),
+    PLT = prepare(Opts),
+    %% First we run XREF to find all callers of any known RPC backend:
+    Callers = find_remote_calls(Opts),
+    {BPAPICalls, NonBPAPICalls} = lists:partition(fun is_bpapi_call/1, Callers),
+    warn_nonbpapi_rpcs(NonBPAPICalls),
+    APIDump = collect_bpapis(BPAPICalls),
+    DialyzerDump = collect_signatures(PLT, APIDump),
+    dump_api(#{api => APIDump, signatures => DialyzerDump, release => "master"}),
+    dump_versions(APIDump),
+    dump_owner_applications(APIDump),
+    xref:stop(?XREF),
+    erase(bpapi_ok).
+
+prepare(#{reldir := RelDir, plt := PLT}) ->
+    logger:info("Starting xref...", []),
+    xref:start(?XREF),
+    filelib:wildcard(RelDir ++ "/*/ebin/") =:= [] andalso
+        error("No applications found in the release directory. Wrong directory?"),
+    xref:set_default(?XREF, [{warnings, false}]),
+    xref:add_release(?XREF, RelDir),
+    %% Now to the dialyzer stuff:
+    logger:info("Loading PLT...", []),
+    load_plt(PLT).
+
+%% erlfmt-ignore
+find_remote_calls(_Opts) ->
+    IgnoredApps = ?IGNORED_APPS ++ plugin_apps(),
+    Query =
+        "XC | (A - [" ++ IgnoredApps ++ "]:App - ["?IGNORED_MODULES"]:Mod - ["?EXEMPTIONS"])
+           || ((["?RPC_MODULES"] : Mod + ["?RPC_FUNCTIONS"]) - ["?IGNORED_RPC_CALLS"])",
+    {ok, Calls} = xref:q(?XREF, Query),
+    logger:info("Calls to RPC modules ~p", [Calls]),
+    {Callers, _Callees} = lists:unzip(Calls),
+    Callers.
+
+%% In-tree plugins own their static-check policy and may be present in
+%% the analyzed build tree (the static_checks make target compiles them
+%% for the cluster_rpc target check, which covers them separately).
+%% Exclude them from the BPAPI analysis.
+plugin_apps() ->
+    lists:append([
+        ", " ++ filename:basename(Dir)
+     || Dir <- filelib:wildcard("plugins/*"),
+        filelib:is_dir(Dir)
+    ]).
+
+-spec warn_nonbpapi_rpcs([mfa()]) -> ok.
+warn_nonbpapi_rpcs([]) ->
+    ok;
+warn_nonbpapi_rpcs(L) ->
+    setnok(),
+    lists:foreach(
+        fun({M, F, A}) ->
+            logger:error(
+                "~p:~p/~p does a remote call outside of a dedicated "
+                "backplane API module. "
+                "It may break during rolling cluster upgrade",
+                [M, F, A]
+            )
+        end,
+        L
+    ).
+
+-spec is_bpapi_call(mfa()) -> boolean().
+is_bpapi_call({Module, _Function, _Arity}) ->
+    case catch Module:bpapi_meta() of
+        #{api := _} -> true;
+        _ -> false
+    end.
+
+-spec dump_api(fulldump()) -> ok.
+dump_api(Term = #{api := _, signatures := _, release := Release}) ->
+    Filename = filename:join(dumps_dir(), Release ++ dump_file_extension()),
+    ok = filelib:ensure_dir(Filename),
+    file:write_file(Filename, io_lib:format("~0p.~n", [Term])).
+
+-spec dump_versions(api_dump()) -> ok.
+dump_versions(APIs) ->
+    Filename = versions_file(),
+    logger:notice("Dumping API versions to ~p", [Filename]),
+    ok = filelib:ensure_dir(Filename),
+    {ok, FD} = file:open(Filename, [write]),
+    io:format(
+        FD, "%% This file is automatically generated by `make static_checks`, do not edit.~n", []
+    ),
+    lists:foreach(
+        fun(API) ->
+            ok = io:format(FD, "~p.~n", [API])
+        end,
+        lists:sort(maps:keys(APIs))
+    ),
+    file:close(FD).
+
+dump_owner_applications(APIs0) ->
+    APIs = maps:groups_from_list(
+        fun({API, Vsn}) -> get_application(API, Vsn) end,
+        fun({API, _Vsn}) -> API end,
+        maps:keys(APIs0)
+    ),
+    Filename = owner_applications_file(),
+    logger:notice("Dumping API owner application to ~p", [Filename]),
+    ok = filelib:ensure_dir(Filename),
+    {ok, FD} = file:open(Filename, [write]),
+    io:format(
+        FD, "%% This file is automatically generated by `make static_checks`, do not edit.~n", []
+    ),
+    lists:foreach(
+        fun({App, APIs1}) ->
+            lists:foreach(
+                fun(API) ->
+                    ok = io:format(FD, "~p.~n", [{API, App}])
+                end,
+                lists:usort(APIs1)
+            )
+        end,
+        lists:sort(maps:to_list(APIs))
+    ),
+    file:close(FD).
+
+-spec collect_bpapis([mfa()]) -> api_dump().
+collect_bpapis(L) ->
+    Modules = lists:usort([M || {M, _F, _A} <- L]),
+    lists:foldl(
+        fun(Mod, Acc) ->
+            #{
+                api := API,
+                version := Vsn,
+                calls := Calls,
+                casts := Casts
+            } = Mod:bpapi_meta(),
+            Acc#{
+                {API, Vsn} => #{
+                    calls => Calls,
+                    casts => Casts
+                }
+            }
+        end,
+        #{},
+        Modules
+    ).
+
+-spec collect_signatures(_PLT, api_dump()) -> dialyzer_dump().
+collect_signatures(PLT, APIs) ->
+    maps:fold(
+        fun(_APIAndVersion, #{calls := Calls, casts := Casts}, Acc0) ->
+            Acc1 = lists:foldl(fun enrich/2, {Acc0, PLT}, Calls),
+            {Acc, PLT} = lists:foldl(fun enrich/2, Acc1, Casts),
+            Acc
+        end,
+        #{},
+        APIs
+    ).
+
+%% Add information about the call types from the PLT
+-spec enrich(emqx_bpapi:rpc(), {dialyzer_dump(), _PLT}) -> {dialyzer_dump(), _PLT}.
+enrich({From0, To0}, {Acc0, PLT}) ->
+    From = call_to_mfa(From0),
+    To = call_to_mfa(To0),
+    case {dialyzer_plt:lookup_contract(PLT, From), dialyzer_plt:lookup(PLT, To)} of
+        {{value, #contract{args = FromArgs}}, {value, TTo}} ->
+            %% TODO: Check return type
+            FromRet = erl_types:t_any(),
+            Acc = Acc0#{
+                From => {FromRet, FromArgs},
+                To => TTo
+            },
+            {Acc, PLT};
+        {{value, _}, none} ->
+            setnok(),
+            logger:critical(
+                "Backplane API function ~s calls a missing remote function ~s",
+                [format_call(From0), format_call(To0)]
+            ),
+            error(missing_target)
+    end.
+
+-spec call_to_mfa(emqx_bpapi:call()) -> mfa().
+call_to_mfa({M, F, A}) ->
+    {M, F, length(A)}.
+
+format_call({M, F, A}) ->
+    io_lib:format("~p:~p/~p", [M, F, length(A)]).
+
+setnok() ->
+    put(bpapi_ok, false).
+
+dumps_dir() ->
+    filename:join(bpapi_app_dir(), "test/emqx_static_checks_data").
+
+%% Every checked-in dump the running OTP can read. Dumps written by an older
+%% OTP are rewritten by upgrade_dump/2 when they are loaded.
+-spec dump_files() -> [file:filename()].
+dump_files() ->
+    lists:append([
+        filelib:wildcard(dumps_dir() ++ "/*" ++ Extension)
+     || Extension <- readable_dump_extensions()
+    ]).
+
+versions_file() ->
+    filename:join(emqx_app_dir(), "priv/bpapi.versions").
+
+owner_applications_file() ->
+    filename:join(emqx_app_dir(), "priv/bpapi.apps").
+
+%% The directory of the application this module belongs to.
+%% The per-release BPAPI dumps are stored there.
+bpapi_app_dir() ->
+    Info = ?MODULE:module_info(compile),
+    case proplists:get_value(source, Info) of
+        Source when is_list(Source) ->
+            filename:dirname(filename:dirname(Source));
+        undefined ->
+            "apps/emqx_bpapi"
+    end.
+
+emqx_app_dir() ->
+    Info = ?MODULE:module_info(compile),
+    case proplists:get_value(source, Info) of
+        Source when is_list(Source) ->
+            BPAPIAppDir = filename:dirname(filename:dirname(Source)),
+            Root = filename:dirname(filename:dirname(BPAPIAppDir)),
+            filename:join([Root, "apps", "emqx"]);
+        undefined ->
+            "apps/emqx"
+    end.
+
+project_root_dir() ->
+    filename:dirname(filename:dirname(emqx_app_dir())).
+
+get_application(API, Vsn) ->
+    ModStr = atom_to_list(API) ++ "_proto_v" ++ integer_to_list(Vsn),
+    {ok, [App]} = xref:q(?XREF, "(App) " ++ ModStr),
+    App.
+
+-if(?OTP_RELEASE >= 26).
+load_plt(File) ->
+    dialyzer_cplt:from_file(File).
+-else.
+load_plt(File) ->
+    dialyzer_plt:from_file(File).
+-endif.
+
+-if(?OTP_RELEASE >= 28).
+
+dump_file_extension() ->
+    %% OTP28 replaces opaque types with nominal ones in the internal format
+    %% for the types:
+    ".bpapi3".
+
+readable_dump_extensions() ->
+    [".bpapi2", ".bpapi3"].
+
+%% OTP28 replaced opaque types with nominal ones and dropped the opaque slot
+%% from the union tuple. Rewrite an OTP26/27 dump into the current
+%% representation so that the releases it describes stay in the comparison.
+upgrade_dump(".bpapi2", Dump = #{signatures := Signatures}) ->
+    Dump#{signatures := maps:map(fun(_MFA, Sig) -> upgrade_signature(Sig) end, Signatures)};
+upgrade_dump(_Extension, Dump) ->
+    Dump.
+
+upgrade_signature({Return, Args}) ->
+    {upgrade_type(Return), [upgrade_type(Arg) || Arg <- Args]}.
+
+%% An opaque type becomes the nominal OTP28 declares for it. Keeping it
+%% nominal rather than unwrapping it to its structure is what makes the
+%% comparison meaningful: the current release holds the same type as a
+%% nominal, and a bare structure is not a subtype of one.
+upgrade_type({c, opaque, OpaqueSet, Qual}) ->
+    erl_types:t_sup([
+        {c, nominal, {{Mod, Name, Arity, opaque}, upgrade_type(Struct)}, Qual}
+     || {opaque, Mod, Name, Arity, Struct} <- OpaqueSet
+    ]);
+upgrade_type({c, union, Slots, Qual}) when length(Slots) =:= ?OTP27_UNION_SIZE ->
+    {Head, [Opaque, Map]} = lists:split(?OTP27_UNION_OPAQUE_SLOT - 1, [
+        upgrade_type(Slot)
+     || Slot <- Slots
+    ]),
+    Union = {c, union, Head ++ [Map], Qual},
+    case Opaque of
+        none -> Union;
+        _ -> erl_types:t_sup(Union, Opaque)
+    end;
+upgrade_type(Tuple) when is_tuple(Tuple) ->
+    list_to_tuple([upgrade_type(Element) || Element <- tuple_to_list(Tuple)]);
+upgrade_type(List) when is_list(List) ->
+    [upgrade_type(Element) || Element <- List];
+upgrade_type(Map) when is_map(Map) ->
+    maps:from_list([{upgrade_type(K), upgrade_type(V)} || {K, V} <- maps:to_list(Map)]);
+upgrade_type(Other) ->
+    Other.
+
+-else.
+
+-if(?OTP_RELEASE >= 26).
+dump_file_extension() ->
+    %% OTP26 changes the internal format for the types:
+    ".bpapi2".
+-else.
+dump_file_extension() ->
+    ".bpapi".
+-endif.
+
+readable_dump_extensions() ->
+    [dump_file_extension()].
+
+upgrade_dump(_Extension, Dump) ->
+    Dump.
+
+-endif.

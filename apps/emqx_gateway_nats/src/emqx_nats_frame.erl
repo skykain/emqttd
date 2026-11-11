@@ -1,0 +1,792 @@
+%%--------------------------------------------------------------------
+%% Copyright (c) 2025-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
+%%--------------------------------------------------------------------
+
+-module(emqx_nats_frame).
+
+-behaviour(emqx_gateway_frame).
+
+-include("emqx_nats.hrl").
+
+-export([
+    initial_parse_state/1,
+    serialize_opts/0,
+    serialize_pkt/2,
+    parse/2,
+    format/1,
+    type/1,
+    is_message/1
+]).
+
+-export([
+    message/1,
+    subject/1,
+    sid/1,
+    queue_group/1,
+    reply_to/1,
+    headers/1,
+    payload/1,
+    payload_total_size/1,
+    max_msgs/1
+]).
+
+-define(INIT_STATE(S, B), #{state := init, buffer := B} = S).
+-define(ARGS_STATE(S, B), #{state := args, buffer := B} = S).
+-define(HEADERS_STATE(S, B), #{state := headers, buffer := B} = S).
+-define(PAYLOAD_STATE(S, B), #{state := payload, buffer := B} = S).
+
+-elvis([{elvis_style, dont_repeat_yourself, disable}]).
+
+%%--------------------------------------------------------------------
+%% API
+%%--------------------------------------------------------------------
+
+initial_parse_state(Opts) ->
+    #{
+        buffer => <<>>,
+        headers => false,
+        %% init | args | headers | payload
+        state => init,
+        %% in parsing frame, the current frame is stored in iframe
+        iframe => undefined,
+        max_payload => max_payload_size(Opts),
+        max_control_line => max_control_line(Opts)
+    }.
+
+max_payload_size(Opts) when is_map(Opts), is_map_key(max_payload_size, Opts) ->
+    maps:get(max_payload_size, Opts);
+max_payload_size(_Opts) ->
+    emqx_conf:get([gateway, nats, protocol, max_payload_size], ?DEFAULT_MAX_PAYLOAD).
+
+max_control_line(Opts) when is_map(Opts), is_map_key(max_control_line, Opts) ->
+    maps:get(max_control_line, Opts);
+max_control_line(_Opts) ->
+    emqx_conf:get([gateway, nats, protocol, max_control_line], ?DEFAULT_MAX_CONTROL_LINE).
+
+parse(Data0, ?INIT_STATE(State, Buffer)) ->
+    parse_operation(append_parse_buffer(Buffer, Data0), State);
+parse(Data0, ?ARGS_STATE(State, Buffer)) ->
+    ok = check_control_line_chunk(Buffer, Data0, State),
+    parse_args(append_parse_buffer(Buffer, Data0), State#{buffer => <<>>});
+parse(Data0, ?HEADERS_STATE(State, Buffer)) ->
+    parse_headers(append_parse_buffer(Buffer, Data0), State#{buffer => <<>>});
+parse(Data0, ?PAYLOAD_STATE(State, Buffer)) ->
+    parse_payload(append_parse_buffer(Buffer, Data0), State#{buffer => <<>>}).
+
+%%--------------------------------------------------------------------
+%% Control frames
+
+parse_operation(<<"PING", Rest/binary>> = Data, State) ->
+    parse_control_line(Rest, Data, ?OP_PING, State);
+parse_operation(<<"ping", Rest/binary>> = Data, State) ->
+    parse_control_line(Rest, Data, ?OP_PING, State);
+parse_operation(<<"PONG", Rest/binary>> = Data, State) ->
+    parse_control_line(Rest, Data, ?OP_PONG, State);
+parse_operation(<<"pong", Rest/binary>> = Data, State) ->
+    parse_control_line(Rest, Data, ?OP_PONG, State);
+parse_operation(<<"CONNECT ", Rest/binary>>, State) ->
+    parse_args(Rest, to_args_state(State, ?OP_CONNECT));
+parse_operation(<<"connect ", Rest/binary>>, State) ->
+    parse_args(Rest, to_args_state(State, ?OP_CONNECT));
+parse_operation(<<"INFO ", Rest/binary>>, State) ->
+    parse_args(Rest, to_args_state(State, ?OP_INFO));
+parse_operation(<<"info ", Rest/binary>>, State) ->
+    parse_args(Rest, to_args_state(State, ?OP_INFO));
+parse_operation(<<"+OK", Rest/binary>> = Data, State) ->
+    parse_control_line(Rest, Data, ?OP_OK, State);
+parse_operation(<<"+ok", Rest/binary>> = Data, State) ->
+    parse_control_line(Rest, Data, ?OP_OK, State);
+parse_operation(<<"-ERR ", Rest/binary>>, State) ->
+    parse_args(Rest, to_args_state(State, ?OP_ERR));
+parse_operation(<<"-err ", Rest/binary>>, State) ->
+    parse_args(Rest, to_args_state(State, ?OP_ERR));
+%%--------------------------------------------------------------------
+%% Message frames
+
+parse_operation(<<"PUB ", Rest/binary>>, State) ->
+    parse_args(Rest, to_args_state(State, ?OP_PUB));
+parse_operation(<<"pub ", Rest/binary>>, State) ->
+    parse_args(Rest, to_args_state(State, ?OP_PUB));
+parse_operation(<<"SUB ", Rest/binary>>, State) ->
+    parse_args(Rest, to_args_state(State, ?OP_SUB));
+parse_operation(<<"sub ", Rest/binary>>, State) ->
+    parse_args(Rest, to_args_state(State, ?OP_SUB));
+parse_operation(<<"UNSUB ", Rest/binary>>, State) ->
+    parse_args(Rest, to_args_state(State, ?OP_UNSUB));
+parse_operation(<<"unsub ", Rest/binary>>, State) ->
+    parse_args(Rest, to_args_state(State, ?OP_UNSUB));
+parse_operation(<<"MSG ", Rest/binary>>, State) ->
+    parse_args(Rest, to_args_state(State, ?OP_MSG));
+parse_operation(<<"msg ", Rest/binary>>, State) ->
+    parse_args(Rest, to_args_state(State, ?OP_MSG));
+parse_operation(<<"HPUB ", Rest/binary>>, State) ->
+    parse_args(Rest, to_args_state(State, ?OP_HPUB));
+parse_operation(<<"hpub ", Rest/binary>>, State) ->
+    parse_args(Rest, to_args_state(State, ?OP_HPUB));
+parse_operation(<<"HMSG ", Rest/binary>>, State) ->
+    parse_args(Rest, to_args_state(State, ?OP_HMSG));
+parse_operation(<<"hmsg ", Rest/binary>>, State) ->
+    parse_args(Rest, to_args_state(State, ?OP_HMSG));
+parse_operation(Data, State) ->
+    case is_prefix_of_any(Data, ?ALL_OPS) of
+        true ->
+            {more, State#{buffer => Data}};
+        false ->
+            error({unknown_operation, Data})
+    end.
+
+is_prefix_of_any(Data, Ops) ->
+    DataLen = byte_size(Data),
+    lists:any(
+        fun(Op) ->
+            case Op of
+                <<Data:DataLen/binary, _/binary>> ->
+                    true;
+                _ ->
+                    false
+            end
+        end,
+        Ops
+    ).
+
+%%--------------------------------------------------------------------
+%% Serialize frames
+%%--------------------------------------------------------------------
+
+serialize_opts() ->
+    #{}.
+
+serialize_pkt(#nats_frame{operation = Op, message = Message}, Opts) ->
+    UseLowerHeader = maps:get(use_lower_header, Opts, false),
+    Bin1 = serialize_operation(Op, UseLowerHeader),
+    case Message of
+        undefined ->
+            [Bin1, "\r\n"];
+        _ ->
+            Bin2 = serialize_message(Op, Message),
+            [Bin1, " ", Bin2, "\r\n"]
+    end.
+
+serialize_operation(?OP_OK, _UseLowerHeader = false) ->
+    [?OP_RAW_OK];
+serialize_operation(?OP_OK, _UseLowerHeader = true) ->
+    [?OP_RAW_OK_L];
+serialize_operation(?OP_ERR, _UseLowerHeader = false) ->
+    [?OP_RAW_ERR];
+serialize_operation(?OP_ERR, _UseLowerHeader = true) ->
+    [?OP_RAW_ERR_L];
+serialize_operation(Op, _UseLowerHeader = false) when is_atom(Op) ->
+    [string:to_upper(atom_to_list(Op))];
+serialize_operation(Op, _UseLowerHeader = true) ->
+    [string:to_lower(atom_to_list(Op))].
+
+serialize_message(?OP_INFO, Message) ->
+    [emqx_utils_json:encode(Message)];
+serialize_message(?OP_CONNECT, Message) ->
+    [emqx_utils_json:encode(Message)];
+serialize_message(?OP_ERR, Message) ->
+    [Message];
+serialize_message(?OP_PUB, Message) ->
+    Subject = maps:get(subject, Message),
+    Payload = maps:get(payload, Message),
+    PayloadSize = integer_to_list(byte_size(Payload)),
+    ok = validate_subject(Subject),
+    case maps:get(reply_to, Message, undefined) of
+        undefined ->
+            [Subject, " ", PayloadSize, "\r\n", Payload];
+        ReplyTo ->
+            ok = validate_non_wildcard_subject(ReplyTo),
+            [Subject, " ", ReplyTo, " ", PayloadSize, "\r\n", Payload]
+    end;
+serialize_message(?OP_HPUB, Message) ->
+    Subject = maps:get(subject, Message),
+    Headers = maps:get(headers, Message, #{}),
+    HeadersBin0 = serialize_headers(Headers),
+    HeadersBin = <<HeadersBin0/binary, "\r\n">>,
+    HeadersSize = integer_to_list(byte_size(HeadersBin)),
+    Payload = maps:get(payload, Message),
+    TotalSize = integer_to_list(byte_size(Payload) + byte_size(HeadersBin)),
+    ok = validate_subject(Subject),
+    case maps:get(reply_to, Message, undefined) of
+        undefined ->
+            [Subject, " ", HeadersSize, " ", TotalSize, "\r\n", HeadersBin, Payload];
+        ReplyTo ->
+            ok = validate_non_wildcard_subject(ReplyTo),
+            [Subject, " ", ReplyTo, " ", HeadersSize, " ", TotalSize, "\r\n", HeadersBin, Payload]
+    end;
+serialize_message(?OP_SUB, Message) ->
+    Subject = maps:get(subject, Message),
+    Sid = maps:get(sid, Message),
+    ok = validate_subject(Subject),
+    case maps:get(queue_group, Message, undefined) of
+        undefined ->
+            [Subject, " ", Sid];
+        QGroup ->
+            ok = validate_queue_group(QGroup),
+            [Subject, " ", QGroup, " ", Sid]
+    end;
+serialize_message(?OP_UNSUB, Message) ->
+    Sid = maps:get(sid, Message),
+    case maps:get(max_msgs, Message, 0) of
+        0 ->
+            [Sid];
+        MaxMsgs when is_integer(MaxMsgs) ->
+            [Sid, " ", integer_to_list(MaxMsgs)]
+    end;
+serialize_message(?OP_MSG, Message) ->
+    Subject = maps:get(subject, Message),
+    Sid = maps:get(sid, Message),
+    Payload = maps:get(payload, Message),
+    PayloadSize = integer_to_list(byte_size(Payload)),
+    ok = validate_non_wildcard_subject(Subject),
+    case maps:get(reply_to, Message, undefined) of
+        undefined ->
+            [Subject, " ", Sid, " ", PayloadSize, "\r\n", Payload];
+        ReplyTo ->
+            [Subject, " ", Sid, " ", ReplyTo, " ", PayloadSize, "\r\n", Payload]
+    end;
+serialize_message(?OP_HMSG, Message) ->
+    Subject = maps:get(subject, Message),
+    Sid = maps:get(sid, Message),
+    Headers = maps:get(headers, Message, #{}),
+    HeadersBin0 = serialize_headers(Headers),
+    HeadersBin = <<HeadersBin0/binary, "\r\n">>,
+    HeadersSize = integer_to_list(byte_size(HeadersBin)),
+    Payload = maps:get(payload, Message),
+    TotalSize = integer_to_list(byte_size(Payload) + byte_size(HeadersBin)),
+    case maps:get(reply_to, Message, undefined) of
+        undefined ->
+            [Subject, " ", Sid, " ", HeadersSize, " ", TotalSize, "\r\n", HeadersBin, Payload];
+        ReplyTo ->
+            [
+                Subject,
+                " ",
+                Sid,
+                " ",
+                ReplyTo,
+                " ",
+                HeadersSize,
+                " ",
+                TotalSize,
+                "\r\n",
+                HeadersBin,
+                Payload
+            ]
+    end;
+serialize_message(Op, _Message) ->
+    error({unknown_operation, Op}).
+
+serialize_headers(Headers) when is_map(Headers) ->
+    HeaderPrefix =
+        case maps:get(<<"code">>, Headers, false) of
+            false ->
+                <<"NATS/1.0\r\n">>;
+            503 ->
+                %% Only 503 is supported for the no_responders fast fail
+                <<"NATS/1.0 503\r\n">>
+        end,
+    serialize_headers(maps:to_list(maps:remove(<<"code">>, Headers)), HeaderPrefix).
+
+serialize_headers([], Acc) ->
+    Acc;
+serialize_headers([{Key, Value} | Rest], Acc) ->
+    serialize_headers(Rest, <<Acc/binary, Key/binary, ": ", Value/binary, "\r\n">>).
+
+format(#nats_frame{operation = Op, message = undefined}) ->
+    io_lib:format("~s", [Op]);
+format(#nats_frame{operation = ?OP_CONNECT, message = Message}) ->
+    io_lib:format("~s: ~0p", [?OP_CONNECT, redact_nats_connect(Message)]);
+format(#nats_frame{operation = Op, message = Message}) ->
+    io_lib:format("~s: ~0p", [Op, Message]).
+
+redact_nats_connect(Message) when is_map(Message) ->
+    maps:map(
+        fun
+            (K, _) when
+                K =:= <<"pass">>;
+                K =:= <<"auth_token">>;
+                K =:= <<"jwt">>;
+                K =:= <<"nkey">>
+            ->
+                <<"******">>;
+            (_, V) ->
+                V
+        end,
+        Message
+    );
+redact_nats_connect(Message) ->
+    Message.
+
+type(#nats_frame{operation = Op}) ->
+    Op.
+
+is_message(#nats_frame{operation = Op}) ->
+    Op =:= ?OP_MSG orelse
+        Op =:= ?OP_HMSG orelse
+        Op =:= ?OP_PUB orelse
+        Op =:= ?OP_HPUB.
+
+%%--------------------------------------------------------------------
+%% Getter
+
+message(#nats_frame{message = M}) ->
+    M.
+
+subject(#nats_frame{operation = Op, message = M}) when ?HAS_SUBJECT_OP(Op) ->
+    maps:get(subject, M, undefined);
+subject(_) ->
+    error(badarg).
+
+sid(#nats_frame{operation = Op, message = M}) when ?HAS_SID_OP(Op) ->
+    maps:get(sid, M, undefined);
+sid(_) ->
+    error(badarg).
+
+queue_group(#nats_frame{operation = Op, message = M}) when ?HAS_QUEUE_GROUP_OP(Op) ->
+    maps:get(queue_group, M, undefined);
+queue_group(_) ->
+    error(badarg).
+
+reply_to(#nats_frame{operation = Op, message = M}) when ?HAS_REPLY_TO_OP(Op) ->
+    maps:get(reply_to, M, undefined);
+reply_to(_) ->
+    error(badarg).
+
+headers(#nats_frame{operation = Op, message = M}) when ?HAS_HEADERS_OP(Op) ->
+    maps:get(headers, M, #{});
+headers(_) ->
+    #{}.
+
+payload(#nats_frame{operation = Op, message = M}) when ?HAS_PAYLOAD_OP(Op) ->
+    maps:get(payload, M);
+payload(_) ->
+    error(badarg).
+
+payload_total_size(#nats_frame{operation = Op} = Frame) when ?HAS_PAYLOAD_OP(Op) ->
+    Payload = payload(Frame),
+    case Op of
+        ?OP_HPUB ->
+            payload_and_headers_size(Frame, Payload);
+        ?OP_HMSG ->
+            payload_and_headers_size(Frame, Payload);
+        _ ->
+            byte_size(Payload)
+    end;
+payload_total_size(_) ->
+    error(badarg).
+
+max_msgs(#nats_frame{operation = ?OP_UNSUB, message = M}) ->
+    maps:get(max_msgs, M, 0);
+max_msgs(_) ->
+    error(badarg).
+
+payload_and_headers_size(Frame, Payload) ->
+    Headers = headers(Frame),
+    HeadersBinSize = byte_size(serialize_headers(Headers)) + 2,
+    HeadersBinSize + byte_size(Payload).
+
+%%--------------------------------------------------------------------
+%% utils
+%%--------------------------------------------------------------------
+
+reset(State) ->
+    State#{state => init, iframe => undefined, buffer => <<>>}.
+
+to_args_state(State = #{state := init}, Op) ->
+    PrefixSize =
+        case Op of
+            ?OP_ERR -> 5;
+            _ -> byte_size(atom_to_binary(Op)) + 1
+        end,
+    State#{state => args, iframe => #nats_frame{operation = Op}, line_prefix_size => PrefixSize}.
+
+to_payload_state(State = #{state := S, iframe := Frame0}, M0) when
+    S == args;
+    S == headers
+->
+    Frame = Frame0#nats_frame{message = M0},
+    State#{state => payload, iframe => Frame}.
+
+to_header_state(State = #{state := args, iframe := Frame0}, M0) ->
+    Frame = Frame0#nats_frame{message = M0},
+    State#{state => headers, iframe => Frame}.
+
+parse_control_line(<<"\r\n", Rest/binary>>, _Data, Op, State) ->
+    {ok, #nats_frame{operation = Op}, Rest, reset(State)};
+parse_control_line(Rest, Data, _Op, State) when Rest =:= <<>>; Rest =:= <<"\r">> ->
+    {more, State#{buffer => Data}};
+parse_control_line(_Rest, Data, _Op, _State) ->
+    error({unknown_operation, Data}).
+
+parse_args(
+    Data,
+    State = #{
+        state := args,
+        iframe := #nats_frame{operation = Op},
+        line_prefix_size := PrefixSize
+    }
+) ->
+    case split_to_first_linefeed(Data) of
+        false ->
+            %% A trailing CR may be the first byte of the CRLF delimiter.
+            ok = check_size(control_line, PrefixSize + incomplete_line_size(Data), State),
+            {more, State#{buffer => Data}};
+        {Line, Rest} ->
+            ok = check_size(control_line, PrefixSize + byte_size(Line), State),
+            pre_do_parse_args(Op, Line, Rest, State)
+    end.
+
+pre_do_parse_args(Op, JsonStr, Rest, State) when Op == ?OP_INFO; Op == ?OP_CONNECT ->
+    case emqx_utils_json:safe_decode(JsonStr, [return_maps]) of
+        {ok, Message} ->
+            {ok, #nats_frame{operation = Op, message = Message}, Rest, reset(State)};
+        {error, _} ->
+            error(invalid_json_payload)
+    end;
+pre_do_parse_args(?OP_ERR, ErrorMessage, Rest, State) ->
+    {ok, #nats_frame{operation = ?OP_ERR, message = ErrorMessage}, Rest, reset(State)};
+pre_do_parse_args(?OP_PUB, Line, Rest, State) ->
+    do_parse_pub_args(Line, Rest, State);
+pre_do_parse_args(?OP_HPUB, Line, Rest, State) ->
+    do_parse_hpub_args(Line, Rest, State);
+pre_do_parse_args(Op, Line, Rest, State) ->
+    Args = binary:split(Line, <<" ">>, [global]),
+    do_parse_args(Op, Args, Rest, State).
+
+do_parse_pub_args(Line, Rest, State) ->
+    case split_once(Line) of
+        {pair, Subject, Tail1} ->
+            case split_once(Tail1) of
+                {single, PayloadSize0} ->
+                    ok = validate_subject(Subject),
+                    PayloadSize = binary_to_integer(PayloadSize0),
+                    ok = check_size(payload, PayloadSize, State),
+                    M0 = #{subject => Subject, payload_size => PayloadSize},
+                    parse_payload(Rest, to_payload_state(State, M0));
+                {pair, ReplyTo, PayloadSize0} ->
+                    case binary:match(PayloadSize0, <<" ">>) of
+                        nomatch ->
+                            ok = validate_subject(Subject),
+                            ok = validate_non_wildcard_subject(ReplyTo),
+                            PayloadSize = binary_to_integer(PayloadSize0),
+                            ok = check_size(payload, PayloadSize, State),
+                            M0 = #{
+                                subject => Subject,
+                                reply_to => ReplyTo,
+                                payload_size => PayloadSize
+                            },
+                            parse_payload(Rest, to_payload_state(State, M0));
+                        _ ->
+                            error(invalid_args)
+                    end
+            end;
+        {single, _} ->
+            error(invalid_args)
+    end.
+
+do_parse_hpub_args(Line, Rest, State) ->
+    case split_once(Line) of
+        {pair, Subject, Tail1} ->
+            do_parse_hpub_subject_args(Subject, Tail1, Rest, State);
+        {single, _} ->
+            error(invalid_args)
+    end.
+
+do_parse_hpub_subject_args(Subject, Tail1, Rest, State) ->
+    case split_once(Tail1) of
+        {single, _} ->
+            error(invalid_args);
+        {pair, A, Tail2} ->
+            do_parse_hpub_sizes(Subject, A, Tail2, Rest, State)
+    end.
+
+do_parse_hpub_sizes(Subject, A, Tail2, Rest, State) ->
+    case split_once(Tail2) of
+        {single, B} ->
+            ok = validate_subject(Subject),
+            HeadersSize = binary_to_integer(A),
+            TotalSize = binary_to_integer(B),
+            ok = check_declared_sizes(HeadersSize, TotalSize, State),
+            M0 = #{
+                subject => Subject,
+                headers_size => HeadersSize,
+                payload_size => TotalSize - HeadersSize
+            },
+            parse_headers(Rest, to_header_state(State, M0));
+        {pair, B, C} ->
+            ok = ensure_no_space(C),
+            ok = validate_subject(Subject),
+            ok = validate_non_wildcard_subject(A),
+            HeadersSize = binary_to_integer(B),
+            TotalSize = binary_to_integer(C),
+            ok = check_declared_sizes(HeadersSize, TotalSize, State),
+            M0 = #{
+                subject => Subject,
+                reply_to => A,
+                headers_size => HeadersSize,
+                payload_size => TotalSize - HeadersSize
+            },
+            parse_headers(Rest, to_header_state(State, M0))
+    end.
+do_parse_args(sub, [Subject, Sid], Rest, State) ->
+    ok = validate_subject(Subject),
+    Msg = #{subject => Subject, sid => Sid},
+    Frame = #nats_frame{operation = ?OP_SUB, message = Msg},
+    {ok, Frame, Rest, reset(State)};
+do_parse_args(sub, [Subject, QGroup, Sid], Rest, State) ->
+    ok = validate_subject(Subject),
+    ok = validate_queue_group(QGroup),
+    Msg =
+        case QGroup of
+            <<>> ->
+                #{subject => Subject, sid => Sid};
+            QGroup ->
+                #{subject => Subject, sid => Sid, queue_group => QGroup}
+        end,
+    Frame = #nats_frame{operation = ?OP_SUB, message = Msg},
+    {ok, Frame, Rest, reset(State)};
+do_parse_args(unsub, [Sid], Rest, State) ->
+    Msg = #{sid => Sid},
+    Frame = #nats_frame{operation = ?OP_UNSUB, message = Msg},
+    {ok, Frame, Rest, reset(State)};
+do_parse_args(unsub, [Sid, MaxMsgs], Rest, State) ->
+    Msg = #{sid => Sid, max_msgs => binary_to_integer(MaxMsgs)},
+    Frame = #nats_frame{operation = ?OP_UNSUB, message = Msg},
+    {ok, Frame, Rest, reset(State)};
+do_parse_args(msg, [Subject, Sid, PayloadSize0], Rest, State) ->
+    PayloadSize = binary_to_integer(PayloadSize0),
+    ok = check_size(payload, PayloadSize, State),
+    M0 = #{subject => Subject, sid => Sid, payload_size => PayloadSize},
+    parse_payload(Rest, to_payload_state(State, M0));
+do_parse_args(msg, [Subject, Sid, ReplyTo, PayloadSize0], Rest, State) ->
+    PayloadSize = binary_to_integer(PayloadSize0),
+    ok = check_size(payload, PayloadSize, State),
+    M0 = #{
+        subject => Subject,
+        sid => Sid,
+        reply_to => ReplyTo,
+        payload_size => PayloadSize
+    },
+    parse_payload(Rest, to_payload_state(State, M0));
+do_parse_args(hmsg, [Subject, Sid, HeadersSize0, TotalSize0], Rest, State) ->
+    HeadersSize = binary_to_integer(HeadersSize0),
+    TotalSize = binary_to_integer(TotalSize0),
+    ok = check_declared_sizes(HeadersSize, TotalSize, State),
+    M0 = #{
+        subject => Subject,
+        sid => Sid,
+        headers_size => HeadersSize,
+        payload_size => TotalSize - HeadersSize
+    },
+    parse_headers(Rest, to_header_state(State, M0));
+do_parse_args(hmsg, [Subject, Sid, ReplyTo, HeadersSize0, TotalSize0], Rest, State) ->
+    HeadersSize = binary_to_integer(HeadersSize0),
+    TotalSize = binary_to_integer(TotalSize0),
+    ok = check_declared_sizes(HeadersSize, TotalSize, State),
+    M0 = #{
+        subject => Subject,
+        sid => Sid,
+        reply_to => ReplyTo,
+        headers_size => HeadersSize,
+        payload_size => TotalSize - HeadersSize
+    },
+    parse_headers(Rest, to_header_state(State, M0));
+do_parse_args(_Op, _Args, _Rest, _State) ->
+    error(invalid_args).
+
+parse_headers(
+    Data,
+    State = #{
+        state := headers,
+        iframe := #nats_frame{message = #{headers_size := HeadersSize} = Message0}
+    }
+) ->
+    %% The size of the headers section in bytes
+    %% including the \r\n\r\n delimiter before the payload.
+    Len = byte_size(Data),
+    case Len >= HeadersSize of
+        false ->
+            {more, State#{state => headers, buffer => Data}};
+        true ->
+            HeadersBin = binary:part(Data, 0, HeadersSize),
+            Headers = parse_headers_binary(HeadersBin),
+            Message1 = maps:remove(headers_size, Message0),
+            Message = Message1#{headers => Headers},
+            Rest0 = binary:part(Data, HeadersSize, Len - HeadersSize),
+            parse_payload(Rest0, to_payload_state(State, Message))
+    end.
+
+parse_headers_binary(Bin) ->
+    {Headers0, HeaderAndValuePart} = parse_headers_version_and_code(Bin),
+    case binary:split(HeaderAndValuePart, [<<"\r\n">>, <<": ">>, <<":">>], [global]) of
+        L when length(L) rem 2 == 0 ->
+            convert_header_list_to_map(L, Headers0);
+        _ ->
+            error(invalid_headers_binary)
+    end.
+
+parse_headers_version_and_code(Bin) ->
+    case binary:split(Bin, [<<"\r\n">>]) of
+        [VersionAndCode, HeaderAndValuePart] ->
+            case binary:split(VersionAndCode, [<<" ">>]) of
+                [<<"NATS/1.0">>, Code] ->
+                    {#{<<"code">> => binary_to_integer(Code)}, HeaderAndValuePart};
+                [<<"NATS/1.0">>] ->
+                    {#{}, HeaderAndValuePart};
+                _ ->
+                    error(invalid_headers_binary)
+            end;
+        _ ->
+            error(invalid_headers_binary)
+    end.
+
+%% End with [<<>>, <<>>] due to the header section is end with \r\n\r\n
+convert_header_list_to_map([<<>>, <<>>], Map) ->
+    Map;
+convert_header_list_to_map([Header, Value | Rest], Map) ->
+    convert_header_list_to_map(Rest, Map#{Header => Value}).
+
+parse_payload(
+    Data,
+    State = #{
+        state := payload,
+        iframe := #nats_frame{message = #{payload_size := PayloadSize} = Message0} = Frame0
+    }
+) ->
+    Len = byte_size(Data),
+    case Len >= (PayloadSize + 2) of
+        false ->
+            {more, State#{state => payload, buffer => Data}};
+        true ->
+            Message1 = maps:remove(payload_size, Message0),
+            Message = Message1#{payload => binary:part(Data, 0, PayloadSize)},
+            Rest0 = binary:part(Data, PayloadSize + 2, Len - PayloadSize - 2),
+            {ok, Frame0#nats_frame{message = Message}, Rest0, reset(State)}
+    end.
+
+split_to_first_linefeed(Bin) when is_binary(Bin) ->
+    case binary:match(Bin, <<"\r\n">>) of
+        {Pos, 2} ->
+            {binary:part(Bin, 0, Pos), binary:part(Bin, Pos + 2, byte_size(Bin) - Pos - 2)};
+        nomatch ->
+            false
+    end.
+
+append_parse_buffer(<<>>, Data) ->
+    Data;
+append_parse_buffer(Buffer, Data) ->
+    <<Buffer/binary, Data/binary>>.
+
+split_once(Bin) ->
+    case binary:match(Bin, <<" ">>) of
+        nomatch ->
+            {single, Bin};
+        {Pos, 1} ->
+            {
+                pair,
+                binary:part(Bin, 0, Pos),
+                binary:part(Bin, Pos + 1, byte_size(Bin) - Pos - 1)
+            }
+    end.
+
+ensure_no_space(Bin) ->
+    case binary:match(Bin, <<" ">>) of
+        nomatch ->
+            ok;
+        _ ->
+            error(invalid_args)
+    end.
+
+incomplete_line_size(<<>>) ->
+    0;
+incomplete_line_size(Bin) ->
+    Size = byte_size(Bin),
+    case binary:last(Bin) of
+        $\r -> Size - 1;
+        _ -> Size
+    end.
+
+%% Check the next chunk before copying it into the buffered control line.
+%% Bytes after the first CRLF belong to the next part of the frame.
+check_control_line_chunk(Buffer, Data, #{line_prefix_size := PrefixSize} = State) ->
+    Size =
+        case {ends_with_cr(Buffer), Data} of
+            {true, <<$\n, _/binary>>} ->
+                byte_size(Buffer) - 1;
+            _ ->
+                case binary:match(Data, <<"\r\n">>) of
+                    {Pos, 2} ->
+                        byte_size(Buffer) + Pos;
+                    nomatch ->
+                        PendingCR =
+                            case Data of
+                                <<>> -> ends_with_cr(Buffer);
+                                _ -> ends_with_cr(Data)
+                            end,
+                        byte_size(Buffer) + byte_size(Data) -
+                            case PendingCR of
+                                true -> 1;
+                                false -> 0
+                            end
+                end
+        end,
+    check_size(control_line, PrefixSize + Size, State).
+
+ends_with_cr(<<>>) -> false;
+ends_with_cr(Bin) -> binary:last(Bin) =:= $\r.
+
+%% Reject a control line or declared message size before buffering it.
+check_size(Position, Size, State) when is_integer(Size), Size >= 0 ->
+    {LimitKey, Max} =
+        case Position of
+            control_line -> {max_control_line, maps:get(max_control_line, State)};
+            _ -> {max_payload_size, maps:get(max_payload, State)}
+        end,
+    case Size > Max of
+        true ->
+            error(
+                {frame_too_large, #{
+                    LimitKey => Max,
+                    position => Position,
+                    size => Size
+                }}
+            );
+        false ->
+            ok
+    end;
+check_size(_Position, _Size, _State) ->
+    error(invalid_args).
+
+%% HPUB/HMSG declare `headers_size total_size`; each is bounded, and the header
+%% section must fit inside the total.
+check_declared_sizes(HeadersSize, TotalSize, State) ->
+    ok = check_size(headers, HeadersSize, State),
+    ok = check_size(payload, TotalSize, State),
+    case HeadersSize =< TotalSize of
+        true -> ok;
+        false -> error(invalid_args)
+    end.
+
+validate_non_wildcard_subject(Subject) ->
+    case emqx_nats_topic:validate_nats_subject(Subject) of
+        {ok, false} ->
+            ok;
+        {ok, true} ->
+            error({invalid_subject, wildcard_subject_not_allowed_in_pub_message});
+        {error, Reason} ->
+            error({invalid_subject, Reason})
+    end.
+
+validate_subject(Subject) ->
+    case emqx_nats_topic:validate_nats_subject(Subject) of
+        {ok, _} ->
+            ok;
+        {error, Reason} ->
+            error({invalid_subject, Reason})
+    end.
+
+validate_queue_group(QGroup) ->
+    case binary:match(QGroup, [<<"/">>, <<"+">>, <<"#">>]) of
+        nomatch -> ok;
+        _ -> error({invalid_queue_group, mqtt_reserved_char})
+    end.

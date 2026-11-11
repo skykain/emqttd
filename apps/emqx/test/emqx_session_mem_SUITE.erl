@@ -1,0 +1,2344 @@
+%%--------------------------------------------------------------------
+%% Copyright (c) 2018-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
+%%--------------------------------------------------------------------
+
+-module(emqx_session_mem_SUITE).
+
+-compile(export_all).
+-compile(nowarn_export_all).
+
+-include_lib("emqx/include/emqx.hrl").
+-include_lib("emqx/include/emqx_mqtt.hrl").
+-include_lib("emqx/include/emqx_session_mem.hrl").
+-include_lib("emqx/include/asserts.hrl").
+-include_lib("eunit/include/eunit.hrl").
+-include_lib("common_test/include/ct.hrl").
+
+-type inflight_data_phase() :: wait_ack | wait_comp.
+
+-record(inflight_data, {
+    phase :: inflight_data_phase(),
+    message :: emqx_types:message(),
+    timestamp :: non_neg_integer()
+}).
+
+-define(RETRY_DEQUEUE_TIMER, retry_dequeue).
+
+-define(on_exit(EXPR), emqx_common_test_helpers:on_exit(fun() -> EXPR end)).
+
+%%--------------------------------------------------------------------
+%% CT callbacks
+%%--------------------------------------------------------------------
+
+all() -> emqx_common_test_helpers:all(?MODULE).
+
+init_per_suite(Config) ->
+    ok = meck:new(
+        [emqx_broker, emqx_cm],
+        [passthrough, no_history, no_link]
+    ),
+    Apps = emqx_cth_suite:start(
+        [
+            {emqx, #{
+                override_env => [{boot_modules, [broker]}]
+            }}
+        ],
+        #{work_dir => emqx_cth_suite:work_dir(Config)}
+    ),
+    create_limiters('tcp:default', #{}),
+    [{suite_apps, Apps} | Config].
+
+end_per_suite(Config) ->
+    ok = emqx_cth_suite:stop(?config(suite_apps, Config)),
+    meck:unload().
+
+init_per_testcase(_TestCase, TCConfig) ->
+    TCConfig.
+
+end_per_testcase(_TestCase, _TCConfig) ->
+    emqx_common_test_helpers:call_janitor(),
+    ok.
+
+%%--------------------------------------------------------------------
+%% Test cases for session init
+%%--------------------------------------------------------------------
+
+-doc "Creation, import and zone changes obtain current session settings from the zone.".
+t_session_zone_conf(_) ->
+    ClientInfo = clientinfo(),
+    ConnInfo = #{receive_maximum => 3, expiry_interval => 0},
+    First = emqx_session_mem:create(ClientInfo, ConnInfo, undefined),
+    set_zone_conf(max_subscriptions, 17),
+    set_zone_conf(upgrade_qos, true),
+    set_zone_conf(retry_interval, 100),
+    set_zone_conf(max_awaiting_rel, 19),
+    set_zone_conf(await_rel_timeout, 200),
+    Second = emqx_session_mem:create(ClientInfo, ConnInfo, undefined),
+    ?assertEqual([17, true, 100, 19, 200], session_settings(Second)),
+    ?assertNotEqual(session_settings(First), session_settings(Second)),
+    ?assertEqual(3, emqx_session_mem:info(inflight_max, Second)),
+    Imported = emqx_session_mem:import(ClientInfo, ConnInfo, emqx_session_mem:export(First)),
+    ?assertEqual(session_settings(Second), session_settings(Imported)),
+    ?assertEqual(3, emqx_session_mem:info(inflight_max, Imported)),
+    {ok, Updated} = emqx_session_mem:handle_info(ClientInfo, zone_changed, First),
+    ?assertEqual(session_settings(Second), session_settings(Updated)).
+
+session_settings(Session) ->
+    [
+        emqx_session_mem:info(Key, Session)
+     || Key <- [subscriptions_max, upgrade_qos, retry_interval, awaiting_rel_max, await_rel_timeout]
+    ].
+
+t_session_init(_) ->
+    ClientInfo = #{
+        zone => default,
+        listener => 'tcp:default',
+        clientid => <<"fake-test">>
+    },
+    ConnInfo = #{receive_maximum => 64, expiry_interval => 0},
+    Session = emqx_session_mem:create(
+        ClientInfo,
+        ConnInfo,
+        _WillMsg = undefined
+    ),
+    ?assertEqual(#{}, emqx_session_mem:info(subscriptions, Session)),
+    ?assertEqual(0, emqx_session_mem:info(subscriptions_cnt, Session)),
+    ?assertEqual(infinity, emqx_session_mem:info(subscriptions_max, Session)),
+    ?assertEqual(false, emqx_session_mem:info(upgrade_qos, Session)),
+    ?assertEqual(0, emqx_session_mem:info(inflight_cnt, Session)),
+    ?assertEqual(64, emqx_session_mem:info(inflight_max, Session)),
+    ?assertEqual(1, emqx_session_mem:info(next_pkt_id, Session)),
+    ?assertEqual(infinity, emqx_session_mem:info(retry_interval, Session)),
+    ?assertEqual(0, emqx_mqueue:len(emqx_session_mem:info(mqueue, Session))),
+    ?assertEqual(0, emqx_session_mem:info(awaiting_rel_cnt, Session)),
+    ?assertEqual(32, emqx_session_mem:info(awaiting_rel_max, Session)),
+    ?assertEqual(0, emqx_session_mem:info(await_rel_timeout, Session)),
+    ?assert(is_integer(emqx_session_mem:info(created_at, Session))).
+
+-doc """
+Checks that a new session holds an `{empty, MaxLen}` mqueue, and that it
+reports the same stats as a session with an empty queue built from the zone
+config.
+""".
+t_session_init_lazy_mqueue(_) ->
+    Session = session(),
+    ?assertMatch(#session{mqueue = {empty, 1000}}, Session),
+    MQ = emqx_mqueue:init(zone_mqueue_opts(default)),
+    Built = emqx_session_mem:set_field(mqueue, MQ, Session),
+    ?assertEqual(emqx_session_mem:stats(Built), emqx_session_mem:stats(Session)),
+    ?assert(emqx_mqueue:is_empty(emqx_session_mem:info(mqueue, Session))),
+    ?assertEqual(1000, emqx_mqueue:max_len(emqx_session_mem:info(mqueue, Session))),
+    ?assertEqual(
+        emqx_session_mem:info({mqueue_msgs, #{limit => 10}}, Built),
+        emqx_session_mem:info({mqueue_msgs, #{limit => 10}}, Session)
+    ),
+    ?assertEqual({ok, [], Session}, emqx_session_mem:dequeue(clientinfo(), [], Session)),
+    ?assertEqual([], maps:get(mqueue, emqx_session_mem:export(Session))).
+
+-doc """
+Checks that an unbuilt mqueue keeps the `max_mqueue_len` of session creation,
+stays unbuilt when a QoS 0 message is not stored, and that the first stored
+message builds the queue with that limit and the zone's other options.
+""".
+t_lazy_mqueue_zone_config(_) ->
+    set_zone_conf(max_mqueue_len, 2),
+    Session0 = session(),
+    ?assertEqual(2, emqx_session_mem:info(mqueue_max, Session0)),
+    set_zone_conf(max_mqueue_len, 5),
+    set_zone_conf(mqueue_store_qos0, false),
+    ?assertEqual(2, emqx_session_mem:info(mqueue_max, Session0)),
+    QoS0 = emqx_message:make(clientid, ?QOS_0, <<"t">>, <<"0">>),
+    Session1 = emqx_session_mem:enqueue(clientinfo(), [QoS0], Session0),
+    ?assertMatch(#session{mqueue = {empty, 2}}, Session1),
+    Msgs = [emqx_message:make(clientid, ?QOS_1, <<"t">>, P) || P <- [<<"1">>, <<"2">>, <<"3">>]],
+    Session2 = emqx_session_mem:enqueue(clientinfo(), Msgs, Session1),
+    ?assertEqual(2, emqx_session_mem:info(mqueue_len, Session2)),
+    ?assertEqual(2, emqx_session_mem:info(mqueue_max, Session2)),
+    ?assertEqual(1, emqx_session_mem:info(mqueue_dropped, Session2)),
+    ?assertEqual(2, emqx_session_mem:info(total_payload_bytes, Session2)),
+    ?assertEqual(
+        [<<"2">>, <<"3">>],
+        [
+            emqx_message:payload(M)
+         || M <- emqx_mqueue:to_list(emqx_session_mem:info(mqueue, Session2))
+        ]
+    ),
+    set_zone_conf(max_mqueue_len, infinity),
+    ?assertEqual(0, emqx_session_mem:info(mqueue_max, session())),
+    ?assertEqual(2, emqx_session_mem:info(mqueue_max, Session2)).
+
+-doc """
+Checks that the first enqueue applies the zone's `mqueue_priorities`.
+""".
+t_lazy_mqueue_priorities(_) ->
+    set_zone_conf(mqueue_priorities, #{<<"t/high">> => 10, <<"t/low">> => 1}),
+    Session0 = session(),
+    Low = emqx_message:make(clientid, ?QOS_1, <<"t/low">>, <<"low">>),
+    High = emqx_message:make(clientid, ?QOS_1, <<"t/high">>, <<"high">>),
+    Session1 = emqx_session_mem:enqueue(clientinfo(), [Low, High], Session0),
+    ?assertEqual(
+        [<<"high">>, <<"low">>],
+        [
+            emqx_message:payload(M)
+         || M <- emqx_mqueue:to_list(emqx_session_mem:info(mqueue, Session1))
+        ]
+    ).
+
+%%--------------------------------------------------------------------
+%% Test cases for session info/stats
+%%--------------------------------------------------------------------
+
+t_session_info(_) ->
+    Keys = [subscriptions, upgrade_qos, retry_interval, await_rel_timeout],
+    ?assertMatch(
+        #{
+            subscriptions := #{},
+            upgrade_qos := false,
+            retry_interval := infinity,
+            await_rel_timeout := 0
+        },
+        maps:from_list(emqx_session_mem:info(Keys, session()))
+    ).
+
+t_session_stats(_) ->
+    Stats = emqx_session_mem:stats(session()),
+    ?assertMatch(
+        #{
+            subscriptions_cnt := 0,
+            inflight_cnt := 0,
+            mqueue_len := 0,
+            mqueue_dropped := 0,
+            total_payload_bytes := 0,
+            awaiting_rel_cnt := 0
+        },
+        maps:from_list(Stats)
+    ),
+    %% The attributes that do not change with traffic are not stats: the
+    %% channel caches them in the channel info table.
+    ?assert(lists:all(fun({_, V}) -> is_integer(V) end, Stats)),
+    ?assertMatch(
+        #{
+            durable := false,
+            subscriptions_max := infinity,
+            awaiting_rel_max := 32,
+            inflight_max := 0,
+            mqueue_max := 1000
+        },
+        emqx_session:chan_info(session())
+    ).
+
+t_session_buffer_bytes_stats(_) ->
+    MqueueMsg = emqx_message:make(<<"clientid">>, ?QOS_1, <<"mqueue/topic">>, <<"queued">>),
+    InflightMsg = emqx_message:make(
+        <<"clientid">>, ?QOS_1, <<"inflight/topic">>, <<"inflight">>
+    ),
+    ClientInfo = clientinfo(#{zone => default, listener => 'tcp:default'}),
+    Session0 = emqx_session_mem:create(
+        ClientInfo,
+        #{receive_maximum => 1, expiry_interval => 0},
+        _WillMsg = undefined
+    ),
+    Session1 = emqx_session_mem:enqueue(ClientInfo, [InflightMsg, MqueueMsg], Session0),
+    {ok, [{1, InflightMsg}], Session2} = emqx_session_mem:dequeue(ClientInfo, [], Session1),
+    Stats = maps:from_list(emqx_session_mem:stats(Session2)),
+    ?assertMatch(#{mqueue_len := 1, inflight_cnt := 1}, Stats),
+    MqueueBytes = emqx_message:payload_size(MqueueMsg),
+    InflightBytes = emqx_message:payload_size(InflightMsg),
+    ?assertEqual(MqueueBytes + InflightBytes, maps:get(total_payload_bytes, Stats)).
+
+-doc "Query positions use delivery time with packet ID tie-breaking, independently of retry times.".
+t_session_inflight_query_timestamp(_) ->
+    Headers = fun(X) -> #{deliver_begin_at_us => X} end,
+    Inflight = lists:foldl(
+        fun({PacketId, Data}, Acc) -> emqx_inflight:insert(PacketId, Data, Acc) end,
+        emqx_inflight:new(),
+        [
+            {65535,
+                with_ts(
+                    wait_ack,
+                    emqx_message:make(?MODULE, ?QOS_1, ~"t", ~"65535", #{}, Headers(1001)),
+                    101
+                )},
+            {1, emqx_message:make(?MODULE, ?QOS_1, ~"t", ~"1", #{}, Headers(1002))},
+            {2, emqx_message:make(?MODULE, ?QOS_1, ~"t", ~"2", #{}, Headers(1002))},
+            {3, emqx_message:make(?MODULE, ?QOS_1, ~"t", ~"3", #{}, Headers(1000))}
+        ]
+    ),
+    Session = session(#{inflight => Inflight}),
+    Query = fun Next(Position) ->
+        case inflight_query(Session, Position, 1) of
+            {[], _} ->
+                [];
+            {[Msg], #{position := NextPosition}} ->
+                ?assertNotEqual(Position, NextPosition),
+                [Msg | Next(NextPosition)]
+        end
+    end,
+    ?assertMatch(
+        [
+            #message{
+                payload = ~"3",
+                extra = #{query_cursor := {1000, 3}, inflight_insert_ts := 1000000}
+            },
+            #message{
+                payload = ~"65535",
+                extra = #{query_cursor := {1001, 65535}, inflight_insert_ts := 1001000}
+            },
+            #message{
+                payload = ~"1",
+                extra = #{query_cursor := {1002, 1}, inflight_insert_ts := 1002000}
+            },
+            #message{
+                payload = ~"2",
+                extra = #{query_cursor := {1002, 2}, inflight_insert_ts := 1002000}
+            }
+        ],
+        Query(none)
+    ).
+
+-doc "Legacy inflight queries expose synthetic nanosecond cursors and page in cursor order.".
+t_session_inflight_query_legacy(_) ->
+    BeginUs = 1700000000000000,
+    Headers = fun(X) -> #{deliver_begin_at_us => X} end,
+    Inflight = lists:foldl(
+        fun({PacketId, Data}, Acc) -> emqx_inflight:insert(PacketId, Data, Acc) end,
+        emqx_inflight:new(),
+        [
+            {65535, emqx_message:make(?MODULE, ?QOS_1, ~"t", ~"65535", #{}, Headers(BeginUs))},
+            {1, emqx_message:make(?MODULE, ?QOS_1, ~"t", ~"1", #{}, Headers(BeginUs + 1))},
+            {2, emqx_message:make(?MODULE, ?QOS_1, ~"t", ~"2", #{}, Headers(BeginUs + 1))}
+        ]
+    ),
+    Session = session(#{inflight => Inflight}),
+    Query = fun Next(Position) ->
+        case emqx_session_mem:info({inflight_msgs, #{position => Position, limit => 1}}, Session) of
+            {[], _} ->
+                [];
+            {[Msg], #{position := NextPosition}} ->
+                ?assertNotEqual(Position, NextPosition),
+                [Msg | Next(NextPosition)]
+        end
+    end,
+    Results = [
+        {maps:get(inflight_insert_ts, Msg#message.extra), emqx_message:payload(Msg)}
+     || Msg <- Query(none)
+    ],
+    %% Legacy cursors add the packet ID to nanoseconds.
+    %% Message having ID 65535 sorts after IDs 1 and 2, even though it's older.
+    ?assertEqual(
+        [
+            {(BeginUs + 1) * 1000 + 1, ~"1"},
+            {(BeginUs + 1) * 1000 + 2, ~"2"},
+            {BeginUs * 1000 + 65535, ~"65535"}
+        ],
+        Results
+    ),
+    %% Explicit cursor takes precedence over legacy position, even when cursor is none.
+    {Last, _} = lists:last(Results),
+    ?assertEqual(
+        inflight_query(Session, none, 1),
+        emqx_session_mem:info(
+            {inflight_msgs, #{cursor => none, position => Last, limit => 1}}, Session
+        )
+    ).
+
+t_session_inflight_query(_) ->
+    EmptyInflight = emqx_inflight:new(500),
+    Session = session(#{inflight => EmptyInflight}),
+    EmptyQueryResMeta = {[], #{position => none, start => none}},
+    ?assertEqual(EmptyQueryResMeta, inflight_query(Session, none, 10)),
+    ?assertEqual(EmptyQueryResMeta, inflight_query(Session, none, 10)),
+    RandPos = {erlang:system_time(microsecond), 1},
+    ?assertEqual({[], #{position => RandPos, start => none}}, inflight_query(Session, RandPos, 10)),
+    Inflight = lists:foldl(
+        fun(Seq, Acc) ->
+            Msg = emqx_message:make(clientid, ?QOS_2, <<"t">>, integer_to_binary(Seq)),
+            emqx_session_mem:insert_inflight(Seq, Msg, Acc)
+        end,
+        EmptyInflight,
+        lists:seq(1, 114)
+    ),
+
+    Session1 = session(#{inflight => Inflight}),
+
+    {LastPos, LastStart} = lists:foldl(
+        fun(PageSeq, {Pos, PrevStart}) ->
+            Limit = 10,
+            {Page, #{position := NextPos, start := Start}} = inflight_query(Session1, Pos, Limit),
+            ?assertEqual(10, length(Page)),
+            ExpFirst = PageSeq * Limit - Limit + 1,
+            ExpLast = PageSeq * Limit,
+            FirstMsg = lists:nth(1, Page),
+            LastMsg = lists:nth(10, Page),
+            ?assertEqual(integer_to_binary(ExpFirst), emqx_message:payload(FirstMsg)),
+            ?assertEqual(integer_to_binary(ExpLast), emqx_message:payload(LastMsg)),
+            %% start value must not change as Inflight is not modified during traversal
+            NextStart =
+                case PageSeq of
+                    1 ->
+                        ?assertEqual(inflight_position(FirstMsg), Start),
+                        Start;
+                    _ ->
+                        ?assertEqual(PrevStart, Start),
+                        PrevStart
+                end,
+            ?assertEqual(inflight_position(LastMsg), NextPos),
+            {NextPos, NextStart}
+        end,
+        {none, none},
+        lists:seq(1, 11)
+    ),
+    {LastPartialPage, #{position := FinalPos} = LastMeta} = inflight_query(
+        Session1, LastPos, 10
+    ),
+    LastMsg = lists:nth(4, LastPartialPage),
+    ?assertEqual(4, length(LastPartialPage)),
+    ?assertEqual(<<"111">>, emqx_message:payload(lists:nth(1, LastPartialPage))),
+    ?assertEqual(<<"114">>, emqx_message:payload(LastMsg)),
+    ?assertEqual(#{position => inflight_position(LastMsg), start => LastStart}, LastMeta),
+    ?assertEqual(
+        {[], #{start => LastStart, position => FinalPos}},
+        inflight_query(Session1, FinalPos, 10)
+    ),
+
+    {LargePage, LargeMeta} = inflight_query(Session1, none, 1000),
+    ?assertEqual(114, length(LargePage)),
+    ?assertEqual(<<"1">>, emqx_message:payload(hd(LargePage))),
+    ?assertEqual(<<"114">>, emqx_message:payload(lists:last(LargePage))),
+    ?assertEqual(#{start => LastStart, position => FinalPos}, LargeMeta),
+
+    {FullPage, FullMeta} = inflight_query(Session1, none, 114),
+    ?assertEqual(LargePage, FullPage),
+    ?assertEqual(LargeMeta, FullMeta),
+
+    Session2 = session(#{inflight => emqx_inflight:delete(1, Inflight)}),
+    {PageAfterRemove, #{start := StartAfterRemove}} = inflight_query(Session2, none, 10),
+    ?assertEqual(<<"2">>, emqx_message:payload(hd(PageAfterRemove))),
+    ?assertEqual(StartAfterRemove, inflight_position(hd(PageAfterRemove))).
+
+-doc "Unsupported inflight cursors produce empty pages and take precedence over legacy positions.".
+t_session_inflight_query_invalid_cursor(_) ->
+    Session = session(),
+    Params = #{cursor => #{<<"unknown">> => 1}, position => none, limit => 10},
+    ?assertMatch({[], _}, emqx_session_mem:info({inflight_msgs, Params}, Session)).
+
+%%--------------------------------------------------------------------
+%% Test cases for sub/unsub
+%%--------------------------------------------------------------------
+
+t_subscribe(_) ->
+    ok = meck:expect(emqx_broker, subscribe, fun(_, _, _) -> ok end),
+    {ok, Session} = emqx_session_mem:subscribe(clientinfo(), <<"#">>, subopts(), session()),
+    ?assertEqual(1, emqx_session_mem:info(subscriptions_cnt, Session)).
+
+-doc "An infinite subscription limit allows additional subscriptions.".
+t_subscribe_unlimited(_) ->
+    ok = meck:expect(emqx_broker, subscribe, fun(_, _, _, _) -> ok end),
+    Session = session(#{max_subscriptions => infinity}),
+    {ok, Session1} = emqx_session_mem:subscribe(clientinfo(), <<"t1">>, subopts(), Session),
+    {ok, Session2} = emqx_session_mem:subscribe(clientinfo(), <<"t2">>, subopts(), Session1),
+    ?assertEqual(2, emqx_session_mem:info(subscriptions_cnt, Session2)).
+
+-doc "The subscription limit rejects new topics but allows updates to existing subscriptions.".
+t_subscribe_limit(_) ->
+    ok = meck:expect(emqx_broker, subscribe, fun(_, _, _, _) -> ok end),
+    ?assertEqual(
+        {error, ?RC_QUOTA_EXCEEDED},
+        emqx_session_mem:subscribe(
+            clientinfo(), <<"t1">>, subopts(), session(#{max_subscriptions => 0})
+        )
+    ),
+    Session = session(#{max_subscriptions => 1}),
+    {ok, Session1} = emqx_session_mem:subscribe(
+        clientinfo(), <<"t1">>, subopts(), Session
+    ),
+    {error, ?RC_QUOTA_EXCEEDED} = emqx_session_mem:subscribe(
+        clientinfo(), <<"t2">>, subopts(), Session1
+    ),
+    UpdatedOpts = subopts(#{qos => 2}),
+    {ok, Session2} = emqx_session_mem:subscribe(clientinfo(), <<"t1">>, UpdatedOpts, Session1),
+    ?assertEqual(1, emqx_session_mem:info(subscriptions_cnt, Session2)),
+    ?assertEqual(UpdatedOpts, emqx_session_mem:get_subscription(<<"t1">>, Session2)).
+
+t_unsubscribe(_) ->
+    ok = meck:expect(emqx_broker, unsubscribe, fun(_) -> ok end),
+    SubOpts = subopts(),
+    Session = session(#{subscriptions => #{<<"#">> => SubOpts}}),
+    {ok, Session1, SubOpts} =
+        emqx_session_mem:unsubscribe(clientinfo(), <<"#">>, Session),
+    {error, ?RC_NO_SUBSCRIPTION_EXISTED} =
+        emqx_session_mem:unsubscribe(clientinfo(), <<"#">>, Session1).
+
+t_publish_qos0(_) ->
+    ok = meck:expect(emqx_broker, publish2, fun(M) -> {ok, [], M} end),
+    Msg = emqx_message:make(clientid, ?QOS_0, <<"t">>, <<"payload">>),
+    {ok, {ok, [], Msg}, [], Session} = emqx_session_mem:publish(1, Msg, Session = session()),
+    {ok, {ok, [], Msg}, [], Session} = emqx_session_mem:publish(undefined, Msg, Session).
+
+t_publish_qos1(_) ->
+    ok = meck:expect(emqx_broker, publish2, fun(M) -> {ok, [], M} end),
+    Msg = emqx_message:make(clientid, ?QOS_1, <<"t">>, <<"payload">>),
+    {ok, {ok, [], Msg}, [], Session} = emqx_session_mem:publish(1, Msg, Session = session()),
+    {ok, {ok, [], Msg}, [], Session} = emqx_session_mem:publish(2, Msg, Session).
+
+t_publish_qos2(_) ->
+    ok = meck:expect(emqx_broker, publish2, fun(M) -> {ok, [], M} end),
+    Msg = emqx_message:make(clientid, ?QOS_2, <<"t">>, <<"payload">>),
+    {ok, {ok, [], Msg}, Session} = emqx_session_mem:publish(1, Msg, session()),
+    ?assertEqual(1, emqx_session_mem:info(awaiting_rel_cnt, Session)),
+    {ok, Session1} = emqx_session_mem:pubrel(1, Session),
+    ?assertEqual(0, emqx_session_mem:info(awaiting_rel_cnt, Session1)),
+    {error, ?RC_PACKET_IDENTIFIER_NOT_FOUND} = emqx_session_mem:pubrel(1, Session1).
+
+t_publish_qos2_with_error_return(_) ->
+    ok = meck:expect(emqx_broker, publish2, fun(M) -> {ok, [], M} end),
+    Action = {?MODULE, on_message_dropped, [self()]},
+    ok = emqx_hooks:add('message.dropped', Action, 0),
+    ?on_exit(emqx_hooks:del('message.dropped', Action)),
+
+    PacketId1 = 1,
+    Session = session(#{max_awaiting_rel => 2, awaiting_rel => #{PacketId1 => ts(millisecond)}}),
+    Msg1 = emqx_message:make(clientid, ?QOS_2, <<"t">>, <<"payload1">>),
+    {error, RC1 = ?RC_PACKET_IDENTIFIER_IN_USE} = emqx_session:publish(
+        clientinfo(), PacketId1, Msg1, Session
+    ),
+    receive
+        {'message.dropped', Reason1, RecMsg1} ->
+            ?assertEqual(Reason1, emqx_reason_codes:name(RC1)),
+            ?assertEqual(RecMsg1, Msg1)
+    after 1000 ->
+        ct:fail(?FUNCTION_NAME)
+    end,
+
+    Msg2 = emqx_message:make(clientid, ?QOS_2, <<"t">>, <<"payload2">>),
+    {ok, {ok, [], Msg2}, Session1} = emqx_session:publish(
+        clientinfo(), _PacketId2 = 2, Msg2, Session
+    ),
+    ?assertEqual(2, emqx_session_mem:info(awaiting_rel_cnt, Session1)),
+    {error, RC2 = ?RC_RECEIVE_MAXIMUM_EXCEEDED} = emqx_session:publish(
+        clientinfo(), _PacketId3 = 3, Msg2, Session1
+    ),
+    receive
+        {'message.dropped', Reason2, RecMsg2} ->
+            ?assertEqual(Reason2, emqx_reason_codes:name(RC2)),
+            ?assertEqual(RecMsg2, Msg2)
+    after 1000 ->
+        ct:fail(?FUNCTION_NAME)
+    end.
+
+-doc "An infinite awaiting-PUBREL limit allows additional QoS2 publishes.".
+t_publish_qos2_unlimited(_) ->
+    ok = meck:expect(emqx_broker, publish2, fun(M) -> {ok, [], M} end),
+    Msg = emqx_message:make(clientid, ?QOS_2, <<"t">>, <<"payload">>),
+    Session = session(#{max_awaiting_rel => infinity}),
+    {ok, {ok, [], Msg}, Session1} = emqx_session_mem:publish(1, Msg, Session),
+    {ok, {ok, [], Msg}, Session2} = emqx_session_mem:publish(2, Msg, Session1),
+    ?assertEqual(2, emqx_session_mem:info(awaiting_rel_cnt, Session2)).
+
+-doc "The awaiting-PUBREL limit rejects new QoS2 publishes while preserving duplicate handling.".
+t_publish_qos2_limit(_) ->
+    ok = meck:expect(emqx_broker, publish2, fun(M) -> {ok, [], M} end),
+    Msg = emqx_message:make(clientid, ?QOS_2, <<"t">>, <<"payload">>),
+    ?assertEqual(
+        {error, ?RC_RECEIVE_MAXIMUM_EXCEEDED},
+        emqx_session_mem:publish(1, Msg, session(#{max_awaiting_rel => 0}))
+    ),
+    {ok, {ok, [], Msg}, Session} = emqx_session_mem:publish(
+        1, Msg, session(#{max_awaiting_rel => 1})
+    ),
+    ?assertEqual({error, ?RC_RECEIVE_MAXIMUM_EXCEEDED}, emqx_session_mem:publish(2, Msg, Session)),
+    ?assertEqual({error, ?RC_PACKET_IDENTIFIER_IN_USE}, emqx_session_mem:publish(1, Msg, Session)),
+    {ok, _, Session} = emqx_session_mem:publish(1, emqx_message:set_flag(dup, Msg), Session),
+    {ok, Session1} = emqx_session_mem:pubrel(1, Session),
+    {ok, {ok, [], Msg}, Session2} = emqx_session_mem:publish(2, Msg, Session1),
+    ?assertEqual(1, emqx_session_mem:info(awaiting_rel_cnt, Session2)).
+
+t_puback(_) ->
+    Msg = emqx_message:make(test, ?QOS_1, <<"t">>, <<>>),
+    Inflight = emqx_inflight:insert(1, with_ts(wait_ack, Msg), emqx_inflight:new()),
+    Session = session(#{inflight => Inflight, mqueue => mqueue()}),
+    {ok, Msg, [], Session1} = emqx_session_mem:puback(clientinfo(), 1, [], Session),
+    ?assertEqual(0, emqx_session_mem:info(inflight_cnt, Session1)).
+
+t_puback_with_dequeue(_) ->
+    Msg1 = emqx_message:make(clientid, ?QOS_1, <<"t1">>, <<"payload1">>),
+    Inflight = emqx_inflight:insert(1, with_ts(wait_ack, Msg1), emqx_inflight:new()),
+    Msg2 = emqx_message:make(clientid, ?QOS_1, <<"t2">>, <<"payload2">>),
+    {_, Q} = emqx_mqueue:in(Msg2, mqueue(#{max_len => 10})),
+    Session = session(#{inflight => Inflight, mqueue => Q}),
+    {ok, Msg1, [{_, Msg3}], Session1} = emqx_session_mem:puback(clientinfo(), 1, [], Session),
+    ?assertEqual(1, emqx_session_mem:info(inflight_cnt, Session1)),
+    ?assertEqual(0, emqx_session_mem:info(mqueue_len, Session1)),
+    ?assertEqual(<<"t2">>, emqx_message:topic(Msg3)).
+
+%% A client that takes over a session can advertise a Receive Maximum lower than the
+%% number of transferred inflight messages. Dequeue must wait until acks free inflight
+%% slots, and must not take queued messages only to nack or re-enqueue them.
+t_puback_inflight_over_receive_maximum(_) ->
+    TC = self(),
+    ok = meck:new(emqx_hooks, [passthrough, no_history, no_link]),
+    ?on_exit(meck:unload(emqx_hooks)),
+    ok = meck:expect(emqx_hooks, 'message.nack', fun(Msg, Acc) ->
+        TC ! {message_nack, emqx_message:topic(Msg)},
+        Acc
+    end),
+    Inflight = lists:foldl(
+        fun(PacketId, InflightAcc) ->
+            Msg = emqx_message:make(clientid, ?QOS_1, <<"inflight">>, <<>>),
+            emqx_inflight:insert(PacketId, with_ts(wait_ack, Msg), InflightAcc)
+        end,
+        emqx_inflight:new(1),
+        [1, 2, 3]
+    ),
+    Queued = [emqx_message:make(clientid, ?QOS_1, T, <<>>) || T <- [<<"q1">>, <<"q2">>]],
+    Session0 = session(#{
+        inflight => Inflight,
+        mqueue => mqueue(#{max_len => 10}),
+        next_pkt_id => 4
+    }),
+    Session = emqx_session_mem:enqueue(clientinfo(), Queued, Session0),
+    {ok, _, [], Session1} = emqx_session_mem:puback(clientinfo(), 1, [], Session),
+    ?assertEqual(2, emqx_session_mem:info(inflight_cnt, Session1)),
+    ?assertEqual(2, emqx_session_mem:info(mqueue_len, Session1)),
+    {ok, _, [], Session2} = emqx_session_mem:puback(clientinfo(), 2, [], Session1),
+    ?assertEqual(1, emqx_session_mem:info(inflight_cnt, Session2)),
+    ?assertEqual(2, emqx_session_mem:info(mqueue_len, Session2)),
+    {ok, _, [{4, Msg1}], Session3} = emqx_session_mem:puback(clientinfo(), 3, [], Session2),
+    ?assertEqual(<<"q1">>, emqx_message:topic(Msg1)),
+    ?assertEqual(1, emqx_session_mem:info(inflight_cnt, Session3)),
+    ?assertEqual(1, emqx_session_mem:info(mqueue_len, Session3)),
+    receive
+        {message_nack, Topic} -> ct:fail({unexpected_message_nack, Topic})
+    after 0 -> ok
+    end.
+
+t_puback_error_packet_id_in_use(_) ->
+    Inflight = emqx_inflight:insert(1, with_ts(wait_comp, undefined), emqx_inflight:new()),
+    {error, ?RC_PACKET_IDENTIFIER_IN_USE} =
+        emqx_session_mem:puback(clientinfo(), 1, [], session(#{inflight => Inflight})).
+
+t_puback_error_packet_id_not_found(_) ->
+    {error, ?RC_PACKET_IDENTIFIER_NOT_FOUND} =
+        emqx_session_mem:puback(clientinfo(), 1, [], session()).
+
+t_pubrec(_) ->
+    Msg = emqx_message:make(test, ?QOS_2, <<"t">>, <<>>),
+    Inflight = emqx_inflight:insert(2, with_ts(wait_ack, Msg), emqx_inflight:new()),
+    Session = session(#{inflight => Inflight}),
+    {ok, Msg, Session1} = emqx_session_mem:pubrec(2, Session),
+    ?assertMatch(
+        [#inflight_data{phase = wait_comp}],
+        emqx_inflight:values(emqx_session_mem:info(inflight, Session1))
+    ).
+
+-doc "PUBREC for an outstanding QoS1 message is a protocol error.".
+t_pubrec_qos1_protocol_error(_) ->
+    Msg = emqx_message:make(test, ?QOS_1, <<"t">>, <<>>),
+    {_, [{PacketId, _}], Session} = emqx_session_mem:deliver(clientinfo(), [Msg], [], session()),
+    ?assertEqual(
+        {error, ?RC_PROTOCOL_ERROR},
+        emqx_session_mem:pubrec(PacketId, Session)
+    ).
+
+t_pubrec_packet_id_in_use_error(_) ->
+    Inflight = emqx_inflight:insert(1, with_ts(wait_comp, undefined), emqx_inflight:new()),
+    Session = session(#{inflight => Inflight}),
+    {error, ?RC_PACKET_IDENTIFIER_IN_USE} = emqx_session_mem:pubrec(1, Session).
+
+t_pubrec_packet_id_not_found_error(_) ->
+    {error, ?RC_PACKET_IDENTIFIER_NOT_FOUND} = emqx_session_mem:pubrec(1, session()).
+
+t_pubrel(_) ->
+    Session = session(#{awaiting_rel => #{1 => ts(millisecond)}}),
+    {ok, Session1} = emqx_session_mem:pubrel(1, Session),
+    ?assertEqual(#{}, emqx_session_mem:info(awaiting_rel, Session1)).
+
+t_pubrel_error_packetid_not_found(_) ->
+    {error, ?RC_PACKET_IDENTIFIER_NOT_FOUND} = emqx_session_mem:pubrel(1, session()).
+
+t_pubcomp(_) ->
+    Msg = emqx_message:make(test, ?QOS_2, <<"t">>, <<>>),
+    Inflight = emqx_inflight:insert(1, with_ts(wait_comp, Msg), emqx_inflight:new()),
+    Session = session(#{inflight => Inflight}),
+    {ok, Msg, [], Session1} = emqx_session_mem:pubcomp(clientinfo(), 1, [], Session),
+    ?assertEqual(0, emqx_session_mem:info(inflight_cnt, Session1)).
+
+-doc "PUBCOMP for an outstanding QoS1 message is a protocol error.".
+t_pubcomp_qos1_protocol_error(_) ->
+    Msg = emqx_message:make(test, ?QOS_1, <<"t">>, <<>>),
+    {_, [{PacketId, _}], Session} = emqx_session_mem:deliver(clientinfo(), [Msg], [], session()),
+    ?assertEqual(
+        {error, ?RC_PROTOCOL_ERROR},
+        emqx_session_mem:pubcomp(clientinfo(), PacketId, [], Session)
+    ).
+
+t_pubcomp_error_packetid_in_use(_) ->
+    Msg = emqx_message:make(test, ?QOS_2, <<"t">>, <<>>),
+    Inflight = emqx_inflight:insert(1, {Msg, ts(millisecond)}, emqx_inflight:new()),
+    Session = session(#{inflight => Inflight}),
+    {error, ?RC_PACKET_IDENTIFIER_IN_USE} = emqx_session_mem:pubcomp(clientinfo(), 1, [], Session).
+
+t_pubcomp_error_packetid_not_found(_) ->
+    {error, ?RC_PACKET_IDENTIFIER_NOT_FOUND} =
+        emqx_session_mem:pubcomp(clientinfo(), 1, [], session()).
+
+%%--------------------------------------------------------------------
+%% Test cases for deliver/retry
+%%--------------------------------------------------------------------
+
+t_dequeue(_) ->
+    Q = mqueue(#{store_qos0 => true}),
+    {ok, [], Session} = emqx_session_mem:dequeue(clientinfo(), [], session(#{mqueue => Q})),
+    Msgs = [
+        emqx_message:make(clientid, ?QOS_0, <<"t0">>, <<"payload">>),
+        emqx_message:make(clientid, ?QOS_1, <<"t1">>, <<"payload">>),
+        emqx_message:make(clientid, ?QOS_2, <<"t2">>, <<"payload">>)
+    ],
+    Session1 = emqx_session_mem:enqueue(clientinfo(), Msgs, Session),
+    {ok, [{undefined, Msg0}, {1, Msg1}, {2, Msg2}], Session2} =
+        emqx_session_mem:dequeue(clientinfo(), [], Session1),
+    ?assertEqual(0, emqx_session_mem:info(mqueue_len, Session2)),
+    ?assertEqual(2, emqx_session_mem:info(inflight_cnt, Session2)),
+    ?assertEqual(<<"t0">>, emqx_message:topic(Msg0)),
+    ?assertEqual(<<"t1">>, emqx_message:topic(Msg1)),
+    ?assertEqual(<<"t2">>, emqx_message:topic(Msg2)).
+
+t_deliver_qos0(_) ->
+    ok = meck:expect(emqx_broker, subscribe, fun(_, _, _) -> ok end),
+    {ok, Session} = emqx_session_mem:subscribe(clientinfo(), <<"t0">>, subopts(), session()),
+    {ok, Session1} = emqx_session_mem:subscribe(clientinfo(), <<"t1">>, subopts(), Session),
+    Deliveries = enrich([delivery(?QOS_0, T) || T <- [<<"t0">>, <<"t1">>]], Session1),
+    {ok, [{undefined, Msg1}, {undefined, Msg2}], Session1} =
+        emqx_session_mem:deliver(clientinfo(), Deliveries, [], Session1),
+    ?assertEqual(<<"t0">>, emqx_message:topic(Msg1)),
+    ?assertEqual(<<"t1">>, emqx_message:topic(Msg2)).
+
+t_deliver_subscription_filter(_) ->
+    DroppedBefore = emqx_metrics:val_global('delivery.dropped'),
+    DroppedByFilterBefore = emqx_metrics:val_global('delivery.dropped.filter'),
+    MatchMsg = emqx_message:set_header(
+        properties,
+        #{'User-Property' => [{<<"location">>, <<"roomA">>}, {<<"value">>, <<"26">>}]},
+        emqx_message:make(clientid, ?QOS_0, <<"t">>, <<"payload-match">>)
+    ),
+    MissMsg = emqx_message:set_header(
+        properties,
+        #{'User-Property' => [{<<"location">>, <<"roomB">>}, {<<"value">>, <<"10">>}]},
+        emqx_message:make(clientid, ?QOS_0, <<"t">>, <<"payload-miss">>)
+    ),
+    Session = session(#{
+        subscriptions => #{
+            <<"t">> => subopts(#{
+                sub_filter_ast => [{eq, <<"location">>, <<"roomA">>}, {gt, <<"value">>, 25.0}],
+                sub_filter_enabled => true,
+                sub_filter_raw => <<"location=roomA&value>25">>,
+                sub_filter_source => <<"t?location=roomA&value>25">>
+            })
+        }
+    }),
+    [FilteredMsg] = enrich([{deliver, <<"t">>, MatchMsg}, {deliver, <<"t">>, MissMsg}], Session),
+    ?assertEqual(<<"payload-match">>, emqx_message:payload(FilteredMsg)),
+    ?assertEqual(DroppedBefore + 1, emqx_metrics:val_global('delivery.dropped')),
+    ?assertEqual(
+        DroppedByFilterBefore + 1,
+        emqx_metrics:val_global('delivery.dropped.filter')
+    ).
+
+t_deliver_qos1(_) ->
+    ok = meck:expect(emqx_broker, subscribe, fun(_, _, _) -> ok end),
+    {ok, Session} = emqx_session_mem:subscribe(
+        clientinfo(), <<"t1">>, subopts(#{qos => ?QOS_1}), session()
+    ),
+    DeliversIn = enrich([delivery(?QOS_1, T) || T <- [<<"t1">>, <<"t2">>]], Session),
+    Delivers = [Msg#message{extra = #{other => metadata}} || Msg <- DeliversIn],
+    {ok, [{1, Msg1}, {2, Msg2}], Session1} =
+        emqx_session_mem:deliver(clientinfo(), Delivers, [], Session),
+    ?assertEqual(2, emqx_session_mem:info(inflight_cnt, Session1)),
+    ?assertEqual(<<"t1">>, emqx_message:topic(Msg1)),
+    ?assertEqual(<<"t2">>, emqx_message:topic(Msg2)),
+    ?assertEqual(Delivers, [Msg1, Msg2]),
+    {ok, Msg1T, [], Session2} = emqx_session_mem:puback(clientinfo(), 1, [], Session1),
+    ?assertEqual(Msg1, remove_deliver_flag(Msg1T)),
+    ?assertEqual(1, emqx_session_mem:info(inflight_cnt, Session2)),
+    {ok, Msg2T, [], Session3} = emqx_session_mem:puback(clientinfo(), 2, [], Session2),
+    ?assertEqual(Msg2, remove_deliver_flag(Msg2T)),
+    ?assertEqual(0, emqx_session_mem:info(inflight_cnt, Session3)).
+
+t_deliver_qos2(_) ->
+    ok = meck:expect(emqx_broker, subscribe, fun(_, _, _) -> ok end),
+    Session = session(),
+    DeliversIn = enrich([delivery(?QOS_2, <<"t0">>), delivery(?QOS_2, <<"t1">>)], Session),
+    Delivers = [Msg#message{extra = #{other => metadata}} || Msg <- DeliversIn],
+    {ok, [{1, Msg1}, {2, Msg2}], Session1} =
+        emqx_session_mem:deliver(clientinfo(), Delivers, [], Session),
+    ?assertEqual(2, emqx_session_mem:info(inflight_cnt, Session1)),
+    ?assertEqual(<<"t0">>, emqx_message:topic(Msg1)),
+    ?assertEqual(<<"t1">>, emqx_message:topic(Msg2)),
+    ?assertEqual(Delivers, [Msg1, Msg2]),
+    {ok, Msg1T, Session2} = emqx_session_mem:pubrec(1, Session1),
+    ?assertEqual(Msg1, remove_deliver_flag(Msg1T)),
+    {ok, Msg2T, _Session3} = emqx_session_mem:pubrec(2, Session2),
+    ?assertEqual(Msg2, remove_deliver_flag(Msg2T)).
+
+t_deliver_one_msg(_) ->
+    Session = session(),
+    {ok, [{1, Msg}], Session1} = emqx_session_mem:deliver(
+        clientinfo(),
+        enrich(delivery(?QOS_1, <<"t1">>), Session),
+        [],
+        Session
+    ),
+    ?assertEqual(1, emqx_session_mem:info(inflight_cnt, Session1)),
+    ?assertEqual(<<"t1">>, emqx_message:topic(Msg)).
+
+t_deliver_when_inflight_is_full(_) ->
+    Session = session(#{inflight => emqx_inflight:new(1)}),
+    Delivers = enrich([delivery(?QOS_1, <<"t1">>), delivery(?QOS_2, <<"t2">>)], Session),
+    {ok, Publishes, Session1} =
+        emqx_session_mem:deliver(clientinfo(), Delivers, [], Session),
+    ?assertEqual(1, length(Publishes)),
+    ?assertEqual(1, emqx_session_mem:info(inflight_cnt, Session1)),
+    ?assertEqual(1, emqx_session_mem:info(mqueue_len, Session1)),
+    {ok, Msg1, [{2, Msg2}], Session2} =
+        emqx_session_mem:puback(clientinfo(), 1, [], Session1),
+    ?assertEqual(1, emqx_session_mem:info(inflight_cnt, Session2)),
+    ?assertEqual(0, emqx_session_mem:info(mqueue_len, Session2)),
+    ?assertEqual(<<"t1">>, emqx_message:topic(Msg1)),
+    ?assertEqual(<<"t2">>, emqx_message:topic(Msg2)).
+
+t_deliver_qos0_when_inflight_is_full(_) ->
+    Session = session(#{inflight => emqx_inflight:new(1)}),
+    Delivers = enrich([delivery(?QOS_1, <<"t1">>), delivery(?QOS_0, <<"t0">>)], Session),
+    {ok, [{1, Msg1}, {undefined, Msg0}], Session1} =
+        emqx_session_mem:deliver(clientinfo(), Delivers, [], Session),
+    ?assertEqual(1, emqx_session_mem:info(inflight_cnt, Session1)),
+    ?assertEqual(0, emqx_session_mem:info(mqueue_len, Session1)),
+    ?assertEqual(<<"t1">>, emqx_message:topic(Msg1)),
+    ?assertEqual(<<"t0">>, emqx_message:topic(Msg0)),
+    {ok, Msg1T, [], Session2} =
+        emqx_session_mem:puback(clientinfo(), 1, [], Session1),
+    ?assertEqual(<<"t1">>, emqx_message:topic(Msg1T)),
+    ?assertEqual(0, emqx_session_mem:info(inflight_cnt, Session2)),
+    ?assertEqual(0, emqx_session_mem:info(mqueue_len, Session2)).
+
+-doc "Queued QoS1/2 does not prevent QoS0 delivery when inflight is full.".
+t_deliver_qos0_with_qos12_queued(_) ->
+    S0 = session(#{inflight => emqx_inflight:new(1)}),
+    Delivers = enrich(
+        [
+            delivery(?QOS_1, <<"t1">>),
+            delivery(?QOS_2, <<"t2">>),
+            delivery(?QOS_0, <<"t0">>)
+        ],
+        S0
+    ),
+    {ok, [{1, _Msg1}, {undefined, Msg0}], S1} =
+        emqx_session_mem:deliver(clientinfo(), Delivers, [], S0),
+    ?assertEqual(<<"t0">>, emqx_message:topic(Msg0)),
+    ?assertEqual(1, emqx_session_mem:info(inflight_cnt, S1)),
+    ?assertEqual(1, emqx_session_mem:info(mqueue_len, S1)).
+
+-doc "Decongestion drains leading QoS0 and preserves its order across blocked QoS1/2 and new arrivals.".
+t_deliver_qos0_after_decongestion(_) ->
+    Session0 = session(#{inflight => emqx_inflight:new(1)}),
+    {ok, [{1, _}], Session} = emqx_session_mem:deliver(
+        clientinfo(), enrich([delivery(?QOS_1, <<"t1">>)], Session0), [], Session0
+    ),
+    Delivers = enrich(
+        [
+            delivery(?QOS_0, <<"t0">>, <<"first">>),
+            delivery(?QOS_1, <<"t2">>),
+            delivery(?QOS_0, <<"t0">>, <<"second">>),
+            delivery(?QOS_2, <<"t3">>),
+            delivery(?QOS_0, <<"t0">>, <<"third">>)
+        ],
+        Session
+    ),
+    {ok, [], Session1} =
+        emqx_session_mem:deliver(clientinfo(), Delivers, [congested], Session),
+    ?assertEqual(5, emqx_session_mem:info(mqueue_len, Session1)),
+    %% Decongestion drains QoS0 across the blocked QoS1/2 in the same priority.
+    {ok, [{undefined, First}, {undefined, Second}, {undefined, Third}], Session2} = emqx_session_mem:handle_signal(
+        clientinfo(), {connection, decongested, #{}}, Session1
+    ),
+    ?assertEqual(<<"first">>, emqx_message:payload(First)),
+    ?assertEqual(<<"second">>, emqx_message:payload(Second)),
+    ?assertEqual(<<"third">>, emqx_message:payload(Third)),
+    ?assertEqual(2, emqx_session_mem:info(mqueue_len, Session2)),
+    {ok, [], Session2} = emqx_session_mem:dequeue(clientinfo(), [], Session2),
+    Fresh = enrich([delivery(?QOS_0, <<"t0">>, <<"fourth">>)], Session2),
+    {ok, [{undefined, Fourth}], Session3} = emqx_session_mem:deliver(
+        clientinfo(), Fresh, [], Session2
+    ),
+    ?assertEqual(<<"fourth">>, emqx_message:payload(Fourth)),
+    {ok, _, [{2, #message{topic = <<"t2">>}}], Session4} =
+        emqx_session_mem:puback(clientinfo(), 1, [], Session3),
+    {ok, _, [{3, #message{topic = <<"t3">>}}], Session5} =
+        emqx_session_mem:puback(clientinfo(), 2, [], Session4),
+    ?assertEqual(0, emqx_session_mem:info(mqueue_len, Session5)).
+
+-doc """
+Buffered QoS0 consumes quota only on delivery, decongestion drops consecutive over-limit messages.
+""".
+t_deliver_qos0_after_rate_limited_decongestion(_) ->
+    ListenerId = 'tcp:qos0_decongestion',
+    create_limiters(ListenerId, #{<<"delivery_messages_rate">> => <<"2/1s">>}),
+    ?on_exit(delete_limiters(ListenerId)),
+    S0 = session(#{listener => ListenerId}, #{inflight => emqx_inflight:new(1)}),
+    Delivers = enrich(
+        [
+            delivery(?QOS_0, <<"t0">>, <<"first">>),
+            delivery(?QOS_0, <<"t0">>, <<"second">>),
+            delivery(?QOS_0, <<"t0">>, <<"dropped">>),
+            delivery(?QOS_0, <<"t0">>, <<"third">>)
+        ],
+        S0
+    ),
+    {ok, [], S1} = emqx_session_mem:deliver(clientinfo(), Delivers, [congested], S0),
+    %% Enqueue did not materialize or consume the limiter. Only actual delivery
+    %% spends the two available tokens; the remaining QoS0 messages are dropped.
+    ?assertEqual(S0#session.quota, S1#session.quota),
+    ?assertEqual(4, emqx_session_mem:info(mqueue_len, S1)),
+    {ok, [{undefined, First}, {undefined, Second}], S2} =
+        emqx_session_mem:handle_signal(clientinfo(), {connection, decongested, #{}}, S1),
+    ?assertEqual(<<"first">>, emqx_message:payload(First)),
+    ?assertEqual(<<"second">>, emqx_message:payload(Second)),
+    ?assertEqual(0, emqx_session_mem:info(inflight_cnt, S2)),
+    ?assertEqual(0, emqx_session_mem:info(mqueue_len, S2)),
+    {ok, [], S2} =
+        emqx_session_mem:handle_timeout(clientinfo(), ?RETRY_DEQUEUE_TIMER, [], S2).
+
+t_deliver_qos0_when_inflight_is_full_no_store_qos0(_) ->
+    Session = session(#{
+        inflight => emqx_inflight:new(1),
+        mqueue => mqueue(#{store_qos0 => false})
+    }),
+    Delivers = enrich([delivery(?QOS_1, <<"t1">>), delivery(?QOS_0, <<"t0">>)], Session),
+    {ok, [{1, Msg1}, {undefined, Msg0}], Session1} =
+        emqx_session_mem:deliver(clientinfo(), Delivers, [], Session),
+    ?assertEqual(1, emqx_session_mem:info(inflight_cnt, Session1)),
+    ?assertEqual(0, emqx_session_mem:info(mqueue_len, Session1)),
+    ?assertEqual(<<"t1">>, emqx_message:topic(Msg1)),
+    ?assertEqual(<<"t0">>, emqx_message:topic(Msg0)).
+
+-doc "Deliver drops over-limit QoS0, postpones the batch at rejected QoS1/2, and preserves retry order.".
+t_delivery_limiter_mixed_deliver(_) ->
+    test_delivery_limiter_mixed(deliver).
+
+-doc "Dequeue drops over-limit QoS0, retains the remainder at rejected QoS1/2, and preserves retry order.".
+t_delivery_limiter_mixed_dequeue(_) ->
+    test_delivery_limiter_mixed(dequeue).
+
+test_delivery_limiter_mixed(Path) ->
+    ListenerId = 'tcp:mixed_delivery',
+    create_limiters(ListenerId, #{<<"delivery_bytes_rate">> => <<"10KB/5s">>}),
+    ?on_exit(delete_limiters(ListenerId)),
+    S0 = session(#{listener => ListenerId}, #{}),
+    Delivers = enrich(
+        [
+            delivery(?QOS_0, <<"q0">>, binary:copy(<<"a">>, 4000)),
+            delivery(?QOS_0, <<"q0">>, binary:copy(<<"x">>, 8000)),
+            delivery(?QOS_0, <<"q0">>, binary:copy(<<"y">>, 8000)),
+            delivery(?QOS_1, <<"ordered">>, binary:copy(<<"b">>, 8000)),
+            delivery(?QOS_0, <<"q0">>, binary:copy(<<"c">>, 8000)),
+            delivery(?QOS_0, <<"q0">>, binary:copy(<<"d">>, 8000)),
+            delivery(?QOS_0, <<"q0">>, <<"small">>),
+            delivery(?QOS_2, <<"ordered">>, <<"qos2">>)
+        ],
+        S0
+    ),
+    {Effect, Publishes, S1} =
+        case Path of
+            deliver ->
+                emqx_session_mem:deliver(clientinfo(), Delivers, [], S0);
+            dequeue ->
+                emqx_session_mem:dequeue(
+                    clientinfo(),
+                    [],
+                    emqx_session_mem:enqueue(clientinfo(), Delivers, S0)
+                )
+        end,
+    ?assertMatch({set_timer, ?RETRY_DEQUEUE_TIMER, _}, Effect),
+    %% Drop consecutive over-limit QoS0, then stop at the rejected QoS1.
+    ?assertMatch([{undefined, #message{qos = 0}}], Publishes),
+    ?assertEqual(3, emqx_mqueue:num_qos0(S1#session.mqueue)),
+    ?assertEqual(2, emqx_mqueue:num_qos12(S1#session.mqueue)),
+    %% An early retry must also leave the QoS0 behind the blocked QoS1 untouched.
+    {Retry, [], Blocked} =
+        emqx_session_mem:handle_timeout(clientinfo(), ?RETRY_DEQUEUE_TIMER, [], S1),
+    ?assertMatch({set_timer, ?RETRY_DEQUEUE_TIMER, _}, Retry),
+    ?assertEqual(S1#session.mqueue, Blocked#session.mqueue),
+    %% New QoS1 must not bypass the retained QoS1 once quota is restored.
+    S2 = emqx_session_mem:set_field(quota, limiter_client(ListenerId), S1),
+    Later = enrich([delivery(?QOS_1, <<"ordered">>, <<"later">>)], S2),
+    {ok, [], S3} = emqx_session_mem:deliver(clientinfo(), Later, [], S2),
+    ?assertEqual(S2#session.quota, S3#session.quota),
+    {ok,
+        [
+            {1, #message{qos = 1}},
+            {undefined, #message{payload = <<"small">>}},
+            {2, #message{payload = <<"qos2">>}},
+            {3, #message{payload = <<"later">>}}
+        ],
+        Session4} =
+        emqx_session_mem:handle_timeout(clientinfo(), ?RETRY_DEQUEUE_TIMER, [], S3),
+    ?assertEqual(0, emqx_session_mem:info(mqueue_len, Session4)).
+
+-doc "Congestion postpones QoS0 while allowing QoS1/2 to fill available inflight slots.".
+t_congestion_postpones_only_qos0_on_deliver(_) ->
+    S0 = session(#{inflight => emqx_inflight:new(2)}),
+    Pending = enrich(
+        [
+            delivery(?QOS_0, <<"q0">>, <<"first">>),
+            delivery(?QOS_1, <<"q1">>),
+            delivery(?QOS_0, <<"q0">>, <<"second">>),
+            delivery(?QOS_2, <<"q2">>)
+        ],
+        S0
+    ),
+    {ok, [{1, #message{qos = 1}}, {2, #message{qos = 2}}], S1} =
+        emqx_session_mem:deliver(clientinfo(), Pending, [congested], S0),
+    ?assertEqual(2, emqx_mqueue:num_qos0(S1#session.mqueue)),
+    {ok, [], S1} = emqx_session_mem:dequeue(clientinfo(), [congested], S1),
+    {ok,
+        [
+            {undefined, #message{payload = <<"first">>}},
+            {undefined, #message{payload = <<"second">>}}
+        ],
+        S2} =
+        emqx_session_mem:handle_signal(clientinfo(), {connection, decongested, #{}}, S1),
+    ?assertEqual(0, emqx_session_mem:info(mqueue_len, S2)).
+
+-doc """
+Congested batches share allowance across QoS levels and wait for decongestion when no
+ACKs are expected.
+""".
+t_congestion_shared_batch_on_ack(_) ->
+    S0 = session(#{inflight => emqx_inflight:new(1)}),
+    {ok, [{1, _}], S1} = emqx_session_mem:deliver(
+        clientinfo(),
+        enrich([delivery(?QOS_1, ~"q1")], S0),
+        [],
+        S0
+    ),
+    Pending = enrich(
+        [
+            delivery(?QOS_0, ~"q0", ~"first"),
+            delivery(?QOS_1, ~"q1", ~"second"),
+            delivery(?QOS_0, ~"q0", ~"third"),
+            delivery(?QOS_2, ~"q2", ~"fourth")
+        ],
+        S1
+    ),
+    {ok, [], S2} = emqx_session_mem:deliver(clientinfo(), Pending, [congested], S1),
+    {ok, [], S2} = emqx_session_mem:dequeue(clientinfo(), [congested], S2),
+    %% QoS0 spends the single batch unit, leaving inflight free: wait for decongestion.
+    {ok, _, [{undefined, #message{payload = ~"first"}}], S3} =
+        emqx_session_mem:puback(clientinfo(), 1, [congested], S2),
+    %% Decongestion sends the next QoS1 and its trailing QoS0 in order.
+    {ok,
+        [
+            {2, #message{qos = 1, payload = ~"second"}},
+            {undefined, #message{qos = 0, payload = ~"third"}}
+        ],
+        S4} =
+        emqx_session_mem:handle_signal(clientinfo(), {connection, decongested, #{}}, S3),
+    %% Congestion returns with the inflight window full; the ACK resumes draining.
+    {ok, [], S4} = emqx_session_mem:dequeue(clientinfo(), [congested], S4),
+    {ok, _, [{3, #message{qos = 2, payload = ~"fourth"}}], S5} =
+        emqx_session_mem:puback(clientinfo(), 2, [congested], S4),
+    {ok, _, S6} = emqx_session_mem:pubrec(3, S5),
+    {ok, _, [], S7} = emqx_session_mem:pubcomp(clientinfo(), 3, [congested], S6),
+    ?assertEqual(0, emqx_session_mem:info(mqueue_len, S7)).
+
+-doc "Congested retries retain limiter-blocked QoS1/2 and drop over-limit QoS0 when it reaches the head.".
+t_congestion_limiter_retry(_) ->
+    ListenerId = 'tcp:congested_retry',
+    create_limiters(ListenerId, #{<<"delivery_messages_rate">> => <<"1/5s">>}),
+    ?on_exit(delete_limiters(ListenerId)),
+    S0 = session(
+        #{listener => ListenerId},
+        #{inflight => emqx_inflight:new(3)}
+    ),
+    Pending = enrich(
+        [
+            delivery(?QOS_0, <<"q0">>, <<"first">>),
+            delivery(?QOS_1, <<"q1">>),
+            delivery(?QOS_0, <<"q0">>, <<"second">>),
+            delivery(?QOS_2, <<"q2">>)
+        ],
+        S0
+    ),
+    S1 = emqx_session_mem:enqueue(clientinfo(), Pending, S0),
+    {ok, S2} =
+        emqx_session_mem:handle_signal(clientinfo(), {connection, congested, #{}}, S1),
+    {{set_timer, ?RETRY_DEQUEUE_TIMER, _}, [{undefined, #message{payload = <<"first">>}}], S3} =
+        emqx_session_mem:dequeue(clientinfo(), [congested], S2),
+    %% Rejected QoS1 stops draining before the next QoS0.
+    ?assertEqual(1, emqx_mqueue:num_qos0(S3#session.mqueue)),
+    ?assertEqual(2, emqx_mqueue:num_qos12(S3#session.mqueue)),
+    {{set_timer, ?RETRY_DEQUEUE_TIMER, _}, [], Blocked} =
+        emqx_session_mem:handle_timeout(clientinfo(), ?RETRY_DEQUEUE_TIMER, [congested], S3),
+    ?assertEqual(S3#session.mqueue, Blocked#session.mqueue),
+    S4 = emqx_session_mem:set_field(quota, limiter_client(ListenerId), Blocked),
+    {{set_timer, ?RETRY_DEQUEUE_TIMER, _}, [{1, #message{qos = 1}}], S5} =
+        emqx_session_mem:handle_timeout(clientinfo(), ?RETRY_DEQUEUE_TIMER, [congested], S4),
+    %% With the first QoS1 delivered, the following over-limit QoS0 is dropped.
+    ?assertEqual(0, emqx_mqueue:num_qos0(S5#session.mqueue)),
+    ?assertEqual(1, emqx_mqueue:num_qos12(S5#session.mqueue)),
+    S6 = emqx_session_mem:set_field(quota, limiter_client(ListenerId), S5),
+    {ok, [{2, #message{qos = 2}}], S7} =
+        emqx_session_mem:handle_timeout(clientinfo(), ?RETRY_DEQUEUE_TIMER, [congested], S6),
+    ?assertEqual(0, emqx_session_mem:info(mqueue_len, S7)).
+
+-doc "Congested dequeue uses bounded mixed-QoS batches even with unlimited inflight; ACKs resume draining.".
+t_congestion_bounded_dequeue(_) ->
+    S0 = session(#{
+        inflight => emqx_inflight:new(0),
+        mqueue => mqueue(#{max_len => 0, store_qos0 => true})
+    }),
+    NPending = 2 * ?DEFAULT_BATCH_N,
+    Pending = enrich(
+        [
+            delivery(?QOS_0, <<"q0">>, <<"first">>)
+            | [delivery(?QOS_1, <<"q1">>, integer_to_binary(N)) || N <- lists:seq(1, NPending)]
+        ],
+        S0
+    ),
+    S1 = emqx_session_mem:enqueue(clientinfo(), Pending, S0),
+    {ok, S2} = emqx_session_mem:handle_signal(clientinfo(), {connection, congested, #{}}, S1),
+    {ok, Batch1, S3} = emqx_session_mem:dequeue(clientinfo(), [congested], S2),
+    %% Outstanding ACKs drive continuation even with unlimited inflight.
+    {ok, _, Batch2, S4} = emqx_session_mem:puback(clientinfo(), 1, [congested], S3),
+    {ok, _, Batch3, S5} = emqx_session_mem:puback(clientinfo(), 2, [congested], S4),
+    ?assertEqual(?DEFAULT_BATCH_N, length(Batch1)),
+    ?assertEqual(?DEFAULT_BATCH_N, length(Batch2)),
+    ?assertMatch([{undefined, #message{payload = <<"first">>}} | _], Batch1),
+    LastPayload = integer_to_binary(NPending),
+    ?assertMatch([{_, #message{payload = LastPayload}}], Batch3),
+    ?assertEqual(
+        [integer_to_binary(N) || N <- lists:seq(1, NPending)],
+        [M#message.payload || {_, M = #message{qos = 1}} <- Batch1 ++ Batch2 ++ Batch3]
+    ),
+    ?assertEqual(0, emqx_session_mem:info(mqueue_len, S5)).
+
+-doc "Congested QoS0 waits for decongestion after exhausting inflight allowance without scheduling a retry.".
+t_congestion_qos0_waits_for_decongestion(_) ->
+    test_congestion_qos0_waits_for_decongestion(1, 1).
+
+-doc "Congested QoS0 waits for decongestion when both allowance and outgoing budget are exhausted.".
+t_congestion_qos0_budget_waits_for_decongestion(_) ->
+    test_congestion_qos0_waits_for_decongestion(0, ?DEFAULT_BATCH_N).
+
+test_congestion_qos0_waits_for_decongestion(MaxInflight, BatchN) ->
+    S0 = session(#{
+        inflight => emqx_inflight:new(MaxInflight),
+        mqueue => mqueue(#{store_qos0 => true})
+    }),
+    Pending = enrich(
+        [delivery(?QOS_0, <<"q0">>, integer_to_binary(N)) || N <- lists:seq(1, BatchN + 1)],
+        S0
+    ),
+    S1 = emqx_session_mem:enqueue(clientinfo(), Pending, S0),
+    {ok, First, S2} = emqx_session_mem:dequeue(clientinfo(), [congested], S1),
+    ?assertEqual(
+        [integer_to_binary(N) || N <- lists:seq(1, BatchN)],
+        [M#message.payload || {undefined, M} <- First]
+    ),
+    ?assertEqual(0, emqx_session_mem:info(inflight_cnt, S2)),
+    ?assertEqual(1, emqx_session_mem:info(mqueue_len, S2)),
+    PayloadLast = integer_to_binary(BatchN + 1),
+    {ok, [{undefined, #message{payload = PayloadLast}}], S3} =
+        emqx_session_mem:handle_signal(clientinfo(), {connection, decongested, #{}}, S2),
+    ?assertEqual(0, emqx_session_mem:info(mqueue_len, S3)).
+
+-doc "Replay extracts QoS0 past blocked QoS1 in bounded batches / ACKs resume QoS1 delivery.".
+t_replay_qos0_bounded_dequeue(_) ->
+    S0 = session(#{
+        inflight => emqx_inflight:new(1),
+        mqueue => mqueue(#{store_qos0 => true})
+    }),
+    Q1First = delivery(?QOS_1, <<"q1">>),
+    {ok, [{1, _Q1First}], S1} = emqx_session_mem:deliver(
+        clientinfo(),
+        enrich([Q1First], S0),
+        [],
+        S0
+    ),
+    %% Offline backlog: a blocked QoS1 followed by more than one batch of QoS0.
+    Q1Second = delivery(?QOS_1, <<"q1">>),
+    Q0Sequence = [
+        delivery(?QOS_0, <<"q0">>, integer_to_binary(N))
+     || N <- lists:seq(1, ?DEFAULT_BATCH_N + 1)
+    ],
+    S2 = emqx_session_mem:enqueue(
+        clientinfo(),
+        enrich([Q1Second | Q0Sequence], S1),
+        S1
+    ),
+    {{set_timer, ?RETRY_DEQUEUE_TIMER, 1}, [{1, _Q1Resent} | Publishes], S3} =
+        emqx_session_mem:replay(clientinfo(), S2),
+    ?assertEqual(
+        [integer_to_binary(N) || N <- lists:seq(1, ?DEFAULT_BATCH_N)],
+        [M#message.payload || {undefined, M} <- Publishes]
+    ),
+    ?assertEqual(1, emqx_mqueue:num_qos0(S3#session.mqueue)),
+    %% Deliver one more QoS0: it should be queued as the mqueue still contains QoS0 messages.
+    Q0More = enrich([delivery(?QOS_0, <<"q0">>, <<"new">>)], S3),
+    {ok, [], S4} = emqx_session_mem:deliver(clientinfo(), Q0More, [], S3),
+    %% Continue draining QoS0 without waiting for the outstanding QoS1 ACK.
+    PayloadNM0 = integer_to_binary(?DEFAULT_BATCH_N + 1),
+    {ok,
+        [
+            {undefined, #message{payload = PayloadNM0}},
+            {undefined, #message{payload = <<"new">>}}
+        ],
+        S5} =
+        emqx_session_mem:handle_timeout(clientinfo(), ?RETRY_DEQUEUE_TIMER, [], S4),
+    {ok, [], S5} = emqx_session_mem:dequeue(clientinfo(), [], S5),
+    {ok, _, [{2, _Q1Second}], S6} = emqx_session_mem:puback(clientinfo(), 1, [], S5),
+    ?assertEqual(0, emqx_session_mem:info(mqueue_len, S6)).
+
+-doc "Expired messages do not consume outgoing budget and inflight allowance.".
+t_dequeue_expired_does_not_spend_budget(_) ->
+    test_dequeue_expired_does_not_spend_budget([]).
+
+-doc "Expired messages do not consume outgoing budget and shared batch allowance under congestion.".
+t_dequeue_expired_does_not_spend_budget_congested(_) ->
+    test_dequeue_expired_does_not_spend_budget([congested]).
+
+test_dequeue_expired_does_not_spend_budget(Flags) ->
+    S0 = session(#{
+        inflight => emqx_inflight:new(1),
+        mqueue => mqueue(#{max_len => 0, store_qos0 => true})
+    }),
+    Expired = [
+        Msg#message{timestamp = 0}
+     || Msg <- enrich(
+            [
+                delivery(N rem 3, <<"expired">>, <<"expired">>, 1)
+             || N <- lists:seq(1, ?DEFAULT_BATCH_N + 1)
+            ],
+            S0
+        )
+    ],
+    Pending = Expired ++ enrich([delivery(?QOS_1, <<"live">>, <<"live">>)], S0),
+    S1 = emqx_session_mem:enqueue(clientinfo(), Pending, S0),
+    {ok, [{1, #message{payload = <<"live">>}}], S2} =
+        emqx_session_mem:dequeue(clientinfo(), Flags, S1),
+    ?assertEqual(0, emqx_session_mem:info(mqueue_len, S2)).
+
+-doc "Limiter-dropped QoS0 do not consume outgoing budget and inflight allowance.".
+t_dequeue_dropped_does_not_spend_budget(_) ->
+    %% NOTE
+    %% Setting limiter to 50 bytes so that:
+    %% 1. two 18-byte messages would pass,
+    %% 2. then more than a batch of messages are dropped,
+    %% 3. then the 11-byte one with empty payload fits.
+    ListenerId = 'tcp:dropped_batch',
+    create_limiters(ListenerId, #{<<"delivery_bytes_rate">> => <<"50B/5s">>}),
+    ?on_exit(delete_limiters(ListenerId)),
+    test_dequeue_dropped_does_not_spend_budget(ListenerId, []).
+
+-doc "Limiter-dropped QoS0 do not consume outgoing budget and shared batch allowance under congestion.".
+t_dequeue_dropped_does_not_spend_budget_congested(_) ->
+    ListenerId = 'tcp:dropped_batch_congested',
+    create_limiters(ListenerId, #{<<"delivery_bytes_rate">> => <<"50B/5s">>}),
+    ?on_exit(delete_limiters(ListenerId)),
+    test_dequeue_dropped_does_not_spend_budget(ListenerId, [congested]).
+
+test_dequeue_dropped_does_not_spend_budget(ListenerId, Flags) ->
+    S0 = session(#{listener => ListenerId}, #{
+        inflight => emqx_inflight:new(3),
+        quota => limiter_client(ListenerId),
+        mqueue => mqueue(#{max_len => 0, store_qos0 => true})
+    }),
+    NPending = ?DEFAULT_BATCH_N + 4,
+    Pending = enrich(
+        lists:append([
+            [
+                delivery(?QOS_0, <<"q0">>, <<"message">>)
+             || _ <- lists:seq(1, NPending - 1)
+            ],
+            [delivery(?QOS_1, <<"q1">>, <<>>)]
+        ]),
+        S0
+    ),
+    S1 = emqx_session_mem:enqueue(clientinfo(), Pending, S0),
+    {ok,
+        [
+            {undefined, #message{qos = 0, payload = <<"message">>}},
+            {undefined, #message{qos = 0, payload = <<"message">>}},
+            {1, #message{payload = <<>>}}
+        ],
+        S2} =
+        emqx_session_mem:dequeue(clientinfo(), Flags, S1),
+    ?assertEqual(0, emqx_session_mem:info(mqueue_len, S2)).
+
+-doc "Outgoing budget uses configured max inflight, allowing a large QoS0 batch even when inflight is full.".
+t_dequeue_budget_uses_max_inflight(_) ->
+    MaxInflight = 2 * ?DEFAULT_BATCH_N,
+    S0 = session(#{
+        inflight => emqx_inflight:new(MaxInflight),
+        mqueue => mqueue(#{max_len => 0, store_qos0 => true})
+    }),
+    QoS1 = enrich(
+        [delivery(?QOS_1, <<"q1">>) || _ <- lists:seq(1, MaxInflight)],
+        S0
+    ),
+    S1 = emqx_session_mem:enqueue(clientinfo(), QoS1, S0),
+    {ok, Publishes, S2} = emqx_session_mem:dequeue(clientinfo(), [], S1),
+    ?assertEqual(MaxInflight, length(Publishes)),
+    ?assertEqual(MaxInflight, emqx_session_mem:info(inflight_cnt, S2)),
+    QoS0 = enrich(
+        [
+            delivery(?QOS_0, <<"q0">>, integer_to_binary(N))
+         || N <- lists:seq(1, MaxInflight + 1)
+        ],
+        S2
+    ),
+    S3 = emqx_session_mem:enqueue(clientinfo(), QoS0, S2),
+    %% Congestion still uses available slots, while the outgoing budget uses the maximum.
+    {ok, [], S3} = emqx_session_mem:dequeue(clientinfo(), [congested], S3),
+    {_Rescedule = {set_timer, ?RETRY_DEQUEUE_TIMER, 1}, Batch1, S4} =
+        emqx_session_mem:dequeue(clientinfo(), [], S3),
+    ?assertEqual(
+        [{undefined, integer_to_binary(N)} || N <- lists:seq(1, MaxInflight)],
+        [{PktId, M#message.payload} || {PktId, M} <- Batch1]
+    ),
+    {ok, Batch2, S5} =
+        emqx_session_mem:handle_timeout(clientinfo(), ?RETRY_DEQUEUE_TIMER, [], S4),
+    ?assertEqual(
+        [{undefined, integer_to_binary(MaxInflight + 1)}],
+        [{PktId, M#message.payload} || {PktId, M} <- Batch2]
+    ),
+    ?assertEqual(0, emqx_session_mem:info(mqueue_len, S5)).
+
+-doc "A long QoS0 prefix obeys the outgoing cap and schedules continuation when no ACKs are expected.".
+t_dequeue_qos0_prefix_bounded(_) ->
+    S0 = session(#{
+        inflight => emqx_inflight:new(1),
+        mqueue => mqueue(#{max_len => 0, store_qos0 => true})
+    }),
+    Pending = enrich(
+        [
+            delivery(?QOS_0, <<"q0">>, integer_to_binary(N))
+         || N <- lists:seq(1, ?DEFAULT_BATCH_N + 1)
+        ] ++
+            [delivery(?QOS_1, <<"q1">>)],
+        S0
+    ),
+    S1 = emqx_session_mem:enqueue(clientinfo(), Pending, S0),
+    {{set_timer, ?RETRY_DEQUEUE_TIMER, 1}, First, S2} =
+        emqx_session_mem:dequeue(clientinfo(), [], S1),
+    ?assertEqual(
+        [integer_to_binary(N) || N <- lists:seq(1, ?DEFAULT_BATCH_N)],
+        [M#message.payload || {undefined, M} <- First]
+    ),
+    ?assertEqual(0, emqx_session_mem:info(inflight_cnt, S2)),
+    PayloadLast = integer_to_binary(?DEFAULT_BATCH_N + 1),
+    {ok, [{undefined, #message{payload = PayloadLast}}, {1, #message{qos = 1}}], S3} =
+        emqx_session_mem:handle_timeout(clientinfo(), ?RETRY_DEQUEUE_TIMER, [], S2),
+    ?assertEqual(0, emqx_session_mem:info(mqueue_len, S3)).
+
+-doc """
+Budget continuation extracts trailing QoS0 past blocked QoS1/2, then waits for an ACK.
+""".
+t_dequeue_mixed_qos_budget(_) ->
+    S0 = session(#{
+        inflight => emqx_inflight:new(1),
+        mqueue => mqueue(#{max_len => 0, store_qos0 => true})
+    }),
+    Pending = enrich(
+        lists:append([
+            [delivery(?QOS_1, <<"q1">>)],
+            [delivery(?QOS_0, <<"q0">>) || _ <- lists:seq(1, ?DEFAULT_BATCH_N - 1)],
+            [
+                delivery(?QOS_2, <<"q2">>),
+                delivery(?QOS_0, <<"q0">>, <<"last">>)
+            ]
+        ]),
+        S0
+    ),
+    S1 = emqx_session_mem:enqueue(clientinfo(), Pending, S0),
+    %% Exhausting batch budget schedules a continuation.
+    {_Rescedule = {set_timer, ?RETRY_DEQUEUE_TIMER, 1}, Batch1, S2} =
+        emqx_session_mem:dequeue(clientinfo(), [], S1),
+    %% The newly dequeued QoS1 consumes one unit of the shared outgoing budget.
+    ?assertEqual(
+        [{1, ?QOS_1} | lists:duplicate(?DEFAULT_BATCH_N - 1, {undefined, ?QOS_0})],
+        [{PacketId, Msg#message.qos} || {PacketId, Msg} <- Batch1]
+    ),
+    ?assertEqual(2, emqx_session_mem:info(mqueue_len, S2)),
+    %% Continuation bypasses the blocked QoS2, without rescheduling for it.
+    {ok, [{undefined, #message{payload = <<"last">>}}], S3} =
+        emqx_session_mem:handle_timeout(clientinfo(), ?RETRY_DEQUEUE_TIMER, [], S2),
+    {ok, [], S3} = emqx_session_mem:dequeue(clientinfo(), [], S3),
+    {ok, _, [{2, #message{qos = 2}}], S4} =
+        emqx_session_mem:puback(clientinfo(), 1, [], S3),
+    ?assertEqual(0, emqx_session_mem:info(mqueue_len, S4)).
+
+-doc "Blocked higher-priority QoS1 preserves queue state and prevents lower-priority QoS0 from bypassing it.".
+t_dequeue_blocked_priority(_) ->
+    S0 = session(#{
+        inflight => emqx_inflight:new(1),
+        mqueue => mqueue(#{
+            store_qos0 => true,
+            priorities => #{<<"high">> => 1, <<"low">> => 0}
+        })
+    }),
+    {ok, [{1, _}], S1} = emqx_session_mem:deliver(
+        clientinfo(),
+        enrich([delivery(?QOS_1, <<"inflight">>)], S0),
+        [],
+        S0
+    ),
+    Pending = enrich(
+        [
+            delivery(?QOS_0, <<"low">>),
+            delivery(?QOS_1, <<"high">>)
+        ],
+        S1
+    ),
+    S2 = emqx_session_mem:enqueue(clientinfo(), Pending, S1),
+    %% Restore the original queue, including priority credit, when the head cannot fit.
+    {ok, [], S2} = emqx_session_mem:dequeue(clientinfo(), [], S2),
+    {ok, _,
+        [
+            {2, #message{topic = <<"high">>}},
+            {undefined, #message{topic = <<"low">>}}
+        ],
+        S3} =
+        emqx_session_mem:puback(clientinfo(), 1, [], S2),
+    ?assertEqual(0, emqx_session_mem:info(mqueue_len, S3)).
+
+t_deliver_qos0_when_congested_no_store_qos0(_) ->
+    DroppedBefore = emqx_metrics:val_global('delivery.dropped.qos0_msg'),
+    Session = session(#{mqueue => mqueue(#{store_qos0 => false})}),
+    Delivers = enrich([delivery(?QOS_0, <<"t0">>)], Session),
+    {ok, [], Session1} =
+        emqx_session_mem:deliver(clientinfo(), Delivers, [congested], Session),
+    ?assertEqual(0, emqx_session_mem:info(inflight_cnt, Session1)),
+    ?assertEqual(0, emqx_session_mem:info(mqueue_len, Session1)),
+    ?assertEqual(
+        DroppedBefore + 1,
+        emqx_metrics:val_global('delivery.dropped.qos0_msg')
+    ).
+
+t_enqueue(_) ->
+    Session = session(#{mqueue => mqueue(#{max_len => 3, store_qos0 => true})}),
+    Session1 = emqx_session_mem:enqueue(
+        clientinfo(),
+        emqx_session:enrich_delivers(
+            clientinfo(),
+            [
+                delivery(?QOS_0, <<"t0">>),
+                delivery(?QOS_1, <<"t1">>),
+                delivery(?QOS_2, <<"t2">>)
+            ],
+            Session
+        ),
+        Session
+    ),
+    ?assertEqual(3, emqx_session_mem:info(mqueue_len, Session1)),
+    Session2 = emqx_session_mem:enqueue(
+        clientinfo(),
+        emqx_session:enrich_delivers(clientinfo(), [delivery(?QOS_1, <<"t3">>)], Session1),
+        Session1
+    ),
+    ?assertEqual(3, emqx_session_mem:info(mqueue_len, Session2)),
+    {Msgs, _} = emqx_session_mem:info({mqueue_msgs, #{position => none, limit => 10}}, Session2),
+    %% mqueue is fifo, drop t0.
+    ?assertMatch([<<"t1">>, <<"t2">>, <<"t3">>], lists:map(fun emqx_message:topic/1, Msgs)),
+    ?assertEqual(1, emqx_session_mem:info(mqueue_dropped, Session2)).
+
+t_enqueue_qos0(_) ->
+    Session = session(#{mqueue => mqueue(#{store_qos0 => false})}),
+    Session1 = emqx_session_mem:enqueue(
+        clientinfo(),
+        emqx_session:enrich_delivers(
+            clientinfo(),
+            [
+                delivery(?QOS_0, <<"t0">>),
+                delivery(?QOS_1, <<"t1">>),
+                delivery(?QOS_2, <<"t2">>)
+            ],
+            Session
+        ),
+        Session
+    ),
+    ?assertEqual(2, emqx_session_mem:info(mqueue_len, Session1)).
+
+-doc "Congested dequeue does not arm delivery retries / decongestion arms even under empty queue.".
+t_decongestion_arms_delivery_retry_empty_queue(_) ->
+    S0 = session(#{retry_interval => 1000, inflight => emqx_inflight:new(2)}),
+    S1 = emqx_session_mem:enqueue(clientinfo(), enrich([delivery(?QOS_1, <<"q1">>)], S0), S0),
+    {ok, [_], S2} = emqx_session_mem:dequeue(clientinfo(), [congested], S1),
+    ?assertMatch(
+        {{set_timer, retry_delivery, 1000}, [], _},
+        emqx_session_mem:handle_signal(clientinfo(), {connection, decongested, #{}}, S2)
+    ).
+
+-doc "Decongestion restores delivery retries when the queue is blocked by full inflight.".
+t_decongestion_arms_delivery_retry_blocked_queue(_) ->
+    S0 = session(#{retry_interval => 1000, inflight => emqx_inflight:new(1)}),
+    Messages = enrich([delivery(?QOS_1, <<"q1">>), delivery(?QOS_2, <<"q2">>)], S0),
+    S1 = emqx_session_mem:enqueue(clientinfo(), Messages, S0),
+    {ok, [_], S2} = emqx_session_mem:dequeue(clientinfo(), [congested], S1),
+    ?assertMatch(
+        {{set_timer, retry_delivery, 1000}, [], _},
+        emqx_session_mem:handle_signal(clientinfo(), {connection, decongested, #{}}, S2)
+    ).
+
+-doc "Decongestion arms delivery retries alongside continuation of queued QoS0 batches.".
+t_decongestion_arms_delivery_retry_with_continuation(_) ->
+    S0 = session(#{
+        retry_interval => 1000,
+        inflight => emqx_inflight:new(1),
+        mqueue => mqueue(#{max_len => 0, store_qos0 => true})
+    }),
+    Messages = enrich(
+        lists:append(
+            [delivery(?QOS_1, <<"q1">>)],
+            [delivery(?QOS_0, <<"q0">>) || _ <- lists:seq(1, ?DEFAULT_BATCH_N + 1)]
+        ),
+        S0
+    ),
+    S1 = emqx_session_mem:enqueue(clientinfo(), Messages, S0),
+    {ok, [_], S2} = emqx_session_mem:dequeue(clientinfo(), [congested], S1),
+    {Effects, Publishes, _S3} =
+        emqx_session_mem:handle_signal(clientinfo(), {connection, decongested, #{}}, S2),
+    ?assertEqual(?DEFAULT_BATCH_N, length(Publishes)),
+    ?assertEqual(
+        [{set_timer, retry_delivery, 1000}, {set_timer, ?RETRY_DEQUEUE_TIMER, 1}], Effects
+    ).
+
+-doc "A QoS0-only delivery does not arm delivery retries when inflight is empty.".
+t_deliver_qos0_does_not_start_delivery_retry(_) ->
+    Session = session(#{retry_interval => 1000}),
+    Messages = enrich([delivery(?QOS_0, <<"qos0">>)], Session),
+    ?assertMatch({ok, [_], _}, emqx_session_mem:deliver(clientinfo(), Messages, [], Session)).
+
+-doc "QoS0-only dequeue batches arm only the continuation timer while messages remain.".
+t_dequeue_qos0_does_not_start_delivery_retry(_) ->
+    Session0 = session(#{retry_interval => 1000}),
+    Messages = enrich(
+        lists:duplicate(?DEFAULT_BATCH_N + 1, delivery(?QOS_0, <<"qos0">>)), Session0
+    ),
+    Session1 = emqx_session_mem:enqueue(clientinfo(), Messages, Session0),
+    {{set_timer, ?RETRY_DEQUEUE_TIMER, 1}, Publishes, Session2} =
+        emqx_session_mem:dequeue(clientinfo(), [], Session1),
+    ?assertEqual(?DEFAULT_BATCH_N, length(Publishes)),
+    ?assertMatch(
+        {ok, [_], _},
+        emqx_session_mem:handle_timeout(clientinfo(), ?RETRY_DEQUEUE_TIMER, [], Session2)
+    ).
+
+-doc "Expiring the last inflight message during retry does not rearm the delivery timer.".
+t_retry_expired_empties_inflight(_) ->
+    {deliver, _, Msg} = delivery(?QOS_1, <<"expired">>, <<"payload">>, 1),
+    Expired = Msg#message{timestamp = 0},
+    Inflight = emqx_inflight:insert(1, with_ts(wait_ack, Expired, 0), emqx_inflight:new()),
+    Session0 = session(#{retry_interval => 1000, inflight => Inflight}),
+    {ok, [], Session1} = emqx_session_mem:handle_timeout(
+        clientinfo(), retry_delivery, [], Session0
+    ),
+    ?assertEqual(0, emqx_session_mem:info(inflight_cnt, Session1)).
+
+-doc "Disconnect cancels both session retry timers while preserving inflight messages.".
+t_disconnect_cancels_retry_timers(_) ->
+    Session0 = session(#{retry_interval => 1000}),
+    Messages = enrich([delivery(?QOS_1, <<"inflight">>)], Session0),
+    {{set_timer, retry_delivery, 1000}, [_Publish], Session1} =
+        emqx_session_mem:deliver(clientinfo(), Messages, [], Session0),
+    ?assertEqual(
+        {idle,
+            [
+                {reset_timer, retry_delivery, infinity},
+                {reset_timer, retry_dequeue, infinity}
+            ],
+            Session1},
+        emqx_session_mem:disconnect(Session1, #{})
+    ).
+
+-doc "Retry preserves delivery timestamps, sends only due messages, and preserves the next deadline across import.".
+t_retry(_) ->
+    RetryIntervalMs = 1000,
+    Session = session(#{retry_interval => RetryIntervalMs}),
+    Delivers = enrich(
+        [
+            delivery(?QOS_1, ~"t1", ~"expiressoon", _Expiry = 1),
+            delivery(?QOS_2, ~"t2"),
+            delivery(?QOS_0, ~"t3"),
+            delivery(?QOS_1, ~"t4"),
+            delivery(?QOS_2, ~"t5")
+        ],
+        Session
+    ),
+    {{set_timer, retry_delivery, RetryIntervalMs}, Pubs, Session1} =
+        emqx_session_mem:deliver(clientinfo(), Delivers, [], Session),
+    [_Pub1, Pub2, _Pub3, Pub4, Pub5] = Pubs,
+    DeliveryTimes = fun(S) ->
+        {Messages, _} = inflight_query(S, none, 5),
+        [{Msg#message.topic, inflight_ts(Msg)} || Msg <- Messages]
+    end,
+    [_Expired | ExpectedTimes] = DeliveryTimes(Session1),
+    {ok, _Msg, Session2} = emqx_session_mem:pubrec(get_packet_id(Pub2), Session1),
+    ?assertMatch(
+        {{set_timer, retry_delivery, _}, [], _},
+        emqx_session_mem:handle_timeout(clientinfo(), retry_delivery, [], Session2)
+    ),
+    ElapseMs = 1500,
+    ok = timer:sleep(ElapseMs),
+    {{set_timer, retry_delivery, RetryIntervalMs}, PubsRetry, Session3} =
+        emqx_session_mem:handle_timeout(clientinfo(), retry_delivery, [], Session2),
+    ?assertEqual(
+        [
+            % Pub1 is expired
+            {pubrel, get_packet_id(Pub2)},
+            % Pub3 is QoS0
+            set_duplicate_pub(Pub4),
+            set_duplicate_pub(Pub5)
+        ],
+        remove_deliver_flag(PubsRetry)
+    ),
+    ?assertEqual(3, emqx_session_mem:info(inflight_cnt, Session3)),
+    ?assertEqual(ExpectedTimes, DeliveryTimes(Session3)),
+    ?assertMatch(
+        {{set_timer, retry_delivery, _}, [], _},
+        emqx_session_mem:handle_timeout(clientinfo(), retry_delivery, [], Session3)
+    ),
+    Imported = emqx_session_mem:import(clientinfo(), emqx_session_mem:export(Session3)),
+    Session4 = emqx_session_mem:set_field(retry_interval, RetryIntervalMs, Imported),
+    ?assertMatch(
+        {{set_timer, retry_delivery, _}, [], _},
+        emqx_session_mem:handle_timeout(clientinfo(), retry_delivery, [], Session4)
+    ),
+    %% Due retry after import also retains the original delivery timestamps.
+    {_Effect, PubsRetryAgain, Session5} = emqx_session_mem:retry(
+        clientinfo(),
+        emqx_session_mem:set_field(retry_interval, 0, Session4)
+    ),
+    ?assertEqual(PubsRetry, PubsRetryAgain),
+    ?assertEqual(ExpectedTimes, DeliveryTimes(Session5)).
+
+-doc """
+Similar to `t_retry_dequeue_qos{1,2}`.
+
+The difference is that QoS 0 messages are simply dropped if the rate limit is hit and
+never retried.
+""".
+t_retry_dequeue_qos0(_TCConfig) ->
+    ListenerId = 'tcp:rate_limit_qos0',
+    create_limiters(ListenerId, #{<<"delivery_messages_rate">> => <<"2/1s">>}),
+    ?on_exit(delete_limiters(ListenerId)),
+    QoS = ?QOS_0,
+    Session0 = session(#{listener => ListenerId}, #{}),
+    Delivers = enrich(
+        [
+            delivery(QoS, <<"t1">>),
+            delivery(QoS, <<"t2">>),
+            delivery(QoS, <<"t3">>),
+            delivery(QoS, <<"t4">>)
+        ],
+        Session0
+    ),
+    %% Only two messages come out.
+    %% No timer should have been armed.
+    {ok, [_Pub1, _Pub2], Session1} =
+        emqx_session_mem:deliver(clientinfo(), Delivers, [], Session0),
+    %% Immediately retrying would yield no messages, if it were attempted.
+    {ok, [], Session2} = emqx_session_mem:dequeue(clientinfo(), [], Session1),
+    %% After rate tokens are restored, no more messages are returned, because QoS 0
+    %% messages are dropped.
+    Session3 = emqx_session_mem:set_field(quota, limiter_client(ListenerId), Session2),
+    {ok, [], _Session4} =
+        emqx_session_mem:handle_timeout(clientinfo(), ?RETRY_DEQUEUE_TIMER, [], Session3).
+
+t_retry_dequeue_qos1(TCConfig) ->
+    test_retry_dequeue(?QOS_1, TCConfig).
+
+t_retry_dequeue_qos2(TCConfig) ->
+    test_retry_dequeue(?QOS_2, TCConfig).
+
+-doc """
+Verifies that we use delivery rate limiters when they are stashed in the session context.
+
+When delivering messages, we check their number and size.  If rate limit is hit, we start
+a timer based on the limiter that was hit so that dequeuing is attempted again.
+""".
+test_retry_dequeue(QoS, _TCConfig) ->
+    ListenerId = 'tcp:rate_limit',
+    create_limiters(ListenerId, #{<<"delivery_messages_rate">> => <<"2/1s">>}),
+    ?on_exit(delete_limiters(ListenerId)),
+    %% Instantiate a session.
+    Session0 = session(#{listener => ListenerId}, #{}),
+    Delivers = enrich(
+        [
+            delivery(QoS, <<"t1">>),
+            delivery(QoS, <<"t2">>),
+            delivery(QoS, <<"t3">>),
+            delivery(QoS, <<"t4">>)
+        ],
+        Session0
+    ),
+    %% Only two messages come out.
+    {Effect1, [_Pub1, _Pub2], Session1} =
+        emqx_session_mem:deliver(clientinfo(), Delivers, [], Session0),
+    ?assertMatch({set_timer, ?RETRY_DEQUEUE_TIMER, _}, Effect1),
+    %% Immediately retrying would yield no messages, if it were attempted.
+    {Effect2, [], Session2} = emqx_session_mem:dequeue(clientinfo(), [], Session1),
+    ?assertMatch({set_timer, ?RETRY_DEQUEUE_TIMER, _}, Effect2),
+    %% After rate tokens are restored, it should yield more messages that were enqueued.
+    Session3 = emqx_session_mem:set_field(quota, limiter_client(ListenerId), Session2),
+    {ok, [_Pub3, _Pub4], Session4} =
+        emqx_session_mem:handle_timeout(clientinfo(), ?RETRY_DEQUEUE_TIMER, [], Session3),
+    %% Nothing left.
+    Session5 = emqx_session_mem:set_field(quota, limiter_client(ListenerId), Session4),
+    {ok, [], _Session6} =
+        emqx_session_mem:handle_timeout(clientinfo(), ?RETRY_DEQUEUE_TIMER, [], Session5).
+
+-doc """
+The session keeps the compact limiter placeholder while no delivery limit is configured.
+""".
+t_delivery_quota_lazy_stays_placeholder(_TCConfig) ->
+    ListenerId = 'tcp:lazy_no_limit',
+    create_limiters(ListenerId, #{}),
+    ?on_exit(delete_limiters(ListenerId)),
+    Session0 = session(#{listener => ListenerId}, #{}),
+    ?assertMatch(#session{quota = {lazy, ListenerId}}, Session0),
+    Delivers = enrich([delivery(?QOS_1, <<"t1">>), delivery(?QOS_1, <<"t2">>)], Session0),
+    {ok, [_Pub1, _Pub2], Session1} =
+        emqx_session_mem:deliver(clientinfo(), Delivers, [], Session0),
+    ?assertMatch(#session{quota = {lazy, ListenerId}}, Session1).
+
+-doc """
+A delivery limit configured after session creation applies without reconnect:
+the placeholder delivers without a limit until the next quota refresh, then
+materializes into a container.
+""".
+t_delivery_quota_lazy_hot_update(_TCConfig) ->
+    ListenerId = 'tcp:lazy_hot_update',
+    create_limiters(ListenerId, #{}),
+    ?on_exit(delete_limiters(ListenerId)),
+    Session0 = session(#{listener => ListenerId}, #{}),
+    ?assertMatch(#session{quota = {lazy, ListenerId}}, Session0),
+    %% Configure a tight rate at runtime.
+    {ok, MessagesRate} = emqx_limiter_schema:to_rate("2/1s"),
+    ok = emqx_limiter:update_listener_limiters(ListenerId, #{
+        delivery_messages_rate => MessagesRate
+    }),
+    Delivers = enrich(
+        [
+            delivery(?QOS_1, <<"t1">>),
+            delivery(?QOS_1, <<"t2">>),
+            delivery(?QOS_1, <<"t3">>),
+            delivery(?QOS_1, <<"t4">>)
+        ],
+        Session0
+    ),
+    %% Before the refresh, the placeholder applies no limit.
+    {_Effect0, [_, _, _, _], #session{quota = {lazy, ListenerId}}} =
+        emqx_session_mem:deliver(clientinfo(), Delivers, [], Session0),
+    Session1 = emqx_session_mem:refresh_quota(Session0),
+    ?assertMatch(#session{quota = #{}}, Session1),
+    %% Only two messages come out; the rest wait for the retry timer.
+    {Effect, [_Pub1, _Pub2], _Session2} =
+        emqx_session_mem:deliver(clientinfo(), Delivers, [], Session1),
+    ?assertMatch({set_timer, ?RETRY_DEQUEUE_TIMER, _}, Effect).
+
+-doc """
+A session on a listener with a delivery limit at creation holds a resolved
+container, not the placeholder, and is limited from the first delivery.
+""".
+t_delivery_quota_resolved_on_create(_TCConfig) ->
+    ListenerId = 'tcp:resolved_on_create',
+    create_limiters(ListenerId, #{<<"delivery_messages_rate">> => <<"2/1s">>}),
+    ?on_exit(delete_limiters(ListenerId)),
+    Session0 = session(#{listener => ListenerId}, #{}),
+    ?assertMatch(#session{quota = #{}}, Session0),
+    Delivers = enrich(
+        [
+            delivery(?QOS_1, <<"t1">>),
+            delivery(?QOS_1, <<"t2">>),
+            delivery(?QOS_1, <<"t3">>)
+        ],
+        Session0
+    ),
+    {Effect, [_Pub1, _Pub2], _Session1} =
+        emqx_session_mem:deliver(clientinfo(), Delivers, [], Session0),
+    ?assertMatch({set_timer, ?RETRY_DEQUEUE_TIMER, _}, Effect).
+
+-doc """
+A container installed by a `session.limiter_adjustment` callback, on a listener
+with no delivery limit, survives a quota refresh and keeps limiting delivery.
+""".
+t_delivery_quota_hook_container_survives_refresh(_TCConfig) ->
+    ListenerId = 'tcp:hook_no_limit',
+    SourceListenerId = 'tcp:hook_source',
+    create_limiters(ListenerId, #{}),
+    ?on_exit(delete_limiters(ListenerId)),
+    create_limiters(SourceListenerId, #{<<"delivery_messages_rate">> => <<"2/1s">>}),
+    ?on_exit(delete_limiters(SourceListenerId)),
+    Hook = {?MODULE, install_session_limiter, [SourceListenerId]},
+    ok = emqx_hooks:add('session.limiter_adjustment', Hook, 0),
+    ?on_exit(emqx_hooks:del('session.limiter_adjustment', Hook)),
+    Session0 = session(#{listener => ListenerId}, #{}),
+    ?assertMatch(#session{quota = #{}}, Session0),
+    Session1 = emqx_session_mem:refresh_quota(Session0),
+    ?assertEqual(Session0#session.quota, Session1#session.quota),
+    Delivers = enrich(
+        [
+            delivery(?QOS_1, <<"t1">>),
+            delivery(?QOS_1, <<"t2">>),
+            delivery(?QOS_1, <<"t3">>)
+        ],
+        Session1
+    ),
+    {Effect, [_Pub1, _Pub2], _Session2} =
+        emqx_session_mem:deliver(clientinfo(), Delivers, [], Session1),
+    ?assertMatch({set_timer, ?RETRY_DEQUEUE_TIMER, _}, Effect).
+
+install_session_limiter(_ClientInfo, _Limiter, SourceListenerId) ->
+    {ok, emqx_limiter:create_session_client_container(SourceListenerId)}.
+
+-doc """
+A session without a listener has no delivery limiter, and a refresh does not
+create one.
+""".
+t_delivery_quota_false_survives_refresh(_TCConfig) ->
+    ClientInfo = #{zone => default, clientid => <<"no-listener">>},
+    Session0 = emqx_session_mem:create(
+        ClientInfo,
+        #{receive_maximum => 0, expiry_interval => 0},
+        _WillMsg = undefined
+    ),
+    ?assertMatch(#session{quota = false}, Session0),
+    Session1 = emqx_session_mem:refresh_quota(Session0),
+    ?assertMatch(#session{quota = false}, Session1),
+    Delivers = enrich([delivery(?QOS_1, <<"t1">>), delivery(?QOS_1, <<"t2">>)], Session1),
+    {ok, [_Pub1, _Pub2], #session{quota = false}} =
+        emqx_session_mem:deliver(clientinfo(), Delivers, [], Session1).
+
+-doc """
+A refresh resolves the placeholder once. A later refresh keeps the container it
+built, with its consumed tokens.
+""".
+t_delivery_quota_refresh_resolves_once(_TCConfig) ->
+    ListenerId = 'tcp:refresh_once',
+    create_limiters(ListenerId, #{}),
+    ?on_exit(delete_limiters(ListenerId)),
+    Session0 = session(#{listener => ListenerId}, #{}),
+    ?assertMatch(#session{quota = {lazy, ListenerId}}, Session0),
+    {ok, MessagesRate} = emqx_limiter_schema:to_rate("2/1s"),
+    ok = emqx_limiter:update_listener_limiters(ListenerId, #{
+        delivery_messages_rate => MessagesRate
+    }),
+    Session1 = emqx_session_mem:refresh_quota(Session0),
+    ?assertMatch(#session{quota = #{}}, Session1),
+    Session2 = emqx_session_mem:refresh_quota(Session1),
+    ?assertEqual(Session1#session.quota, Session2#session.quota).
+
+-doc """
+Verifies that delivery limits do not compromise message ordering.
+""".
+t_delivery_rate_limit_preserves_qos12_order(_TCConfig) ->
+    ListenerId = 'tcp:ordering',
+    create_limiters(ListenerId, #{<<"delivery_bytes_rate">> => <<"10KB/5s">>}),
+    ?on_exit(delete_limiters(ListenerId)),
+    Session0 = session(#{listener => ListenerId}, #{}),
+    %% Out of 3 messages, either `t1` fits into delivery limit or `t0` & `t2`.
+    Delivers = enrich(
+        [
+            delivery(?QOS_1, <<"t0">>, binary:copy(<<"x">>, 4000)),
+            delivery(?QOS_1, <<"t1">>, binary:copy(<<"x">>, 8000)),
+            delivery(?QOS_1, <<"t2">>, <<"x">>)
+        ],
+        Session0
+    ),
+    %% Delivery limit admits `t0` delivery but not `t1`, this should make both `t1` & `t2`
+    %% enter mqueue.
+    {Effect, [_Msg1], Session1} =
+        emqx_session_mem:deliver(clientinfo(), Delivers, [], Session0),
+    ?assertMatch({set_timer, ?RETRY_DEQUEUE_TIMER, _}, Effect),
+    ?assertEqual(1, emqx_session_mem:info(inflight_cnt, Session1)),
+    ?assertEqual(2, emqx_session_mem:info(mqueue_len, Session1)),
+    ?assertMatch(
+        {[#message{topic = <<"t1">>}, #message{topic = <<"t2">>}], _},
+        emqx_session_mem:info({mqueue_msgs, #{position => none, limit => 10}}, Session1)
+    ),
+    %% After cooldown, both `t1` and `t2` should pass through.
+    Session2 = emqx_session_mem:set_field(quota, limiter_client(ListenerId), Session1),
+    {ok, Publishes, _Session3} =
+        emqx_session_mem:handle_timeout(clientinfo(), ?RETRY_DEQUEUE_TIMER, [], Session2),
+    ?assertMatch(
+        [{_, #message{topic = <<"t1">>}}, {_, #message{topic = <<"t2">>}}],
+        Publishes
+    ).
+
+-doc """
+Verifies that we apply delivery rate limiters when processing a `PUBACK`.
+""".
+t_delivery_rate_limit_puback(_TCConfig) ->
+    ListenerId = 'tcp:rate_limit_puback',
+    create_limiters(ListenerId, #{<<"delivery_messages_rate">> => <<"2/3s">>}),
+    ?on_exit(delete_limiters(ListenerId)),
+    %% First, we ensure that the mqueue has something enqueued.
+    Session0 = session(#{listener => ListenerId}, #{}),
+    Delivers = enrich(
+        [
+            delivery(?QOS_1, <<"t1">>),
+            delivery(?QOS_1, <<"t2">>),
+            delivery(?QOS_1, <<"t3">>),
+            delivery(?QOS_1, <<"t4">>)
+        ],
+        Session0
+    ),
+    %% Should have 3 messages enqueued
+    {Effect1, [{PacketId1, _Pub1}, {PacketId2, _Pub2}], Session1} =
+        emqx_session_mem:deliver(clientinfo(), Delivers, [], Session0),
+    ?assertMatch({set_timer, ?RETRY_DEQUEUE_TIMER, _}, Effect1),
+
+    %% Now, a puback comes in while limiter is still recovering.  It shouldn't yield more
+    %% publishes.
+    {Effect2, _, [], Session2} =
+        emqx_session_mem:puback(clientinfo(), PacketId1, [], Session1),
+    ?assertMatch({set_timer, ?RETRY_DEQUEUE_TIMER, _}, Effect2),
+
+    %% After limiter tokens are restored, should dequeue the rest.
+    Limiter = limiter_client(ListenerId),
+    Session3 = emqx_session_mem:set_field(quota, Limiter, Session2),
+    {ok, _, [_, _], _Session3} = emqx_session_mem:puback(clientinfo(), PacketId2, [], Session3),
+
+    ok.
+
+-doc """
+Verifies that we apply delivery rate limiters when processing a `PUBCOMP`.
+""".
+t_delivery_rate_limit_pubcomp(_TCConfig) ->
+    ListenerId = 'tcp:rate_limit_pubcomp',
+    LimiterConfig0 = #{<<"delivery_messages_rate">> => <<"2/5s">>},
+    create_limiters(ListenerId, LimiterConfig0),
+    ?on_exit(delete_limiters(ListenerId)),
+    %% First, we ensure that the mqueue has something enqueued.
+    Session0 = session(#{listener => ListenerId}, #{}),
+    Delivers = enrich(
+        [
+            delivery(?QOS_2, <<"t1">>),
+            delivery(?QOS_2, <<"t2">>),
+            delivery(?QOS_2, <<"t3">>),
+            delivery(?QOS_2, <<"t4">>)
+        ],
+        Session0
+    ),
+    %% Should have 3 messages enqueued
+    {Effect1, [{PacketId1, _Pub1}, {PacketId2, _Pub2}], Session1} =
+        emqx_session_mem:deliver(clientinfo(), Delivers, [], Session0),
+    ?assertMatch({set_timer, ?RETRY_DEQUEUE_TIMER, _}, Effect1),
+
+    %% Now, a puback comes in while limiter is still recovering.  It shouldn't yield more
+    %% publishes.
+    {ok, _, Session2} = emqx_session_mem:pubrec(PacketId1, Session1),
+    {Effect2, _, [], Session3} = emqx_session_mem:pubcomp(clientinfo(), PacketId1, [], Session2),
+    ?assertMatch({set_timer, ?RETRY_DEQUEUE_TIMER, _}, Effect2),
+
+    %% After limiter tokens are restored, should dequeue the rest.
+    {ok, _, Session4} = emqx_session_mem:pubrec(PacketId2, Session3),
+    Limiter = limiter_client(ListenerId),
+    Session5 = emqx_session_mem:set_field(quota, Limiter, Session4),
+    {ok, _, [_, _], _Session5} = emqx_session_mem:pubcomp(clientinfo(), PacketId2, [], Session5).
+
+-doc """
+Verifies that the session offers each message that the delivery rate limit refuses to the
+`message.nack` hook. A message that a hook takes does not enter mqueue. A QoS 0 message that
+no hook takes is dropped with the `rate_limited` reason.
+""".
+t_delivery_rate_limit_nack(_TCConfig) ->
+    %% `message.nack' takes the messages with the `nacked/' topic prefix
+    TC = self(),
+    ok = meck:new(emqx_hooks, [passthrough, no_history, no_link]),
+    ?on_exit(meck:unload(emqx_hooks)),
+    ok = meck:expect(emqx_hooks, 'message.nack', fun
+        (#message{topic = <<"nacked/", _/binary>> = Topic}, _Acc) ->
+            TC ! {message_nack, Topic},
+            true;
+        (Msg, Acc) ->
+            meck:passthrough([Msg, Acc])
+    end),
+    ok = meck:expect(emqx_hooks, 'delivery.dropped', fun(_ClientInfo, Msg, Reason) ->
+        TC ! {delivery_dropped, emqx_message:topic(Msg), Reason},
+        ok
+    end),
+    ListenerId = 'tcp:nack',
+    create_limiters(ListenerId, #{<<"delivery_messages_rate">> => <<"1/1h">>}),
+    ?on_exit(delete_limiters(ListenerId)),
+
+    %% The first message takes the only token. The rate limit refuses the second message,
+    %% and the session offers the rest of the batch to the hook.
+    Session0 = session(#{listener => ListenerId}, #{}),
+    Delivers0 = enrich(
+        [
+            delivery(?QOS_1, <<"sent">>),
+            delivery(?QOS_1, <<"nacked/1">>),
+            delivery(?QOS_1, <<"queued/1">>),
+            delivery(?QOS_0, <<"nacked/0">>),
+            delivery(?QOS_0, <<"queued/0">>)
+        ],
+        Session0
+    ),
+    {Effect, [{_, #message{topic = <<"sent">>}}], Session1} =
+        emqx_session_mem:deliver(clientinfo(), Delivers0, [], Session0),
+    ?assertMatch({set_timer, ?RETRY_DEQUEUE_TIMER, _}, Effect),
+    ?assertReceive({message_nack, <<"nacked/1">>}),
+    ?assertReceive({message_nack, <<"nacked/0">>}),
+    ?assertMatch(
+        {[#message{topic = <<"queued/1">>}, #message{topic = <<"queued/0">>}], _},
+        emqx_session_mem:info({mqueue_msgs, #{position => none, limit => 10}}, Session1)
+    ),
+    ?assertNotReceive({delivery_dropped, _, _}),
+
+    %% The rate limit refuses QoS 0 messages one by one. The session drops the message
+    %% that the hook does not take.
+    Session2 = session(#{listener => ListenerId}, #{quota => Session1#session.quota}),
+    Delivers1 = enrich(
+        [delivery(?QOS_0, <<"nacked/0">>), delivery(?QOS_0, <<"dropped/0">>)],
+        Session2
+    ),
+    {ok, [], Session3} = emqx_session_mem:deliver(clientinfo(), Delivers1, [], Session2),
+    ?assertReceive({message_nack, <<"nacked/0">>}),
+    ?assertReceive({delivery_dropped, <<"dropped/0">>, rate_limited}),
+    ?assertNotReceive({delivery_dropped, _, _}),
+    ?assertEqual(0, emqx_session_mem:info(mqueue_len, Session3)).
+
+%%--------------------------------------------------------------------
+%% Test cases for takeover/resume
+%%--------------------------------------------------------------------
+
+t_takeover(_) ->
+    ok = meck:expect(emqx_broker, unsubscribe, fun(_) -> ok end),
+    Session = session(#{subscriptions => #{<<"t">> => ?DEFAULT_SUBOPTS}}),
+    ok = emqx_session_mem:takeover(Session).
+
+t_resume(_) ->
+    ok = meck:expect(emqx_broker, subscribe, fun(_, _, _) -> ok end),
+    Session = session(#{subscriptions => #{<<"t">> => ?DEFAULT_SUBOPTS}}),
+    _ = emqx_session_mem:resume(#{clientid => <<"clientid">>}, Session).
+
+t_export_import(_) ->
+    Msg1 = emqx_message:make(clientid, ?QOS_1, ~"t1", ~"payload1"),
+    Msg2 = emqx_message:make(clientid, ?QOS_2, ~"t2", ~"payload2"),
+    Msg3 = emqx_message:make(clientid, ?QOS_1, ~"t3", ~"payload3"),
+    Session0 = session(#{
+        subscriptions => #{~"t" => ?DEFAULT_SUBOPTS},
+        max_subscriptions => 1,
+        upgrade_qos => true,
+        retry_interval => 42,
+        max_awaiting_rel => 2,
+        await_rel_timeout => 43
+    }),
+    Before = erlang:system_time(microsecond),
+    {{set_timer, retry_delivery, _}, [{PacketId1, Msg1}, {PacketId2, Msg2}], Session1} =
+        emqx_session_mem:deliver(clientinfo(), [Msg1, Msg2], [], Session0),
+    After = erlang:system_time(microsecond),
+    Session2 = emqx_session_mem:enqueue(clientinfo(), [Msg3], Session1),
+    Persistent = emqx_session_mem:export(Session2),
+    ?assertNot(maps:is_key(clientid, Persistent)),
+    ?assertNot(maps:is_key(max_subscriptions, Persistent)),
+    ?assertNot(maps:is_key(upgrade_qos, Persistent)),
+    ?assertNot(maps:is_key(retry_interval, Persistent)),
+    ?assertNot(maps:is_key(max_awaiting_rel, Persistent)),
+    ?assertNot(maps:is_key(await_rel_timeout, Persistent)),
+    [ExportedMsg3 = #message{extra = #{mqueue_insert_ts := InsertTs}}] =
+        maps:get(mqueue, Persistent),
+    ?assert(is_integer(InsertTs)),
+    ?assertEqual(Msg3#message{extra = #{mqueue_insert_ts => InsertTs}}, ExportedMsg3),
+    [InflightEntry1, InflightEntry2] = maps:get(inflight, Persistent),
+    lists:foreach(
+        fun({PacketId, Entry}) ->
+            ?assertMatch(
+                #{
+                    packet_id := PacketId,
+                    phase := wait_ack,
+                    message := #message{headers = #{deliver_begin_at_us := Begin}},
+                    timestamp := Timestamp
+                } when
+                    is_integer(Begin) andalso
+                        Begin >= Before andalso
+                        Begin =< After andalso
+                        Timestamp =:= Begin div 1000,
+                Entry
+            )
+        end,
+        [{PacketId1, InflightEntry1}, {PacketId2, InflightEntry2}]
+    ),
+    Session3 =
+        emqx_session_mem:import(
+            clientinfo(#{zone => default, listener => 'tcp:default'}),
+            Persistent
+        ),
+    ?assertEqual(2, emqx_session_mem:info(inflight_cnt, Session3)),
+    ?assertEqual(Persistent, emqx_session_mem:export(Session3)),
+    ?assertEqual(inflight_query(Session2, none, 2), inflight_query(Session3, none, 2)),
+    Query = {mqueue_msgs, #{limit => 1}},
+    ?assertEqual(emqx_session_mem:info(Query, Session2), emqx_session_mem:info(Query, Session3)),
+    ?assertEqual(
+        [Msg3],
+        emqx_mqueue:to_list(emqx_session_mem:info(mqueue, Session3))
+    ),
+    %% Export/import preserves the `wait_comp` entry and inflight query results:
+    {ok, _, Session4} = emqx_session_mem:pubrec(PacketId2, Session3),
+    Exported4 = emqx_session_mem:export(Session4),
+    [InflightEntry1, InflightEntry2WComp] = maps:get(inflight, Exported4),
+    ?assertEqual(InflightEntry2#{phase := wait_comp}, InflightEntry2WComp),
+    Imported4 = emqx_session_mem:import(clientinfo(), Exported4),
+    ?assertEqual(Exported4, emqx_session_mem:export(Imported4)),
+    ?assertEqual(inflight_query(Session4, none, 2), inflight_query(Imported4, none, 2)),
+    %% Older peers export messages without queue timestamps; importing attaches them:
+    Legacy = Persistent#{mqueue := [Msg3]},
+    Session5 = emqx_session_mem:import(clientinfo(), Legacy),
+    ?assertMatch(
+        #{mqueue := [#message{extra = #{mqueue_insert_ts := _}}]},
+        emqx_session_mem:export(Session5)
+    ).
+
+-doc """
+Checks that exporting a session with nothing queued and importing it gives a
+placeholder mqueue for the importing zone.
+""".
+t_export_import_empty_mqueue(_) ->
+    Persistent = emqx_session_mem:export(session()),
+    ?assertEqual([], maps:get(mqueue, Persistent)),
+    Session = emqx_session_mem:import(
+        clientinfo(#{zone => default, listener => 'tcp:default'}),
+        Persistent
+    ),
+    ?assertMatch(#session{mqueue = {empty, 1000}}, Session).
+
+-doc "Legacy evacuated sessions omit the listener, and reconnecting restores the limiter.".
+t_import_without_listener(_) ->
+    ClientInfo = clientinfo(#{listener => 'tcp:default'}),
+    ConnInfo = #{receive_maximum => 32, expiry_interval => 86400000},
+    Msg1 = emqx_message:make(clientid, ?QOS_1, <<"t1">>, <<"inflight">>),
+    Msg2 = emqx_message:make(clientid, ?QOS_1, <<"t2">>, <<"queued">>),
+    Session0 = session(#{
+        is_persistent => true,
+        subscriptions => #{<<"t">> => ?DEFAULT_SUBOPTS}
+    }),
+    {_Ok, [_], Session1} = emqx_session_mem:deliver(ClientInfo, [Msg1], [], Session0),
+    Session2 = emqx_session_mem:enqueue(ClientInfo, [Msg2], Session1),
+    Exported = emqx_session_mem:export(Session2),
+    LegacyClientInfo = maps:remove(listener, ClientInfo),
+    Evacuated = emqx_session_mem:import(LegacyClientInfo, ConnInfo, Exported),
+    ?assertMatch(#session{quota = false}, Evacuated),
+    ReExported = emqx_session_mem:export(Evacuated),
+    ?assertEqual(Exported, ReExported),
+    Reconnected = emqx_session_mem:import(ClientInfo, ConnInfo, ReExported),
+    ?assertMatch(#session{quota = {lazy, 'tcp:default'}}, Reconnected),
+    ?assertEqual(Exported, emqx_session_mem:export(Reconnected)).
+
+t_replay(_) ->
+    Session = session(),
+    Messages = enrich([delivery(?QOS_1, <<"t1">>), delivery(?QOS_2, <<"t2">>)], Session),
+    {ok, _, Session1} = emqx_session_mem:deliver(clientinfo(), Messages, [], Session),
+    Msg = emqx_message:make(clientid, ?QOS_1, <<"t1">>, <<"payload">>),
+    Session2 = emqx_session_mem:enqueue(clientinfo(), [Msg], Session1),
+    #{inflight := Inflight} = emqx_session_mem:export(Session1),
+    Pubs = [{I, emqx_message:set_flag(dup, M)} || #{packet_id := I, message := M} <- Inflight],
+    D4 = delivery(?QOS_1, <<"t4">>),
+    D5 = delivery(?QOS_2, <<"t5">>),
+    D6 = delivery(?QOS_1, <<"t6">>),
+    [Msg4, Msg5] = enrich([D4, D5], Session1),
+    _ = self() ! D5,
+    _ = self() ! D6,
+    [Msg6] = enrich([D6], Session1),
+    ok = meck:expect(emqx_cm, takeover_session_end, fun(ReplayCtx) -> {ok, ReplayCtx} end),
+    {ok, ReplayPubs, Session3} = emqx_session_mem:replay(clientinfo(), [D4, D5], Session2),
+    {ReplayInflight, ReplayNew} = lists:split(length(Pubs), ReplayPubs),
+    %% Replayed messages retain their original delivery timestamps.
+    ?assertEqual(Pubs, ReplayInflight),
+    ?assertEqual(
+        [{3, Msg}, {4, Msg4}, {5, Msg5}, {6, Msg6}],
+        remove_deliver_flag(ReplayNew)
+    ),
+    ?assertEqual(6, emqx_session_mem:info(inflight_cnt, Session3)).
+
+t_expire_awaiting_rel(_) ->
+    Now = ts(millisecond),
+    AwaitRelTimeout = 10000,
+    Session = session(#{await_rel_timeout => AwaitRelTimeout}),
+    Ts1 = Now - 1000,
+    Ts2 = Now - 20000,
+    {ok, [], Session1} = emqx_session_mem:expire(clientinfo(), Session),
+    Session2 = emqx_session_mem:set_field(awaiting_rel, #{1 => Ts1, 2 => Ts2}, Session1),
+    {ok, [], Timeout, Session3} = emqx_session_mem:expire(clientinfo(), Session2),
+    ?assertEqual(#{1 => Ts1}, emqx_session_mem:info(awaiting_rel, Session3)),
+    ?assert(Timeout =< AwaitRelTimeout).
+
+t_expire_awaiting_rel_all(_) ->
+    Session = session(#{await_rel_timeout => 1, awaiting_rel => #{1 => 1, 2 => 2}}),
+    {ok, [], Session1} = emqx_session_mem:expire(clientinfo(), Session),
+    ?assertEqual(#{}, emqx_session_mem:info(awaiting_rel, Session1)).
+
+t_expire_awaiting_rel_disabled(_) ->
+    AwaitingRel = #{1 => 1, 2 => 2},
+    Session = session(#{await_rel_timeout => 0, awaiting_rel => AwaitingRel}),
+    {ok, [], Session1} = emqx_session_mem:expire(clientinfo(), Session),
+    ?assertEqual(AwaitingRel, emqx_session_mem:info(awaiting_rel, Session1)).
+
+%%--------------------------------------------------------------------
+%% CT for utility functions
+%%--------------------------------------------------------------------
+
+t_next_pakt_id(_) ->
+    ?assertEqual(1, emqx_session_mem:next_pkt_id(16#FFFF)),
+    ?assertEqual(2, emqx_session_mem:next_pkt_id(1)).
+
+t_obtain_next_pkt_id(_) ->
+    Session = session(#{next_pkt_id => 16#FFFF}),
+    {16#FFFF, Session1} = emqx_session_mem:obtain_next_pkt_id(Session),
+    ?assertEqual(1, emqx_session_mem:info(next_pkt_id, Session1)),
+    {1, Session2} = emqx_session_mem:obtain_next_pkt_id(Session1),
+    ?assertEqual(2, emqx_session_mem:info(next_pkt_id, Session2)).
+
+%% Helper functions
+%%--------------------------------------------------------------------
+
+on_message_dropped(Msg, _By, ReasonName, TestPid) ->
+    TestPid ! {'message.dropped', ReasonName, Msg},
+    ok.
+
+zone_mqueue_opts(Zone) ->
+    #{
+        max_len => emqx_config:get_zone_conf(Zone, [mqtt, max_mqueue_len]),
+        store_qos0 => emqx_config:get_zone_conf(Zone, [mqtt, mqueue_store_qos0]),
+        priorities => emqx_config:get_zone_conf(Zone, [mqtt, mqueue_priorities]),
+        default_priority => emqx_config:get_zone_conf(Zone, [mqtt, mqueue_default_priority])
+    }.
+
+set_zone_conf(Key, Value) ->
+    Old = emqx_config:get_zone_conf(default, [mqtt, Key]),
+    ?on_exit(emqx_config:put_zone_conf(default, [mqtt, Key], Old)),
+    ok = emqx_config:put_zone_conf(default, [mqtt, Key], Value).
+
+mqueue() -> mqueue(#{}).
+mqueue(Opts) ->
+    emqx_mqueue:init(maps:merge(#{max_len => 0, store_qos0 => false}, Opts)).
+
+session() -> session(#{}).
+session(InitFields) -> session(#{}, InitFields).
+session(InitClientInfo, InitFields) when is_map(InitFields) ->
+    ClientInfo = maps:merge(
+        #{
+            zone => default,
+            listener => 'tcp:default',
+            clientid => <<"fake-test">>
+        },
+        InitClientInfo
+    ),
+    ConnInfo = #{receive_maximum => 0, expiry_interval => 0},
+    Session = emqx_session_mem:create(
+        ClientInfo,
+        ConnInfo,
+        _WillMsg = undefined
+    ),
+    maps:fold(
+        fun(Field, Value, SessionAcc) ->
+            emqx_session_mem:set_field(Field, Value, SessionAcc)
+        end,
+        Session,
+        InitFields
+    ).
+
+clientinfo() -> clientinfo(#{}).
+clientinfo(Init) ->
+    maps:merge(
+        #{
+            zone => default,
+            clientid => <<"clientid">>,
+            username => <<"username">>
+        },
+        Init
+    ).
+
+subopts() -> subopts(#{}).
+subopts(Init) ->
+    maps:merge(?DEFAULT_SUBOPTS, Init).
+
+delivery(QoS, Topic) ->
+    delivery(QoS, Topic, emqx_guid:to_hexstr(emqx_guid:gen())).
+
+delivery(QoS, Topic, Payload) ->
+    {deliver, Topic, emqx_message:make(test, QoS, Topic, Payload)}.
+
+delivery(QoS, Topic, Payload, ExpiryInterval) ->
+    Headers = #{properties => #{'Message-Expiry-Interval' => ExpiryInterval}},
+    {deliver, Topic, emqx_message:make(test, QoS, Topic, Payload, #{}, Headers)}.
+
+enrich(Delivers, Session) when is_list(Delivers) ->
+    emqx_session:enrich_delivers(clientinfo(), Delivers, Session);
+enrich(Delivery, Session) when is_tuple(Delivery) ->
+    enrich([Delivery], Session).
+
+ts(second) ->
+    erlang:system_time(second);
+ts(millisecond) ->
+    erlang:system_time(millisecond).
+
+with_ts(Phase, Msg) ->
+    with_ts(Phase, Msg, erlang:system_time(millisecond)).
+
+with_ts(Phase, Msg, Ts) ->
+    #inflight_data{
+        phase = Phase,
+        message = Msg,
+        timestamp = Ts
+    }.
+
+remove_deliver_flag({pubrel, Id}) ->
+    {pubrel, Id};
+remove_deliver_flag({Id, Data}) ->
+    {Id, remove_deliver_flag(Data)};
+remove_deliver_flag(List) when is_list(List) ->
+    lists:map(fun remove_deliver_flag/1, List);
+remove_deliver_flag(Msg) ->
+    emqx_message:remove_header(deliver_begin_at_us, Msg).
+
+set_duplicate_pub({Id, Msg}) ->
+    {Id, emqx_message:set_flag(dup, Msg)}.
+
+get_packet_id({Id, _}) ->
+    Id.
+
+inflight_query(Session, Cursor, Limit) ->
+    emqx_session_mem:info({inflight_msgs, #{cursor => Cursor, limit => Limit}}, Session).
+
+inflight_ts(#message{extra = #{query_cursor := {Ts, _PacketId}}}) -> Ts.
+
+inflight_position(#message{extra = #{query_cursor := Cursor}}) ->
+    Cursor.
+
+limiter_client(ListenerId) ->
+    emqx_limiter:create_session_client_container(ListenerId).
+
+create_limiters(ListenerId, MQTTConfig) ->
+    Opts = #{atom_key => true, required => false},
+    RawConfig = #{<<"mqtt">> => MQTTConfig},
+    #{mqtt := Config} = hocon_tconf:check_plain(emqx_limiter_schema, RawConfig, Opts, [mqtt]),
+    catch emqx_limiter:delete_listener_limiters(ListenerId),
+    emqx_limiter:create_listener_limiters(ListenerId, Config).
+
+delete_limiters(ListenerId) ->
+    emqx_limiter:delete_listener_limiters(ListenerId).
+
+restart_limiters(ListenerId, RawConfig) ->
+    ok = emqx_limiter:delete_listener_limiters(ListenerId),
+    create_limiters(ListenerId, RawConfig).
+
+exhaust_limiter(Name, Limiter0) ->
+    Res = emqx_limiter_client_container:try_consume(Limiter0, [{Name, 1}]),
+    case Res of
+        {true, Limiter} ->
+            exhaust_limiter(Name, Limiter);
+        {false, Limiter, _Reason} ->
+            Limiter
+    end.

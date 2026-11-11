@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_prometheus).
@@ -22,90 +10,148 @@
 %% be used by the prometheus application
 -behaviour(prometheus_collector).
 
--include_lib("prometheus/include/prometheus.hrl").
--include_lib("prometheus/include/prometheus_model.hrl").
+-behaviour(emqx_prometheus_cluster).
+-export([supports_listener_accept_result/0]).
 
--import(minirest, [return/1]).
+-export([
+    fetch_cluster_consistented_data/0,
+    aggre_or_zip_init_acc/0,
+    logic_sum_metrics/0
+]).
 
--rest_api(#{name   => stats,
-            method => 'GET',
-            path   => "/emqx_prometheus",
-            func   => stats,
-            descr  => "Get emqx all stats info"
-           }).
+-include("emqx_prometheus.hrl").
 
--import(prometheus_model_helpers,
-        [ create_mf/5
-        , gauge_metric/1
-        , counter_metric/1
-        ]).
-
-%% REST APIs
--export([stats/2]).
+-include_lib("public_key/include/public_key.hrl").
+-include_lib("emqx/include/logger.hrl").
+-include_lib("emqx/include/emqx_instr.hrl").
+-include_lib("emqx_durable_storage/include/emqx_ds_metrics.hrl").
+-include_lib("emqx/include/emqx_config.hrl").
 
 %% APIs
--export([start_link/2]).
+-export([start_link/1, info/0]).
 
 %% gen_server callbacks
--export([ init/1
-        , handle_call/3
-        , handle_cast/2
-        , handle_info/2
-        , code_change/3
-        , terminate/2
-        ]).
+-export([
+    init/1,
+    handle_continue/2,
+    handle_call/3,
+    handle_cast/2,
+    handle_info/2,
+    code_change/3,
+    terminate/2
+]).
 
 %% prometheus_collector callback
--export([ deregister_cleanup/1
-        , collect_mf/2
-        , collect_metrics/2
-        ]).
+-export([
+    deregister_cleanup/1,
+    collect_mf/2,
+    collect_metrics/2
+]).
+
+-export([collect/1, collect_ns/2]).
+
+-export([fetch_cluster_wide_namespaced_metrics/2]).
+
+%% RPC targets
+-export([
+    %% Proto v2
+    fetch_from_local_node/1,
+    %% Proto v{3..}
+    fetch_namespaced_metrics_v1/2
+]).
+
+-ifdef(TEST).
+-export([cert_expiry_at_from_path/1, cert_data/1, acl_metric_meta/0]).
+-endif.
+
+%%--------------------------------------------------------------------
+%% Macros
+%%--------------------------------------------------------------------
+
+-define(MG(K, MAP), maps:get(K, MAP)).
+-define(MG(K, MAP, DEFAULT), maps:get(K, MAP, DEFAULT)).
 
 -define(C(K, L), proplists:get_value(K, L, 0)).
 
 -define(TIMER_MSG, '#interval').
 
--record(state, {push_gateway, timer, interval}).
+-define(HTTP_OPTIONS, [{autoredirect, true}, {timeout, 60000}]).
+
+-define(SAFELY(EXPR, ELSE),
+    (try
+        EXPR
+    catch
+        _:_ -> ELSE
+    end)
+).
 
 %%--------------------------------------------------------------------
 %% APIs
 %%--------------------------------------------------------------------
 
-start_link(PushGateway, Interval) ->
-    gen_server:start_link({local, ?MODULE}, ?MODULE, [PushGateway, Interval], []).
+start_link(Conf) ->
+    gen_server:start_link({local, ?MODULE}, ?MODULE, Conf, []).
 
-%%--------------------------------------------------------------------
-%% REST APIs
-
-stats(_Bindings, Params) ->
-    collect(proplists:get_value(<<"type">>, Params, <<"json">>)).
+info() ->
+    gen_server:call(?MODULE, info).
 
 %%--------------------------------------------------------------------
 %% gen_server callbacks
 %%--------------------------------------------------------------------
 
-init([undefined, Interval]) ->
-    {ok, #state{interval = Interval}};
+init(Conf) ->
+    {ok, #{}, {continue, Conf}}.
 
-init([PushGateway, Interval]) ->
-    Ref = erlang:start_timer(Interval, self(), ?TIMER_MSG),
-    {ok, #state{timer = Ref, push_gateway = PushGateway, interval = Interval}}.
+handle_continue(Conf, State) ->
+    Opts = #{interval := Interval} = opts(Conf),
+    {noreply, State#{
+        timer => ensure_timer(Interval),
+        opts => Opts,
+        ok => 0,
+        failed => 0
+    }}.
 
+handle_call(info, _From, State = #{timer := Timer, opts := Opts}) ->
+    {reply, State#{opts => Opts, next_push_ms => erlang:read_timer(Timer)}, State};
 handle_call(_Msg, _From, State) ->
-    {noreply, State}.
+    {reply, ok, State}.
 
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
-handle_info({timeout, R, ?TIMER_MSG}, S = #state{interval=I, timer=R, push_gateway=Uri}) ->
-    [Name, Ip] = string:tokens(atom_to_list(node()), "@"),
-    Url = lists:concat([Uri, "/metrics/job/", Name, "/instance/",Name, "~", Ip]),
-    Data = prometheus_text_format:format(),
-    httpc:request(post, {Url, [], "text/plain", Data}, [{autoredirect, true}], []),
-    {noreply, S#state{timer = erlang:start_timer(I, self(), ?TIMER_MSG)}};
-
+handle_info({timeout, Timer, ?TIMER_MSG}, State = #{timer := Timer, opts := Opts}) ->
+    #{interval := Interval, headers := Headers, url := Server, method := Method} = Opts,
+    PushRes = push_to_push_gateway(Method, Server, Headers),
+    NewTimer = ensure_timer(Interval),
+    NewState = maps:update_with(PushRes, fun(C) -> C + 1 end, 1, State#{timer => NewTimer}),
+    %% Data is too big, hibernate for saving memory and stop system monitor warning.
+    {noreply, NewState, hibernate};
+handle_info({update, Conf}, State = #{timer := Timer}) ->
+    emqx_utils:cancel_timer(Timer),
+    handle_continue(Conf, State);
 handle_info(_Msg, State) ->
     {noreply, State}.
+
+push_to_push_gateway(Method, Url, Headers) when
+    is_list(Headers) andalso (Method =:= put orelse Method =:= post)
+->
+    Data = push_metrics_data(),
+    case httpc:request(Method, {Url, Headers, "text/plain", Data}, ?HTTP_OPTIONS, []) of
+        {ok, {{"HTTP/1.1", 200, _}, _RespHeaders, _RespBody}} ->
+            ok;
+        Error ->
+            ?SLOG(error, #{
+                msg => "post_to_push_gateway_failed",
+                error => Error,
+                url => Url,
+                headers => emqx_utils_redact:redact_headers(Headers)
+            }),
+            failed
+    end.
+
+push_metrics_data() ->
+    Rows = [prometheus_text_format:format(Registry) || Registry <- ?PROMETHEUS_ALL_REGISTRIES],
+    iolist_to_binary(Rows).
 
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
@@ -113,65 +159,257 @@ code_change(_OldVsn, State, _Extra) ->
 terminate(_Reason, _State) ->
     ok.
 
+ensure_timer(Interval) ->
+    emqx_utils:start_timer(Interval, ?TIMER_MSG).
+
 %%--------------------------------------------------------------------
 %% prometheus callbacks
 %%--------------------------------------------------------------------
+opts(
+    Conf = #{
+        interval := Interval, headers := Headers, job_name := JobName, push_gateway_server := Url
+    }
+) ->
+    #{
+        interval => Interval,
+        headers => Headers,
+        url => join_url(Url, JobName),
+        method => ?MG(method, Conf, put)
+    };
+opts(#{push_gateway := #{url := Url, job_name := JobName} = PushGateway}) ->
+    PushGateway#{
+        url => join_url(Url, JobName),
+        method => ?MG(method, PushGateway, put)
+    }.
 
-deregister_cleanup(_Registry) ->
+join_url(Url, JobName0) ->
+    ClusterName = atom_to_binary(emqx:get_config([cluster, name], emqxcl)),
+    [Name, Ip] = string:tokens(atom_to_list(node()), "@"),
+    % NOTE: allowing errors here to keep rough backward compatibility
+    {JobName1, Errors} = emqx_template:render(
+        emqx_template:parse(JobName0),
+        #{<<"name">> => Name, <<"host">> => Ip, <<"cluster_name">> => ClusterName}
+    ),
+    _ =
+        Errors == [] orelse
+            ?SLOG(warning, #{
+                msg => "prometheus_job_name_template_invalid",
+                errors => Errors,
+                template => JobName0
+            }),
+    lists:concat([Url, "/metrics/job/", unicode:characters_to_list(JobName1)]).
+
+deregister_cleanup(?PROMETHEUS_DEFAULT_REGISTRY) ->
+    ok;
+deregister_cleanup(?PROMETHEUS_NS_STATS_REGISTRY) ->
     ok.
 
-collect_mf(_Registry, Callback) ->
-    Metrics = emqx_metrics:all(),
-    Stats = emqx_stats:getstats(),
-    VMData = emqx_vm_data(),
-    ClusterData = emqx_cluster_data(),
-    _ = [add_collect_family(Name, Stats, Callback, gauge) || Name <- emqx_stats()],
-    _ = [add_collect_family(Name, VMData, Callback, gauge) || Name <- emqx_vm()],
-    _ = [add_collect_family(Name, ClusterData, Callback, gauge) || Name <- emqx_cluster()],
-    _ = [add_collect_family(Name, Metrics, Callback, counter) || Name <- emqx_metrics_packets()],
-    _ = [add_collect_family(Name, Metrics, Callback, counter) || Name <- emqx_metrics_messages()],
-    _ = [add_collect_family(Name, Metrics, Callback, counter) || Name <- emqx_metrics_delivery()],
-    _ = [add_collect_family(Name, Metrics, Callback, counter) || Name <- emqx_metrics_client()],
-    _ = [add_collect_family(Name, Metrics, Callback, counter) || Name <- emqx_metrics_session()],
+collect_mf(?PROMETHEUS_DEFAULT_REGISTRY, Callback) ->
+    RawData = emqx_prometheus_cluster:raw_data(?MODULE, ?GET_PROM_DATA_MODE()),
+    %% TODO: license expiry epoch and cert expiry epoch should be cached
+    ok = add_collect_family(Callback, stats_metric_meta(), ?MG(stats_data, RawData)),
+    ok = add_collect_family(
+        Callback,
+        stats_metric_cluster_consistented_meta(),
+        ?MG(stats_data_cluster_consistented, RawData)
+    ),
+    ok = add_collect_family(Callback, vm_metric_meta(), ?MG(vm_data, RawData)),
+    ok = add_collect_family(Callback, cluster_metric_meta(), ?MG(cluster_data, RawData)),
+
+    ok = add_collect_family(Callback, emqx_packet_metric_meta(), ?MG(emqx_packet_data, RawData)),
+    ok = add_collect_family(Callback, message_metric_meta(), ?MG(emqx_message_data, RawData)),
+    ok = add_collect_family(Callback, delivery_metric_meta(), ?MG(emqx_delivery_data, RawData)),
+    ok = add_collect_family(Callback, client_metric_meta(), ?MG(emqx_client_data, RawData)),
+    ok = add_collect_family(Callback, session_metric_meta(), ?MG(emqx_session_data, RawData)),
+    ok = add_collect_family(Callback, olp_metric_meta(), ?MG(emqx_olp_data, RawData)),
+    ok = add_collect_family(Callback, acl_metric_meta(), ?MG(emqx_acl_data, RawData)),
+    ok = add_collect_family(Callback, authn_metric_meta(), ?MG(emqx_authn_data, RawData)),
+
+    ok = collect_broker_instr_family(Callback, ?MG(emqx_broker_instr_data, RawData)),
+
+    ok = add_collect_family(Callback, cert_metric_meta(), ?MG(cert_data, RawData)),
+    ok = add_collect_family(Callback, cluster_rpc_meta(), ?MG(cluster_rpc, RawData)),
+    ok = add_collect_family(Callback, mria_metric_meta(), ?MG(mria_data, RawData)),
+    ok = maybe_add_ds_collect_family(Callback, RawData),
+    ok = maybe_license_add_collect_family(Callback, RawData),
+    ok;
+collect_mf(?PROMETHEUS_NS_STATS_REGISTRY, Callback) ->
+    RawData = emqx_prometheus_cluster:raw_data_ns(
+        ?MODULE, get_namespace_pd(), ?GET_PROM_DATA_MODE()
+    ),
+
+    ok = add_collect_family(Callback, packet_metric_ns_meta(), ?MG(packet_data_ns, RawData)),
+    ok = add_collect_family(Callback, message_metric_ns_meta(), ?MG(message_data_ns, RawData)),
+    ok = add_collect_family(Callback, delivery_metric_ns_meta(), ?MG(delivery_data_ns, RawData)),
+    ok = add_collect_family(Callback, session_metric_ns_meta(), ?MG(session_metric_ns, RawData)),
+    ok = add_collect_family(Callback, authz_metric_ns_meta(), ?MG(authz_metric_ns, RawData)),
+    ok = add_collect_family(Callback, authn_metric_ns_meta(), ?MG(authn_metric_ns, RawData)),
+
+    ok;
+collect_mf(_Registry, _Callback) ->
     ok.
+
+maybe_add_ds_collect_family(Callback, RawData) ->
+    case emqx_persistent_message:is_persistence_enabled() of
+        true ->
+            add_collect_family(
+                Callback, emqx_ds_builtin_metrics:prometheus_meta(), ?MG(ds_data, RawData)
+            ),
+            DSRaftPrefix = <<"emqx_ds_raft_">>,
+            prefix_collect_helpful_family(
+                Callback, DSRaftPrefix, ds_raft_node_meta(), ?MG(ds_raft_node_data, RawData)
+            ),
+            prefix_collect_helpful_family(
+                Callback, DSRaftPrefix, ds_raft_cluster_meta(), ?MG(ds_raft_cluster_data, RawData)
+            );
+        false ->
+            ok
+    end.
+
+maybe_collect_ds_data(Mode) ->
+    case emqx_persistent_message:is_persistence_enabled() of
+        true ->
+            #{
+                ds_data => emqx_ds_builtin_metrics:prometheus_collect(with_node_label(Mode, [])),
+                ds_raft_node_data => collect_ds_raft_node_data(Mode)
+            };
+        false ->
+            #{}
+    end.
+
+maybe_collect_ds_cluster_data(Acc) ->
+    case emqx_persistent_message:is_persistence_enabled() of
+        true ->
+            Acc#{
+                ds_raft_cluster_data => collect_ds_raft_cluster_data()
+            };
+        false ->
+            Acc
+    end.
+
+collect_ds_raft_node_data(Mode) ->
+    Labels0 = with_node_label(Mode, []),
+    Acc = emqx_ds_builtin_raft_metrics:local_dbs(Labels0),
+    maps:merge(emqx_ds_builtin_raft_metrics:local_shards(Labels0), Acc).
+
+collect_ds_raft_cluster_data() ->
+    Acc1 = emqx_ds_builtin_raft_metrics:cluster(),
+    Acc2 = maps:merge(emqx_ds_builtin_raft_metrics:dbs(), Acc1),
+    maps:merge(emqx_ds_builtin_raft_metrics:shards(), Acc2).
 
 %% @private
-collect(<<"json">>) ->
-    Metrics = emqx_metrics:all(),
-    Stats = emqx_stats:getstats(),
-    VMData = emqx_vm_data(),
-    Data = [{stats, [collect_stats(Name, Stats) || Name <- emqx_stats()]},
-            {metrics, [collect_stats(Name, VMData) || Name <- emqx_vm()]},
-            {packets, [collect_stats(Name, Metrics) || Name <- emqx_metrics_packets()]},
-            {messages, [collect_stats(Name, Metrics) || Name <- emqx_metrics_messages()]},
-            {delivery, [collect_stats(Name, Metrics) || Name <- emqx_metrics_delivery()]},
-            {client, [collect_stats(Name, Metrics) || Name <- emqx_metrics_client()]},
-            {session, [collect_stats(Name, Metrics) || Name <- emqx_metrics_session()]}],
-    return({ok, Data});
-
 collect(<<"prometheus">>) ->
-    Data = prometheus_text_format:format(),
-    {ok, #{<<"content-type">> => <<"text/plain">>}, Data}.
+    prometheus_text_format:format(?PROMETHEUS_DEFAULT_REGISTRY).
 
-%% @private
-collect_stats(Name, Stats) ->
-    R = collect_metrics(Name, Stats),
-    case R#'Metric'.gauge of
-        undefined ->
-            {_, Val} = R#'Metric'.counter,
-            {Name, Val};
-        {_, Val} ->
-            {Name, Val}
+collect_ns(Namespace, Mode) ->
+    try
+        ?PUT_PROM_DATA_MODE(Mode),
+        put_namespace_pd(Namespace),
+        prometheus_text_format:format(?PROMETHEUS_NS_STATS_REGISTRY)
+    after
+        _ = erase(?PROM_DATA_MODE_KEY__),
+        _ = erase_namespace_pd()
     end.
 
 collect_metrics(Name, Metrics) ->
     emqx_collect(Name, Metrics).
 
-add_collect_family(Name, Data, Callback, Type) ->
-    Callback(create_schema(Name, <<"">>,  Data, Type)).
+add_collect_family(Callback, MetricWithType, Data) ->
+    _ = [add_collect_family(Name, Data, Callback, Type) || {Name, Type, _} <- MetricWithType],
+    ok.
 
-create_schema(Name, Help, Data, Type) ->
-  create_mf(Name, Help, Type, ?MODULE, Data).
+add_collect_family(Name, Data, Callback, Type) ->
+    Callback(prometheus_model_helpers:create_mf(Name, _Help = <<"">>, Type, ?MODULE, Data)).
+
+prefix_collect_helpful_family(Callback, Prefix, MetricsTypeAndHelp, Metrics) ->
+    lists:foreach(
+        fun({Name, Type, Help}) ->
+            %% Using `create_mf/4` that doesn't call back into `collect_metrics/2.`
+            PromName = [Prefix, atom_to_binary(Name)],
+            Callback(
+                prometheus_model_helpers:create_mf(PromName, Help, Type, ?MG(Name, Metrics, []))
+            )
+        end,
+        MetricsTypeAndHelp
+    ).
+
+%% behaviour
+%% RPC target (`emqx_prometheus_proto_v2`)
+fetch_from_local_node(Mode) ->
+    {node(), (maybe_collect_ds_data(Mode))#{
+        stats_data => stats_data(Mode),
+        vm_data => vm_data(Mode),
+        cluster_data => cluster_data(Mode),
+        %% Metrics
+        emqx_packet_data => emqx_metric_data(emqx_packet_metric_meta(), Mode),
+        emqx_message_data => emqx_metric_data(message_metric_meta(), Mode),
+        emqx_delivery_data => emqx_metric_data(delivery_metric_meta(), Mode),
+        emqx_client_data => client_metric_data(Mode),
+        emqx_session_data => emqx_metric_data(session_metric_meta(), Mode),
+        emqx_olp_data => emqx_metric_data(olp_metric_meta(), Mode),
+        emqx_acl_data => emqx_metric_data(acl_metric_meta(), Mode),
+        emqx_authn_data => emqx_metric_data(authn_metric_meta(), Mode),
+        emqx_broker_instr_data => emqx_broker_instr_data(Mode),
+        cluster_rpc => cluster_rpc_data(Mode),
+        mria_data => mria_data(Mode)
+    }}.
+
+fetch_cluster_consistented_data() ->
+    Acc1 = maybe_license_fetch_data(),
+    Acc = maybe_collect_ds_cluster_data(Acc1),
+    Acc#{
+        stats_data_cluster_consistented => stats_data_cluster_consistented(),
+        cert_data => cert_data()
+    }.
+
+aggre_or_zip_init_acc() ->
+    (maybe_add_ds_meta())#{
+        stats_data => meta_to_init_from(stats_metric_meta()),
+        vm_data => meta_to_init_from(vm_metric_meta()),
+        cluster_data => meta_to_init_from(cluster_metric_meta()),
+        emqx_packet_data => meta_to_init_from(emqx_packet_metric_meta()),
+        emqx_message_data => meta_to_init_from(message_metric_meta()),
+        emqx_delivery_data => meta_to_init_from(delivery_metric_meta()),
+        emqx_client_data => meta_to_init_from(client_metric_meta()),
+        emqx_session_data => meta_to_init_from(session_metric_meta()),
+        emqx_olp_data => meta_to_init_from(olp_metric_meta()),
+        emqx_acl_data => meta_to_init_from(acl_metric_meta()),
+        emqx_authn_data => meta_to_init_from(authn_metric_meta()),
+        emqx_broker_instr_data => emqx_broker_instr_init(),
+        cluster_rpc => meta_to_init_from(cluster_rpc_meta()),
+        mria_data => meta_to_init_from(mria_metric_meta())
+    }.
+
+logic_sum_metrics() ->
+    [].
+
+put_namespace_pd(Namespace) when is_binary(Namespace) orelse Namespace == all ->
+    _ = put({?MODULE, ns}, Namespace),
+    ok.
+
+erase_namespace_pd() ->
+    _ = erase({?MODULE, ns}),
+    ok.
+
+get_namespace_pd() ->
+    get({?MODULE, ns}).
+
+%% RPC target (`emqx_prometheus_proto_v3`)
+-spec fetch_namespaced_metrics_v1(all | emqx_config:namespace(), _Mode) -> {node(), map()}.
+fetch_namespaced_metrics_v1(Namespace, Mode) ->
+    {node(), #{
+        packet_data_ns => metric_data_ns(Namespace, packet_metric_ns_meta(), Mode),
+        message_data_ns => metric_data_ns(Namespace, message_metric_ns_meta(), Mode),
+        delivery_data_ns => metric_data_ns(Namespace, delivery_metric_ns_meta(), Mode)
+    }}.
+
+-spec fetch_cluster_wide_namespaced_metrics(all | emqx_config:namespace(), _Mode) -> map().
+fetch_cluster_wide_namespaced_metrics(Namespace, Mode) ->
+    #{
+        session_metric_ns => session_metric_ns(Namespace, session_metric_ns_meta(), Mode),
+        authz_metric_ns => authz_metric_ns(Namespace, authz_metric_ns_meta(), Mode),
+        authn_metric_ns => authn_metric_ns(Namespace, authn_metric_ns_meta(), Mode)
+    }.
 
 %%--------------------------------------------------------------------
 %% Collector
@@ -179,434 +417,1121 @@ create_schema(Name, Help, Data, Type) ->
 
 %%--------------------------------------------------------------------
 %% Stats
-
 %% connections
-emqx_collect(emqx_connections_count, Stats) ->
-    gauge_metric(?C('connections.count', Stats));
-emqx_collect(emqx_connections_max, Stats) ->
-    gauge_metric(?C('connections.max', Stats));
-
+emqx_collect(K = emqx_connections_count, D) -> gauge_metrics(?MG(K, D));
+emqx_collect(K = emqx_connections_max, D) -> gauge_metrics(?MG(K, D));
+emqx_collect(K = emqx_live_connections_count, D) -> gauge_metrics(?MG(K, D));
+emqx_collect(K = emqx_live_connections_max, D) -> gauge_metrics(?MG(K, D));
 %% sessions
-emqx_collect(emqx_sessions_count, Stats) ->
-    gauge_metric(?C('sessions.count', Stats));
-emqx_collect(emqx_sessions_max, Stats) ->
-    gauge_metric(?C('sessions.max', Stats));
-
+emqx_collect(K = emqx_sessions_count, D) -> gauge_metrics(?MG(K, D));
+emqx_collect(K = emqx_sessions_max, D) -> gauge_metrics(?MG(K, D));
+emqx_collect(K = emqx_disconnected_sessions_count, D) -> gauge_metrics(?MG(K, D));
+emqx_collect(K = emqx_channels_count, D) -> gauge_metrics(?MG(K, D));
+emqx_collect(K = emqx_channels_max, D) -> gauge_metrics(?MG(K, D));
+emqx_collect(K = emqx_cluster_sessions_count, D) -> gauge_metrics(?MG(K, D));
+emqx_collect(K = emqx_cluster_sessions_max, D) -> gauge_metrics(?MG(K, D));
 %% pub/sub stats
-emqx_collect(emqx_topics_count, Stats) ->
-    gauge_metric(?C('topics.count', Stats));
-emqx_collect(emqx_topics_max, Stats) ->
-    gauge_metric(?C('topics.max', Stats));
-emqx_collect(emqx_suboptions_count, Stats) ->
-    gauge_metric(?C('suboptions.count', Stats));
-emqx_collect(emqx_suboptions_max, Stats) ->
-    gauge_metric(?C('suboptions.max', Stats));
-emqx_collect(emqx_subscribers_count, Stats) ->
-    gauge_metric(?C('subscribers.count', Stats));
-emqx_collect(emqx_subscribers_max, Stats) ->
-    gauge_metric(?C('subscribers.max', Stats));
-emqx_collect(emqx_subscriptions_count, Stats) ->
-    gauge_metric(?C('subscriptions.count', Stats));
-emqx_collect(emqx_subscriptions_max, Stats) ->
-    gauge_metric(?C('subscriptions.max', Stats));
-emqx_collect(emqx_subscriptions_shared_count, Stats) ->
-    gauge_metric(?C('subscriptions.shared.count', Stats));
-emqx_collect(emqx_subscriptions_shared_max, Stats) ->
-    gauge_metric(?C('subscriptions.shared.max', Stats));
-
-%% routes
-emqx_collect(emqx_routes_count, Stats) ->
-    gauge_metric(?C('routes.count', Stats));
-emqx_collect(emqx_routes_max, Stats) ->
-    gauge_metric(?C('routes.max', Stats));
-
+emqx_collect(K = emqx_durable_subscriptions_count, D) -> gauge_metrics(?MG(K, D));
+emqx_collect(K = emqx_durable_subscriptions_max, D) -> gauge_metrics(?MG(K, D));
+emqx_collect(K = emqx_topics_count, D) -> gauge_metrics(?MG(K, D));
+emqx_collect(K = emqx_topics_max, D) -> gauge_metrics(?MG(K, D));
+emqx_collect(K = emqx_routes_count, D) -> gauge_metrics(?MG(K, D));
+emqx_collect(K = emqx_routes_max, D) -> gauge_metrics(?MG(K, D));
+emqx_collect(K = emqx_suboptions_count, D) -> gauge_metrics(?MG(K, D));
+emqx_collect(K = emqx_suboptions_max, D) -> gauge_metrics(?MG(K, D));
+emqx_collect(K = emqx_subscribers_count, D) -> gauge_metrics(?MG(K, D));
+emqx_collect(K = emqx_subscribers_max, D) -> gauge_metrics(?MG(K, D));
+emqx_collect(K = emqx_subscriptions_count, D) -> gauge_metrics(?MG(K, D));
+emqx_collect(K = emqx_subscriptions_max, D) -> gauge_metrics(?MG(K, D));
+emqx_collect(K = emqx_subscriptions_shared_count, D) -> gauge_metrics(?MG(K, D));
+emqx_collect(K = emqx_subscriptions_shared_max, D) -> gauge_metrics(?MG(K, D));
 %% retained
-emqx_collect(emqx_retained_count, Stats) ->
-    gauge_metric(?C('retained.count', Stats));
-emqx_collect(emqx_retained_max, Stats) ->
-    gauge_metric(?C('retained.max', Stats));
-
-%%--------------------------------------------------------------------
-%% Metrics - packets & bytes
-
-%% bytes
-emqx_collect(emqx_bytes_received, Metrics) ->
-    counter_metric(?C('bytes.received', Metrics));
-emqx_collect(emqx_bytes_sent, Metrics) ->
-    counter_metric(?C('bytes.sent', Metrics));
-
-%% received.sent
-emqx_collect(emqx_packets_received, Metrics) ->
-    counter_metric(?C('packets.received', Metrics));
-emqx_collect(emqx_packets_sent, Metrics) ->
-    counter_metric(?C('packets.sent', Metrics));
-
-%% connect
-emqx_collect(emqx_packets_connect, Metrics) ->
-    counter_metric(?C('packets.connect.received', Metrics));
-emqx_collect(emqx_packets_connack_sent, Metrics) ->
-    counter_metric(?C('packets.connack.sent', Metrics));
-emqx_collect(emqx_packets_connack_error, Metrics) ->
-    counter_metric(?C('packets.connack.error', Metrics));
-emqx_collect(emqx_packets_connack_auth_error, Metrics) ->
-    counter_metric(?C('packets.connack.auth_error', Metrics));
-
-%% sub.unsub
-emqx_collect(emqx_packets_subscribe_received, Metrics) ->
-    counter_metric(?C('packets.subscribe.received', Metrics));
-emqx_collect(emqx_packets_subscribe_auth_error, Metrics) ->
-    counter_metric(?C('packets.subscribe.auth_error', Metrics));
-emqx_collect(emqx_packets_subscribe_error, Metrics) ->
-    counter_metric(?C('packets.subscribe.error', Metrics));
-emqx_collect(emqx_packets_suback_sent, Metrics) ->
-    counter_metric(?C('packets.suback.sent', Metrics));
-emqx_collect(emqx_packets_unsubscribe_received, Metrics) ->
-    counter_metric(?C('packets.unsubscribe.received', Metrics));
-emqx_collect(emqx_packets_unsubscribe_error, Metrics) ->
-    counter_metric(?C('packets.unsubscribe.error', Metrics));
-emqx_collect(emqx_packets_unsuback_sent, Metrics) ->
-    counter_metric(?C('packets.unsuback.sent', Metrics));
-
-%% publish.puback
-emqx_collect(emqx_packets_publish_received, Metrics) ->
-    counter_metric(?C('packets.publish.received', Metrics));
-emqx_collect(emqx_packets_publish_sent, Metrics) ->
-    counter_metric(?C('packets.publish.sent', Metrics));
-emqx_collect(emqx_packets_publish_inuse, Metrics) ->
-    counter_metric(?C('packets.publish.inuse', Metrics));
-emqx_collect(emqx_packets_publish_error, Metrics) ->
-    counter_metric(?C('packets.publish.error', Metrics));
-emqx_collect(emqx_packets_publish_auth_error, Metrics) ->
-    counter_metric(?C('packets.publish.auth_error', Metrics));
-emqx_collect(emqx_packets_publish_dropped, Metrics) ->
-    counter_metric(?C('packets.publish.dropped', Metrics));
-
-%% puback
-emqx_collect(emqx_packets_puback_received, Metrics) ->
-    counter_metric(?C('packets.puback.received', Metrics));
-emqx_collect(emqx_packets_puback_sent, Metrics) ->
-    counter_metric(?C('packets.puback.sent', Metrics));
-emqx_collect(emqx_packets_puback_inuse, Metrics) ->
-    counter_metric(?C('packets.puback.inuse', Metrics));
-emqx_collect(emqx_packets_puback_missed, Metrics) ->
-    counter_metric(?C('packets.puback.missed', Metrics));
-
-%% pubrec
-emqx_collect(emqx_packets_pubrec_received, Metrics) ->
-    counter_metric(?C('packets.pubrec.received', Metrics));
-emqx_collect(emqx_packets_pubrec_sent, Metrics) ->
-    counter_metric(?C('packets.pubrec.sent', Metrics));
-emqx_collect(emqx_packets_pubrec_inuse, Metrics) ->
-    counter_metric(?C('packets.pubrec.inuse', Metrics));
-emqx_collect(emqx_packets_pubrec_missed, Metrics) ->
-    counter_metric(?C('packets.pubrec.missed', Metrics));
-
-%% pubrel
-emqx_collect(emqx_packets_pubrel_received, Metrics) ->
-    counter_metric(?C('packets.pubrel.received', Metrics));
-emqx_collect(emqx_packets_pubrel_sent, Metrics) ->
-    counter_metric(?C('packets.pubrel.sent', Metrics));
-emqx_collect(emqx_packets_pubrel_missed, Metrics) ->
-    counter_metric(?C('packets.pubrel.missed', Metrics));
-
-%% pubcomp
-emqx_collect(emqx_packets_pubcomp_received, Metrics) ->
-    counter_metric(?C('packets.pubcomp.received', Metrics));
-emqx_collect(emqx_packets_pubcomp_sent, Metrics) ->
-    counter_metric(?C('packets.pubcomp.sent', Metrics));
-emqx_collect(emqx_packets_pubcomp_inuse, Metrics) ->
-    counter_metric(?C('packets.pubcomp.inuse', Metrics));
-emqx_collect(emqx_packets_pubcomp_missed, Metrics) ->
-    counter_metric(?C('packets.pubcomp.missed', Metrics));
-
-%% pingreq
-emqx_collect(emqx_packets_pingreq_received, Metrics) ->
-    counter_metric(?C('packets.pingreq.received', Metrics));
-emqx_collect(emqx_packets_pingresp_sent, Metrics) ->
-    counter_metric(?C('packets.pingresp.sent', Metrics));
-
-%% disconnect
-emqx_collect(emqx_packets_disconnect_received, Metrics) ->
-    counter_metric(?C('packets.disconnect.received', Metrics));
-emqx_collect(emqx_packets_disconnect_sent, Metrics) ->
-    counter_metric(?C('packets.disconnect.sent', Metrics));
-
-%% auth
-emqx_collect(emqx_packets_auth_received, Metrics) ->
-    counter_metric(?C('packets.auth.received', Metrics));
-emqx_collect(emqx_packets_auth_sent, Metrics) ->
-    counter_metric(?C('packets.auth.sent', Metrics));
-
-%%--------------------------------------------------------------------
-%% Metrics - messages
-
-%% messages
-emqx_collect(emqx_messages_received, Metrics) ->
-    counter_metric(?C('messages.received', Metrics));
-
-emqx_collect(emqx_messages_sent, Metrics) ->
-    counter_metric(?C('messages.sent', Metrics));
-
-emqx_collect(emqx_messages_qos0_received, Metrics) ->
-    counter_metric(?C('messages.qos0.received', Metrics));
-emqx_collect(emqx_messages_qos0_sent, Metrics) ->
-    counter_metric(?C('messages.qos0.sent', Metrics));
-
-emqx_collect(emqx_messages_qos1_received, Metrics) ->
-    counter_metric(?C('messages.qos1.received', Metrics));
-emqx_collect(emqx_messages_qos1_sent, Metrics) ->
-    counter_metric(?C('messages.qos1.sent', Metrics));
-
-emqx_collect(emqx_messages_qos2_received, Metrics) ->
-    counter_metric(?C('messages.qos2.received', Metrics));
-emqx_collect(emqx_messages_qos2_sent, Metrics) ->
-    counter_metric(?C('messages.qos2.sent', Metrics));
-
-emqx_collect(emqx_messages_publish, Metrics) ->
-    counter_metric(?C('messages.publish', Metrics));
-
-emqx_collect(emqx_messages_dropped, Metrics) ->
-    counter_metric(?C('messages.dropped', Metrics));
-
-emqx_collect(emqx_messages_dropped_expired, Metrics) ->
-    counter_metric(?C('messages.dropped.expired', Metrics));
-
-emqx_collect(emqx_messages_dropped_no_subscribers, Metrics) ->
-    counter_metric(?C('messages.dropped.no_subscribers', Metrics));
-
-emqx_collect(emqx_messages_forward, Metrics) ->
-    counter_metric(?C('messages.forward', Metrics));
-
-emqx_collect(emqx_messages_retained, Metrics) ->
-    counter_metric(?C('messages.retained', Metrics));
-
-emqx_collect(emqx_messages_delayed, Stats) ->
-    counter_metric(?C('messages.delayed', Stats));
-
-emqx_collect(emqx_messages_delivered, Stats) ->
-    counter_metric(?C('messages.delivered', Stats));
-
-emqx_collect(emqx_messages_acked, Stats) ->
-    counter_metric(?C('messages.acked', Stats));
-
-%%--------------------------------------------------------------------
-%% Metrics - delivery
-
-emqx_collect(emqx_delivery_dropped, Stats) ->
-    counter_metric(?C('delivery.dropped', Stats));
-emqx_collect(emqx_delivery_dropped_no_local, Stats) ->
-    counter_metric(?C('delivery.dropped.no_local', Stats));
-emqx_collect(emqx_delivery_dropped_too_large, Stats) ->
-    counter_metric(?C('delivery.dropped.too_large', Stats));
-emqx_collect(emqx_delivery_dropped_qos0_msg, Stats) ->
-    counter_metric(?C('delivery.dropped.qos0_msg', Stats));
-emqx_collect(emqx_delivery_dropped_queue_full, Stats) ->
-    counter_metric(?C('delivery.dropped.queue_full', Stats));
-emqx_collect(emqx_delivery_dropped_expired, Stats) ->
-    counter_metric(?C('delivery.dropped.expired', Stats));
-
-%%--------------------------------------------------------------------
-%% Metrics - client
-
-emqx_collect(emqx_client_connected, Stats) ->
-    counter_metric(?C('client.connected', Stats));
-emqx_collect(emqx_client_authenticate, Stats) ->
-    counter_metric(?C('client.authenticate', Stats));
-emqx_collect(emqx_client_auth_anonymous, Stats) ->
-    counter_metric(?C('client.auth.anonymous', Stats));
-emqx_collect(emqx_client_check_acl, Stats) ->
-    counter_metric(?C('client.check_acl', Stats));
-emqx_collect(emqx_client_subscribe, Stats) ->
-    counter_metric(?C('client.subscribe', Stats));
-emqx_collect(emqx_client_unsubscribe, Stats) ->
-    counter_metric(?C('client.unsubscribe', Stats));
-emqx_collect(emqx_client_disconnected, Stats) ->
-    counter_metric(?C('client.disconnected', Stats));
-
-%%--------------------------------------------------------------------
-%% Metrics - session
-
-emqx_collect(emqx_session_created, Stats) ->
-    counter_metric(?C('session.created', Stats));
-emqx_collect(emqx_session_resumed, Stats) ->
-    counter_metric(?C('session.resumed', Stats));
-emqx_collect(emqx_session_takeovered, Stats) ->
-    counter_metric(?C('session.takeovered', Stats));
-emqx_collect(emqx_session_discarded, Stats) ->
-    counter_metric(?C('session.discarded', Stats));
-emqx_collect(emqx_session_terminated, Stats) ->
-    counter_metric(?C('session.terminated', Stats));
-
+emqx_collect(K = emqx_retained_count, D) -> gauge_metrics(?MG(K, D));
+emqx_collect(K = emqx_retained_max, D) -> gauge_metrics(?MG(K, D));
+%% delayed
+emqx_collect(K = emqx_delayed_count, D) -> gauge_metrics(?MG(K, D));
+emqx_collect(K = emqx_delayed_max, D) -> gauge_metrics(?MG(K, D));
 %%--------------------------------------------------------------------
 %% VM
-
-emqx_collect(emqx_vm_cpu_use, VMData) ->
-    gauge_metric(?C(cpu_use, VMData));
-
-emqx_collect(emqx_vm_cpu_idle, VMData) ->
-    gauge_metric(?C(cpu_idle, VMData));
-
-emqx_collect(emqx_vm_run_queue, VMData) ->
-    gauge_metric(?C(run_queue, VMData));
-
-emqx_collect(emqx_vm_process_messages_in_queues, VMData) ->
-    gauge_metric(?C(process_total_messages, VMData));
-
-emqx_collect(emqx_vm_total_memory, VMData) ->
-    gauge_metric(?C(total_memory, VMData));
-
-emqx_collect(emqx_vm_used_memory, VMData) ->
-    gauge_metric(?C(used_memory, VMData));
-
-emqx_collect(emqx_cluster_nodes_running, ClusterData) ->
-    gauge_metric(?C(nodes_running, ClusterData));
-
-emqx_collect(emqx_cluster_nodes_stopped, ClusterData) ->
-    gauge_metric(?C(nodes_stopped, ClusterData)).
+emqx_collect(K = emqx_vm_cpu_use, D) -> gauge_metrics(?MG(K, D));
+emqx_collect(K = emqx_vm_cpu_idle, D) -> gauge_metrics(?MG(K, D));
+emqx_collect(K = emqx_vm_run_queue, D) -> gauge_metrics(?MG(K, D));
+emqx_collect(K = emqx_vm_uptime_ms, D) -> gauge_metrics(?MG(K, D));
+emqx_collect(K = emqx_vm_max_fds, D) -> gauge_metrics(?MG(K, D));
+emqx_collect(K = emqx_vm_total_memory, D) -> gauge_metrics(?MG(K, D));
+emqx_collect(K = emqx_vm_used_memory, D) -> gauge_metrics(?MG(K, D));
+emqx_collect(K = emqx_vm_mnesia_tm_mailbox_size, D) -> gauge_metrics(?MG(K, D));
+emqx_collect(K = emqx_vm_broker_pool_max_mailbox_size, D) -> gauge_metrics(?MG(K, D));
+%%--------------------------------------------------------------------
+%% Cluster Info
+emqx_collect(K = emqx_cluster_nodes_running, D) -> gauge_metrics(?MG(K, D));
+emqx_collect(K = emqx_cluster_nodes_stopped, D) -> gauge_metrics(?MG(K, D));
+%%--------------------------------------------------------------------
+%% Metrics - packets & bytes
+%% bytes
+emqx_collect(K = emqx_bytes_received, D) -> counter_metrics(?MG(K, D));
+emqx_collect(K = emqx_bytes_sent, D) -> counter_metrics(?MG(K, D));
+%% received.sent
+emqx_collect(K = emqx_packets_received, D) -> counter_metrics(?MG(K, D));
+emqx_collect(K = emqx_packets_sent, D) -> counter_metrics(?MG(K, D));
+%% connect
+emqx_collect(K = emqx_packets_connect, D) -> counter_metrics(?MG(K, D));
+emqx_collect(K = emqx_packets_connack_sent, D) -> counter_metrics(?MG(K, D));
+emqx_collect(K = emqx_packets_connack_error, D) -> counter_metrics(?MG(K, D));
+emqx_collect(K = emqx_packets_connack_auth_error, D) -> counter_metrics(?MG(K, D));
+%% sub.unsub
+emqx_collect(K = emqx_packets_subscribe_received, D) -> counter_metrics(?MG(K, D));
+emqx_collect(K = emqx_packets_subscribe_auth_error, D) -> counter_metrics(?MG(K, D));
+emqx_collect(K = emqx_packets_subscribe_error, D) -> counter_metrics(?MG(K, D));
+emqx_collect(K = emqx_packets_suback_sent, D) -> counter_metrics(?MG(K, D));
+emqx_collect(K = emqx_packets_unsubscribe_received, D) -> counter_metrics(?MG(K, D));
+emqx_collect(K = emqx_packets_unsubscribe_error, D) -> counter_metrics(?MG(K, D));
+emqx_collect(K = emqx_packets_unsuback_sent, D) -> counter_metrics(?MG(K, D));
+%% publish.puback
+emqx_collect(K = emqx_packets_publish_received, D) -> counter_metrics(?MG(K, D));
+emqx_collect(K = emqx_packets_publish_sent, D) -> counter_metrics(?MG(K, D));
+emqx_collect(K = emqx_packets_publish_inuse, D) -> counter_metrics(?MG(K, D));
+emqx_collect(K = emqx_packets_publish_error, D) -> counter_metrics(?MG(K, D));
+emqx_collect(K = emqx_packets_publish_auth_error, D) -> counter_metrics(?MG(K, D));
+emqx_collect(K = emqx_packets_publish_quota_exceeded, D) -> counter_metrics(?MG(K, D));
+%% puback
+emqx_collect(K = emqx_packets_puback_received, D) -> counter_metrics(?MG(K, D));
+emqx_collect(K = emqx_packets_puback_sent, D) -> counter_metrics(?MG(K, D));
+emqx_collect(K = emqx_packets_puback_inuse, D) -> counter_metrics(?MG(K, D));
+emqx_collect(K = emqx_packets_puback_missed, D) -> counter_metrics(?MG(K, D));
+%% pubrec
+emqx_collect(K = emqx_packets_pubrec_received, D) -> counter_metrics(?MG(K, D));
+emqx_collect(K = emqx_packets_pubrec_sent, D) -> counter_metrics(?MG(K, D));
+emqx_collect(K = emqx_packets_pubrec_inuse, D) -> counter_metrics(?MG(K, D));
+emqx_collect(K = emqx_packets_pubrec_missed, D) -> counter_metrics(?MG(K, D));
+%% pubrel
+emqx_collect(K = emqx_packets_pubrel_received, D) -> counter_metrics(?MG(K, D));
+emqx_collect(K = emqx_packets_pubrel_sent, D) -> counter_metrics(?MG(K, D));
+emqx_collect(K = emqx_packets_pubrel_missed, D) -> counter_metrics(?MG(K, D));
+%% pubcomp
+emqx_collect(K = emqx_packets_pubcomp_received, D) -> counter_metrics(?MG(K, D));
+emqx_collect(K = emqx_packets_pubcomp_sent, D) -> counter_metrics(?MG(K, D));
+emqx_collect(K = emqx_packets_pubcomp_inuse, D) -> counter_metrics(?MG(K, D));
+emqx_collect(K = emqx_packets_pubcomp_missed, D) -> counter_metrics(?MG(K, D));
+%% pingreq
+emqx_collect(K = emqx_packets_pingreq_received, D) -> counter_metrics(?MG(K, D));
+emqx_collect(K = emqx_packets_pingresp_sent, D) -> counter_metrics(?MG(K, D));
+%% disconnect
+emqx_collect(K = emqx_packets_disconnect_received, D) -> counter_metrics(?MG(K, D));
+emqx_collect(K = emqx_packets_disconnect_sent, D) -> counter_metrics(?MG(K, D));
+%% auth
+emqx_collect(K = emqx_packets_auth_received, D) -> counter_metrics(?MG(K, D));
+emqx_collect(K = emqx_packets_auth_sent, D) -> counter_metrics(?MG(K, D));
+%%--------------------------------------------------------------------
+%% Metrics - messages
+%% messages
+emqx_collect(K = emqx_messages_received, D) -> counter_metrics(?MG(K, D));
+emqx_collect(K = emqx_messages_sent, D) -> counter_metrics(?MG(K, D));
+emqx_collect(K = emqx_messages_qos0_received, D) -> counter_metrics(?MG(K, D));
+emqx_collect(K = emqx_messages_qos0_sent, D) -> counter_metrics(?MG(K, D));
+emqx_collect(K = emqx_messages_qos1_received, D) -> counter_metrics(?MG(K, D));
+emqx_collect(K = emqx_messages_qos1_sent, D) -> counter_metrics(?MG(K, D));
+emqx_collect(K = emqx_messages_qos2_received, D) -> counter_metrics(?MG(K, D));
+emqx_collect(K = emqx_messages_qos2_sent, D) -> counter_metrics(?MG(K, D));
+emqx_collect(K = emqx_messages_publish, D) -> counter_metrics(?MG(K, D));
+emqx_collect(K = emqx_messages_dropped, D) -> counter_metrics(?MG(K, D));
+emqx_collect(K = emqx_messages_dropped_expired, D) -> counter_metrics(?MG(K, D));
+emqx_collect(K = emqx_messages_dropped_no_subscribers, D) -> counter_metrics(?MG(K, D));
+emqx_collect(K = emqx_messages_dropped_quota_exceeded, D) -> counter_metrics(?MG(K, D));
+emqx_collect(K = emqx_messages_dropped_receive_maximum, D) -> counter_metrics(?MG(K, D));
+emqx_collect(K = emqx_messages_rejected_quota_exceeded, D) -> counter_metrics(?MG(K, D));
+emqx_collect(K = emqx_messages_forward, D) -> counter_metrics(?MG(K, D));
+emqx_collect(K = emqx_messages_retained, D) -> counter_metrics(?MG(K, D));
+emqx_collect(K = emqx_messages_delayed, D) -> counter_metrics(?MG(K, D));
+emqx_collect(K = emqx_messages_delivered, D) -> counter_metrics(?MG(K, D));
+emqx_collect(K = emqx_messages_acked, D) -> counter_metrics(?MG(K, D));
+%%--------------------------------------------------------------------
+%% Metrics - delivery
+emqx_collect(K = emqx_delivery_dropped, D) -> counter_metrics(?MG(K, D));
+emqx_collect(K = emqx_delivery_dropped_no_local, D) -> counter_metrics(?MG(K, D));
+emqx_collect(K = emqx_delivery_dropped_too_large, D) -> counter_metrics(?MG(K, D));
+emqx_collect(K = emqx_delivery_dropped_qos0_msg, D) -> counter_metrics(?MG(K, D));
+emqx_collect(K = emqx_delivery_dropped_queue_full, D) -> counter_metrics(?MG(K, D));
+emqx_collect(K = emqx_delivery_dropped_expired, D) -> counter_metrics(?MG(K, D));
+%%--------------------------------------------------------------------
+%% Metrics - client
+emqx_collect(K = emqx_client_connect, D) -> counter_metrics(?MG(K, D));
+emqx_collect(K = emqx_client_connack, D) -> counter_metrics(?MG(K, D));
+emqx_collect(K = emqx_client_connected, D) -> counter_metrics(?MG(K, D));
+emqx_collect(K = emqx_client_authenticate, D) -> counter_metrics(?MG(K, D));
+emqx_collect(K = emqx_client_auth_anonymous, D) -> counter_metrics(?MG(K, D));
+emqx_collect(K = emqx_client_authorize, D) -> counter_metrics(?MG(K, D));
+emqx_collect(K = emqx_client_subscribe, D) -> counter_metrics(?MG(K, D));
+emqx_collect(K = emqx_client_unsubscribe, D) -> counter_metrics(?MG(K, D));
+emqx_collect(K = emqx_client_disconnected, D) -> counter_metrics(?MG(K, D));
+emqx_collect(K = emqx_client_disconnected_reason, D) -> counter_metrics(?MG(K, D));
+emqx_collect(K = emqx_client_accept_result, D) -> counter_metrics(?MG(K, D));
+%%--------------------------------------------------------------------
+%% Metrics - session
+emqx_collect(K = emqx_session_created, D) -> counter_metrics(?MG(K, D));
+emqx_collect(K = emqx_session_resumed, D) -> counter_metrics(?MG(K, D));
+emqx_collect(K = emqx_session_takenover, D) -> counter_metrics(?MG(K, D));
+emqx_collect(K = emqx_session_discarded, D) -> counter_metrics(?MG(K, D));
+emqx_collect(K = emqx_session_terminated, D) -> counter_metrics(?MG(K, D));
+%%--------------------------------------------------------------------
+%% Metrics - overload protection
+emqx_collect(K = emqx_overload_protection_delay_ok, D) -> counter_metrics(?MG(K, D));
+emqx_collect(K = emqx_overload_protection_delay_timeout, D) -> counter_metrics(?MG(K, D));
+emqx_collect(K = emqx_overload_protection_hibernation, D) -> counter_metrics(?MG(K, D));
+emqx_collect(K = emqx_overload_protection_gc, D) -> counter_metrics(?MG(K, D));
+emqx_collect(K = emqx_overload_protection_new_conn, D) -> counter_metrics(?MG(K, D));
+%%--------------------------------------------------------------------
+%% Metrics - acl
+emqx_collect(K = emqx_authorization_allow, D) -> counter_metrics(?MG(K, D));
+emqx_collect(K = emqx_authorization_deny, D) -> counter_metrics(?MG(K, D));
+emqx_collect(K = emqx_authorization_cache_hit, D) -> counter_metrics(?MG(K, D));
+emqx_collect(K = emqx_authorization_cache_miss, D) -> counter_metrics(?MG(K, D));
+emqx_collect(K = emqx_authorization_superuser, D) -> counter_metrics(?MG(K, D));
+emqx_collect(K = emqx_authorization_nomatch, D) -> counter_metrics(?MG(K, D));
+emqx_collect(K = emqx_authorization_matched_allow, D) -> counter_metrics(?MG(K, D));
+emqx_collect(K = emqx_authorization_matched_deny, D) -> counter_metrics(?MG(K, D));
+%% This comes from a cluster-wide collection (namespaced)
+emqx_collect(K = emqx_authz_builtin_record_count, D) -> gauge_metrics(?MG(K, D));
+%%--------------------------------------------------------------------
+%% Metrics - authn
+emqx_collect(K = emqx_authentication_success, D) -> counter_metrics(?MG(K, D));
+emqx_collect(K = emqx_authentication_success_anonymous, D) -> counter_metrics(?MG(K, D));
+emqx_collect(K = emqx_authentication_failure, D) -> counter_metrics(?MG(K, D));
+%% This comes from a cluster-wide collection (namespaced)
+emqx_collect(K = emqx_authn_builtin_record_count, D) -> gauge_metrics(?MG(K, D));
+%%--------------------------------------------------------------------
+%% License
+emqx_collect(K = emqx_license_max_sessions, D) -> gauge_metric(?MG(K, D));
+emqx_collect(K = emqx_license_expiry_at, D) -> gauge_metric(?MG(K, D));
+emqx_collect(K = emqx_license_issued_at, D) -> gauge_metric(?MG(K, D));
+%%--------------------------------------------------------------------
+%% Certs
+emqx_collect(K = emqx_cert_expiry_at, D) -> gauge_metrics(?MG(K, D));
+%% Cluster RPC
+emqx_collect(K = emqx_conf_sync_txid, D) -> gauge_metrics(?MG(K, D));
+%% Mria
+%% ========== core
+emqx_collect(K = emqx_mria_last_intercepted_trans, D) -> gauge_metrics(?MG(K, D, []));
+emqx_collect(K = emqx_mria_weight, D) -> gauge_metrics(?MG(K, D, []));
+emqx_collect(K = emqx_mria_replicants, D) -> gauge_metrics(?MG(K, D, []));
+emqx_collect(K = emqx_mria_server_mql, D) -> gauge_metrics(?MG(K, D, []));
+%% ========== replicant
+emqx_collect(K = emqx_mria_lag, D) -> gauge_metrics(?MG(K, D, []));
+emqx_collect(K = emqx_mria_bootstrap_time, D) -> gauge_metrics(?MG(K, D, []));
+emqx_collect(K = emqx_mria_bootstrap_num_keys, D) -> gauge_metrics(?MG(K, D, []));
+emqx_collect(K = emqx_mria_message_queue_len, D) -> gauge_metrics(?MG(K, D, []));
+emqx_collect(K = emqx_mria_replayq_len, D) -> gauge_metrics(?MG(K, D, []));
+%% DS
+emqx_collect(K = ?DS_BUFFER_BATCHES, D) -> counter_metrics(?MG(K, D, []));
+emqx_collect(K = ?DS_BUFFER_BATCHES_RETRY, D) -> counter_metrics(?MG(K, D, []));
+emqx_collect(K = ?DS_BUFFER_BATCHES_FAILED, D) -> counter_metrics(?MG(K, D, []));
+emqx_collect(K = ?DS_BUFFER_MESSAGES, D) -> counter_metrics(?MG(K, D, []));
+emqx_collect(K = ?DS_BUFFER_BYTES, D) -> counter_metrics(?MG(K, D, []));
+emqx_collect(K = ?DS_BUFFER_FLUSH_TIME, D) -> gauge_metrics(?MG(K, D, []));
+emqx_collect(K = ?DS_BUFFER_LATENCY, D) -> gauge_metrics(?MG(K, D, []));
+emqx_collect(K = ?DS_STORE_BATCH_TIME, D) -> gauge_metrics(?MG(K, D, []));
+emqx_collect(K = ?DS_BUILTIN_NEXT_TIME, D) -> gauge_metrics(?MG(K, D, []));
+emqx_collect(K = ?DS_SKIPSTREAM_LTS_SEEK, D) -> counter_metrics(?MG(K, D, []));
+emqx_collect(K = ?DS_SKIPSTREAM_LTS_NEXT, D) -> counter_metrics(?MG(K, D, []));
+emqx_collect(K = ?DS_SKIPSTREAM_LTS_HASH_COLLISION, D) -> counter_metrics(?MG(K, D, []));
+emqx_collect(K = ?DS_SKIPSTREAM_LTS_HIT, D) -> counter_metrics(?MG(K, D, []));
+emqx_collect(K = ?DS_SKIPSTREAM_LTS_MISS, D) -> counter_metrics(?MG(K, D, []));
+emqx_collect(K = ?DS_SKIPSTREAM_LTS_FUTURE, D) -> counter_metrics(?MG(K, D, []));
+emqx_collect(K = ?DS_SKIPSTREAM_LTS_EOS, D) -> counter_metrics(?MG(K, D, []));
+%% DS beamformer:
+emqx_collect(K = ?DS_SUBS_FANOUT_TIME, D) -> gauge_metrics(?MG(K, D, []));
+emqx_collect(K = ?DS_SUBS_STUCK_TOTAL, D) -> counter_metrics(?MG(K, D, []));
+emqx_collect(K = ?DS_SUBS_UNSTUCK_TOTAL, D) -> counter_metrics(?MG(K, D, []));
+%% DS beamformer worker:
+emqx_collect(K = ?DS_SUBS, D) -> gauge_metrics(?MG(K, D, []));
+emqx_collect(K = ?DS_SUBS_HANDOVER, D) -> gauge_metrics(?MG(K, D, []));
+emqx_collect(K = ?DS_SUBS_PROCESS_COMMANDS_TIME, D) -> gauge_metrics(?MG(K, D, []));
+emqx_collect(K = ?DS_SUBS_BEAMS_SENT_TOTAL, D) -> gauge_metrics(?MG(K, D, []));
+emqx_collect(K = ?DS_SUBS_REQUEST_SHARING, D) -> gauge_metrics(?MG(K, D, []));
+emqx_collect(K = ?DS_SUBS_FULFILL_TIME, D) -> counter_metrics(?MG(K, D, []));
+emqx_collect(K = ?DS_SUBS_SCAN_TIME, D) -> counter_metrics(?MG(K, D, []));
+%% DS DB group metrics:
+emqx_collect(K = ?DS_DISK_USAGE, D) -> counter_metrics(?MG(K, D, []));
+emqx_collect(K = ?DS_WRITE_BUFFER_MEM, D) -> counter_metrics(?MG(K, D, []));
+emqx_collect(K = ?DS_TRASH_SIZE, D) -> counter_metrics(?MG(K, D, [])).
 
 %%--------------------------------------------------------------------
 %% Indicators
 %%--------------------------------------------------------------------
 
-emqx_stats() ->
-    [ emqx_connections_count
-    , emqx_connections_max
-    , emqx_sessions_count
-    , emqx_sessions_max
-    , emqx_topics_count
-    , emqx_topics_max
-    , emqx_suboptions_count
-    , emqx_suboptions_max
-    , emqx_subscribers_count
-    , emqx_subscribers_max
-    , emqx_subscriptions_count
-    , emqx_subscriptions_max
-    , emqx_subscriptions_shared_count
-    , emqx_subscriptions_shared_max
-    , emqx_routes_count
-    , emqx_routes_max
-    , emqx_retained_count
-    , emqx_retained_max
+%%========================================
+%% Stats
+%%========================================
+
+stats_metric_meta() ->
+    [
+        %% connections
+        {emqx_connections_count, gauge, 'connections.count'},
+        {emqx_connections_max, gauge, 'connections.max'},
+        {emqx_live_connections_count, gauge, 'live_connections.count'},
+        {emqx_live_connections_max, gauge, 'live_connections.max'},
+        %% sessions
+        {emqx_sessions_count, gauge, 'sessions.count'},
+        {emqx_sessions_max, gauge, 'sessions.max'},
+        {emqx_disconnected_sessions_count, gauge, 'disconnected_sessions.count'},
+        {emqx_channels_count, gauge, 'channels.count'},
+        {emqx_channels_max, gauge, 'channels.max'},
+        %% pub/sub stats
+        {emqx_suboptions_count, gauge, 'suboptions.count'},
+        {emqx_suboptions_max, gauge, 'suboptions.max'},
+        {emqx_subscribers_count, gauge, 'subscribers.count'},
+        {emqx_subscribers_max, gauge, 'subscribers.max'},
+        {emqx_subscriptions_count, gauge, 'subscriptions.count'},
+        {emqx_subscriptions_max, gauge, 'subscriptions.max'},
+        {emqx_durable_subscriptions_count, gauge, 'durable_subscriptions.count'},
+        {emqx_durable_subscriptions_max, gauge, 'durable_subscriptions.max'},
+        %% delayed
+        {emqx_delayed_count, gauge, 'delayed.count'},
+        {emqx_delayed_max, gauge, 'delayed.max'}
     ].
 
-emqx_metrics_packets() ->
-    [ emqx_bytes_received
-    , emqx_bytes_sent
-    , emqx_packets_received
-    , emqx_packets_sent
-    , emqx_packets_connect
-    , emqx_packets_connack_sent
-    , emqx_packets_connack_error
-    , emqx_packets_connack_auth_error
-    , emqx_packets_publish_received
-    , emqx_packets_publish_sent
-    , emqx_packets_publish_inuse
-    , emqx_packets_publish_error
-    , emqx_packets_publish_auth_error
-    , emqx_packets_publish_dropped
-    , emqx_packets_puback_received
-    , emqx_packets_puback_sent
-    , emqx_packets_puback_inuse
-    , emqx_packets_puback_missed
-    , emqx_packets_pubrec_received
-    , emqx_packets_pubrec_sent
-    , emqx_packets_pubrec_inuse
-    , emqx_packets_pubrec_missed
-    , emqx_packets_pubrel_received
-    , emqx_packets_pubrel_sent
-    , emqx_packets_pubrel_missed
-    , emqx_packets_pubcomp_received
-    , emqx_packets_pubcomp_sent
-    , emqx_packets_pubcomp_inuse
-    , emqx_packets_pubcomp_missed
-    , emqx_packets_subscribe_received
-    , emqx_packets_subscribe_error
-    , emqx_packets_subscribe_auth_error
-    , emqx_packets_suback_sent
-    , emqx_packets_unsubscribe_received
-    , emqx_packets_unsubscribe_error
-    , emqx_packets_unsuback_sent
-    , emqx_packets_pingreq_received
-    , emqx_packets_pingresp_sent
-    , emqx_packets_disconnect_received
-    , emqx_packets_disconnect_sent
-    , emqx_packets_auth_received
-    , emqx_packets_auth_sent
+stats_metric_cluster_consistented_meta() ->
+    [
+        %% sessions
+        {emqx_cluster_sessions_count, gauge, 'cluster_sessions.count'},
+        {emqx_cluster_sessions_max, gauge, 'cluster_sessions.max'},
+        %% topics
+        {emqx_topics_max, gauge, 'topics.max'},
+        {emqx_topics_count, gauge, 'topics.count'},
+        %% routes
+        {emqx_routes_count, gauge, 'routes.count'},
+        {emqx_routes_max, gauge, 'routes.max'},
+        %% retained
+        {emqx_retained_count, gauge, 'retained.count'},
+        {emqx_retained_max, gauge, 'retained.max'},
+        %% shared subscriptions
+        {emqx_subscriptions_shared_count, gauge, 'subscriptions.shared.count'},
+        {emqx_subscriptions_shared_max, gauge, 'subscriptions.shared.max'}
     ].
 
-emqx_metrics_messages() ->
-    [ emqx_messages_received
-    , emqx_messages_sent
-    , emqx_messages_qos0_received
-    , emqx_messages_qos0_sent
-    , emqx_messages_qos1_received
-    , emqx_messages_qos1_sent
-    , emqx_messages_qos2_received
-    , emqx_messages_qos2_sent
-    , emqx_messages_publish
-    , emqx_messages_dropped
-    , emqx_messages_dropped_expired
-    , emqx_messages_dropped_no_subscribers
-    , emqx_messages_forward
-    , emqx_messages_retained
-    , emqx_messages_delayed
-    , emqx_messages_delivered
-    , emqx_messages_acked
+stats_data(Mode) ->
+    Stats = emqx_stats:getstats(),
+    lists:foldl(
+        fun({Name, _Type, MetricKAtom}, AccIn) ->
+            AccIn#{Name => [{with_node_label(Mode, []), ?C(MetricKAtom, Stats)}]}
+        end,
+        #{},
+        stats_metric_meta()
+    ).
+
+stats_data_cluster_consistented() ->
+    Stats = emqx_stats:getstats(),
+    lists:foldl(
+        fun({Name, _Type, MetricKAtom}, AccIn) ->
+            AccIn#{Name => [{[], ?C(MetricKAtom, Stats)}]}
+        end,
+        #{},
+        stats_metric_cluster_consistented_meta()
+    ).
+
+%%========================================
+%% Erlang VM
+%%========================================
+
+vm_metric_meta() ->
+    [
+        {emqx_vm_cpu_use, gauge, 'cpu_use'},
+        {emqx_vm_cpu_idle, gauge, 'cpu_idle'},
+        {emqx_vm_run_queue, gauge, 'run_queue'},
+        {emqx_vm_uptime_ms, gauge, 'uptime'},
+        {emqx_vm_max_fds, gauge, 'max_fds'},
+        {emqx_vm_total_memory, gauge, 'total_memory'},
+        {emqx_vm_used_memory, gauge, 'used_memory'},
+        {emqx_vm_mnesia_tm_mailbox_size, gauge, 'mnesia_tm_mailbox_size'},
+        {emqx_vm_broker_pool_max_mailbox_size, gauge, 'broker_pool_max_mailbox_size'}
     ].
 
-emqx_metrics_delivery() ->
-    [ emqx_delivery_dropped
-    , emqx_delivery_dropped_no_local
-    , emqx_delivery_dropped_too_large
-    , emqx_delivery_dropped_qos0_msg
-    , emqx_delivery_dropped_queue_full
-    , emqx_delivery_dropped_expired
+vm_data(Mode) ->
+    VmStats = emqx_mgmt:vm_stats(),
+    lists:foldl(
+        fun({Name, _Type, MetricKAtom}, AccIn) ->
+            Labels =
+                case Mode of
+                    ?PROM_DATA_MODE__NODE ->
+                        [];
+                    _ ->
+                        [{node, node(self())}]
+                end,
+            AccIn#{Name => [{Labels, ?C(MetricKAtom, VmStats)}]}
+        end,
+        #{},
+        vm_metric_meta()
+    ).
+
+%%========================================
+%% Cluster
+%%========================================
+
+cluster_metric_meta() ->
+    [
+        {emqx_cluster_nodes_running, gauge, undefined},
+        {emqx_cluster_nodes_stopped, gauge, undefined}
     ].
 
-emqx_metrics_client() ->
-    [ emqx_client_connected
-    , emqx_client_authenticate
-    , emqx_client_auth_anonymous
-    , emqx_client_check_acl
-    , emqx_client_subscribe
-    , emqx_client_unsubscribe
-    , emqx_client_disconnected
+cluster_data(node) ->
+    Labels = [],
+    do_cluster_data(Labels);
+cluster_data(_) ->
+    Labels = [{node, node(self())}],
+    do_cluster_data(Labels).
+
+do_cluster_data(Labels) ->
+    Running = emqx:cluster_nodes(running),
+    Stopped = emqx:cluster_nodes(stopped),
+    #{
+        emqx_cluster_nodes_running => [{Labels, length(Running)}],
+        emqx_cluster_nodes_stopped => [{Labels, length(Stopped)}]
+    }.
+
+%%========================================
+%% Metrics
+%%========================================
+
+emqx_metric_data(MetricNameTypeKeyL, Mode) ->
+    emqx_metric_data(MetricNameTypeKeyL, Mode, _Acc = #{}).
+
+emqx_metric_data(MetricNameTypeKeyL, Mode, Acc) ->
+    Metrics = emqx_metrics:all_global(),
+    lists:foldl(
+        fun
+            ({_Name, _Type, undefined}, AccIn) ->
+                AccIn;
+            ({Name, _Type, MetricKAtom}, AccIn) ->
+                AccIn#{Name => [{with_node_label(Mode, []), ?C(MetricKAtom, Metrics)}]}
+        end,
+        Acc,
+        MetricNameTypeKeyL
+    ).
+
+metric_data_ns(all, MetricSpecs, Mode) ->
+    NsToMetrics0 = emqx_metrics:all_ns(),
+    NsToMetrics = maps:remove(?global_ns, NsToMetrics0),
+    do_metric_data_ns(NsToMetrics, MetricSpecs, Mode);
+metric_data_ns(Namespace, MetricSpecs, Mode) when is_binary(Namespace) ->
+    NsToMetrics =
+        case emqx_metrics:all(Namespace) of
+            [] ->
+                %% No metrics counters for this namespace: omit it, as the `all' clause
+                %% does for namespaces absent from `emqx_metrics:all_ns/0'.
+                #{};
+            Metrics ->
+                #{Namespace => Metrics}
+        end,
+    do_metric_data_ns(NsToMetrics, MetricSpecs, Mode).
+
+do_metric_data_ns(NsToMetrics, MetricSpecs, Mode) ->
+    lists:foldl(
+        fun
+            ({_Name, _Type, undefined}, AccIn) ->
+                AccIn;
+            ({Name, _Type, MetricKAtom}, AccIn) ->
+                AccIn#{Name => metric_data_ns1(MetricKAtom, NsToMetrics, Mode)}
+        end,
+        #{},
+        MetricSpecs
+    ).
+
+metric_data_ns1(MetricKAtom, NsToMetrics, Mode) ->
+    maps:fold(
+        fun(Namespace, Metrics, Acc) ->
+            Labels = [{namespace, Namespace}],
+            [{with_node_label(Mode, Labels), ?C(MetricKAtom, Metrics)} | Acc]
+        end,
+        [],
+        NsToMetrics
+    ).
+
+session_metric_ns(Namespace, MetricSpecs, Mode) when is_binary(Namespace); Namespace == all ->
+    NsToMetrics = gather_session_ns_data(Namespace),
+    do_metric_data_ns(NsToMetrics, MetricSpecs, Mode).
+
+%% Currently, we only collect total session count.
+gather_session_ns_data(all) ->
+    FoldFn = fun(#{ns := Namespace}, Acc) ->
+        case emqx_mt_state:count_clients(Namespace) of
+            {ok, N} ->
+                Acc#{Namespace => [{emqx_sessions_count, N}]};
+            {error, _} ->
+                %% Namespace deleted concurrently: omit it.
+                Acc
+        end
+    end,
+    InitAcc = #{},
+    emqx_mt_state:fold_known_nss(FoldFn, InitAcc);
+gather_session_ns_data(Namespace) when is_binary(Namespace) ->
+    case emqx_mt_state:count_clients(Namespace) of
+        {ok, N} ->
+            #{Namespace => [{emqx_sessions_count, N}]};
+        {error, _} ->
+            %% Unknown namespace: omit the metric instead of fabricating a zero.
+            #{}
+    end.
+
+authz_metric_ns(Namespace, MetricSpecs, Mode) when is_binary(Namespace); Namespace == all ->
+    NsToMetrics = gather_authz_ns_data(Namespace),
+    do_metric_data_ns(NsToMetrics, MetricSpecs, Mode).
+
+%% Currently, we only collect number of records.
+gather_authz_ns_data(all) ->
+    maps:map(
+        fun(_Namespace, RecordCount) ->
+            [{emqx_authz_builtin_record_count, RecordCount}]
+        end,
+        emqx_authz_mnesia:record_count_per_namespace()
+    );
+gather_authz_ns_data(Namespace) when is_binary(Namespace) ->
+    case emqx_mt_state:is_known_ns(Namespace) of
+        true ->
+            N = emqx_authz_mnesia:record_count(Namespace),
+            #{Namespace => [{emqx_authz_builtin_record_count, N}]};
+        false ->
+            #{}
+    end.
+
+authn_metric_ns(Namespace, MetricSpecs, Mode) when is_binary(Namespace); Namespace == all ->
+    NsToMetrics = gather_authn_ns_data(Namespace),
+    do_metric_data_ns(NsToMetrics, MetricSpecs, Mode).
+
+%% Currently, we only collect number of records.
+gather_authn_ns_data(all) ->
+    maps:map(
+        fun(_Namespace, RecordCount) ->
+            [{emqx_authn_builtin_record_count, RecordCount}]
+        end,
+        emqx_authn_mnesia:record_count_per_namespace()
+    );
+gather_authn_ns_data(Namespace) when is_binary(Namespace) ->
+    case emqx_mt_state:is_known_ns(Namespace) of
+        true ->
+            N = emqx_authn_mnesia:record_count(Namespace),
+            #{Namespace => [{emqx_authn_builtin_record_count, N}]};
+        false ->
+            #{}
+    end.
+
+client_metric_data(Mode) ->
+    Acc = listener_counts(Mode),
+    emqx_metric_data(client_metric_meta(), Mode, Acc).
+
+listener_counts(Mode) ->
+    Running = [{Id, Bind} || {Id, #{bind := Bind, running := true}} <- emqx_listeners:list()],
+    Counts = #{
+        emqx_client_disconnected_reason =>
+            listeners_points(fun emqx_listeners:shutdown_count/2, reason, Running, Mode)
+    },
+    case include_accept_result(Mode) of
+        true ->
+            Counts#{
+                emqx_client_accept_result =>
+                    listeners_points(fun emqx_listeners:accept_stats/2, result, Running, Mode)
+            };
+        false ->
+            Counts
+    end.
+
+%% A node older than `emqx_prometheus' BPAPI version 4 crashes when it
+%% aggregates a metric it does not know. Send accept results to other nodes
+%% only when every node supports version 4. The `node' mode is local only.
+include_accept_result(?PROM_DATA_MODE__NODE) ->
+    true;
+include_accept_result(_Mode) ->
+    emqx_bpapi:supported_version(emqx_prometheus) >= 4.
+
+%% RPC target (`emqx_prometheus_proto_v4')
+supports_listener_accept_result() -> true.
+
+listeners_points(GetCounts, LabelName, Listeners, Mode) ->
+    lists:flatmap(
+        fun({Id, Bind}) ->
+            listener_points(GetCounts(Id, Bind), Id, LabelName, Mode)
+        end,
+        Listeners
+    ).
+
+listener_points({error, _}, _Id, _LabelName, _Mode) ->
+    [];
+listener_points(Counts, Id, LabelName, Mode) ->
+    {ok, #{type := Type, name := Name}} = emqx_listeners:parse_listener_id(Id),
+    [
+        {
+            with_node_label(Mode, [{listener_type, Type}, {listener_name, Name}, {LabelName, Key}]),
+            Count
+        }
+     || {Key, Count} <- Counts
     ].
 
-emqx_metrics_session() ->
-    [ emqx_session_created
-    , emqx_session_resumed
-    , emqx_session_takeovered
-    , emqx_session_discarded
-    , emqx_session_terminated
+%%==========
+%% Durable Storage
+maybe_add_ds_meta() ->
+    case emqx_persistent_message:is_persistence_enabled() of
+        true ->
+            #{
+                ds_data => meta_to_init_from(emqx_ds_builtin_metrics:prometheus_meta()),
+                ds_raft_node_data => meta_to_init_from(ds_raft_node_meta())
+            };
+        false ->
+            #{}
+    end.
+
+ds_raft_node_meta() ->
+    emqx_ds_builtin_raft_metrics:local_dbs_meta() ++
+        emqx_ds_builtin_raft_metrics:local_shards_meta().
+
+ds_raft_cluster_meta() ->
+    emqx_ds_builtin_raft_metrics:cluster_meta() ++
+        emqx_ds_builtin_raft_metrics:dbs_meta() ++
+        emqx_ds_builtin_raft_metrics:shards_meta().
+
+%%==========
+%% Bytes && Packets
+emqx_packet_metric_meta() ->
+    [
+        {emqx_bytes_received, counter, 'bytes.received'},
+        {emqx_bytes_sent, counter, 'bytes.sent'},
+        %% received.sent
+        {emqx_packets_received, counter, 'packets.received'},
+        {emqx_packets_sent, counter, 'packets.sent'},
+        %% connect
+        {emqx_packets_connect, counter, 'packets.connect.received'},
+        {emqx_packets_connack_sent, counter, 'packets.connack.sent'},
+        {emqx_packets_connack_error, counter, 'packets.connack.error'},
+        {emqx_packets_connack_auth_error, counter, 'packets.connack.auth_error'},
+        %% sub.unsub
+        {emqx_packets_subscribe_received, counter, 'packets.subscribe.received'},
+        {emqx_packets_subscribe_auth_error, counter, 'packets.subscribe.auth_error'},
+        {emqx_packets_subscribe_error, counter, 'packets.subscribe.error'},
+        {emqx_packets_suback_sent, counter, 'packets.suback.sent'},
+        {emqx_packets_unsubscribe_received, counter, 'packets.unsubscribe.received'},
+        {emqx_packets_unsubscribe_error, counter, 'packets.unsubscribe.error'},
+        {emqx_packets_unsuback_sent, counter, 'packets.unsuback.sent'},
+        %% publish.puback
+        {emqx_packets_publish_received, counter, 'packets.publish.received'},
+        {emqx_packets_publish_sent, counter, 'packets.publish.sent'},
+        {emqx_packets_publish_inuse, counter, 'packets.publish.inuse'},
+        {emqx_packets_publish_error, counter, 'packets.publish.error'},
+        {emqx_packets_publish_auth_error, counter, 'packets.publish.auth_error'},
+        {emqx_packets_publish_quota_exceeded, counter, 'packets.publish.quota_exceeded'},
+        %% puback
+        {emqx_packets_puback_received, counter, 'packets.puback.received'},
+        {emqx_packets_puback_sent, counter, 'packets.puback.sent'},
+        {emqx_packets_puback_inuse, counter, 'packets.puback.inuse'},
+        {emqx_packets_puback_missed, counter, 'packets.puback.missed'},
+        %% pubrec
+        {emqx_packets_pubrec_received, counter, 'packets.pubrec.received'},
+        {emqx_packets_pubrec_sent, counter, 'packets.pubrec.sent'},
+        {emqx_packets_pubrec_inuse, counter, 'packets.pubrec.inuse'},
+        {emqx_packets_pubrec_missed, counter, 'packets.pubrec.missed'},
+        %% pubrel
+        {emqx_packets_pubrel_received, counter, 'packets.pubrel.received'},
+        {emqx_packets_pubrel_sent, counter, 'packets.pubrel.sent'},
+        {emqx_packets_pubrel_missed, counter, 'packets.pubrel.missed'},
+        %% pubcomp
+        {emqx_packets_pubcomp_received, counter, 'packets.pubcomp.received'},
+        {emqx_packets_pubcomp_sent, counter, 'packets.pubcomp.sent'},
+        {emqx_packets_pubcomp_inuse, counter, 'packets.pubcomp.inuse'},
+        {emqx_packets_pubcomp_missed, counter, 'packets.pubcomp.missed'},
+        %% pingreq
+        {emqx_packets_pingreq_received, counter, 'packets.pingreq.received'},
+        {emqx_packets_pingresp_sent, counter, 'packets.pingresp.sent'},
+        %% disconnect
+        {emqx_packets_disconnect_received, counter, 'packets.disconnect.received'},
+        {emqx_packets_disconnect_sent, counter, 'packets.disconnect.sent'},
+        %% auth
+        {emqx_packets_auth_received, counter, 'packets.auth.received'},
+        {emqx_packets_auth_sent, counter, 'packets.auth.sent'}
     ].
 
-emqx_vm() ->
-    [ emqx_vm_cpu_use
-    , emqx_vm_cpu_idle
-    , emqx_vm_run_queue
-    , emqx_vm_process_messages_in_queues
-    , emqx_vm_total_memory
-    , emqx_vm_used_memory
+packet_metric_ns_meta() ->
+    emqx_packet_metric_meta().
+
+%%==========
+%% Messages
+message_metric_meta() ->
+    [
+        {emqx_messages_received, counter, 'messages.received'},
+        {emqx_messages_sent, counter, 'messages.sent'},
+        {emqx_messages_qos0_received, counter, 'messages.qos0.received'},
+        {emqx_messages_qos0_sent, counter, 'messages.qos0.sent'},
+        {emqx_messages_qos1_received, counter, 'messages.qos1.received'},
+        {emqx_messages_qos1_sent, counter, 'messages.qos1.sent'},
+        {emqx_messages_qos2_received, counter, 'messages.qos2.received'},
+        {emqx_messages_qos2_sent, counter, 'messages.qos2.sent'},
+        {emqx_messages_publish, counter, 'messages.publish'},
+        {emqx_messages_dropped, counter, 'messages.dropped'},
+        {emqx_messages_dropped_expired, counter, 'messages.dropped.await_pubrel_timeout'},
+        {emqx_messages_dropped_no_subscribers, counter, 'messages.dropped.no_subscribers'},
+        {emqx_messages_dropped_quota_exceeded, counter, 'messages.dropped.quota_exceeded'},
+        {emqx_messages_dropped_receive_maximum, counter, 'messages.dropped.receive_maximum'},
+        {emqx_messages_rejected_quota_exceeded, counter, 'messages.rejected.quota_exceeded'},
+        {emqx_messages_forward, counter, 'messages.forward'},
+        {emqx_messages_retained, counter, 'messages.retained'},
+        {emqx_messages_delayed, counter, 'messages.delayed'},
+        {emqx_messages_delivered, counter, 'messages.delivered'},
+        {emqx_messages_acked, counter, 'messages.acked'}
     ].
 
-emqx_vm_data() ->
-    Idle = case cpu_sup:util([detailed]) of
-               {_, 0, 0, _} -> 0; %% Not support for Windows
-               {_Num, _Use, IdleList, _} -> ?C(idle, IdleList)
-           end,
-    RunQueue = erlang:statistics(run_queue),
-    [{run_queue, RunQueue},
-     {process_total_messages, 0}, %% XXX: Plan removed at v5.0
-     {cpu_idle, Idle},
-     {cpu_use, 100 - Idle}] ++ emqx_vm:mem_info().
+message_metric_ns_meta() ->
+    message_metric_meta().
 
-emqx_cluster() ->
-    [ emqx_cluster_nodes_running
-    , emqx_cluster_nodes_stopped
+%%==========
+%% Delivery
+delivery_metric_meta() ->
+    [
+        {emqx_delivery_dropped, counter, 'delivery.dropped'},
+        {emqx_delivery_dropped_no_local, counter, 'delivery.dropped.no_local'},
+        {emqx_delivery_dropped_too_large, counter, 'delivery.dropped.too_large'},
+        {emqx_delivery_dropped_qos0_msg, counter, 'delivery.dropped.qos0_msg'},
+        {emqx_delivery_dropped_queue_full, counter, 'delivery.dropped.queue_full'},
+        {emqx_delivery_dropped_expired, counter, 'delivery.dropped.expired'}
     ].
 
-emqx_cluster_data() ->
-    #{running_nodes := Running, stopped_nodes := Stopped} = ekka_mnesia:cluster_info(),
-    [{nodes_running, length(Running)},
-     {nodes_stopped, length(Stopped)}].
+delivery_metric_ns_meta() ->
+    delivery_metric_meta().
+
+%%==========
+%% Client
+client_metric_meta() ->
+    [
+        {emqx_client_connect, counter, 'client.connect'},
+        {emqx_client_connack, counter, 'client.connack'},
+        {emqx_client_connected, counter, 'client.connected'},
+        {emqx_client_authenticate, counter, 'client.authenticate'},
+        {emqx_client_auth_anonymous, counter, 'client.auth.anonymous'},
+        {emqx_client_authorize, counter, 'client.authorize'},
+        {emqx_client_subscribe, counter, 'client.subscribe'},
+        {emqx_client_unsubscribe, counter, 'client.unsubscribe'},
+        {emqx_client_disconnected, counter, 'client.disconnected'},
+        {emqx_client_disconnected_reason, counter, undefined},
+        {emqx_client_accept_result, counter, undefined}
+    ].
+
+%%==========
+%% Metrics - session
+session_metric_meta() ->
+    [
+        {emqx_session_created, counter, 'session.created'},
+        {emqx_session_resumed, counter, 'session.resumed'},
+        {emqx_session_takenover, counter, 'session.takenover'},
+        {emqx_session_discarded, counter, 'session.discarded'},
+        {emqx_session_terminated, counter, 'session.terminated'}
+    ].
+
+session_metric_ns_meta() ->
+    [
+        %% Taken from `emqx_mt_state:count_clients/1`.
+        {emqx_sessions_count, gauge, emqx_sessions_count}
+    ].
+
+%%==========
+%% Metrics - acl
+acl_metric_meta() ->
+    [
+        {emqx_authorization_allow, counter, 'authorization.allow'},
+        {emqx_authorization_deny, counter, 'authorization.deny'},
+        {emqx_authorization_cache_hit, counter, 'authorization.cache_hit'},
+        {emqx_authorization_cache_miss, counter, 'authorization.cache_miss'},
+        {emqx_authorization_superuser, counter, 'authorization.superuser'},
+        {emqx_authorization_nomatch, counter, 'authorization.nomatch'},
+        {emqx_authorization_matched_allow, counter, 'authorization.matched.allow'},
+        {emqx_authorization_matched_deny, counter, 'authorization.matched.deny'}
+    ].
+
+authz_metric_ns_meta() ->
+    [
+        %% Taken from `emqx_authz_mnesia:record_count/1` and
+        %% `emqx_authz_mnesia:record_count_per_namespace/0`
+        {emqx_authz_builtin_record_count, gauge, emqx_authz_builtin_record_count}
+    ].
+
+%%==========
+%% Metrics - authn
+authn_metric_meta() ->
+    [
+        {emqx_authentication_success, counter, 'authentication.success'},
+        {emqx_authentication_success_anonymous, counter, 'authentication.success.anonymous'},
+        {emqx_authentication_failure, counter, 'authentication.failure'}
+    ].
+
+authn_metric_ns_meta() ->
+    [
+        %% Taken from `emqx_authn_mnesia:record_count/1` and
+        %% `emqx_authn_mnesia:record_count_per_namespace/0`
+        {emqx_authn_builtin_record_count, gauge, emqx_authn_builtin_record_count}
+    ].
+
+%%==========
+%% Overload Protection
+olp_metric_meta() ->
+    emqx_metrics_olp_meta(emqx_config_zones:is_olp_enabled()).
+
+emqx_metrics_olp_meta(true) ->
+    [
+        {emqx_overload_protection_delay_ok, counter, 'overload_protection.delay.ok'},
+        {emqx_overload_protection_delay_timeout, counter, 'overload_protection.delay.timeout'},
+        {emqx_overload_protection_hibernation, counter, 'overload_protection.hibernation'},
+        {emqx_overload_protection_gc, counter, 'overload_protection.gc'},
+        {emqx_overload_protection_new_conn, counter, 'overload_protection.new_conn'}
+    ];
+emqx_metrics_olp_meta(false) ->
+    [].
+
+%%========================================
+%% License
+%%========================================
+
+maybe_license_add_collect_family(Callback, RawData) ->
+    ok = add_collect_family(Callback, license_metric_meta(), ?MG(license_data, RawData)),
+    ok.
+
+maybe_license_fetch_data() ->
+    #{license_data => license_data()}.
+
+%% license
+license_metric_meta() ->
+    [
+        {emqx_license_max_sessions, gauge, undefined},
+        {emqx_license_expiry_at, gauge, undefined},
+        {emqx_license_issued_at, gauge, undefined}
+    ].
+
+license_data() ->
+    Dump =
+        try
+            emqx_license_checker:dump()
+        catch
+            _:_ -> []
+        end,
+    MaxSessions =
+        case proplists:get_value(max_sessions, Dump, 0) of
+            N when is_integer(N) -> N;
+            _ -> 0
+        end,
+    ExpiryAt = license_date_to_epoch(proplists:get_value(expiry_at, Dump, undefined)),
+    IssuedAt = license_date_to_epoch(proplists:get_value(start_at, Dump, undefined)),
+    #{
+        emqx_license_max_sessions => MaxSessions,
+        emqx_license_expiry_at => ExpiryAt,
+        emqx_license_issued_at => IssuedAt
+    }.
+
+%% start_at / expiry_at from emqx_license_checker:dump/0 are binary "YYYY-MM-DD"
+%% (output of emqx_license_parser_v20220101:format_date/1).
+license_date_to_epoch(undefined) ->
+    0;
+license_date_to_epoch(Bin) when is_binary(Bin) ->
+    try
+        [Y, M, D] = [binary_to_integer(P) || P <- binary:split(Bin, <<"-">>, [global])],
+        emqx_license_checker:date_to_expiry_epoch({Y, M, D})
+    catch
+        _:_ -> 0
+    end;
+license_date_to_epoch(_) ->
+    0.
+
+%%========================================
+%% Certs
+%%========================================
+
+cert_metric_meta() ->
+    [
+        {emqx_cert_expiry_at, gauge, undefined}
+    ].
+
+-define(LISTENER_TYPES, [ssl, wss, quic]).
+
+-spec cert_data() ->
+    [_Point :: {[Label], Epoch}]
+when
+    Label :: TypeLabel | NameLabel,
+    TypeLabel :: {listener_type, ssl | wss | quic},
+    NameLabel :: {listener_name, atom()},
+    Epoch :: non_neg_integer().
+cert_data() ->
+    cert_data(emqx_config:get([listeners], undefined)).
+
+cert_data(undefined) ->
+    [];
+cert_data(AllListeners) ->
+    Points = lists:foldl(
+        fun(ListenerType, PointsAcc) ->
+            lists:append(PointsAcc, points_of_listeners(ListenerType, AllListeners))
+        end,
+        _PointsInitAcc = [],
+        ?LISTENER_TYPES
+    ),
+    #{
+        emqx_cert_expiry_at => Points
+    }.
+
+points_of_listeners(Type, AllListeners) ->
+    do_points_of_listeners(Type, maps:get(Type, AllListeners, undefined)).
+
+-spec do_points_of_listeners(Type, Listeners) ->
+    [_Point :: {[{LabelKey, LabelValue}], Epoch}]
+when
+    Type :: ssl | wss | quic,
+    Listeners :: #{ListenerName :: atom() => ListenerConf :: map()} | undefined,
+    LabelKey :: atom(),
+    LabelValue :: atom(),
+    Epoch :: non_neg_integer().
+do_points_of_listeners(_, undefined) ->
+    [];
+do_points_of_listeners(Type, Listeners) ->
+    lists:foldl(
+        fun(Name, PointsAcc) ->
+            #{Name := Listener} = Listeners,
+            case resolve_listener_certfile(Type, Name, Listener) of
+                error ->
+                    PointsAcc;
+                {ok, Certfile} ->
+                    [gen_point_cert_expiry_at(Type, Name, Certfile) | PointsAcc]
+            end
+        end,
+        [],
+        %% listener names
+        maps:keys(Listeners)
+    ).
+
+gen_point_cert_expiry_at(Type, Name, Path) ->
+    {[{listener_type, Type}, {listener_name, Name}], cert_expiry_at_from_path(Path)}.
+
+resolve_listener_certfile(Type, Name, #{enable := true, ssl_options := #{} = SSLOpts0}) ->
+    %% A listener with no certificate configured serves the node's default one;
+    %% report that certificate. Nothing is generated here: a scrape only reads.
+    SSLOpts1 = emqx_tls_lib:default_certs_if_present(SSLOpts0),
+    %% `to_server_opts' throws when a `managed_certs' reference cannot be resolved
+    %% (e.g. the bundle was deleted out-of-band); one bad listener must not fail the
+    %% whole scrape.
+    try emqx_tls_lib:to_server_opts(tls, SSLOpts1) of
+        SSLOpts ->
+            case lists:keyfind(certfile, 1, SSLOpts) of
+                {certfile, Certfile} ->
+                    {ok, Certfile};
+                _ ->
+                    error
+            end
+    catch
+        throw:Reason ->
+            ?SLOG(warning, #{
+                msg => "failed_to_resolve_listener_certfile",
+                listener_type => Type,
+                listener_name => Name,
+                reason => Reason
+            }),
+            error
+    end;
+resolve_listener_certfile(_Type, _Name, #{}) ->
+    error.
+
+%% TODO: cert manager for more generic utils functions
+cert_expiry_at_from_path(Path0) ->
+    Path = emqx_schema:naive_env_interpolation(Path0),
+    try
+        case file:read_file(Path) of
+            {ok, PemBin} ->
+                [CertEntry | _] = public_key:pem_decode(PemBin),
+                Cert = public_key:pem_entry_decode(CertEntry),
+                %% XXX: Only pem cert supported by listeners
+                not_after_epoch(Cert);
+            {error, Reason} ->
+                ?SLOG(error, #{
+                    msg => "read_cert_file_failed",
+                    path => Path0,
+                    resolved_path => Path,
+                    reason => Reason
+                }),
+                0
+        end
+    catch
+        E:R:S ->
+            ?SLOG(error, #{
+                msg => "obtain_cert_expiry_time_failed",
+                error => E,
+                reason => R,
+                stacktrace => S,
+                path => Path0,
+                resolved_path => Path
+            }),
+            0
+    end.
+
+%% 62167219200 =:= calendar:datetime_to_gregorian_seconds({{1970, 1, 1}, {0, 0, 0}}).
+-define(EPOCH_START, 62167219200).
+not_after_epoch(#'Certificate'{
+    'tbsCertificate' = #'TBSCertificate'{
+        validity =
+            #'Validity'{'notAfter' = NotAfter}
+    }
+}) ->
+    pubkey_cert:'time_str_2_gregorian_sec'(NotAfter) - ?EPOCH_START;
+not_after_epoch(_) ->
+    0.
+
+%%========================================
+%% Cluster RPC
+%%========================================
+
+cluster_rpc_meta() ->
+    [{emqx_conf_sync_txid, gauge, undefined}].
+
+%%========================================
+%% Mria
+%%========================================
+
+mria_metric_meta() ->
+    mria_metric_meta(core) ++ mria_metric_meta(replicant).
+
+mria_metric_meta(core) ->
+    [
+        {emqx_mria_last_intercepted_trans, gauge, last_intercepted_trans},
+        {emqx_mria_weight, gauge, weight},
+        {emqx_mria_replicants, gauge, replicants},
+        {emqx_mria_server_mql, gauge, server_mql}
+    ];
+mria_metric_meta(replicant) ->
+    [
+        {emqx_mria_lag, gauge, lag},
+        {emqx_mria_bootstrap_time, gauge, bootstrap_time},
+        {emqx_mria_bootstrap_num_keys, gauge, bootstrap_num_keys},
+        {emqx_mria_message_queue_len, gauge, message_queue_len},
+        {emqx_mria_replayq_len, gauge, replayq_len}
+    ].
+
+cluster_rpc_data(Mode) ->
+    Labels =
+        case Mode of
+            ?PROM_DATA_MODE__NODE -> [];
+            _ -> [{node, node()}]
+        end,
+    Value = ?SAFELY(emqx_cluster_rpc:get_current_tnx_id(), undefined),
+    #{
+        emqx_conf_sync_txid => [{Labels, Value}]
+    }.
+
+mria_data(Mode) ->
+    case mria_rlog:backend() of
+        rlog ->
+            mria_data(mria_rlog:role(), Mode);
+        mnesia ->
+            #{}
+    end.
+
+%% Local-node gathering function, does not perform rpc calls.
+mria_data(Role, Mode) ->
+    Labels =
+        case Mode of
+            ?PROM_DATA_MODE__NODE -> [];
+            _ -> [{node, node()}]
+        end,
+    ShardMetrics = [
+        {Shard, ?SAFELY(get_local_shard_stats(Role, Shard), #{})}
+     || Shard <- mria_schema:shards(), Shard =/= undefined
+    ],
+    lists:foldl(
+        fun({Name, _Type, MetricK}, AccIn) ->
+            %% TODO: only report shards that are up
+            AccIn#{Name => get_shard_metrics(Labels, MetricK, ShardMetrics)}
+        end,
+        #{},
+        mria_metric_meta(Role)
+    ).
+
+get_local_shard_stats(core = _Role, Shard) ->
+    mria_status:get_local_shard_stats(Shard);
+get_local_shard_stats(replicant = _Role, Shard) ->
+    LocalStats = mria_status:get_local_shard_stats(Shard),
+    ShardLag = emqx_prometheus_cache:get_mria_shard_lag(Shard),
+    LocalStats#{lag => ShardLag}.
+
+get_shard_metrics(Labels, replicants, ShardMetrics) ->
+    [
+        {[{shard, Shard} | Labels], length(mria_status:agents(Shard))}
+     || {Shard, _} <- ShardMetrics
+    ];
+get_shard_metrics(Labels, MetricK, ShardMetrics) ->
+    [
+        {[{shard, Shard} | Labels], maps:get(MetricK, Metrics, undefined)}
+     || {Shard, Metrics} <- ShardMetrics
+    ].
+
+%%========================================
+%% Broker Instrumentation
+%%========================================
+
+emqx_broker_instr_data(_Mode) ->
+    maps:map(
+        fun(N, _) ->
+            maps:to_list(emqx_metrics_worker:get_hists(?BROKER_INSTR_METRICS_WORKER, N)) ++
+                maps:to_list(emqx_metrics_worker:get_counters(?BROKER_INSTR_METRICS_WORKER, N))
+        end,
+        emqx_broker_instr_init()
+    ).
+
+emqx_broker_instr_init() ->
+    maps:from_keys(?BROKER_INSTR_METRICS, []).
+
+collect_broker_instr_family(Callback, Metrics) ->
+    maps:foreach(
+        fun(Id, Ms) ->
+            lists:foreach(
+                fun({Name, M}) ->
+                    collect_broker_instr_metric(Callback, Id, Name, M)
+                end,
+                Ms
+            )
+        end,
+        Metrics
+    ).
+
+collect_broker_instr_metric(
+    Callback,
+    Id,
+    Name,
+    Value
+) when is_integer(Value) ->
+    MName = [<<"emqx_instr_">>, atom_to_binary(Id), <<"_">>, atom_to_binary(Name)],
+    Metric = prometheus_model_helpers:counter_metric([{node, node()}], Value),
+    Callback(prometheus_model_helpers:create_mf(MName, <<>>, counter, Metric));
+collect_broker_instr_metric(
+    Callback,
+    Id,
+    Name,
+    #{count := Count, sum := Sum, bucket_counts := Buckets}
+) ->
+    MName = [<<"emqx_instr_">>, atom_to_binary(Id), <<"_">>, atom_to_binary(Name)],
+    Metric = prometheus_model_helpers:histogram_metric([{node, node()}], Buckets, Count, Sum),
+    Callback(prometheus_model_helpers:create_mf(MName, <<>>, histogram, Metric)).
+
+%%--------------------------------------------------------------------
+%% Collect functions
+%%--------------------------------------------------------------------
+
+meta_to_init_from(Meta) ->
+    maps:from_keys(metrics_name(Meta), []).
+
+metrics_name(MetricsAll) ->
+    [Name || {Name, _, _} <- MetricsAll].
+
+with_node_label(?PROM_DATA_MODE__NODE, Labels) ->
+    Labels;
+with_node_label(?PROM_DATA_MODE__ALL_NODES_AGGREGATED, Labels) ->
+    Labels;
+with_node_label(?PROM_DATA_MODE__ALL_NODES_UNAGGREGATED, Labels) ->
+    [{node, node()} | Labels].
+
+%%--------------------------------------------------------------------
+%% prometheus_model_helpers proxy
+%%
+gauge_metric(Metric) ->
+    prometheus_model_helpers:gauge_metric(Metric).
+
+gauge_metrics(Values) ->
+    prometheus_model_helpers:gauge_metrics(Values).
+
+counter_metrics(Specs) ->
+    prometheus_model_helpers:counter_metrics(Specs).

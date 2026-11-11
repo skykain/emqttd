@@ -1,0 +1,1387 @@
+%%--------------------------------------------------------------------
+%% Copyright (c) 2025-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
+%%--------------------------------------------------------------------
+
+-module(emqx_streams_SUITE).
+
+-moduledoc """
+Main test suite for the Streams application.
+""".
+
+-compile(nowarn_export_all).
+-compile(export_all).
+
+-include_lib("eunit/include/eunit.hrl").
+-include_lib("common_test/include/ct.hrl").
+-include_lib("snabbkaffe/include/snabbkaffe.hrl").
+-include_lib("emqx/include/asserts.hrl").
+-include_lib("emqx/include/emqx.hrl").
+-include_lib("emqx/include/emqx_hooks.hrl").
+-include_lib("emqx/include/emqx_mqtt.hrl").
+
+-include("../src/emqx_streams_internal.hrl").
+
+-define(PUBLISH_AND_CONSUME_CASES, [
+    t_publish_and_consume_regular_many_generations,
+    t_publish_and_consume_lastvalue
+]).
+
+-define(READ_CASES, [
+    t_read_earliest,
+    t_read_latest,
+    t_read_timestamp
+]).
+
+-define(MANY, 999_999_999_999).
+
+-define(DIRECT_PUBLISH_TESTS, [
+    t_direct_publish,
+    t_direct_publish_auto_create,
+    t_direct_publish_missing_destination,
+    t_direct_publish_topic_mismatch,
+    t_direct_publish_persist_error,
+    t_direct_publish_create_race,
+    t_direct_publish_invalid_topic
+]).
+
+all() ->
+    All =
+        emqx_common_test_helpers:all(?MODULE) --
+            (?PUBLISH_AND_CONSUME_CASES ++ ?READ_CASES ++ ?DIRECT_PUBLISH_TESTS),
+    [
+        {group, direct_publish_regular},
+        {group, direct_publish_lastvalue},
+        {group, pub_and_consume},
+        {group, read}
+    ] ++ All.
+
+groups() ->
+    [
+        {direct_publish_regular, [], ?DIRECT_PUBLISH_TESTS},
+        {direct_publish_lastvalue, [], ?DIRECT_PUBLISH_TESTS}
+    ] ++
+        emqx_common_test_helpers:nested_groups([
+            [pub_and_consume],
+            [limited, unlimited],
+            ?PUBLISH_AND_CONSUME_CASES
+        ]) ++
+        [{read, [], ?READ_CASES}].
+
+init_per_suite(Config) ->
+    Apps =
+        emqx_cth_suite:start(
+            [
+                emqx_durable_storage,
+                {emqx, emqx_streams_test_utils:cth_config(emqx)},
+                {emqx_mq, emqx_streams_test_utils:cth_config(emqx_mq)},
+                {emqx_streams, emqx_streams_test_utils:cth_config(emqx_streams)}
+            ],
+            #{work_dir => emqx_cth_suite:work_dir(Config)}
+        ),
+    [{suite_apps, Apps} | Config].
+
+end_per_suite(Config) ->
+    ok = emqx_cth_suite:stop(?config(suite_apps, Config)).
+
+init_per_group(direct_publish_regular, Config) ->
+    [{is_lastvalue, false} | Config];
+init_per_group(direct_publish_lastvalue, Config) ->
+    [{is_lastvalue, true} | Config];
+init_per_group(limited, Config) ->
+    [{limits, #{max_shard_message_bytes => ?MANY, max_shard_message_count => ?MANY}} | Config];
+init_per_group(unlimited, Config) ->
+    [
+        {limits, #{max_shard_message_bytes => infinity, max_shard_message_count => infinity}}
+        | Config
+    ];
+init_per_group(_Group, Config) ->
+    Config.
+
+end_per_group(_Group, _Config) ->
+    ok.
+
+init_per_testcase(_CaseName, Config) ->
+    ok = emqx_streams_test_utils:cleanup_streams(),
+    ok = snabbkaffe:start_trace(),
+    ExtSubMaxUnacked = emqx_extsub:max_unacked(),
+    LimitOpts =
+        case ?config(limits, Config) of
+            undefined -> #{};
+            Limits -> #{limits => Limits}
+        end,
+    [{ext_sub_max_unacked, ExtSubMaxUnacked}, {limits, LimitOpts} | Config].
+
+end_per_testcase(_CaseName, Config) ->
+    _ = emqx_hooks:del('message.publish', {?MODULE, test_schema_validation}),
+    _ = emqx_hooks:del('message.publish', {?MODULE, test_message_transformation}),
+    emqx_common_test_helpers:call_janitor(),
+    ok = snabbkaffe:stop(),
+    ok = emqx_streams_test_utils:cleanup_streams(),
+    ok = emqx_streams_test_utils:reset_config(),
+    ok = emqx_streams_test_utils:reregister_extsub_handler(#{}),
+    ok = emqx_extsub:set_max_unacked(?config(ext_sub_max_unacked, Config)).
+
+%%--------------------------------------------------------------------
+%% Test cases
+%%--------------------------------------------------------------------
+
+%% Check that direct publishes at every QoS reach only the named stream, with or without a topic.
+t_direct_publish(Config) ->
+    %% Create the target stream and matching destinations that must receive nothing.
+    C = direct_publish_client(),
+    Stream = direct_publish_stream(<<"direct">>, <<"bound/topic">>, Config),
+    Other = direct_publish_stream(<<"other">>, <<"$stream/#">>, Config),
+    ok = emqx_broker:subscribe(<<"$stream/#">>),
+    emqx_common_test_helpers:on_exit(fun() -> emqx_broker:unsubscribe(<<"$stream/#">>) end),
+    %% Publish both topic forms at every QoS level.
+    lists:foreach(
+        fun(QoS) ->
+            lists:foreach(
+                fun(Suffix) ->
+                    Result = direct_publish(C, <<"direct", Suffix/binary>>, QoS),
+                    case QoS of
+                        0 -> ?assertEqual(ok, Result);
+                        _ -> ?assertMatch({ok, #{reason_code := ?RC_SUCCESS}}, Result)
+                    end
+                end,
+                [<<>>, <<"/bound/topic">>]
+            )
+        end,
+        [0, 1, 2]
+    ),
+    %% Check storage in the target stream and the absence of other deliveries.
+    ?assertEqual(6, length(emqx_streams_message_db:dirty_read_all(Stream))),
+    ?assertEqual([], emqx_streams_message_db:dirty_read_all(Other)),
+    ?assertNotReceive({deliver, _, _}),
+    ok = emqtt:disconnect(C).
+
+%% Check that direct publishing creates a missing stream with the supplied topic when enabled.
+t_direct_publish_auto_create(Config) ->
+    %% Enable auto-creation for the stream type under test.
+    C = direct_publish_client(),
+    direct_publish_auto_create(true, Config),
+    lists:foreach(
+        fun(QoS) ->
+            %% Check the acknowledgment, stream topic, and stored message for QoS 1 and 2.
+            Name = <<"created-", (integer_to_binary(QoS))/binary>>,
+            ?assertMatch(
+                {ok, #{reason_code := ?RC_SUCCESS}},
+                direct_publish(C, <<Name/binary, "/bound/topic">>, QoS)
+            ),
+            {ok, Stream} = emqx_streams_registry:find(Name),
+            ?assertMatch(#{topic_filter := <<"bound/topic">>}, Stream),
+            ?assertEqual(1, length(emqx_streams_message_db:dirty_read_all(Stream)))
+        end,
+        [1, 2]
+    ),
+    ok = emqtt:disconnect(C).
+
+%% Check that missing streams fail when auto-creation is disabled or the topic is omitted.
+t_direct_publish_missing_destination(Config) ->
+    C = direct_publish_client(),
+    %% Reject both topic forms while auto-creation is disabled.
+    lists:foreach(
+        fun(QoS) ->
+            ?assertMatch(
+                {ok, #{reason_code := ?RC_IMPLEMENTATION_SPECIFIC_ERROR}},
+                direct_publish(C, <<"missing">>, QoS)
+            ),
+            ?assertMatch(
+                {ok, #{reason_code := ?RC_IMPLEMENTATION_SPECIFIC_ERROR}},
+                direct_publish(C, <<"missing/topic">>, QoS)
+            )
+        end,
+        [1, 2]
+    ),
+    %% Auto-creation cannot create a stream without a topic.
+    direct_publish_auto_create(true, Config),
+    ?assertMatch(
+        {ok, #{reason_code := ?RC_IMPLEMENTATION_SPECIFIC_ERROR}},
+        direct_publish(C, <<"missing">>, 1)
+    ),
+    ?assertEqual(not_found, emqx_streams_registry:find(<<"missing">>)),
+    ok = emqtt:disconnect(C).
+
+%% Check that a conflicting topic is rejected regardless of the stream auto-creation setting.
+t_direct_publish_topic_mismatch(Config) ->
+    %% Create a stream bound to a different topic.
+    C = direct_publish_client(),
+    Stream = direct_publish_stream(<<"conflict">>, <<"original/topic">>, Config),
+    %% Check QoS 1 and 2 errors with auto-creation disabled and enabled.
+    lists:foreach(
+        fun(Enabled) ->
+            direct_publish_auto_create(Enabled, Config),
+            lists:foreach(
+                fun(QoS) ->
+                    ?assertMatch(
+                        {ok, #{reason_code := ?RC_TOPIC_NAME_INVALID}},
+                        direct_publish(C, <<"conflict/other/topic">>, QoS)
+                    )
+                end,
+                [1, 2]
+            )
+        end,
+        [false, true]
+    ),
+    %% Check that rejected messages were not stored.
+    ?assertEqual([], emqx_streams_message_db:dirty_read_all(Stream)),
+    ok = emqtt:disconnect(C).
+
+%% Check that stream storage failures return implementation-specific errors for QoS 1 and 2.
+t_direct_publish_persist_error(Config) ->
+    %% Create the stream and make storage writes fail.
+    C = direct_publish_client(),
+    _ = direct_publish_stream(<<"ds-error">>, <<"topic">>, Config),
+    ok = meck:new(emqx_streams_message_db, [passthrough, no_link]),
+    emqx_common_test_helpers:on_exit(fun() -> meck:unload(emqx_streams_message_db) end),
+    ok = meck:expect(emqx_streams_message_db, insert, fun(_, _) ->
+        {error, {recoverable, unavailable}}
+    end),
+    %% Check the PUBACK and PUBREC failure reasons.
+    lists:foreach(
+        fun(QoS) ->
+            ?assertMatch(
+                {ok, #{reason_code := ?RC_IMPLEMENTATION_SPECIFIC_ERROR}},
+                direct_publish(C, <<"ds-error">>, QoS)
+            )
+        end,
+        [1, 2]
+    ),
+    ok = emqtt:disconnect(C).
+
+%% Check that a concurrently created stream is accepted only when its topic matches.
+t_direct_publish_create_race(Config) ->
+    %% Enable auto-creation and intercept stream creation.
+    C = direct_publish_client(),
+    direct_publish_auto_create(true, Config),
+    ok = meck:new(emqx_streams_registry, [passthrough, no_link]),
+    emqx_common_test_helpers:on_exit(fun() -> meck:unload(emqx_streams_registry) end),
+    %% Simulate another creator winning with either the requested topic or a conflicting topic.
+    lists:foreach(
+        fun({Name, ExistingTopic, RC}) ->
+            ok = meck:expect(emqx_streams_registry, create, fun(Stream) ->
+                {ok, _Existing} = meck:passthrough([Stream#{topic_filter := ExistingTopic}]),
+                {error, stream_exists}
+            end),
+            ?assertMatch(
+                {ok, #{reason_code := RC}}, direct_publish(C, <<Name/binary, "/topic">>, 1)
+            )
+        end,
+        [
+            {<<"race-same">>, <<"topic">>, ?RC_SUCCESS},
+            {<<"race-other">>, <<"other">>, ?RC_TOPIC_NAME_INVALID}
+        ]
+    ),
+    ok = emqtt:disconnect(C).
+
+%% Check that direct publishing rejects empty or invalid stream names and empty topic suffixes.
+t_direct_publish_invalid_topic(Config) ->
+    C = direct_publish_client(),
+    direct_publish_auto_create(true, Config),
+    lists:foreach(
+        fun(Suffix) ->
+            ?assertMatch(
+                {ok, #{reason_code := ?RC_TOPIC_NAME_INVALID}}, direct_publish(C, Suffix, 1)
+            )
+        end,
+        [<<>>, <<"/topic">>, <<"invalid name/topic">>, <<"empty-topic/">>]
+    ),
+    ok = emqtt:disconnect(C).
+
+direct_publish_client() ->
+    {ok, C} = emqtt:start_link([{proto_ver, v5}]),
+    {ok, _} = emqtt:connect(C),
+    C.
+
+direct_publish_stream(Name, Topic, Config) ->
+    emqx_streams_test_utils:ensure_stream_created(#{
+        name => Name, topic_filter => Topic, is_lastvalue => ?config(is_lastvalue, Config)
+    }).
+
+direct_publish_auto_create(Enabled, Config) ->
+    Type =
+        case ?config(is_lastvalue, Config) of
+            true -> <<"lastvalue">>;
+            false -> <<"regular">>
+        end,
+    Defaults = #{<<"regular">> => false, <<"lastvalue">> => false},
+    AutoCreate =
+        case Enabled of
+            true -> Defaults#{Type := #{}};
+            false -> Defaults
+        end,
+    {ok, _} = emqx:update_config([streams, auto_create], AutoCreate),
+    ok.
+
+direct_publish(C, Suffix, QoS) ->
+    Key = integer_to_binary(erlang:unique_integer([positive, monotonic])),
+    Properties = #{'User-Property' => [{<<"stream-key">>, Key}]},
+    emqtt:publish(C, <<"$stream/", Suffix/binary>>, Properties, Key, [{qos, QoS}]).
+
+%% Very basic test, publish some messages to the stream and look into the DB
+%% to verify that the messages are stored.
+t_smoke(_Config) ->
+    Stream = emqx_streams_test_utils:ensure_stream_created(#{
+        name => <<"smoke">>, topic_filter => <<"t/#">>
+    }),
+    ok = emqx_streams_test_utils:populate(10, #{topic_prefix => <<"t/">>}),
+    AllMessages = emqx_streams_message_db:dirty_read_all(Stream),
+    ?assertEqual(10, length(AllMessages)),
+    ok.
+
+-doc "The removed `$s/` prefix behaves as an ordinary MQTT topic prefix.".
+t_short_prefix_is_regular_topic(_Config) ->
+    Topic = <<"$s/earliest/regular/topic">>,
+    CSub = emqx_streams_test_utils:emqtt_connect([]),
+    ok = emqx_streams_test_utils:emqtt_sub(CSub, Topic),
+    CPub = emqx_streams_test_utils:emqtt_connect([]),
+    {ok, _} = emqtt:publish(CPub, Topic, <<"payload">>, ?QOS_1),
+    {ok, [#{topic := Topic}]} = emqx_streams_test_utils:emqtt_drain(_MinMsg = 1, _Timeout = 1000),
+    ok = emqtt:disconnect(CPub),
+    ok = emqtt:disconnect(CSub).
+
+t_governance_hooks_run_before_streams(_Config) ->
+    Stream = emqx_streams_test_utils:ensure_stream_created(#{
+        name => <<"governance">>, topic_filter => <<"governed/#">>
+    }),
+    ok = emqx_hooks:add(
+        'message.publish', {?MODULE, test_schema_validation, []}, ?HP_SCHEMA_VALIDATION
+    ),
+    ok = emqx_hooks:add(
+        'message.publish',
+        {?MODULE, test_message_transformation, []},
+        ?HP_MESSAGE_TRANSFORMATION
+    ),
+
+    Dropped = emqx_message:make(<<"ct">>, ?QOS_1, <<"governed/drop">>, <<"invalid">>),
+    _ = emqx_broker:publish2(Dropped),
+    Original = emqx_message:make(<<"ct">>, ?QOS_1, <<"governed/transform">>, <<"secret">>),
+    _ = emqx_broker:publish2(Original),
+
+    ?assertEqual(
+        [<<"redacted">>],
+        record_payloads(emqx_streams_message_db:dirty_read_all(Stream))
+    ).
+
+%% Verify inserting a message with an explicit key stores it under that key.
+t_message_db_insert_with_key(_Config) ->
+    %% Create a stream and a message whose topic differs from the explicit key.
+    Stream = emqx_streams_test_utils:ensure_stream_created(#{
+        name => <<"message_db_insert_with_key">>,
+        topic_filter => <<"db/#">>,
+        is_lastvalue => false
+    }),
+    Message = emqx_message:make(<<"ct">>, ?QOS_1, <<"db/original">>, <<"payload">>),
+
+    %% Insert the message with an explicit key.
+    ok = emqx_streams_message_db:insert(Stream, <<"custom-key">>, Message),
+
+    %% Verify that the message is indexed by the explicit key only.
+    ?assertEqual([], emqx_streams_message_db:dirty_read_key(Stream, <<"other-key">>)),
+    [Record] = emqx_streams_message_db:dirty_read_key(Stream, <<"custom-key">>),
+    ?assertEqual([<<"payload">>], record_payloads([Record])),
+    ok.
+
+%% Verify dirty reads can be limited by start and end timestamps.
+t_message_db_dirty_read_limits(_Config) ->
+    %% Create a stream and insert two messages with different keys.
+    Stream = emqx_streams_test_utils:ensure_stream_created(#{
+        name => <<"message_db_dirty_read_limits">>,
+        topic_filter => <<"db/#">>,
+        is_lastvalue => false
+    }),
+    Message1 = emqx_message:make(<<"ct">>, ?QOS_1, <<"db/1">>, <<"payload-1">>),
+    Message2 = emqx_message:make(<<"ct">>, ?QOS_1, <<"db/2">>, <<"payload-2">>),
+
+    ok = emqx_streams_message_db:insert(Stream, <<"key-1">>, Message1),
+    ok = emqx_streams_message_db:insert(Stream, <<"key-2">>, Message2),
+
+    %% Read back timestamps to build exact time-window filters.
+    [{_, T1, _}] = emqx_streams_message_db:dirty_read_key(Stream, <<"key-1">>),
+    [{_, T2, _}] = emqx_streams_message_db:dirty_read_key(Stream, <<"key-2">>),
+    ?assert(T1 < T2),
+
+    %% Verify all-record and keyed reads honor start/end limits.
+    ?assertEqual(
+        [<<"payload-1">>, <<"payload-2">>],
+        record_payloads(emqx_streams_message_db:dirty_read_all(Stream))
+    ),
+    ?assertEqual(
+        [<<"payload-2">>],
+        record_payloads(emqx_streams_message_db:dirty_read_all(Stream, #{start_time => T2}))
+    ),
+    ?assertEqual(
+        [<<"payload-1">>],
+        record_payloads(emqx_streams_message_db:dirty_read_all(Stream, #{end_time => T2}))
+    ),
+    ?assertEqual(
+        [<<"payload-2">>],
+        record_payloads(
+            emqx_streams_message_db:dirty_read_key(Stream, <<"key-2">>, #{
+                start_time => T2,
+                end_time => T2 + 1
+            })
+        )
+    ),
+    ok.
+
+%% Verify deleting one key removes matching records from every generation.
+t_message_db_delete_key(_Config) ->
+    %% Create a stream and insert messages across generations.
+    Stream = emqx_streams_test_utils:ensure_stream_created(#{
+        name => <<"message_db_delete_key">>,
+        topic_filter => <<"db/#">>,
+        is_lastvalue => false
+    }),
+    Message1 = emqx_message:make(<<"ct">>, ?QOS_1, <<"db/1">>, <<"payload-1">>),
+    Message2 = emqx_message:make(<<"ct">>, ?QOS_1, <<"db/2">>, <<"payload-2">>),
+    Message3 = emqx_message:make(<<"ct">>, ?QOS_1, <<"db/3">>, <<"payload-3">>),
+
+    ok = emqx_streams_message_db:insert(Stream, <<"key-1">>, Message1),
+    ok = emqx_streams_message_db:add_regular_db_generation(),
+    ok = emqx_streams_message_db:insert(Stream, <<"key-1">>, Message2),
+    ok = emqx_streams_message_db:insert(Stream, <<"key-2">>, Message3),
+
+    %% Verify both generations contain records for the key being deleted.
+    ?assertEqual(
+        [<<"payload-1">>, <<"payload-2">>],
+        record_payloads(emqx_streams_message_db:dirty_read_key(Stream, <<"key-1">>))
+    ),
+
+    %% Delete one key from all generations.
+    ok = emqx_streams_message_db:delete_key(Stream, <<"key-1">>),
+
+    %% Verify only the targeted key was removed.
+    ?assertEqual([], emqx_streams_message_db:dirty_read_key(Stream, <<"key-1">>)),
+    ?assertEqual(
+        [<<"payload-3">>],
+        record_payloads(emqx_streams_message_db:dirty_read_key(Stream, <<"key-2">>))
+    ),
+    ok.
+
+%% Verify deleting all stream records removes them from all generations.
+t_message_db_delete_all(_Config) ->
+    %% Create a stream and insert messages across generations.
+    Stream = emqx_streams_test_utils:ensure_stream_created(#{
+        name => <<"message_db_delete_all">>,
+        topic_filter => <<"db/#">>,
+        is_lastvalue => false
+    }),
+    Message1 = emqx_message:make(<<"ct">>, ?QOS_1, <<"db/1">>, <<"payload-1">>),
+    Message2 = emqx_message:make(<<"ct">>, ?QOS_1, <<"db/2">>, <<"payload-2">>),
+
+    ok = emqx_streams_message_db:insert(Stream, <<"key-1">>, Message1),
+    ok = emqx_streams_message_db:add_regular_db_generation(),
+    ok = emqx_streams_message_db:insert(Stream, <<"key-2">>, Message2),
+    ?assertEqual(2, length(emqx_streams_message_db:dirty_read_all(Stream))),
+
+    %% Delete all records for the stream from all generations.
+    ok = emqx_streams_message_db:delete_all(Stream),
+
+    %% Verify the stream has no remaining records.
+    ?assertEqual([], emqx_streams_message_db:dirty_read_all(Stream)),
+    ok.
+
+-doc "A stream handler retains no closures while waiting for the stream to appear.".
+t_handler_state_has_no_closures(_Config) ->
+    ClientId = <<"stream-handler-state">>,
+    C = emqx_streams_test_utils:emqtt_connect([{clientid, ClientId}]),
+    try
+        emqx_streams_test_utils:emqtt_sub(C, <<"$stream/handler-state">>, [
+            {<<"stream-offset">>, <<"earliest">>}
+        ]),
+        [ChanPid] = emqx_cm:lookup_channels(ClientId),
+        emqx_extsub_test_utils:assert_no_retained_functions(ChanPid)
+    after
+        emqtt:disconnect(C)
+    end.
+
+%% Verify reading stream messages from the earliest timestamp.
+t_read_earliest(_Config) ->
+    %% Create a stream
+    StreamOpts = #{topic_filter => <<"t/#">>, name => <<"t_read_earliest">>},
+    _ = emqx_streams_test_utils:ensure_stream_created(StreamOpts),
+    ok = emqx_streams_test_utils:populate(50, #{topic_prefix => <<"t/">>, different_clients => true}),
+
+    %% Subscribe to the stream from the earliest offset.
+    CSub = emqx_streams_test_utils:emqtt_connect([]),
+    emqx_streams_test_utils:emqtt_sub(
+        CSub,
+        [<<"$stream/t_read_earliest/t/#">>],
+        [{<<"stream-offset">>, <<"earliest">>}]
+    ),
+
+    %% Drain the messages from the stream and verify that they are received.
+    {ok, Msgs0} = emqx_streams_test_utils:emqtt_drain(_MinMsg0 = 50, _Timeout0 = 500),
+    ok = validate_headers(Msgs0),
+
+    %% Publish more messages while the clients are still subscribed.
+    %% We should receive all the messages
+    ok = emqx_streams_test_utils:populate(50, #{topic_prefix => <<"t/">>, different_clients => true}),
+    {ok, Msgs1} = emqx_streams_test_utils:emqtt_drain(_MinMsg1 = 50, _Timeout1 = 500),
+    ok = validate_headers(Msgs1),
+
+    %% Now, unsubscribe from the stream
+    emqtt:unsubscribe(CSub, <<"$stream/t_read_earliest/t/#">>),
+
+    %% Publish more messages, we should not receive any
+    ok = emqx_streams_test_utils:populate(50, #{topic_prefix => <<"t/">>, different_clients => true}),
+    {ok, []} = emqx_streams_test_utils:emqtt_drain(_MinMsg2 = 0, _Timeout2 = 1000),
+
+    %% Clean up
+    ok = emqtt:disconnect(CSub).
+
+%% Verify reading stream messages from the latest timestamp.
+t_read_latest(_Config) ->
+    %% Create a stream
+    StreamOpts = #{topic_filter => <<"t/#">>, name => <<"t_read_latest">>},
+    _ = emqx_streams_test_utils:ensure_stream_created(StreamOpts),
+    ok = emqx_streams_test_utils:populate(50, #{topic_prefix => <<"t/">>, different_clients => true}),
+
+    %% Subscribe to the stream from the latest offset.
+    CSub = emqx_streams_test_utils:emqtt_connect([]),
+    emqx_streams_test_utils:emqtt_sub(
+        CSub,
+        [<<"$stream/t_read_latest/t/#">>],
+        [{<<"dummy-prop">>, <<"latest">>}, {<<"stream-offset">>, <<"latest">>}]
+    ),
+
+    %% Drain the messages from the stream
+    %% and verify that they are NOT received — we subscribed to the latest offset.
+    {ok, Msgs0} = emqx_streams_test_utils:emqtt_drain(_MinMsg0 = 0, _Timeout0 = 500),
+    ?assertEqual(0, length(Msgs0)),
+
+    %% Publish more messages while the clients are still subscribed.
+    %% We should receive all the messages.
+    ok = emqx_streams_test_utils:populate(50, #{topic_prefix => <<"t/">>, different_clients => true}),
+    {ok, Msgs1} = emqx_streams_test_utils:emqtt_drain(_MinMsg1 = 50, _Timeout1 = 500),
+    ok = validate_headers(Msgs1),
+
+    %% Clean up
+    ok = emqtt:disconnect(CSub).
+
+%% Verify reading stream messages from a specific offset.
+t_read_timestamp(_Config) ->
+    %% Create a stream
+    StreamOpts = #{topic_filter => <<"t/#">>, name => <<"t_read_timestamp">>},
+    Stream = emqx_streams_test_utils:ensure_stream_created(StreamOpts),
+
+    %% Publish 1st portion of messages to the stream
+    ok = emqx_streams_test_utils:populate(50, #{topic_prefix => <<"t/">>, different_clients => true}),
+
+    %% Get the last message timestamp
+    AllMessages = emqx_streams_message_db:dirty_read_all(Stream),
+    ?assertEqual(50, length(AllMessages)),
+    Offsets = [Offset || {_, Offset, _} <- AllMessages],
+    Offset = lists:max(Offsets),
+
+    %% Publish 2nd portion of messages to the stream
+    ok = emqx_streams_test_utils:populate(50, #{topic_prefix => <<"t/">>, different_clients => true}),
+
+    %% Subscribe to the stream from the selected timestamp.
+    CSub = emqx_streams_test_utils:emqtt_connect([]),
+    OffsetBin = integer_to_binary(Offset + 1),
+    emqx_streams_test_utils:emqtt_sub(
+        CSub,
+        [<<"$stream/t_read_timestamp/t/#">>],
+        [{<<"stream-offset">>, OffsetBin}]
+    ),
+
+    %% Drain the messages from the stream and verify that we receive the messages from
+    %% the second portion, but not the first portion.
+    {ok, Msgs0} = emqx_streams_test_utils:emqtt_drain(_MinMsg0 = 50, _Timeout0 = 1000),
+    ?assertEqual(50, length(Msgs0)),
+    ok = validate_headers(Msgs0),
+
+    %% Publish more messages to the stream
+    ok = emqx_streams_test_utils:populate(50, #{topic_prefix => <<"t/">>, different_clients => true}),
+
+    %% Drain the messages from the stream and verify that we receive the messages
+    {ok, Msgs1} = emqx_streams_test_utils:emqtt_drain(_MinMsg1 = 50, _Timeout1 = 1000),
+    ok = validate_headers(Msgs1),
+
+    %% Clean up
+    ok = emqtt:disconnect(CSub).
+
+%% Consume some history messages from a non-lastvalue(regular) stream
+t_publish_and_consume_regular_many_generations(Config) ->
+    %% Create a non-lastvalue Stream
+    LimitOpts = ?config(limits, Config),
+    StreamOpts = LimitOpts#{
+        name => <<"test_publish_and_consume_regular_many_generations">>,
+        topic_filter => <<"t/#">>,
+        is_lastvalue => false
+    },
+    _ = emqx_streams_test_utils:ensure_stream_created(StreamOpts),
+
+    %% Publish 100 messages to the stream
+    emqx_streams_test_utils:populate(50, #{topic_prefix => <<"t/">>}),
+    emqx_streams_test_utils:populate(50, #{topic_prefix => <<"t/">>, different_clients => true}),
+
+    %% Consume the messages from the stream
+    CSub = emqx_streams_test_utils:emqtt_connect([]),
+    emqx_streams_test_utils:emqtt_sub(
+        CSub,
+        [<<"$stream/test_publish_and_consume_regular_many_generations/t/#">>],
+        [{<<"stream-offset">>, <<"earliest">>}]
+    ),
+    {ok, Msgs0} = emqx_streams_test_utils:emqtt_drain(_MinMsg0 = 100, _Timeout0 = 5000),
+
+    %% Verify the messages
+    ?assertEqual(100, length(Msgs0)),
+
+    %% Add a generation
+    ok = emqx_streams_message_db:add_regular_db_generation(),
+    % %% And another one
+    ok = emqx_streams_message_db:add_regular_db_generation(),
+
+    %% Publish 100 more messages to the stream
+    emqx_streams_test_utils:populate(50, #{topic_prefix => <<"t/">>}),
+    emqx_streams_test_utils:populate(50, #{topic_prefix => <<"t/">>, different_clients => true}),
+
+    %% Consume the rest messages
+    {ok, Msgs1} = emqx_streams_test_utils:emqtt_drain(_MinMsg1 = 100, _Timeout1 = 1000),
+
+    %% Verify the messages
+    ?assertEqual(100, length(Msgs1)),
+
+    %% Clean up
+    ok = emqtt:disconnect(CSub).
+
+%% Consume some history messages from a lastvalue stream
+t_publish_and_consume_lastvalue(Config) ->
+    %% Create a lastvalue Stream
+    LimitOpts = ?config(limits, Config),
+    StreamOpts = LimitOpts#{
+        name => <<"test_publish_and_consume_lastvalue">>,
+        topic_filter => <<"t/#">>,
+        is_lastvalue => true
+    },
+    _ = emqx_streams_test_utils:ensure_stream_created(StreamOpts),
+
+    %% Publish 100 messages to the stream
+    emqx_streams_test_utils:populate_lastvalue(100, #{
+        topic_prefix => <<"t/">>,
+        payload_prefix => <<"payload-">>,
+        n_keys => 10
+    }),
+
+    %% Consume the messages from the stream
+    CSub = emqx_streams_test_utils:emqtt_connect([]),
+    emqx_streams_test_utils:emqtt_sub(
+        CSub,
+        [<<"$stream/test_publish_and_consume_lastvalue/t/#">>],
+        [{<<"stream-offset">>, <<"earliest">>}]
+    ),
+    {ok, Msgs} = emqx_streams_test_utils:emqtt_drain(_MinMsg = 10, _Timeout = 100),
+    ok = emqtt:disconnect(CSub),
+
+    %% Verify the messages
+    ?assertEqual(10, length(Msgs)).
+
+-doc "Backpressure defers stream acknowledgements as data and resumes delivery after ACKs.".
+t_backpressure(_Config) ->
+    %% Set max_inflight to 0 to avoid nacking messages by the client's session
+    emqx_config:put([mqtt, max_inflight], 0),
+    %% Set max_unacked to 100 to allow extsub to send all the messages to the client
+    emqx_extsub:set_max_unacked(100),
+    %% With the settings above, the handler's buffer size should be the limiting factor
+    BufferSize = 20,
+    DSStreamMaxUnacked = 1,
+    emqx_streams_test_utils:reregister_extsub_handler(#{
+        buffer_size => BufferSize
+    }),
+
+    %% Create a non-lastvalue Stream
+    _ =
+        emqx_streams_test_utils:ensure_stream_created(#{
+            name => <<"t_backpressure">>,
+            topic_filter => <<"t/#">>,
+            is_lastvalue => false,
+            read_max_unacked => DSStreamMaxUnacked
+        }),
+
+    %% Publish 100 messages to the stream
+    emqx_streams_test_utils:populate(100, #{topic_prefix => <<"t/">>}),
+
+    %% Consume the messages from the stream
+    ClientId = <<"stream-backpressure">>,
+    CSub = emqx_streams_test_utils:emqtt_connect([{clientid, ClientId}, {auto_ack, false}]),
+    emqx_streams_test_utils:emqtt_sub(CSub, <<"$stream/t_backpressure">>, [
+        {<<"stream-offset">>, <<"earliest">>}
+    ]),
+    {ok, Msgs0} =
+        emqx_streams_test_utils:emqtt_drain(_MinMsg = BufferSize, _Timeout = 200),
+
+    %% Messages should stop being dispatched once the buffer is full and we acked nothing
+    %% After the buffer is full, the handler will stop acknowledging messages from the DS streams,
+    %% but they still arrive till DSStreamMaxUnacked messages are unacked. So the mzximum total number of
+    %% messages is BufferSize + DSStreamMaxUnacked * 2. We multiply by 2 because we have two active DS streams,
+    %% one for each shard.
+    ?assert(
+        length(Msgs0) =< BufferSize + DSStreamMaxUnacked * 2,
+        binfmt(
+            "Msgs received: ~p, expected less than or equal to: ~p",
+            [length(Msgs0), BufferSize + DSStreamMaxUnacked * 2]
+        )
+    ),
+
+    [ChanPid] = emqx_cm:lookup_channels(ClientId),
+    emqx_extsub_test_utils:assert_no_retained_functions(ChanPid),
+
+    %% Acknowledge the messages
+    ok = emqx_streams_test_utils:emqtt_ack(Msgs0),
+
+    %% After acknowledging, the messages should start being received again
+    {ok, Msgs1} =
+        emqx_streams_test_utils:emqtt_drain(_MinMsg1 = BufferSize, _Timeout1 = 200),
+    ?assert(
+        length(Msgs1) =< BufferSize + DSStreamMaxUnacked * 2,
+        binfmt(
+            "Msgs received: ~p, expected less than or equal to: ~p",
+            [length(Msgs1), BufferSize + DSStreamMaxUnacked]
+        )
+    ),
+
+    %% Clean up
+    ok = emqtt:disconnect(CSub).
+
+-doc """
+After takeover, the client receives the inflight stream message again with its packet identifier.
+The new read from the `earliest` offset can send the message once more.
+Delivery continues after the client acknowledges all copies.
+""".
+t_session_transfer(_Config) ->
+    emqx_streams_test_utils:ensure_stream_created(#{
+        name => <<"transfer">>, topic_filter => <<"transfer/#">>, is_lastvalue => false
+    }),
+    emqx_streams_test_utils:populate(1, #{topic_prefix => <<"transfer/">>}),
+    Opts = [
+        {clientid, <<"stream-transfer">>},
+        {auto_ack, false},
+        {clean_start, false},
+        {properties, #{'Session-Expiry-Interval' => 1000}}
+    ],
+
+    %% The first client receives the message and does not acknowledge it
+    COld = emqx_streams_test_utils:emqtt_connect(Opts),
+    true = unlink(COld),
+    emqx_streams_test_utils:emqtt_sub(COld, <<"$stream/transfer">>, [
+        {<<"stream-offset">>, <<"earliest">>}
+    ]),
+    {ok, Msgs0} = emqx_streams_test_utils:emqtt_drain(_MinMsg0 = 1, _Timeout0 = 3000),
+    [#{payload := Payload, packet_id := PacketId}] = Msgs0,
+
+    %% The second client takes over the session
+    CNew = emqx_streams_test_utils:emqtt_connect(Opts),
+    ?assertEqual(1, proplists:get_value(session_present, emqtt:info(CNew))),
+    {ok, Msgs1} = emqx_streams_test_utils:emqtt_drain(_MinMsg1 = 1, _Timeout1 = 1500),
+    ?assertMatch([#{payload := Payload, packet_id := PacketId, dup := true} | _], Msgs1),
+    ?assertEqual([Payload], lists:usort([MsgPayload || #{payload := MsgPayload} <- Msgs1])),
+    ok = emqx_streams_test_utils:emqtt_ack(Msgs1),
+
+    %% New messages are delivered after the acknowledgements
+    emqx_streams_test_utils:populate(1, #{
+        topic_prefix => <<"transfer/">>, payload_prefix => <<"after-">>
+    }),
+    {ok, Msgs2} = emqx_streams_test_utils:emqtt_drain(_MinMsg2 = 1, _Timeout2 = 1500),
+    ?assertMatch([#{payload := <<"after-0">>}], Msgs2),
+
+    %% Clean up
+    ok = emqtt:disconnect(CNew).
+
+%% Verify that the stream is eventually found even if it is not present when
+%% subscribing
+t_find_stream(_Config) ->
+    emqx_config:put([streams, check_stream_status_interval], 100),
+
+    %% Connect a client and subscribe to a non-existent stream
+    CSub = emqx_streams_test_utils:emqtt_connect([]),
+    emqx_streams_test_utils:emqtt_sub(CSub, <<"$stream/t_find_stream">>, [
+        {<<"stream-offset">>, <<"earliest">>}
+    ]),
+
+    %% Create the stream
+    emqx_streams_test_utils:ensure_stream_created(#{
+        name => <<"t_find_stream">>, topic_filter => <<"t/#">>
+    }),
+    emqx_streams_test_utils:populate(1, #{topic_prefix => <<"t/">>}),
+
+    %% Verify that the message is received
+    {ok, _Msgs} = emqx_streams_test_utils:emqtt_drain(_MinMsg = 1, _Timeout = 1000),
+
+    %% Clean up
+    ok = emqtt:disconnect(CSub).
+
+%% Verify that if the stream is recreated, the subscribers are eventually
+%% resubscribe to the new stream.
+t_stream_recreate(_Config) ->
+    emqx_config:put([streams, check_stream_status_interval], 100),
+
+    %% Create the stream
+    emqx_streams_test_utils:ensure_stream_created(#{
+        name => <<"t_stream_recreate">>,
+        topic_filter => <<"t/#">>,
+        is_lastvalue => false
+    }),
+    emqx_streams_test_utils:populate(1, #{
+        topic_prefix => <<"t/">>, payload_prefix => <<"payload-1-">>
+    }),
+
+    %% Subscribe to the stream
+    CSub = emqx_streams_test_utils:emqtt_connect([]),
+    emqx_streams_test_utils:emqtt_sub(CSub, <<"$stream/t_stream_recreate">>, [
+        {<<"stream-offset">>, <<"earliest">>}
+    ]),
+
+    %% Verify that the message is received
+    {ok, [#{payload := <<"payload-1-", _/binary>>}]} = emqx_streams_test_utils:emqtt_drain(
+        _MinMsg0 = 1, _Timeout0 = 1000
+    ),
+
+    %% Recreate the stream
+    emqx_streams_registry:delete(<<"t_stream_recreate">>),
+    ?retry(
+        5, 100, ?assertNot(emqx_streams_registry:is_present(<<"t_stream_recreate">>, <<"t/#">>))
+    ),
+    emqx_streams_test_utils:ensure_stream_created(#{
+        name => <<"t_stream_recreate">>, topic_filter => <<"t/#">>, is_lastvalue => true
+    }),
+    emqx_streams_test_utils:populate_lastvalue(1, #{
+        topic_prefix => <<"t/">>, payload_prefix => <<"payload-2-">>
+    }),
+
+    %% Verify that the messages are received from the new stream
+    {ok, [#{payload := <<"payload-2-", _/binary>>}]} = emqx_streams_test_utils:emqtt_drain(
+        _MinMsg1 = 1, _Timeout1 = 1000
+    ),
+
+    %% Recreate the stream again, but with a pause > check_stream_status_interval
+    emqx_streams_registry:delete(<<"t_stream_recreate">>),
+    ?retry(
+        5, 100, ?assertNot(emqx_streams_registry:is_present(<<"t_stream_recreate">>, <<"t/#">>))
+    ),
+    ct:sleep(emqx_config:get([streams, check_stream_status_interval]) * 3),
+    emqx_streams_test_utils:ensure_stream_created(#{
+        name => <<"t_stream_recreate">>,
+        topic_filter => <<"t/#">>,
+        is_lastvalue => false
+    }),
+    emqx_streams_test_utils:populate(1, #{
+        topic_prefix => <<"t/">>, payload_prefix => <<"payload-3-">>
+    }),
+
+    %% Verify that the message are received from the new stream
+    {ok, [#{payload := <<"payload-3-", _/binary>>}]} = emqx_streams_test_utils:emqtt_drain(
+        _MinMsg3 = 1, _Timeout3 = 1000
+    ),
+
+    %% Clean up
+    ok = emqtt:disconnect(CSub).
+
+-doc "A subscription stops consuming a stream once the stream is marked as being deleted".
+t_stream_marked_deleting(_Config) ->
+    emqx_config:put([streams, check_stream_status_interval], 100),
+    Stream0 = emqx_streams_test_utils:ensure_stream_created(#{
+        name => <<"t_stream_marked_deleting">>, topic_filter => <<"t/#">>, is_lastvalue => false
+    }),
+    emqx_streams_test_utils:populate(1, #{
+        topic_prefix => <<"t/">>, payload_prefix => <<"payload-1-">>
+    }),
+    CSub = emqx_streams_test_utils:emqtt_connect([]),
+    emqx_streams_test_utils:emqtt_sub(CSub, <<"$stream/t_stream_marked_deleting">>, [
+        {<<"stream-offset">>, <<"earliest">>}
+    ]),
+    {ok, [#{payload := <<"payload-1-", _/binary>>}]} = emqx_streams_test_utils:emqtt_drain(
+        _MinMsg0 = 1, _Timeout0 = 1000
+    ),
+
+    %% Mark the stream and wait for the stream status check
+    ok = emqx_streams_registry:mark_deleting(Stream0),
+    ct:sleep(emqx_config:get([streams, check_stream_status_interval]) * 3),
+
+    %% Write to the stream directly, because publishing skips a marked stream
+    Message = emqx_message:make(<<"c">>, 1, <<"t/1">>, <<"payload-2">>),
+    ok = emqx_streams_message_db:insert(Stream0, Message),
+    {ok, []} = emqx_streams_test_utils:emqtt_drain(_MinMsg1 = 0, _Timeout1 = 1000),
+    ok = emqtt:disconnect(CSub).
+
+%% Verify that the metrics are updated correctly
+t_metrics(_Config) ->
+    #{received_messages := ReceivedMessages0, inserted_messages := InsertedMessages0} =
+        emqx_streams_metrics:get_counters(ds),
+
+    %% Create a stream, publish and consume some messages
+    _Stream = emqx_streams_test_utils:ensure_stream_created(#{
+        name => <<"t_metrics">>, topic_filter => <<"t/#">>
+    }),
+    emqx_streams_test_utils:populate(10, #{topic_prefix => <<"t/">>}),
+    CSub = emqx_streams_test_utils:emqtt_connect([]),
+    emqx_streams_test_utils:emqtt_sub(CSub, <<"$stream/t_metrics">>, [
+        {<<"stream-offset">>, <<"earliest">>}
+    ]),
+    {ok, Msgs} = emqx_streams_test_utils:emqtt_drain(_MinMsg = 10, _Timeout = 1000),
+    ok = emqtt:disconnect(CSub),
+    ?assertEqual(10, length(Msgs)),
+
+    %% Verify that the metrics are updated correctly
+    #{received_messages := ReceivedMessages1, inserted_messages := InsertedMessages1} =
+        emqx_streams_metrics:get_counters(ds),
+    ?assertEqual(10, ReceivedMessages1 - ReceivedMessages0),
+    ?assertEqual(10, InsertedMessages1 - InsertedMessages0),
+    #{received_messages := #{current := Current}} = emqx_streams_metrics:get_rates(ds),
+    ?assert(Current > 0),
+
+    %% Verify that other accessors work
+    ?assert(is_integer(emqx_streams_metrics:get_quota_buffer_inbox_size())),
+    emqx_streams_metrics:print_common_hists(),
+    emqx_streams_metrics:print_flush_quota_hist(),
+    emqx_streams_metrics:print_common_hists(regular_limited).
+
+%% Verify that subscription with invalid topic filter
+%% does not prevent further subscription with valid topic filter.
+t_subscribe_invalid_topic(_Config) ->
+    %% Create a stream
+    _Stream = emqx_streams_test_utils:ensure_stream_created(#{
+        name => <<"t_subscribe_invalid_topic">>, topic_filter => <<"t/#">>
+    }),
+    emqx_streams_test_utils:populate(1, #{topic_prefix => <<"t/">>}),
+
+    %% Subscribe to the stream with invalid topic
+    CSub = emqx_streams_test_utils:emqtt_connect([]),
+    emqx_streams_test_utils:emqtt_sub(CSub, <<"$stream/t_subscribe_invalid_topic/xxx/#">>, [
+        {<<"stream-offset">>, <<"earliest">>}
+    ]),
+
+    %% Subscribe to the stream with valid topic filter
+    emqx_streams_test_utils:emqtt_sub(CSub, <<"$stream/t_subscribe_invalid_topic/t/#">>, [
+        {<<"stream-offset">>, <<"earliest">>}
+    ]),
+
+    %% Drain the messages from the stream and verify that we receive the messages
+    {ok, Msgs} = emqx_streams_test_utils:emqtt_drain(_MinMsg = 1, _Timeout = 1000),
+    ?assertEqual(1, length(Msgs)),
+
+    %% Clean up
+    ok = emqtt:disconnect(CSub).
+
+t_autocreate_stream(_Config) ->
+    %% Create a client
+    CSub = emqx_streams_test_utils:emqtt_connect([]),
+
+    %% Autocreate some lastvalue streams
+    RawConfig = emqx:get_raw_config([streams]),
+    {ok, _} = emqx:update_config([streams], RawConfig#{
+        <<"auto_create">> => #{
+            <<"regular">> => false,
+            <<"lastvalue">> => #{
+                <<"key_expression">> => <<"message.headers.properties.User-Property.stream-key">>
+            }
+        }
+    }),
+    ok = emqx_streams_test_utils:emqtt_sub(CSub, [
+        <<"$stream/auto_create_lastvalue/a/#">>
+    ]),
+
+    %% Autocreate some regular streams
+    {ok, _} = emqx:update_config([streams], RawConfig#{
+        <<"auto_create">> => #{
+            <<"regular">> => #{},
+            <<"lastvalue">> => false
+        }
+    }),
+    ok = emqx_streams_test_utils:emqtt_sub(CSub, [
+        <<"$stream/auto_create_regular/d/#">>
+    ]),
+
+    %% Verify that all 6 streams are created
+    ?assertMatch(
+        [
+            #{topic_filter := <<"a/#">>},
+            #{topic_filter := <<"d/#">>}
+        ],
+        emqx_utils_stream:consume(emqx_streams_registry:list())
+    ),
+
+    %% Publish some messages to the streams
+    emqx_streams_test_utils:populate_lastvalue(10, #{topic_prefix => <<"a/">>}),
+    emqx_streams_test_utils:populate(10, #{topic_prefix => <<"d/">>}),
+
+    %% Verify that we receive all the messages
+    {ok, _Msgs0} = emqx_streams_test_utils:emqtt_drain(20, 1000),
+
+    %% Clean up
+    ok = emqtt:disconnect(CSub).
+
+%% Verify that the default configuration does not automatically create streams
+t_autocreate_stream_disabled_by_default(_Config) ->
+    %% Take the `auto_create' settings straight from the schema defaults
+    #{<<"streams">> := #{<<"auto_create">> := AutoCreate}} =
+        emqx_config:fill_defaults(#{<<"streams">> => #{}}),
+    ?assertEqual(#{<<"regular">> => false, <<"lastvalue">> => false}, AutoCreate),
+    {ok, _} = emqx:update_config([streams, auto_create], AutoCreate),
+
+    %% Connect a client and subscribe to a non-existent stream
+    CSub = emqx_streams_test_utils:emqtt_connect([]),
+    ok = emqx_streams_test_utils:emqtt_sub(CSub, [
+        <<"$stream/auto_create_default/a/#">>
+    ]),
+
+    %% Verify that no stream was automatically created
+    ?assertEqual([], emqx_utils_stream:consume(emqx_streams_registry:list())),
+
+    %% Clean up
+    ok = emqtt:disconnect(CSub).
+
+%% Verify that the data retention period is applied correctly
+t_data_retention_period(_Config) ->
+    %% Create a lastvalue and a regular streams with 1s data retention period
+    StreamLV = emqx_streams_test_utils:ensure_stream_created(#{
+        name => <<"data_retention_period_lastvalue">>,
+        topic_filter => <<"t1/#">>,
+        is_lastvalue => true,
+        data_retention_period => 1000
+    }),
+    StreamR = emqx_streams_test_utils:ensure_stream_created(#{
+        name => <<"data_retention_period_regular">>,
+        topic_filter => <<"t2/#">>,
+        is_lastvalue => false,
+        data_retention_period => 1000
+    }),
+
+    %% Timestamp before the message was published
+    TimestampBeforeMessage = erlang:system_time(microsecond) - 1_000_000,
+    TimestampBeforeMessageBin = integer_to_binary(TimestampBeforeMessage),
+
+    %% Publish 1 message to the streams
+    emqx_streams_test_utils:populate_lastvalue(1, #{
+        topic_prefix => <<"t1/">>, key_start_from => 0, payload_prefix => <<"payload-old-">>
+    }),
+    emqx_streams_test_utils:populate(1, #{
+        topic_prefix => <<"t2/">>, payload_prefix => <<"payload-old-">>
+    }),
+    emqx_streams_message_db:add_regular_db_generation(),
+
+    %% Wait for 1s to let the data expire
+    ct:sleep(1000),
+
+    %% Publish 1 more message to the streams
+    emqx_streams_test_utils:populate_lastvalue(1, #{
+        topic_prefix => <<"t1/">>, key_start_from => 1, payload_prefix => <<"payload-new-">>
+    }),
+    emqx_streams_test_utils:populate(1, #{
+        topic_prefix => <<"t2/">>, payload_prefix => <<"payload-new-">>
+    }),
+
+    %% Try to read the messages as earliest and see that the limit is applied.
+    %% We should see the second message from each stream, totaling 2 messages.
+    CSub0 = emqx_streams_test_utils:emqtt_connect([]),
+    emqx_streams_test_utils:emqtt_sub(
+        CSub0,
+        [<<"$stream/data_retention_period_lastvalue">>],
+        [{<<"stream-offset">>, <<"earliest">>}]
+    ),
+    emqx_streams_test_utils:emqtt_sub(
+        CSub0,
+        [<<"$stream/data_retention_period_regular">>],
+        [{<<"stream-offset">>, <<"earliest">>}]
+    ),
+
+    {ok, Msgs0} = emqx_streams_test_utils:emqtt_drain(_MinMsg0 = 2, _Timeout0 = 100),
+    ?assertEqual(2, length(Msgs0)),
+    ok = emqtt:disconnect(CSub0),
+
+    %% Try to read the messages from timestamp 2s ago and see that the limit is applied
+    CSub1 = emqx_streams_test_utils:emqtt_connect([]),
+    emqx_streams_test_utils:emqtt_sub(
+        CSub1,
+        [<<"$stream/data_retention_period_lastvalue">>],
+        [{<<"stream-offset">>, TimestampBeforeMessageBin}]
+    ),
+    emqx_streams_test_utils:emqtt_sub(
+        CSub1,
+        [<<"$stream/data_retention_period_regular">>],
+        [{<<"stream-offset">>, TimestampBeforeMessageBin}]
+    ),
+    {ok, Msgs1} = emqx_streams_test_utils:emqtt_drain(_MinMsg1 = 2, _Timeout1 = 100),
+    ?assertEqual(2, length(Msgs1)),
+    ok = emqtt:disconnect(CSub1),
+
+    %% Now update the data retention period to 1m and verify that we see all the messages
+    %% (because stream was not yet GC-ed)
+    emqx_streams_registry:update(
+        <<"data_retention_period_lastvalue">>,
+        StreamLV#{data_retention_period => 60_000}
+    ),
+    emqx_streams_registry:update(
+        <<"data_retention_period_regular">>,
+        StreamR#{data_retention_period => 60_000}
+    ),
+
+    %% Try to read the messages as earliest and get all the messages
+    CSub2 = emqx_streams_test_utils:emqtt_connect([]),
+    emqx_streams_test_utils:emqtt_sub(
+        CSub2,
+        [<<"$stream/data_retention_period_lastvalue">>],
+        [{<<"stream-offset">>, <<"earliest">>}]
+    ),
+    emqx_streams_test_utils:emqtt_sub(
+        CSub2,
+        [<<"$stream/data_retention_period_regular">>],
+        [{<<"stream-offset">>, <<"earliest">>}]
+    ),
+    {ok, _Msgs2} = emqx_streams_test_utils:emqtt_drain(_MinMsg2 = 4, _Timeout2 = 200),
+    ok = emqtt:disconnect(CSub2),
+
+    %% Try to read the messages from timestamp TimestampBeforeMessage and get all the messages
+    CSub3 = emqx_streams_test_utils:emqtt_connect([]),
+    emqx_streams_test_utils:emqtt_sub(
+        CSub3,
+        [<<"$stream/data_retention_period_lastvalue">>],
+        [{<<"stream-offset">>, TimestampBeforeMessageBin}]
+    ),
+    emqx_streams_test_utils:emqtt_sub(
+        CSub3,
+        [<<"$stream/data_retention_period_regular">>],
+        [{<<"stream-offset">>, TimestampBeforeMessageBin}]
+    ),
+    {ok, _Msgs3} = emqx_streams_test_utils:emqtt_drain(_MinMsg3 = 4, _Timeout3 = 1000),
+
+    %% Clean up
+    ok = emqtt:disconnect(CSub3).
+
+%% Verify that we can subscribe to a stream using the legacy start-from user property
+t_legacy_start_from_user_property(_Config) ->
+    %% Create a stream
+    _ = emqx_streams_test_utils:ensure_stream_created(#{
+        name => <<"legacy_start_from_user_property">>,
+        topic_filter => <<"t/#">>
+    }),
+
+    %% Publish a message to the stream
+    emqx_streams_test_utils:populate(1, #{topic_prefix => <<"t/">>}),
+
+    %% Subscribe to the stream
+    CSub = emqx_streams_test_utils:emqtt_connect([]),
+    emqx_streams_test_utils:emqtt_sub(
+        CSub,
+        [<<"$stream/legacy_start_from_user_property">>],
+        [{<<"$stream.start-from">>, <<"earliest">>}]
+    ),
+    {ok, Msgs} = emqx_streams_test_utils:emqtt_drain(_MinMsg = 1, _Timeout = 1000),
+    ?assertEqual(1, length(Msgs)),
+    ok = emqtt:disconnect(CSub).
+
+%% Verify that Subscription-Identifier is preserved in PUBLISH packets for stream deliveries.
+t_subscription_identifier(_Config) ->
+    %% Create stream
+    _ = emqx_streams_test_utils:ensure_stream_created(#{
+        name => <<"subid">>,
+        topic_filter => <<"t/#">>,
+        is_lastvalue => false
+    }),
+
+    %% Subcribe to the stream with nontrivial sub opts
+    CSub = emqx_streams_test_utils:emqtt_connect([]),
+    SubId = 42,
+    SubProps = #{'Subscription-Identifier' => SubId},
+    {ok, _, [?QOS_1]} = emqtt:subscribe(CSub, SubProps, <<"$stream/subid/t/#">>, ?QOS_1),
+
+    %% Populate the stream and verify that we receive the message
+    %% with the Subscription-Identifier property fron sub opts
+    emqx_streams_test_utils:populate(1, #{topic_prefix => <<"t/">>}),
+    receive
+        {publish, #{
+            topic := <<"t/0">>,
+            properties := #{'Subscription-Identifier' := ReceivedSubId}
+        }} ->
+            ?assertEqual(SubId, ReceivedSubId)
+    after 3000 ->
+        ct:fail("t/0 message from streams not received or missing Subscription-Identifier")
+    end,
+
+    %% Clean up
+    ok = emqtt:disconnect(CSub).
+
+%% Verify that subscription restoration works correctly for stream topics
+t_sub_restoration(_Config) ->
+    %% Create a non-lastvalue stream
+    emqx_streams_test_utils:ensure_stream_created(#{
+        name => <<"offline_session">>,
+        topic_filter => <<"t/#">>,
+        is_lastvalue => false
+    }),
+    emqx_streams_test_utils:populate(10, #{topic_prefix => <<"t/">>}),
+
+    %% Subscribe to the stream
+    CSub0 = emqx_streams_test_utils:emqtt_connect([
+        {clientid, <<"csub">>},
+        {properties, #{'Session-Expiry-Interval' => 1000}},
+        {clean_start, false}
+    ]),
+    emqx_streams_test_utils:emqtt_sub(CSub0, <<"$stream/offline_session">>, [
+        {<<"stream-offset">>, <<"earliest">>}
+    ]),
+
+    %% Verify that we receive all the messages
+    {ok, _Msgs0} = emqx_streams_test_utils:emqtt_drain(_MinMsg0 = 10, _Timeout0 = 1000),
+
+    %% Disconnect the client
+    ok = emqtt:disconnect(CSub0),
+
+    %% Reconnect the client
+    CSub1 = emqx_streams_test_utils:emqtt_connect([
+        {clientid, <<"csub">>},
+        {properties, #{'Session-Expiry-Interval' => 1000}},
+        {clean_start, false}
+    ]),
+
+    %% Receive the messages again
+    {ok, _Msgs1} = emqx_streams_test_utils:emqtt_drain(_MinMsg1 = 10, _Timeout1 = 1000),
+
+    %% Clean up
+    ok = emqtt:disconnect(CSub1).
+
+-doc "MQTT 3.1 and 3.1.1 clients cannot subscribe to streams.".
+t_allow_only_mqtt_v5(_Config) ->
+    lists:foreach(fun reject_legacy_protocol/1, [v3, v4]).
+
+reject_legacy_protocol(ProtoVer) ->
+    {ok, CSub} = emqtt:start_link([{proto_ver, ProtoVer}]),
+    {ok, _} = emqtt:connect(CSub),
+
+    {ok, _, [?RC_UNSPECIFIED_ERROR]} = emqtt:subscribe(CSub, {<<"$stream/some_stream/t/#">>, 1}),
+
+    ok = emqtt:disconnect(CSub).
+
+t_subscribe_unsubscribe_to_many_streams(_Config) ->
+    NStreams = 5,
+
+    %% Create NStreams streams with different names
+    lists:foreach(
+        fun(N) ->
+            NBin = integer_to_binary(N),
+            emqx_streams_test_utils:ensure_stream_created(#{
+                name => <<"stream_", NBin/binary>>,
+                topic_filter => <<"t/", NBin/binary>>
+            })
+        end,
+        lists:seq(1, NStreams)
+    ),
+
+    %% Subscribe to each stream, receive and unsubscribe from the stream,
+    %% all by the same client.
+    CSub = emqx_streams_test_utils:emqtt_connect([{clientid, <<"csub">>}]),
+    CPub = emqx_streams_test_utils:emqtt_connect([{clientid, <<"cpub">>}]),
+    lists:foreach(
+        fun(N) ->
+            NBin = integer_to_binary(N),
+            Topic = <<"$stream/stream_", NBin/binary>>,
+            emqx_streams_test_utils:emqtt_sub(CSub, [Topic], [
+                {<<"stream-offset">>, <<"earliest">>}
+            ]),
+            emqtt:publish(CPub, <<"t/", NBin/binary>>, <<"payload">>, ?QOS_1),
+            {ok, _Msgs} = emqx_streams_test_utils:emqtt_drain(_MinMsg = 1, _Timeout = 5000),
+            emqtt:unsubscribe(CSub, Topic)
+        end,
+        lists:seq(1, NStreams)
+    ),
+    ok = emqtt:disconnect(CPub),
+
+    %% Obtain the extsub info
+    [ChannelPid] = emqx_cm:lookup_channels(<<"csub">>),
+    {ok, Info} = emqx_extsub:inspect(ChannelPid),
+
+    %% Verify that there are no leftovers
+
+    #{
+        unacked_count := UnackedCount,
+        deliver_retry_scheduled := DeliverRetryScheduled,
+        registry := #{
+            buffer := #{delivering := Delivering, message_buffer_size := MessageBufferSize},
+            by_ref := ByRef,
+            by_topic_cbm := ByTopicCBM,
+            generic_message_handlers := GenericMessageHandlers
+        }
+    } = Info,
+    ?assertEqual(0, maps:size(Delivering)),
+    ?assertEqual(0, UnackedCount),
+    ?assertEqual(false, DeliverRetryScheduled),
+    ?assertEqual([], ByRef),
+    ?assertEqual(0, maps:size(ByTopicCBM)),
+    ?assertEqual([], GenericMessageHandlers),
+    ?assertEqual(0, MessageBufferSize),
+
+    ok = emqtt:disconnect(CSub).
+
+t_subscribe_two_unsubscribe_one_stream(_Config) ->
+    %% Create two streams
+    _Stream0 = emqx_streams_test_utils:ensure_stream_created(#{
+        name => <<"s1">>,
+        topic_filter => <<"t1/#">>
+    }),
+    _Stream1 = emqx_streams_test_utils:ensure_stream_created(#{
+        name => <<"s2">>,
+        topic_filter => <<"t2/#">>
+    }),
+    %% Subscribe to both streams
+    CSub = emqx_streams_test_utils:emqtt_connect([]),
+    emqx_streams_test_utils:emqtt_sub(CSub, [<<"$stream/s1">>, <<"$stream/s2">>], [
+        {<<"stream-offset">>, <<"earliest">>}
+    ]),
+    %% Publish a message to both streams
+    emqx_streams_test_utils:populate(1, #{topic_prefix => <<"t1/">>}),
+    emqx_streams_test_utils:populate(1, #{topic_prefix => <<"t2/">>}),
+    %% Receive the messages
+    {ok, _Msgs0} = emqx_streams_test_utils:emqtt_drain(_MinMsg0 = 2, _Timeout0 = 5000),
+
+    %% Unsubscribe from one stream
+    emqtt:unsubscribe(CSub, <<"$stream/s1">>),
+
+    %% Publish a message to the remaining stream
+    emqx_streams_test_utils:populate(1, #{topic_prefix => <<"t2/">>}),
+
+    %% Receive the message
+    {ok, _Msgs1} = emqx_streams_test_utils:emqtt_drain(_MinMsg1 = 1, _Timeout1 = 5000),
+
+    %% Clean up
+    ok = emqtt:disconnect(CSub).
+
+%%--------------------------------------------------------------------
+%% Helper functions
+%%--------------------------------------------------------------------
+
+test_schema_validation(#message{topic = <<"governed/drop">>, headers = Headers} = Message) ->
+    {stop, Message#message{headers = Headers#{allow_publish => false}}};
+test_schema_validation(Message) ->
+    {ok, Message}.
+
+test_message_transformation(#message{topic = <<"governed/transform">>} = Message) ->
+    {ok, Message#message{payload = <<"redacted">>}};
+test_message_transformation(Message) ->
+    {ok, Message}.
+
+validate_headers(Msgs) when is_list(Msgs) ->
+    lists:foreach(fun validate_msg_headers/1, Msgs).
+
+validate_msg_headers(Msg) ->
+    case user_properties(Msg) of
+        #{<<"ts">> := _Ts, <<"key">> := _Key} ->
+            ok;
+        _ ->
+            ct:fail("Message does not have required user properties (part, ts, key): ~p", [Msg])
+    end.
+
+user_properties(_Msg = #{properties := #{'User-Property' := UserProperties}}) ->
+    maps:from_list(UserProperties);
+user_properties(_Msg) ->
+    #{}.
+
+record_payloads(Records) ->
+    [
+        emqx_message:payload(emqx_streams_message_db:decode_message(MessageBin))
+     || {_, _, MessageBin} <- lists:sort(Records)
+    ].
+
+binfmt(Format, Args) ->
+    iolist_to_binary(io_lib:format(Format, Args)).

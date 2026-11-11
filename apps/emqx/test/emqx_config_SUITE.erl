@@ -1,0 +1,691 @@
+%%--------------------------------------------------------------------
+%% Copyright (c) 2020-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
+%%--------------------------------------------------------------------
+
+-module(emqx_config_SUITE).
+
+-compile(export_all).
+-compile(nowarn_export_all).
+-include_lib("eunit/include/eunit.hrl").
+-include_lib("common_test/include/ct.hrl").
+-include_lib("snabbkaffe/include/snabbkaffe.hrl").
+
+all() -> emqx_common_test_helpers:all(?MODULE).
+
+init_per_suite(Config) ->
+    WorkDir = emqx_cth_suite:work_dir(Config),
+    Apps = emqx_cth_suite:start(
+        [
+            {emqx, #{
+                override_env => [
+                    {cluster_override_conf_file, filename:join(WorkDir, "cluster_override.conf")}
+                ]
+            }}
+        ],
+        #{work_dir => WorkDir}
+    ),
+    [{apps, Apps} | Config].
+
+end_per_suite(Config) ->
+    emqx_cth_suite:stop(?config(apps, Config)).
+
+init_per_testcase(TestCase, Config) ->
+    try
+        ?MODULE:TestCase({init, Config})
+    catch
+        error:function_clause ->
+            Config
+    end.
+
+end_per_testcase(TestCase, Config) ->
+    try
+        ?MODULE:TestCase({'end', Config})
+    catch
+        error:function_clause ->
+            ok
+    end.
+
+t_fill_default_values(C) when is_list(C) ->
+    Conf = #{
+        <<"broker">> => #{
+            <<"perf">> => #{},
+            <<"route_batch_clean">> => false
+        }
+    },
+    WithDefaults = emqx_config:fill_defaults(Conf),
+    ?assertMatch(
+        #{
+            <<"broker">> :=
+                #{
+                    <<"enable_session_registry">> := true,
+                    <<"perf">> :=
+                        #{
+                            <<"async_fanout_shard_dispatch">> := false,
+                            <<"route_lock_type">> := <<"key">>
+                        },
+                    <<"route_batch_clean">> := false,
+                    <<"session_history_retain">> := <<"0s">>
+                }
+        },
+        WithDefaults
+    ),
+    %% ensure JSON compatible
+    _ = emqx_utils_json:encode(WithDefaults),
+    ok.
+
+t_init_load(C) when is_list(C) ->
+    ConfFile = "./test_emqx.conf",
+    ok = file:write_file(ConfFile, <<"">>),
+    ExpectRootNames = lists:sort(hocon_schema:root_names(emqx_schema)),
+    emqx_config:erase_all(),
+    {ok, DeprecatedFile} = application:get_env(emqx, cluster_override_conf_file),
+    ?assertEqual(false, filelib:is_regular(DeprecatedFile), DeprecatedFile),
+    %% Don't have deprecated file
+    ok = emqx_config:init_load(emqx_schema, [ConfFile]),
+    ?assertEqual(ExpectRootNames, lists:sort(emqx_config:get_root_names())),
+    ?assertMatch({ok, #{raw_config := 256}}, emqx:update_config([mqtt, max_topic_levels], 256)),
+    emqx_config:erase_all(),
+    %% Has deprecated file
+    ok = file:write_file(DeprecatedFile, <<"{}">>),
+    ok = emqx_config:init_load(emqx_schema, [ConfFile]),
+    ?assertEqual(ExpectRootNames, lists:sort(emqx_config:get_root_names())),
+    ?assertMatch({ok, #{raw_config := 128}}, emqx:update_config([mqtt, max_topic_levels], 128)),
+    emqx_config_backup_manager:flush(),
+    ok = file:delete(DeprecatedFile).
+
+t_init_load_with_base_hocon(C) when is_list(C) ->
+    BaseHocon = emqx_config:base_hocon_file(),
+    ClusterHocon = emqx_config:cluster_hocon_file(),
+    ConfFile = "./test_emqx_2.conf",
+    ok = filelib:ensure_dir(BaseHocon),
+    ok = file:write_file(
+        BaseHocon,
+        "mqtt.max_topic_levels = 123\n"
+        "mqtt.max_clientid_len=12\n"
+        "mqtt.max_inflight=12\n"
+    ),
+    ok = file:write_file(
+        ClusterHocon,
+        "mqtt.max_clientid_len = 123\n"
+        "mqtt.max_inflight=22\n"
+    ),
+    ok = file:write_file(ConfFile, "mqtt.max_inflight = 123\n"),
+    ok = emqx_config:init_load(emqx_schema, [ConfFile]),
+    ?assertEqual(123, emqx:get_config([mqtt, max_topic_levels])),
+    ?assertEqual(123, emqx:get_config([mqtt, max_clientid_len])),
+    ?assertEqual(123, emqx:get_config([mqtt, max_inflight])),
+    emqx_config:erase_all(),
+    ok = file:delete(BaseHocon),
+    ok = file:delete(ClusterHocon),
+    ok.
+
+t_unknown_root_keys(C) when is_list(C) ->
+    ?check_trace(
+        #{timetrap => 1000},
+        begin
+            ok = emqx_config:init_load(
+                emqx_schema, <<"test_1 {}\n test_2 {sub = 100}\n listeners {}">>
+            ),
+            ?block_until(#{?snk_kind := "config_roots_not_recognized"})
+        end,
+        fun(Trace) ->
+            ?assertMatch(
+                [#{config_roots := ["test_1", "test_2"]}],
+                ?of_kind("config_roots_not_recognized", Trace)
+            )
+        end
+    ),
+    ok.
+
+t_cluster_hocon_backup({init, C}) ->
+    emqx_config:put([config_backup_interval], 1),
+    C;
+t_cluster_hocon_backup({'end', _C}) ->
+    File = "backup-test.hocon",
+    Files = [File | filelib:wildcard(File ++ ".*.bak")],
+    lists:foreach(fun file:delete/1, Files);
+t_cluster_hocon_backup(C) when is_list(C) ->
+    Write = fun(Path, Content) ->
+        emqx_config:backup_and_write(Path, Content),
+        %% avoid name clash
+        timer:sleep(10)
+    end,
+    File = "backup-test.hocon",
+    %% write 12 times, 10 backups should be kept
+    %% the latest one is File itself without suffix
+    %% the oldest one is expected to be deleted
+    N = 12,
+    Inputs = lists:seq(1, N),
+    Backups = lists:seq(N - 10, N - 1),
+    InputContents = [integer_to_binary(I) || I <- Inputs],
+    BackupContents = [integer_to_binary(I) || I <- Backups],
+    lists:foreach(
+        fun(Content) ->
+            Write(File, Content)
+        end,
+        InputContents
+    ),
+    LatestContent = integer_to_binary(N),
+    emqx_config_backup_manager:flush(),
+    ?assertEqual({ok, LatestContent}, file:read_file(File)),
+    Re = "\\.[0-9]{4}\\.[0-9]{2}\\.[0-9]{2}\\.[0-9]{2}\\.[0-9]{2}\\.[0-9]{2}\\.[0-9]{3}\\.bak$",
+    Files = filelib:wildcard(File ++ ".*.bak"),
+    ?assert(lists:all(fun(F) -> re:run(F, Re) =/= nomatch end, Files)),
+    %% keep only the latest 10
+    ?assertEqual(10, length(Files)),
+    FilesSorted = lists:zip(lists:sort(Files), BackupContents),
+    lists:foreach(
+        fun({BackupFile, ExpectedContent}) ->
+            ?assertEqual({ok, ExpectedContent}, file:read_file(BackupFile))
+        end,
+        FilesSorted
+    ),
+    ok.
+
+t_cluster_hocon_save_failure({'end', _C}) ->
+    _ = file:delete("backup-test-blocker"),
+    ok;
+t_cluster_hocon_save_failure(C) when is_list(C) ->
+    %% Force a save failure deterministically without depending on user perms
+    %% (CI runs as root, which ignores chmod). We use a regular file as the
+    %% would-be parent directory of the destination, so file:write_file/2 of the
+    %% .tmp file fails with enotdir.
+    Blocker = "backup-test-blocker",
+    ok = file:write_file(Blocker, <<>>),
+    Dest = filename:join(Blocker, "data.hocon"),
+    Result = emqx_config:backup_and_write(Dest, <<"new">>),
+    ?assertMatch({error, #{filename := Dest, reason := enotdir}}, Result),
+    ok = file:delete(Blocker),
+    ok.
+
+-doc "New config is persisted even when reading the current file for backup fails.".
+t_cluster_hocon_save_unreadable_current({init, C}) ->
+    ok = meck:new(file, [passthrough, unstick]),
+    C;
+t_cluster_hocon_save_unreadable_current({'end', _C}) ->
+    ok = meck:unload(file),
+    File = "backup-test-unreadable.hocon",
+    lists:foreach(fun file:delete/1, [File | filelib:wildcard(File ++ ".*")]),
+    ok;
+t_cluster_hocon_save_unreadable_current(C) when is_list(C) ->
+    Dest = "backup-test-unreadable.hocon",
+    ok = file:write_file(Dest, <<"old">>),
+    %% meck instead of chmod: chmod is ineffective when the test runs as root
+    ok = meck:expect(file, read_file, fun
+        (F) when F =:= Dest -> {error, eacces};
+        (F) -> meck:passthrough([F])
+    end),
+    ?assertEqual(ok, emqx_config:backup_and_write(Dest, <<"new">>)),
+    ok = meck:expect(file, read_file, fun(F) -> meck:passthrough([F]) end),
+    %% the new config is persisted and the staged file is gone
+    ?assertEqual({ok, <<"new">>}, file:read_file(Dest)),
+    ?assertEqual({error, enoent}, file:read_file(Dest ++ ".tmp")),
+    %% only this backup generation is skipped
+    ok = emqx_config_backup_manager:flush(),
+    ?assertEqual([], filelib:wildcard(Dest ++ ".*.bak")),
+    ok.
+
+-doc "Failure to sync the staged file returns an error and leaves the previous config intact.".
+t_cluster_hocon_save_sync_failure({init, C}) ->
+    ok = meck:new(file, [passthrough, unstick]),
+    C;
+t_cluster_hocon_save_sync_failure({'end', _C}) ->
+    ok = meck:unload(file),
+    File = "backup-test-sync.hocon",
+    lists:foreach(fun file:delete/1, [File | filelib:wildcard(File ++ ".*")]),
+    ok;
+t_cluster_hocon_save_sync_failure(C) when is_list(C) ->
+    Dest = "backup-test-sync.hocon",
+    ok = file:write_file(Dest, <<"old">>),
+    TestPid = self(),
+    ok = meck:expect(file, sync, fun(Fd) ->
+        case self() of
+            TestPid -> {error, enospc};
+            _ -> meck:passthrough([Fd])
+        end
+    end),
+    ?assertMatch(
+        {error, #{filename := Dest, reason := enospc}},
+        emqx_config:backup_and_write(Dest, <<"new">>)
+    ),
+    ok = meck:expect(file, sync, fun(Fd) -> meck:passthrough([Fd]) end),
+    ?assertEqual({ok, <<"old">>}, file:read_file(Dest)),
+    ?assertEqual({error, enoent}, file:read_file(Dest ++ ".tmp")),
+    ok.
+
+t_init_load_emqx_schema(Config) when is_list(Config) ->
+    emqx_config:erase_all(),
+    %% Given empty config file
+    ConfFile = prepare_conf_file(?FUNCTION_NAME, <<"">>, Config),
+    application:set_env(emqx, config_files, [ConfFile]),
+    %% When load emqx_schema
+    ?assertEqual(ok, emqx_config:init_load(emqx_schema)),
+    %% Then default zone is injected with all global defaults
+    Default = emqx_config:get([zones, default]),
+    MQTT = emqx_config:get([mqtt]),
+    Stats = emqx_config:get([stats]),
+    FD = emqx_config:get([flapping_detect]),
+    FS = emqx_config:get([force_shutdown]),
+    CC = emqx_config:get([conn_congestion]),
+    FG = emqx_config:get([force_gc]),
+    OP = emqx_config:get([overload_protection]),
+    ?assertMatch(
+        #{
+            mqtt := MQTT,
+            stats := Stats,
+            flapping_detect := FD,
+            force_shutdown := FS,
+            conn_congestion := CC,
+            force_gc := FG,
+            overload_protection := OP
+        },
+        Default
+    ).
+
+t_init_zones_load_emqx_schema_no_default_for_none_existing(Config) when is_list(Config) ->
+    emqx_config:erase_all(),
+    %% Given empty config file
+    ConfFile = prepare_conf_file(?FUNCTION_NAME, <<"">>, Config),
+    application:set_env(emqx, config_files, [ConfFile]),
+    %% When emqx_schema is loaded
+    ?assertEqual(ok, emqx_config:init_load(emqx_schema)),
+    %% Then read for none existing zone should throw error
+    ?assertError(
+        {config_not_found, [zones, no_exists]},
+        emqx_config:get([zones, no_exists])
+    ).
+
+t_init_zones_load_other_schema(Config) when is_list(Config) ->
+    emqx_config:erase_all(),
+    %% Given empty config file
+    ConfFile = prepare_conf_file(?FUNCTION_NAME, <<"">>, Config),
+    application:set_env(emqx, config_files, [ConfFile]),
+    %% When load emqx_limiter_schema, not emqx_schema
+    %% Then load should success
+    ?assertEqual(ok, emqx_config:init_load(emqx_limiter_schema)),
+    %% Then no zones is loaded.
+    ?assertError(
+        {config_not_found, [zones]},
+        emqx_config:get([zones])
+    ),
+    %% Then no default zone is loaded.
+    ?assertError(
+        {config_not_found, [zones, default]},
+        emqx_config:get([zones, default])
+    ).
+
+t_default_strict_mode_is_true(Config) when is_list(Config) ->
+    emqx_config:erase_all(),
+    %% Given an empty config that does not set mqtt.strict_mode
+    ConfFile = prepare_conf_file(?FUNCTION_NAME, <<"">>, Config),
+    application:set_env(emqx, config_files, [ConfFile]),
+    ?assertEqual(ok, emqx_config:init_load(emqx_schema)),
+    %% Then mqtt.strict_mode defaults to true at the global root
+    ?assertEqual(true, emqx:get_config([mqtt, strict_mode])),
+    %% And it is propagated to the default zone
+    ?assertEqual(true, emqx_config:get([zones, default, mqtt, strict_mode])).
+
+t_init_zones_with_user_defined_default_zone(Config) when is_list(Config) ->
+    emqx_config:erase_all(),
+    %% Given user defined config for default zone
+    ConfFile = prepare_conf_file(
+        ?FUNCTION_NAME, <<"zones.default.mqtt.max_topic_alias=1024">>, Config
+    ),
+    application:set_env(emqx, config_files, [ConfFile]),
+    %% When schema is loaded
+    ?assertEqual(ok, emqx_config:init_load(emqx_schema)),
+
+    %% Then user defined value is set
+    {MqttV, Others} = maps:take(mqtt, emqx_config:get([zones, default])),
+    {ZGDMQTT, ExpectedOthers} = maps:take(mqtt, zone_global_defaults()),
+    ?assertEqual(ZGDMQTT#{max_topic_alias := 1024}, MqttV),
+    %% Then others are defaults
+    ?assertEqual(ExpectedOthers, Others).
+
+t_init_zones_with_user_defined_other_zone(Config) when is_list(Config) ->
+    emqx_config:erase_all(),
+    %% Given user defined config for default zone
+    ConfFile = prepare_conf_file(
+        ?FUNCTION_NAME, <<"zones.myzone.mqtt.max_topic_alias=1024">>, Config
+    ),
+    application:set_env(emqx, config_files, [ConfFile]),
+    %% When schema is loaded
+    ?assertEqual(ok, emqx_config:init_load(emqx_schema)),
+    %% Then user defined value is set and others are defaults
+
+    %% Then user defined value is set
+    {MqttV, Others} = maps:take(mqtt, emqx_config:get([zones, myzone])),
+    {ZGDMQTT, ExpectedOthers} = maps:take(mqtt, zone_global_defaults()),
+    ?assertEqual(ZGDMQTT#{max_topic_alias := 1024}, MqttV),
+    %% Then others are defaults
+    ?assertEqual(ExpectedOthers, Others),
+    %% Then default zone still have the defaults
+    ?assertEqual(zone_global_defaults(), emqx_config:get([zones, default])).
+
+t_init_zones_with_cust_root_mqtt(Config) when is_list(Config) ->
+    emqx_config:erase_all(),
+    %% Given config file with mqtt user overrides
+    ConfFile = prepare_conf_file(?FUNCTION_NAME, <<"mqtt.retry_interval=10m">>, Config),
+    application:set_env(emqx, config_files, [ConfFile]),
+    %% When emqx_schema is loaded
+    ?assertEqual(ok, emqx_config:init_load(emqx_schema)),
+    %% Then the value is reflected as internal representation in default `zone'
+    %% and other fields under mqtt are defaults.
+    GDefaultMqtt = maps:get(mqtt, zone_global_defaults()),
+    ?assertEqual(
+        GDefaultMqtt#{retry_interval := 600000},
+        emqx_config:get([zones, default, mqtt])
+    ).
+
+t_default_zone_is_updated_after_global_defaults_updated(Config) when is_list(Config) ->
+    emqx_config:erase_all(),
+    %% Given empty emqx conf
+    ConfFile = prepare_conf_file(?FUNCTION_NAME, <<"">>, Config),
+    application:set_env(emqx, config_files, [ConfFile]),
+    ?assertEqual(ok, emqx_config:init_load(emqx_schema)),
+    ?assertNotEqual(900000, emqx_config:get([zones, default, mqtt, retry_interval])),
+    %% When emqx_schema is loaded
+    emqx_config:put([mqtt, retry_interval], 900000),
+    %% Then the value is reflected in default `zone' and other fields under mqtt are defaults.
+    GDefaultMqtt = maps:get(mqtt, zone_global_defaults()),
+    ?assertEqual(
+        GDefaultMqtt#{retry_interval := 900000},
+        emqx_config:get([zones, default, mqtt])
+    ).
+
+t_myzone_is_updated_after_global_defaults_updated(Config) when is_list(Config) ->
+    emqx_config:erase_all(),
+    %% Given emqx conf file with user override in myzone (none default zone)
+    ConfFile = prepare_conf_file(?FUNCTION_NAME, <<"zones.myzone.mqtt.max_inflight=32">>, Config),
+    application:set_env(emqx, config_files, [ConfFile]),
+    ?assertEqual(ok, emqx_config:init_load(emqx_schema)),
+    ?assertNotEqual(900000, emqx_config:get([zones, myzone, mqtt, retry_interval])),
+    %% When update another value of global default
+    emqx_config:put([mqtt, retry_interval], 900000),
+    %% Then the value is reflected in myzone and the user defined value unchanged.
+    GDefaultMqtt = maps:get(mqtt, zone_global_defaults()),
+    ?assertEqual(
+        GDefaultMqtt#{
+            retry_interval := 900000,
+            max_inflight := 32
+        },
+        emqx_config:get([zones, myzone, mqtt])
+    ),
+    %% Then the value is reflected in default zone as well.
+    ?assertEqual(
+        GDefaultMqtt#{retry_interval := 900000},
+        emqx_config:get([zones, default, mqtt])
+    ).
+
+t_zone_no_user_defined_overrides(Config) when is_list(Config) ->
+    emqx_config:erase_all(),
+    %% Given emqx conf file with user specified myzone
+    ConfFile = prepare_conf_file(
+        ?FUNCTION_NAME, <<"zones.myzone.mqtt.retry_interval=10m">>, Config
+    ),
+    application:set_env(emqx, config_files, [ConfFile]),
+    ?assertEqual(ok, emqx_config:init_load(emqx_schema)),
+    ?assertEqual(600000, emqx_config:get([zones, myzone, mqtt, retry_interval])),
+    %% When there is an update in global default
+    emqx_config:put([mqtt, max_inflight], 2),
+    %% Then the value is reflected in both default and myzone
+    ?assertMatch(2, emqx_config:get([zones, default, mqtt, max_inflight])),
+    ?assertMatch(2, emqx_config:get([zones, myzone, mqtt, max_inflight])),
+    %% Then user defined value from config is not overwritten
+    ?assertMatch(600000, emqx_config:get([zones, myzone, mqtt, retry_interval])).
+
+t_zone_no_user_defined_overrides_internal_represent(Config) when is_list(Config) ->
+    emqx_config:erase_all(),
+    %% Given emqx conf file with user specified myzone
+    ConfFile = prepare_conf_file(?FUNCTION_NAME, <<"zones.myzone.mqtt.max_inflight=1">>, Config),
+    application:set_env(emqx, config_files, [ConfFile]),
+    ?assertEqual(ok, emqx_config:init_load(emqx_schema)),
+    ?assertEqual(1, emqx_config:get([zones, myzone, mqtt, max_inflight])),
+    %% When there is an update in global default
+    emqx_config:put([mqtt, max_inflight], 2),
+    %% Then the value is reflected in default `zone' but not user-defined zone
+    ?assertMatch(2, emqx_config:get([zones, default, mqtt, max_inflight])),
+    ?assertMatch(1, emqx_config:get([zones, myzone, mqtt, max_inflight])).
+
+t_update_global_defaults_no_updates_on_user_overrides(Config) when is_list(Config) ->
+    emqx_config:erase_all(),
+    %% Given default zone config in conf file.
+    ConfFile = prepare_conf_file(?FUNCTION_NAME, <<"zones.default.mqtt.max_inflight=1">>, Config),
+    application:set_env(emqx, config_files, [ConfFile]),
+    ?assertEqual(ok, emqx_config:init_load(emqx_schema)),
+    ?assertEqual(1, emqx_config:get([zones, default, mqtt, max_inflight])),
+    %% When there is an update in global default
+    emqx_config:put([mqtt, max_inflight], 20),
+    %% Then the value is not reflected in default `zone'
+    ?assertMatch(1, emqx_config:get([zones, default, mqtt, max_inflight])).
+
+t_zone_update_with_new_zone(Config) when is_list(Config) ->
+    emqx_config:erase_all(),
+    %% Given loaded an empty conf file
+    ConfFile = prepare_conf_file(?FUNCTION_NAME, <<"">>, Config),
+    application:set_env(emqx, config_files, [ConfFile]),
+    ?assertEqual(ok, emqx_config:init_load(emqx_schema)),
+    %% When there is an update for creating new zone config
+    ok = emqx_config:put([zones, myzone, mqtt, max_inflight], 2),
+    %% Then the value is set and other roots are created with defaults.
+    GDefaultMqtt = maps:get(mqtt, zone_global_defaults()),
+    ?assertEqual(
+        GDefaultMqtt#{max_inflight := 2},
+        emqx_config:get([zones, myzone, mqtt])
+    ).
+
+-doc """
+`emqx_config:get/1,2` and `emqx:get_config/1,2` return the stored value, or the
+default when a key is missing or an intermediate value is not a map.
+""".
+t_get_deep_path(Config) when is_list(Config) ->
+    ok = emqx_config:put([config_get_test], #{a => #{b => 1}, c => 2}),
+    try
+        ?assertEqual(1, emqx_config:get([config_get_test, a, b])),
+        ?assertEqual(#{b => 1}, emqx_config:get([config_get_test, a])),
+        ?assertEqual(dflt, emqx_config:get([config_get_test, a, x], dflt)),
+        ?assertEqual(dflt, emqx_config:get([config_get_test, c, x], dflt)),
+        ?assertEqual(dflt, emqx_config:get([config_get_test, a, b, x], dflt)),
+        ?assertEqual(dflt, emqx_config:get([config_get_test_no_root, a], dflt)),
+        ?assertError(
+            {config_not_found, [config_get_test, c, x]},
+            emqx_config:get([config_get_test, c, x])
+        ),
+        ?assertEqual(1, emqx:get_config([config_get_test, a, b], dflt)),
+        ?assertEqual(1, emqx:get_config([<<"config_get_test">>, <<"a">>, b])),
+        ?assertEqual(dflt, emqx:get_config([config_get_test, <<"no_such_atom_cfg_get">>], dflt))
+    after
+        emqx_config:erase(config_get_test)
+    end.
+
+-doc "The CONNECT user-property limit accepts zero and `infinity' in zone configuration.".
+t_max_connect_user_properties(Config) when is_list(Config) ->
+    emqx_config:erase_all(),
+    ConfFile = prepare_conf_file(
+        ?FUNCTION_NAME,
+        ~"""
+        mqtt.max_connect_user_properties = 0
+        zones.myzone.mqtt.max_connect_user_properties = infinity
+        """,
+        Config
+    ),
+    application:set_env(emqx, config_files, [ConfFile]),
+    ?assertEqual(ok, emqx_config:init_load(emqx_schema)),
+    ?assertEqual(0, emqx_config:get([zones, default, mqtt, max_connect_user_properties])),
+    ?assertEqual(
+        infinity,
+        emqx_config:get([zones, myzone, mqtt, max_connect_user_properties])
+    ).
+
+t_init_zone_with_global_defaults(Config) when is_list(Config) ->
+    %% Given uninitialized empty config
+    emqx_config:erase_all(),
+    Zones = #{myzone => #{mqtt => #{max_inflight => 3}}},
+    %% when put zones with global default with emqx_config:put/1
+    GlobalDefaults = zone_global_defaults(),
+    AllConf = maps:put(zones, Zones, GlobalDefaults),
+    %% Then put success
+    ?assertEqual(ok, emqx_config:put(AllConf)),
+    %% Then GlobalDefaults are set
+    ?assertEqual(GlobalDefaults, maps:with(maps:keys(GlobalDefaults), emqx_config:get([]))),
+    %% Then my zone and default zone are set
+    {MqttV, Others} = maps:take(mqtt, emqx_config:get([zones, myzone])),
+    {ZGDMQTT, ExpectedOthers} = maps:take(mqtt, GlobalDefaults),
+    ?assertEqual(ZGDMQTT#{max_inflight := 3}, MqttV),
+    %% Then others are defaults
+    ?assertEqual(ExpectedOthers, Others).
+
+%% Checks that, if multiple backup requests are made close in time, they are coalesced
+%% into a single backup file.
+t_coalesce_multiple_backups({init, Config}) ->
+    PrivDir = ?config(priv_dir, Config),
+    ClusterHocon = filename:join([PrivDir, ?FUNCTION_NAME, "cluster.hocon"]),
+    BackupDir = filename:dirname(ClusterHocon),
+    ok = filelib:ensure_path(BackupDir),
+    application:set_env(emqx, cluster_hocon_file, ClusterHocon),
+    %% Set update in memory for faster test
+    emqx_config:put([config_backup_interval], 5_000),
+    [{backup_dir, BackupDir} | Config];
+t_coalesce_multiple_backups({'end', _Config}) ->
+    application:unset_env(emqx, cluster_hocon_file),
+    ok;
+t_coalesce_multiple_backups(Config) when is_list(Config) ->
+    BackupDir = ?config(backup_dir, Config),
+    %% At this point, there is no cluster.hocon file, which will be created with this
+    %% update.  So this does not enqueued any backups.
+    Value1 = 1_500,
+    ?assertMatch({ok, _}, emqx:update_config([config_backup_interval], Value1)),
+    %% We now have a cluster.hocon file.  This will trigger a backup request containing
+    %% the first value.
+    Value2 = 1_300,
+    ?assertMatch({ok, _}, emqx:update_config([config_backup_interval], Value2)),
+    %% We now have a cluster.hocon file.  This will trigger a backup request, but the
+    %% previous request was already enqueued.
+    Value3 = 1_000,
+    ?assertMatch({ok, _}, emqx:update_config([config_backup_interval], Value3)),
+    %% Two files: current `cluster.hocon' and its backup.
+    ?retry(500, 10, ?assertMatch({ok, [_, _]}, file:list_dir(BackupDir))),
+    Wildcard = filename:join([BackupDir, "*.bak"]),
+    [BackupFile0] = filelib:wildcard(Wildcard),
+    BackupFile = filename:join([BackupDir, BackupFile0]),
+    %% Oldest state is backed up.
+    ?assertMatch({ok, #{<<"config_backup_interval">> := Value1}}, hocon:files([BackupFile])),
+    ?retry(
+        500,
+        10,
+        ?assertMatch(
+            #{<<"config_backup_interval">> := Value3},
+            emqx_config:read_override_conf(#{override_to => cluster})
+        )
+    ),
+    ok.
+
+%%%
+%%% Helpers
+%%%
+prepare_conf_file(Name, Content, CTConfig) ->
+    Filename = tc_conf_file(Name, CTConfig),
+    filelib:ensure_dir(Filename),
+    ok = file:write_file(Filename, Content),
+    Filename.
+
+tc_conf_file(TC, Config) ->
+    DataDir = ?config(data_dir, Config),
+    filename:join([DataDir, TC, 'emqx.conf']).
+
+zone_global_defaults() ->
+    #{
+        conn_congestion =>
+            #{enable_alarm => false, min_alarm_sustain_duration => 60000},
+        flapping_detect =>
+            #{by_clientid => none, by_username => none, by_peerhost => none},
+        force_gc =>
+            #{bytes => 16777216, count => 16000, enable => true},
+        force_shutdown =>
+            #{
+                enable => true,
+                max_heap_size => 4194304,
+                max_mailbox_size => 1000
+            },
+        mqtt =>
+            #{
+                await_rel_timeout => 0,
+                exclusive_subscription => false,
+                hibernate_after => 5000,
+                idle_timeout => 15000,
+                ignore_loop_deliver => false,
+                keepalive_backoff => 0.75,
+                keepalive_multiplier => 1.5,
+                keepalive_check_interval => 30000,
+                max_awaiting_rel => 32,
+                max_clientid_len => 65535,
+                max_connect_packet_size => 65536,
+                max_connect_user_properties => 100,
+                max_inflight => 32,
+                max_mqueue_len => 1000,
+                max_packet_size => 1048576,
+                max_qos_allowed => 2,
+                max_subscriptions => infinity,
+                max_topic_alias => 65535,
+                max_topic_levels => 128,
+                minor_gc_after => 10,
+                mqueue_default_priority => lowest,
+                mqueue_priorities => disabled,
+                mqueue_store_qos0 => true,
+                peer_cert_as_clientid => disabled,
+                peer_cert_as_username => disabled,
+                response_information => <<"">>,
+                retain_available => true,
+                retry_interval => infinity,
+                message_expiry_interval => infinity,
+                server_keepalive => disabled,
+                session_expiry_interval => 7200000,
+                max_session_expiry_interval => infinity,
+                shared_subscription => true,
+                shared_subscription_strategy => round_robin,
+                shared_subscription_initial_sticky_pick => random,
+                stats_emit_interval => 60000,
+                strict_mode => true,
+                subscription_message_filter => disable,
+                upgrade_qos => false,
+                use_username_as_clientid => false,
+                wildcard_subscription => true,
+                client_attrs_init => [],
+                clientid_override => disabled,
+                namespace_as_mountpoint => false
+            },
+        overload_protection =>
+            #{
+                backoff_delay => 1,
+                backoff_gc => false,
+                backoff_hibernation => true,
+                backoff_new_conn => true,
+                enable => false
+            },
+        stats => #{enable => true},
+        durable_sessions =>
+            #{
+                enable => false,
+                batch_size => 100,
+                force_persistence => false,
+                checkpoint_interval => 15000,
+                commit_timeout => 5000,
+                commit_retries => 10,
+                commit_retry_interval => 1000,
+                message_retention_period => 86400000,
+                subscription_count_refresh_interval => 5000,
+                disconnected_session_count_refresh_interval => 5000,
+                shared_subs =>
+                    #{
+                        heartbeat_interval => 5000,
+                        leader_timeout => 5000,
+                        checkpoint_interval => 15000,
+                        realloc_interval => 100,
+                        revocation_timeout => 10000,
+                        max_idle_time => 30000,
+                        commit_timeout => 5000,
+                        commit_retry_interval => 1000,
+                        commit_retries => 10
+                    }
+            }
+    }.

@@ -1,0 +1,512 @@
+%%--------------------------------------------------------------------
+%% Copyright (c) 2021-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
+%%--------------------------------------------------------------------
+
+-module(emqx_authn_http).
+
+-behaviour(emqx_authn_provider).
+
+-export([
+    create/2,
+    update/2,
+    authenticate/2,
+    destroy/1
+]).
+
+-export([
+    create_state/2,
+    generate_request/2,
+    request_for_log/2,
+    response_for_log/1,
+    extract_auth_data/2,
+    safely_parse_body/2
+]).
+
+-include_lib("emqx_auth/include/emqx_authn.hrl").
+-include_lib("emqx/include/logger.hrl").
+-include_lib("snabbkaffe/include/trace.hrl").
+-include("emqx_auth_http.hrl").
+
+-define(DEFAULT_CONTENT_TYPE, <<"application/json">>).
+
+%%------------------------------------------------------------------------------
+%% APIs
+%%------------------------------------------------------------------------------
+
+create(_AuthenticatorID, Config) ->
+    create(Config).
+
+create(Config) ->
+    maybe
+        ResourceId = emqx_authn_utils:make_resource_id(?AUTHN_BACKEND_BIN),
+        {ok, ResourceConfig, State} ?= create_state(ResourceId, Config),
+        ok ?= create_resource(ResourceConfig, State),
+        {ok, State}
+    end.
+
+update(Config0, #{resource_id := ResourceId} = _State) ->
+    maybe
+        {ok, ResourceConfig, State} ?= create_state(ResourceId, Config0),
+        ok ?= update_resource(ResourceConfig, ResourceId, State),
+        {ok, State}
+    end;
+update(Config0, _State) ->
+    %% The previous state had no connector resource (templated host URL).
+    create(Config0).
+
+authenticate(#{auth_method := _}, _) ->
+    ignore;
+authenticate(Credential, State) ->
+    case generate_request(Credential, State) of
+        {ok, Request} ->
+            Response = query(Credential, Request, State),
+            ?TRACE_AUTHN_PROVIDER("http_response", #{
+                request => request_for_log(Credential, State),
+                response => response_for_log(Response),
+                resource => maps:get(resource_id, State, undefined)
+            }),
+            case Response of
+                {ok, 204, _Headers} ->
+                    {ok, #{is_superuser => false}};
+                {ok, 200, Headers, Body} ->
+                    handle_response(Headers, Body);
+                {ok, _StatusCode, _Headers} ->
+                    emqx_authn_utils:backend_failure_result();
+                {ok, _StatusCode, _Headers, _Body} ->
+                    emqx_authn_utils:backend_failure_result();
+                {error, _Reason} ->
+                    emqx_authn_utils:backend_failure_result()
+            end;
+        {error, Reason} ->
+            ?TRACE_AUTHN_PROVIDER(
+                error,
+                "generate_http_request_failed",
+                #{reason => Reason, credential => emqx_authn_utils:without_password(Credential)}
+            ),
+            emqx_authn_utils:backend_failure_result()
+    end.
+
+destroy(#{resource_id := ResourceId}) ->
+    _ = emqx_resource:remove_local(ResourceId),
+    ok;
+destroy(_State) ->
+    ok.
+
+%%--------------------------------------------------------------------
+%% Internal functions
+%%--------------------------------------------------------------------
+
+create_state(ResourceId, Config) ->
+    Pipeline = [
+        fun check_ssl_opts/1,
+        fun normalize_headers/1,
+        fun check_method_headers/1,
+        fun check_oauth2_headers/1,
+        fun parse_config/1
+    ],
+    maybe
+        {ok, ResourceConfig, State} ?= emqx_utils:pipeline(Pipeline, Config, undefined),
+        case ResourceConfig of
+            no_resource ->
+                {ok, no_resource, State};
+            _ ->
+                {ok, ResourceConfig, State#{resource_id => ResourceId}}
+        end
+    end.
+
+create_resource(no_resource, _State) ->
+    ok;
+create_resource(ResourceConfig, State) ->
+    emqx_authn_utils:create_resource(
+        emqx_bridge_http_connector,
+        ResourceConfig,
+        State,
+        ?AUTHN_MECHANISM_BIN,
+        ?AUTHN_BACKEND_BIN
+    ).
+
+update_resource(no_resource, ResourceId, _State) ->
+    %% Updated to a templated host URL: the old connector pool is no longer needed.
+    _ = emqx_resource:remove_local(ResourceId),
+    ok;
+update_resource(ResourceConfig, _ResourceId, State) ->
+    emqx_authn_utils:update_resource(
+        emqx_bridge_http_connector,
+        ResourceConfig,
+        State,
+        ?AUTHN_MECHANISM_BIN,
+        ?AUTHN_BACKEND_BIN
+    ).
+
+query(
+    Credential,
+    Request,
+    #{
+        resource_id := ResourceId,
+        method := Method,
+        request_timeout := RequestTimeout,
+        cache_key_template := CacheKeyTemplate
+    }
+) ->
+    CacheKey = emqx_auth_template:cache_key(Credential, CacheKeyTemplate),
+    emqx_authn_utils:cached_simple_sync_query(
+        CacheKey,
+        ResourceId,
+        {Method, Request, RequestTimeout}
+    );
+query(
+    Credential,
+    Request,
+    #{
+        one_off_base := OneOffBase,
+        method := Method,
+        request_timeout := RequestTimeout,
+        cache_key_template := CacheKeyTemplate
+    }
+) ->
+    CacheKey = emqx_auth_template:cache_key(Credential, CacheKeyTemplate),
+    emqx_authn_utils:cached_apply(CacheKey, fun() ->
+        emqx_auth_http_utils:one_off_request(
+            OneOffBase, Method, RequestTimeout, Credential, Request
+        )
+    end).
+
+check_ssl_opts(#{url := <<"https://", _/binary>>, ssl := #{enable := false}}) ->
+    {error,
+        {invalid_ssl_opts,
+            <<"it's required to enable the TLS option to establish a https connection">>}};
+check_ssl_opts(_) ->
+    ok.
+
+normalize_headers(#{headers := Headers} = Config) ->
+    {ok, Config#{headers => ensure_binary_names(Headers)}, undefined}.
+
+check_method_headers(#{headers := Headers, method := get}) ->
+    case maps:is_key(<<"content-type">>, Headers) of
+        false ->
+            ok;
+        true ->
+            {error, {invalid_headers, <<"HTTP GET requests cannot include content-type header.">>}}
+    end;
+check_method_headers(#{headers := Headers, method := post} = Config) ->
+    {ok,
+        Config#{
+            headers =>
+                maps:merge(#{<<"content-type">> => ?DEFAULT_CONTENT_TYPE}, Headers)
+        },
+        undefined}.
+
+check_oauth2_headers(Config) ->
+    Headers = maps:get(headers, Config, #{}),
+    case emqx_connector_oauth2_schema:validate(Headers, maps:get(oauth2, Config, undefined)) of
+        ok ->
+            ok;
+        {error, #{message := Msg}} ->
+            {error, {invalid_headers, Msg}}
+    end.
+
+parse_config(#{url := RawUrl} = Config) ->
+    Resolution = maps:get(hostname_resolution, Config, static),
+    UrlTemplate = emqx_auth_http_utils:parse_url_template(RawUrl, Resolution),
+    parse_config(Resolution, UrlTemplate, Config).
+
+parse_config(static, #{path := Path, query := Query} = UrlTemplate, Config) ->
+    ok = check_pool_size_for_pooled(Config),
+    {Vars, StateBase} = parse_templates(Path, Query, Config),
+    State = finalize_state(Config, Vars, StateBase),
+    ResourceConfig0 = emqx_authn_utils:cleanup_resource_config(
+        [method, url, headers, request_timeout, allowed_hosts, hostname_resolution],
+        Config
+    ),
+    ResourceConfig = ResourceConfig0#{
+        request_base => emqx_auth_http_utils:request_base(UrlTemplate),
+        pool_type => random
+    },
+    {ok, ResourceConfig, State};
+parse_config(
+    dynamic, #{scheme := Scheme, host := Host, port := Port, path := Path, query := Query}, Config
+) ->
+    ok = check_no_oauth2(Config),
+    {HostVars, OneOffHost} = parse_host_template(Host, Config),
+    {Vars, StateBase} = parse_templates(Path, Query, Config),
+    OneOffBase = #{
+        scheme => Scheme,
+        host => OneOffHost,
+        port => Port,
+        connect_timeout => maps:get(connect_timeout, Config, 15000),
+        ssl_opts => one_off_ssl_opts(Scheme, Config),
+        pool => emqx_auth_http_utils:ensure_pool(authn, pool_size(Config))
+    },
+    State = finalize_state(Config, HostVars ++ Vars, StateBase#{one_off_base => OneOffBase}),
+    {ok, no_resource, State}.
+
+parse_host_template({static, Host}, _Config) ->
+    {[], {static, Host}};
+parse_host_template({template, HostStr}, Config) ->
+    AllowedHosts = allowed_hosts(Config),
+    {HostVars, HostTemplate} = emqx_authn_utils:parse_str(HostStr),
+    {HostVars, {template, HostTemplate, AllowedHosts}}.
+
+pool_size(Config) ->
+    maps:get(pool_size, Config, 8).
+
+check_pool_size_for_pooled(Config) ->
+    case pool_size(Config) of
+        0 ->
+            throw(
+                {invalid_config,
+                    <<"'pool_size' must be at least 1 when 'hostname_resolution' is 'static'">>}
+            );
+        _ ->
+            ok
+    end.
+
+parse_templates(
+    Path,
+    Query,
+    #{
+        method := Method,
+        url := RawUrl,
+        headers := Headers,
+        request_timeout := RequestTimeout
+    } = Config
+) ->
+    {BasePathVars, BasePathTemplate} = emqx_authn_utils:parse_str(Path),
+    {BaseQueryVars, BaseQueryTemplate} = emqx_authn_utils:parse_deep(
+        cow_qs:parse_qs(Query)
+    ),
+    {BodyVars, BodyTemplate} = emqx_authn_utils:parse_deep(
+        emqx_utils_maps:binary_key_map(maps:get(body, Config, #{}))
+    ),
+    {HeadersVars, HeadersTemplate} = emqx_authn_utils:parse_deep(maps:to_list(Headers)),
+    Vars = BasePathVars ++ BaseQueryVars ++ BodyVars ++ HeadersVars,
+    StateBase = #{
+        method => Method,
+        path => Path,
+        headers_template => HeadersTemplate,
+        base_path_template => BasePathTemplate,
+        base_query_template => BaseQueryTemplate,
+        body_template => BodyTemplate,
+        request_timeout => RequestTimeout,
+        url => RawUrl
+    },
+    {Vars, StateBase}.
+
+finalize_state(Config, Vars, StateBase) ->
+    CacheKeyTemplate = emqx_auth_template:cache_key_template(Vars),
+    emqx_authn_utils:init_state(Config, StateBase#{cache_key_template => CacheKeyTemplate}).
+
+check_no_oauth2(#{oauth2 := #{enable := true}}) ->
+    throw(
+        {invalid_config, <<"OAuth2 authentication is not supported with a templated host URL">>}
+    );
+check_no_oauth2(_Config) ->
+    ok.
+
+allowed_hosts(Config) ->
+    case emqx_auth_http_utils:parse_allowed_hosts(maps:get(allowed_hosts, Config, [])) of
+        [] ->
+            throw(
+                {invalid_config,
+                    <<"'allowed_hosts' must be configured when the URL host contains template placeholders">>}
+            );
+        AllowedHosts ->
+            AllowedHosts
+    end.
+
+one_off_ssl_opts(https, Config) ->
+    SSLConf = maps:get(ssl, Config, #{}),
+    emqx_tls_lib:to_client_opts(SSLConf#{enable => true});
+one_off_ssl_opts(http, _Config) ->
+    [].
+
+generate_request(Credential, State) ->
+    emqx_auth_http_utils:generate_request(State, Credential).
+
+handle_response(Headers, Body) ->
+    ContentType = proplists:get_value(<<"content-type">>, Headers),
+    case safely_parse_body(ContentType, Body) of
+        {ok, NBody} ->
+            body_to_auth_data(NBody);
+        {error, _Reason} ->
+            emqx_authn_utils:backend_failure_result()
+    end.
+
+body_to_auth_data(Body) ->
+    case maps:get(<<"result">>, Body, <<"ignore">>) of
+        <<"allow">> ->
+            case extract_auth_data(http, Body) of
+                {error, _Reason} ->
+                    %% The response is malformed: handle it as a backend failure,
+                    %% like an unparseable body or an unexpected status code.
+                    emqx_authn_utils:backend_failure_result();
+                Result ->
+                    Result
+            end;
+        <<"deny">> ->
+            {error, not_authorized};
+        <<"deny_bad_credentials">> ->
+            %% CONNACK reason code 0x86 (MQTT 5.0), return code 4 (MQTT 3.1.1)
+            {error, bad_username_or_password};
+        <<"ignore">> ->
+            ignore;
+        _ ->
+            emqx_authn_utils:backend_failure_result()
+    end.
+
+extract_auth_data(Source, Body) ->
+    IsSuperuser = emqx_authn_utils:is_superuser(Body),
+    Attrs = emqx_authn_utils:client_attrs(Body),
+    try
+        ExpireAt = expire_at(Body),
+        ACL = acl(ExpireAt, Source, Body),
+        ClientIdOverride = clientid_override(Body),
+        ZoneOverride = zone_override(Body),
+        Result = merge_maps(
+            [ExpireAt, IsSuperuser, ACL, ClientIdOverride, ZoneOverride, Attrs]
+        ),
+        {ok, Result}
+    catch
+        throw:{bad_acl_rule, Reason} ->
+            %% it's a invalid token, so ok to log
+            ?TRACE_AUTHN_PROVIDER("bad_acl_rule", Reason#{http_body => emqx_utils:redact(Body)}),
+            {error, invalid_body};
+        throw:Reason ->
+            ?TRACE_AUTHN_PROVIDER("bad_response_body", Reason#{http_body => emqx_utils:redact(Body)}),
+            {error, invalid_body}
+    end.
+
+merge_maps([]) -> #{};
+merge_maps([Map | Maps]) -> maps:merge(Map, merge_maps(Maps)).
+
+%% Return either an empty map, or a map with `expire_at` at millisecond precision
+%% Millisecond precision timestamp is required by `auth_expire_at`
+%% emqx_channel:schedule_connection_expire/1
+expire_at(Body) ->
+    case expire_sec(Body) of
+        undefined ->
+            #{};
+        Sec ->
+            #{expire_at => erlang:convert_time_unit(Sec, second, millisecond)}
+    end.
+
+expire_sec(#{<<"expire_at">> := ExpireTime}) when is_integer(ExpireTime) ->
+    Now = erlang:system_time(second),
+    NowMs = erlang:convert_time_unit(Now, second, millisecond),
+    case ExpireTime < Now of
+        true ->
+            throw(#{
+                cause => "'expire_at' is in the past.",
+                system_time => Now,
+                expire_at => ExpireTime
+            });
+        false when ExpireTime > (NowMs div 2) ->
+            throw(#{
+                cause => "'expire_at' does not appear to be a Unix epoch time in seconds.",
+                system_time => Now,
+                expire_at => ExpireTime
+            });
+        false ->
+            ExpireTime
+    end;
+expire_sec(#{<<"expire_at">> := _}) ->
+    throw(#{cause => "'expire_at' is not an integer (Unix epoch time in seconds)."});
+expire_sec(_) ->
+    undefined.
+
+acl(#{expire_at := ExpireTimeMs}, Source, #{<<"acl">> := Rules}) ->
+    #{
+        acl => #{
+            source_for_logging => Source,
+            rules => emqx_authz_rule_raw:parse_and_compile_rules(Rules),
+            %% It's seconds level precision (like JWT) for authz
+            %% see emqx_authz_client_info:check/1
+            expire => erlang:convert_time_unit(ExpireTimeMs, millisecond, second)
+        }
+    };
+acl(_NoExpire, Source, #{<<"acl">> := Rules}) ->
+    #{
+        acl => #{
+            source_for_logging => Source,
+            rules => emqx_authz_rule_raw:parse_and_compile_rules(Rules)
+        }
+    };
+acl(_, _, _) ->
+    #{}.
+
+clientid_override(#{<<"clientid_override">> := ClientIdOverride} = _Body) when
+    is_binary(ClientIdOverride)
+->
+    #{clientid_override => ClientIdOverride};
+clientid_override(_Body) ->
+    #{}.
+
+zone_override(#{<<"zone_override">> := ZoneOverride} = _Body) when
+    is_binary(ZoneOverride)
+->
+    #{zone_override => ZoneOverride};
+zone_override(_Body) ->
+    #{}.
+
+safely_parse_body(ContentType, Body) ->
+    try
+        parse_body(ContentType, Body)
+    catch
+        _Class:Reason ->
+            ?TRACE_AUTHN_PROVIDER(
+                error,
+                "parse_http_response_failed",
+                #{content_type => ContentType, body => <<"******">>, reason => Reason}
+            ),
+            {error, invalid_body}
+    end.
+
+parse_body(<<"application/json", _/binary>>, Body) ->
+    {ok, emqx_utils_json:decode(Body)};
+parse_body(<<"application/x-www-form-urlencoded", _/binary>>, Body) ->
+    NBody = maps:from_list(cow_qs:parse_qs(Body)),
+    {ok, NBody};
+parse_body(_ContentType, _) ->
+    erlang:throw(unsupported_content_type).
+
+request_for_log(Credential, #{url := Url, method := Method} = State) ->
+    SafeCredential = emqx_authn_utils:without_password(Credential),
+    case generate_request(SafeCredential, State) of
+        {ok, {PathQuery, Headers}} ->
+            #{
+                method => Method,
+                url => Url,
+                path_query => PathQuery,
+                headers => emqx_utils_redact:redact_headers(Headers)
+            };
+        {ok, {PathQuery, Headers, Body}} ->
+            #{
+                method => Method,
+                url => Url,
+                path_query => PathQuery,
+                headers => emqx_utils_redact:redact_headers(Headers),
+                body => emqx_utils:redact(Body)
+            };
+        %% we can't get here actually because the real request was already generated
+        %% successfully, so generating it with hidden password won't fail either.
+        {error, Reason} ->
+            #{
+                method => Method,
+                url => Url,
+                error => Reason
+            }
+    end.
+
+response_for_log({ok, StatusCode, Headers}) ->
+    #{status => StatusCode, headers => emqx_utils_redact:redact_headers(Headers)};
+response_for_log({ok, StatusCode, Headers, _Body}) ->
+    #{
+        status => StatusCode,
+        headers => emqx_utils_redact:redact_headers(Headers),
+        body => <<"******">>
+    };
+response_for_log({error, Error}) ->
+    #{error => Error}.
+
+ensure_binary_names(Headers) ->
+    emqx_utils_maps:binary_key_map(Headers).

@@ -1,25 +1,34 @@
-version: '3.9'
-
 services:
   erlang:
+    hostname: erlang.emqx.net
     container_name: erlang
-    image: emqx/build-env:erl23.2.7.1-emqx-1-ubuntu20.04
+    image: ${DOCKER_CT_RUNNER_IMAGE:-ghcr.io/emqx/emqx-builder/6.2-5:1.19.1-28.5.0.7-6-ubuntu24.04}
     env_file:
+      - credentials.env
       - conf.env
     environment:
-      GITHUB_ACTIONS: ${GITHUB_ACTIONS}
-      GITHUB_TOKEN: ${GITHUB_TOKEN}
-      GITHUB_RUN_ID: ${GITHUB_RUN_ID}
-      GITHUB_SHA: ${GITHUB_SHA}
-      GITHUB_RUN_NUMBER: ${GITHUB_RUN_NUMBER}
-      GITHUB_EVENT_NAME: ${GITHUB_EVENT_NAME}
-      GITHUB_REF: ${GITHUB_REF}
+      GITHUB_ACTIONS: ${GITHUB_ACTIONS:-}
+      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+      GITHUB_RUN_ID: ${GITHUB_RUN_ID:-}
+      GITHUB_SHA: ${GITHUB_SHA:-}
+      GITHUB_RUN_NUMBER: ${GITHUB_RUN_NUMBER:-}
+      GITHUB_EVENT_NAME: ${GITHUB_EVENT_NAME:-}
+      GITHUB_REF: ${GITHUB_REF:-}
     networks:
       - emqx_bridge
+    ports:
+      - 28083:18083
+      - 2883:1883
     volumes:
       - ../..:/emqx
+      - /tmp/emqx-ci/emqx-shared-secret:/var/lib/secret
+      - /tmp/emqx-ci-temp-secrets:/tmp/emqx-ci-temp-secrets
+      - ./kerberos/krb5.conf:/etc/kdc/krb5.conf
+      - ./kerberos/krb5.conf:/etc/krb5.conf
+      # - ./odbc/odbcinst.ini:/etc/odbcinst.ini
     working_dir: /emqx
     tty: true
+    user: "${DOCKER_USER:-root}"
 
 networks:
   emqx_bridge:

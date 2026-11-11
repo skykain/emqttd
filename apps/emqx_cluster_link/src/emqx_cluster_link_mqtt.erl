@@ -1,0 +1,743 @@
+%%--------------------------------------------------------------------
+%% Copyright (c) 2024-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
+%%--------------------------------------------------------------------
+-module(emqx_cluster_link_mqtt).
+
+%% The resource id variable is spelled both Id and ID in this module.
+-elvis([{elvis_style, consistent_variable_naming, disable}]).
+
+-include("emqx_cluster_link.hrl").
+-include("emqx_cluster_link_internal.hrl").
+
+-include_lib("emqx/include/emqx.hrl").
+-include_lib("emqx/include/emqx_mqtt.hrl").
+-include_lib("emqx/include/logger.hrl").
+-include_lib("snabbkaffe/include/trace.hrl").
+-include_lib("emqx_resource/include/emqx_resource.hrl").
+
+-behaviour(ecpool_worker).
+
+%% ecpool
+-export([connect/1]).
+
+%% emqtt
+-export([handle_disconnect/4]).
+
+%% For unit tests, pins the classification the buffer worker consumes.
+-export([on_async_result/2]).
+
+-behaviour(emqx_resource).
+-export([
+    callback_mode/0,
+    resource_type/0,
+    on_start/2,
+    on_stop/2,
+    on_query/3,
+    on_query_async/4,
+    on_get_status/2
+]).
+
+-export([
+    resource_id/1,
+    ensure_msg_fwd_resource/1,
+    remove_msg_fwd_resource/1,
+    decode_forwarded_msg/1,
+    decode_resp/1
+]).
+
+%% Route replication protocol
+-export([
+    publish_actor_init_sync/6,
+    mk_actor_init_ack/3,
+    mk_actor_init_ack_error/3,
+    publish_route_sync/4,
+    publish_heartbeat/3,
+    decode_route_op/1,
+    encode_field/2
+]).
+
+-export([
+    forward/2
+]).
+
+-export([
+    get_all_resources_cluster/0,
+    get_resource_cluster/1
+]).
+
+%% BpAPI / RPC Targets
+-export([
+    get_resource_local_v1/1,
+    get_all_resources_local_v1/0
+]).
+
+-define(MSG_CLIENTID_SUFFIX, ":msg:").
+
+-define(MSG_POOL_PREFIX, "emqx_cluster_link_mqtt:msg:").
+-define(RES_NAME(Prefix, ClusterName), <<Prefix, ClusterName/binary>>).
+-define(MSG_RES_ID(ClusterName), ?RES_NAME(?MSG_POOL_PREFIX, ClusterName)).
+-define(HEALTH_CHECK_TIMEOUT, 1000).
+-define(RES_GROUP, <<"emqx_cluster_link">>).
+
+-define(PROTO_VER, 1).
+
+-define(F_OPERATION, '$op').
+-define(OP_ROUTE, <<"route">>).
+-define(OP_HEARTBEAT, <<"heartbeat">>).
+-define(OP_ACTOR_INIT, <<"actor_init">>).
+-define(OP_ACTOR_INIT_ACK, <<"actor_init_ack">>).
+
+-define(F_ACTOR, 10).
+-define(F_INCARNATION, 11).
+-define(F_ROUTES, 12).
+-define(F_TARGET_CLUSTER, 13).
+-define(F_PROTO_VER, 14).
+-define(F_RESULT, 15).
+-define(F_NEED_BOOTSTRAP, 16).
+
+-define(ROUTE_DELETE, 100).
+
+-define(AUTO_RECONNECT_INTERVAL_S, 2).
+-define(DISCONNECT_REASON(WorkerId), {disconnect_reason, WorkerId}).
+
+-type cluster_name() :: binary().
+
+-spec resource_id(cluster_name()) -> resource_id().
+resource_id(ClusterName) ->
+    ?MSG_RES_ID(ClusterName).
+
+-spec ensure_msg_fwd_resource(emqx_cluster_link_schema:link()) ->
+    {ok, emqx_resource:resource_data() | already_started} | {error, Reason :: term()}.
+ensure_msg_fwd_resource(#{name := Name, resource_opts := ResOpts} = ClusterConf) ->
+    ResOpts1 = ResOpts#{
+        query_mode => async,
+        spawn_buffer_workers => true,
+        start_after_created => true
+    },
+    emqx_resource:create_local(?MSG_RES_ID(Name), ?RES_GROUP, ?MODULE, ClusterConf, ResOpts1).
+
+-spec remove_msg_fwd_resource(cluster_name()) -> ok | {error, Reason :: term()}.
+remove_msg_fwd_resource(ClusterName) ->
+    emqx_resource:remove_local(?MSG_RES_ID(ClusterName)).
+
+-spec get_all_resources_cluster() ->
+    [{node(), emqx_rpc:erpc(#{cluster_name() => emqx_resource:resource_data()})}].
+get_all_resources_cluster() ->
+    Nodes = emqx:running_nodes(),
+    Results = emqx_cluster_link_proto_v1:get_all_resources(Nodes),
+    lists:zip(Nodes, Results).
+
+-spec get_resource_cluster(cluster_name()) ->
+    [{node(), {ok, {ok, emqx_resource:resource_data()} | {error, not_found}} | _Error}].
+get_resource_cluster(ClusterName) ->
+    Nodes = emqx:running_nodes(),
+    Results = emqx_cluster_link_proto_v1:get_resource(Nodes, ClusterName),
+    lists:zip(Nodes, Results).
+
+%% RPC Target in `emqx_cluster_link_proto_v1'.
+-spec get_resource_local_v1(cluster_name()) ->
+    {ok, emqx_resource:resource_data()} | {error, not_found}.
+get_resource_local_v1(ClusterName) ->
+    case emqx_resource:get_instance(?MSG_RES_ID(ClusterName)) of
+        {ok, _ResourceGroup, ResourceData} ->
+            {ok, ResourceData};
+        {error, not_found} ->
+            {error, not_found}
+    end.
+
+%% RPC Target in `emqx_cluster_link_proto_v1'.
+-spec get_all_resources_local_v1() -> #{cluster_name() => emqx_resource:resource_data()}.
+get_all_resources_local_v1() ->
+    lists:foldl(
+        fun
+            (?MSG_RES_ID(Name) = Id, Acc) ->
+                case emqx_resource:get_instance(Id) of
+                    {ok, ?RES_GROUP, ResourceData} ->
+                        Acc#{Name => ResourceData};
+                    _ ->
+                        Acc
+                end;
+            (_Id, Acc) ->
+                %% Doesn't follow the naming pattern; manually crafted?
+                Acc
+        end,
+        #{},
+        emqx_resource:list_group_instances(?RES_GROUP)
+    ).
+
+%%--------------------------------------------------------------------
+%% emqx_resource callbacks (message forwarding)
+%%--------------------------------------------------------------------
+
+callback_mode() -> async_if_possible.
+
+-spec resource_type() -> atom().
+resource_type() ->
+    cluster_link_mqtt.
+
+on_start(ResourceId, #{name := ClusterName, pool_size := PoolSize} = ClusterConf) ->
+    PoolName = ResourceId,
+    %% The health check probes these clients, so they are not configured with
+    %% `emqtt''s own keepalive, which would be a second liveness mechanism with its
+    %% own timing.  A keepalive imposed by the peer's `Server-Keep-Alive' still
+    %% applies.
+    ClientOpts = (emqx_cluster_link_config:mk_emqtt_options(ClusterConf))#{keepalive => 0},
+    Options = [
+        {name, PoolName},
+        {pool_size, PoolSize},
+        {pool_type, hash},
+        {auto_reconnect, ?AUTO_RECONNECT_INTERVAL_S},
+        {target_cluster, ClusterName},
+        {client_opts, ClientOpts}
+    ],
+    ok = emqx_resource:allocate_resource(ResourceId, ?MODULE, pool_name, PoolName),
+    case emqx_resource_pool:start(PoolName, ?MODULE, Options) of
+        ok ->
+            LocalCluster = emqx_cluster_link_config:cluster(),
+            {ok, #{pool_name => PoolName, topic => ?MSG_FWD_TOPIC(LocalCluster)}};
+        {error, {start_pool_failed, _, Reason}} ->
+            {error, Reason}
+    end.
+
+on_stop(ResourceId, _State) ->
+    #{pool_name := PoolName} = emqx_resource:get_allocated_resources(ResourceId),
+    emqx_resource_pool:stop(PoolName).
+
+on_query(
+    _ResourceId,
+    FwdMsg = #message{qos = FwdQoS, extra = PoolKey},
+    _State = #{pool_name := PoolName, topic := LinkTopic}
+) ->
+    QoS = min(?QOS_1, FwdQoS),
+    Payload = encode_payload(FwdMsg#message{extra = #{}}),
+    handle_ecpool_result(
+        ecpool:pick_and_do(
+            {PoolName, PoolKey},
+            fun(ConnPid) ->
+                Result = emqtt:publish(ConnPid, LinkTopic, Payload, QoS),
+                ?tp_debug("cluster_link_message_forwarded", #{
+                    pool => PoolName,
+                    message => FwdMsg,
+                    pub_result => Result
+                }),
+                handle_send_result(Result)
+            end,
+            no_handover
+        )
+    ).
+
+on_query_async(
+    _ResourceId,
+    FwdMsg = #message{qos = FwdQoS, extra = PoolKey},
+    CallbackIn,
+    _State = #{pool_name := PoolName, topic := LinkTopic}
+) ->
+    Callback = {fun on_async_result/2, [CallbackIn]},
+    QoS = min(?QOS_1, FwdQoS),
+    Payload = encode_payload(FwdMsg#message{extra = #{}}),
+    handle_ecpool_result(
+        ecpool:pick_and_do(
+            {PoolName, PoolKey},
+            fun(ConnPid) ->
+                Result = emqtt:publish_async(ConnPid, LinkTopic, Payload, QoS, Callback),
+                ?tp_debug("cluster_link_message_forwarded", #{
+                    pool => PoolName,
+                    message => FwdMsg,
+                    pub_result => Result
+                }),
+                case handle_send_result(Result) of
+                    ok ->
+                        {ok, ConnPid};
+                    Error ->
+                        Error
+                end
+            end,
+            no_handover
+        )
+    ).
+
+%% copied from emqx_bridge_mqtt_connector
+
+on_async_result(Callback, Result) ->
+    apply_callback_function(Callback, handle_send_result(Result)).
+
+apply_callback_function(F, Result) when is_function(F) ->
+    erlang:apply(F, [Result]);
+apply_callback_function({F, A}, Result) when is_function(F), is_list(A) ->
+    erlang:apply(F, A ++ [Result]);
+apply_callback_function({M, F, A}, Result) when is_atom(M), is_atom(F), is_list(A) ->
+    erlang:apply(M, F, A ++ [Result]).
+
+handle_send_result(ok) ->
+    ok;
+handle_send_result({ok, #{reason_code := ?RC_SUCCESS}}) ->
+    ok;
+handle_send_result({ok, #{reason_code := ?RC_NO_MATCHING_SUBSCRIBERS}}) ->
+    ok;
+handle_send_result({ok, Reply}) ->
+    {error, classify_reply(Reply)};
+handle_send_result({error, Reason}) ->
+    {error, classify_error(Reason)}.
+
+handle_ecpool_result({error, {disconnected, Reason}}) ->
+    %% from ecpool_worker:client/1
+    {error, {recoverable_error, Reason}};
+handle_ecpool_result({error, ecpool_empty}) ->
+    {error, {recoverable_error, disconnected}};
+handle_ecpool_result({error, no_such_pool}) ->
+    %% the pool is being (re)started by the resource manager
+    {error, {recoverable_error, no_such_pool}};
+handle_ecpool_result(Result) ->
+    Result.
+
+classify_reply(Reply = #{reason_code := _}) ->
+    {unrecoverable_error, Reply}.
+
+%% `disconnected' on the pool level is mapped by `handle_ecpool_result/1'; this
+%% clause classifies the same reason, and the MQTT-level `{disconnected, RC,
+%% Props}', when it arrives from `emqtt' on the publish callback path.
+classify_error(disconnected = Reason) ->
+    {recoverable_error, Reason};
+classify_error({disconnected, _RC, _} = Reason) ->
+    {recoverable_error, Reason};
+classify_error({shutdown, _} = Reason) ->
+    {recoverable_error, Reason};
+classify_error(shutdown = Reason) ->
+    {recoverable_error, Reason};
+classify_error(Reason) ->
+    case is_connection_error(Reason) of
+        true ->
+            {recoverable_error, Reason};
+        false ->
+            {unrecoverable_error, Reason}
+    end.
+
+%% Reasons that mean the connection to the remote broker is gone (or was never
+%% established).  The query may still be delivered once the broker is reachable
+%% again, so they must be retried instead of being dropped: a query whose error is
+%% unrecoverable is acknowledged by the buffer worker and counted as failed.
+%%
+%% This is a curated list of *connection-level* failures, not the whole
+%% `inet:posix()' type nor every retriable reason: configuration or resource
+%% errors (e.g. `eaddrinuse', `eaddrnotavail', `emsgsize', `eproto') and TLS
+%% handshake failures stay on the fail-fast side of `classify_error/1'.
+is_connection_error({tcp_closed, _}) ->
+    true;
+is_connection_error({tcp_error, _}) ->
+    true;
+is_connection_error({ssl_closed, _}) ->
+    true;
+is_connection_error({ssl_error, _}) ->
+    true;
+is_connection_error({quic_closed, _}) ->
+    true;
+is_connection_error({quic_error, _}) ->
+    true;
+is_connection_error(Reason) when
+    Reason =:= closed;
+    Reason =:= einval;
+    Reason =:= enotconn;
+    Reason =:= epipe;
+    Reason =:= tcp_closed;
+    Reason =:= tcp_error;
+    Reason =:= ssl_closed;
+    Reason =:= ssl_error;
+    Reason =:= quic_closed;
+    Reason =:= quic_error;
+    Reason =:= econnaborted;
+    Reason =:= econnrefused;
+    Reason =:= econnreset;
+    Reason =:= ehostdown;
+    Reason =:= ehostunreach;
+    Reason =:= enetdown;
+    Reason =:= enetreset;
+    Reason =:= enetunreach;
+    Reason =:= etimedout;
+    Reason =:= timeout;
+    Reason =:= nxdomain
+->
+    true;
+is_connection_error(_) ->
+    false.
+
+%% copied from emqx_bridge_mqtt_connector
+on_get_status(ResourceId, #{pool_name := PoolName} = _State) ->
+    Workers = ecpool:workers(PoolName),
+    DisconnectReasons = last_disconnect_reasons(ResourceId),
+    PingTimeout = health_check_ping_timeout(ResourceId),
+    try emqx_utils:pmap(fun get_status/1, Workers, PingTimeout) of
+        Statuses ->
+            enrich_status(combine_status(Statuses), DisconnectReasons)
+    catch
+        exit:timeout ->
+            %% The probe was not answered within the budget.
+            {?status_disconnected, pingresp_timeout}
+    end.
+
+enrich_status(?status_connected, _) ->
+    ?status_connected;
+enrich_status(?status_disconnected, [LastDisconnectReason | _]) ->
+    %% NOTE: Picking only the first one for the sake of simplicity.
+    {?status_disconnected, LastDisconnectReason};
+enrich_status({?status_disconnected, #{} = Details}, [LastDisconnectReason = #{} | _]) ->
+    %% `LastDisconnectreason` has a more friendly, massaged reason code, and `Details`
+    %% from ecpool_worker has the time since the status was observed.  We want to keep the
+    %% former format.
+    Reason = maps:merge(Details, LastDisconnectReason),
+    {?status_disconnected, Reason};
+enrich_status(Status, _) ->
+    Status.
+
+get_status({_Name, Worker}) ->
+    case ecpool_worker:client(Worker) of
+        {ok, Client} -> status(Client);
+        {error, {disconnected, Reason}} -> {?status_disconnected, Reason}
+    end.
+
+%% The local client state cannot tell a working connection from a black-holed one,
+%% where the socket stays open but nothing gets through; only a round trip to the
+%% remote broker can.  Ask it with a PINGREQ and wait for the PINGRESP.
+status(Pid) ->
+    try
+        case emqtt:status(Pid) of
+            connected ->
+                ping_status(Pid);
+            _EmqttState ->
+                %% A client that is not connected cannot be probed; its pool worker
+                %% is reconnecting it.
+                ?status_connecting
+        end
+    catch
+        exit:_Reason ->
+            ?status_disconnected
+    end.
+
+%% `emqtt:ping/1' is declared as returning `pong', but it also replies
+%% `{error, Reason}' when the PINGRESP does not arrive or the PINGREQ cannot be
+%% sent, so dialyzer has to be told that those replies are reachable.
+-dialyzer({nowarn_function, [ping_status/1]}).
+ping_status(Pid) ->
+    case emqtt:ping(Pid) of
+        pong ->
+            ?status_connected;
+        {error, _Reason} ->
+            ?status_disconnected
+    end.
+
+%% Budget of the health check's PINGREQ round trip: half of the configured
+%% `health_check_timeout', so that the probe reports a status of its own before the
+%% framework aborts the whole check at that timeout.
+health_check_ping_timeout(ResourceId) ->
+    ?MSG_RES_ID(ClusterName) = ResourceId,
+    case emqx_cluster_link_config:get_link(ClusterName) of
+        #{resource_opts := ResourceOpts} ->
+            half_health_check_timeout(ResourceOpts);
+        _ ->
+            %% The link is going away; the outcome of the check does not matter.
+            ?HEALTH_CHECK_TIMEOUT
+    end.
+
+half_health_check_timeout(ResourceOpts) ->
+    case maps:get(health_check_timeout, ResourceOpts, ?HEALTHCHECK_TIMEOUT) of
+        infinity -> infinity;
+        Timeout -> Timeout div 2
+    end.
+
+combine_status(Statuses) ->
+    %% NOTE
+    %% Natural order of statuses:
+    %% [connected, connecting, {connecting, _}, disconnected, {disconnected, _}]
+    %% * `disconnected` wins over any other status
+    %% * `connecting` wins over `connected`
+    %% * status with reason wins overs those without
+    case lists:reverse(lists:usort(Statuses)) of
+        [Status | _] ->
+            Status;
+        [] ->
+            {?status_disconnected, ~"no_workers_alive"}
+    end.
+
+%%--------------------------------------------------------------------
+%% ecpool
+%%--------------------------------------------------------------------
+
+connect(Options) ->
+    WorkerId = proplists:get_value(ecpool_worker_id, Options),
+    ResourceId = proplists:get_value(name, Options),
+    TargetCluster = proplists:get_value(target_cluster, Options),
+    ClientOpts0 = #{clientid := ClientId0} = proplists:get_value(client_opts, Options),
+    ClientIdBase = emqx_bridge_mqtt_lib:clientid_base([ClientId0, ?MSG_CLIENTID_SUFFIX]),
+    ClientId = iolist_to_binary([ClientIdBase, $:, integer_to_binary(WorkerId)]),
+    ClientOpts1 = ClientOpts0#{
+        clientid => ClientId,
+        msg_handler => #{
+            disconnected => mk_disconnect_handler(ResourceId, WorkerId, ClientId, TargetCluster)
+        }
+    },
+    ClientOpts = emqx_cluster_link_config:prefer_host(WorkerId, ClientOpts1),
+    case emqtt:start_link(ClientOpts) of
+        {ok, Pid} ->
+            case emqtt:connect(Pid) of
+                {ok, _Props} ->
+                    ok = clear_disconnect_reason(ResourceId, WorkerId),
+                    {ok, Pid};
+                Error ->
+                    Error
+            end;
+        {error, Reason} = Error ->
+            ?SLOG(error, #{
+                msg => "cluster_link_forwarding_client_start_failed",
+                config => emqx_utils:redact(ClientOpts),
+                reason => Reason
+            }),
+            Error
+    end.
+
+mk_disconnect_handler(ResourceId, WorkerId, ClientId, TargetCluster) ->
+    {fun ?MODULE:handle_disconnect/4, [
+        ResourceId,
+        WorkerId,
+        #{
+            target_cluster => TargetCluster,
+            client_id => ClientId
+        }
+    ]}.
+
+-spec handle_disconnect(
+    {disconnected, emqx_types:reason_code(), emqx_types:properties()}
+    | {frame_parse_error, _Reason}
+    | {connack_error, _Reason :: atom()}
+    | connack_timeout
+    | _SocketError,
+    _ResourceId :: resource_id(),
+    _WorkerId :: pos_integer(),
+    #{atom => any()}
+) -> ok.
+handle_disconnect(Reason, ResourceId, WorkerId, EventCtx) ->
+    case Reason of
+        shutdown ->
+            %% NOTE
+            %% Ignoring plain `shutdown`s as they are likely the result of stopping a link.
+            ok;
+        {disconnected, RC, _Props} ->
+            %% NOTE
+            %% Emit warning if RC hints at misconfiguration or integration issues.
+            Level =
+                case RC of
+                    ?RC_SUCCESS -> info;
+                    ?RC_SERVER_BUSY -> info;
+                    ?RC_SERVER_UNAVAILABLE -> info;
+                    ?RC_SERVER_SHUTTING_DOWN -> info;
+                    ?RC_SESSION_TAKEN_OVER -> info;
+                    _ -> warning
+                end,
+            Info = #{
+                cause => broker_disconnect,
+                reason => emqx_reason_codes:name(RC),
+                reason_code => RC
+            },
+            report_disconnect(ResourceId, WorkerId, Level, EventCtx, Info);
+        {frame_parse_error, ParserReason} ->
+            Info = #{cause => malformed_packet, reason => ParserReason},
+            report_disconnect(ResourceId, WorkerId, warning, EventCtx, Info);
+        {connack_error, RCName} ->
+            Info = #{cause => broker_connect_refused, reason => RCName},
+            report_disconnect(ResourceId, WorkerId, Info);
+        connack_timeout ->
+            Info = #{cause => broker_connect_timeout},
+            report_disconnect(ResourceId, WorkerId, Info);
+        SocketError ->
+            Info = #{cause => socket_error, reason => SocketError},
+            report_disconnect(ResourceId, WorkerId, info, EventCtx, Info)
+    end.
+
+report_disconnect(ResourceId, WorkerId, Info) ->
+    emqx_resource:allocate_resource(ResourceId, ?MODULE, ?DISCONNECT_REASON(WorkerId), Info).
+
+report_disconnect(ResourceId, WorkerId, Level, EventCtx, Info) ->
+    ?SLOG(
+        Level,
+        maps:merge(EventCtx#{msg => "cluster_link_forwarding_client_disconnected"}, Info)
+    ),
+    report_disconnect(ResourceId, WorkerId, Info).
+
+last_disconnect_reasons(ResourceId) ->
+    Allocated = emqx_resource:get_allocated_resources_list(ResourceId),
+    [Reason || {_ResourceId, ?DISCONNECT_REASON(_), Reason} <- Allocated].
+
+clear_disconnect_reason(ResourceId, WorkerId) ->
+    emqx_resource:deallocate_resource(ResourceId, ?DISCONNECT_REASON(WorkerId)).
+
+%%--------------------------------------------------------------------
+%% Protocol
+%%--------------------------------------------------------------------
+
+publish_actor_init_sync(ClientPid, ReqId, RespTopic, TargetCluster, Actor, Incarnation) ->
+    Topic = ?ROUTE_TOPIC(emqx_cluster_link_config:cluster()),
+    Payload = #{
+        ?F_OPERATION => ?OP_ACTOR_INIT,
+        ?F_PROTO_VER => ?PROTO_VER,
+        ?F_TARGET_CLUSTER => TargetCluster,
+        ?F_ACTOR => Actor,
+        ?F_INCARNATION => Incarnation
+    },
+    Properties = #{
+        'Response-Topic' => RespTopic,
+        'Correlation-Data' => ReqId
+    },
+    emqtt:publish(ClientPid, Topic, Properties, encode_payload(Payload), [{qos, ?QOS_1}]).
+
+publish_route_sync(ClientPid, Actor, Incarnation, Updates) ->
+    Topic = ?ROUTE_TOPIC(emqx_cluster_link_config:cluster()),
+    Payload = #{
+        ?F_OPERATION => ?OP_ROUTE,
+        ?F_ACTOR => Actor,
+        ?F_INCARNATION => Incarnation,
+        ?F_ROUTES => Updates
+    },
+    emqtt:publish(ClientPid, Topic, encode_payload(Payload), ?QOS_1).
+
+publish_heartbeat(ClientPid, Actor, Incarnation) ->
+    Topic = ?ROUTE_TOPIC(emqx_cluster_link_config:cluster()),
+    Payload = #{
+        ?F_OPERATION => ?OP_HEARTBEAT,
+        ?F_ACTOR => Actor,
+        ?F_INCARNATION => Incarnation
+    },
+    emqtt:publish_async(ClientPid, Topic, encode_payload(Payload), ?QOS_0, {fun(_) -> ok end, []}).
+
+-spec mk_actor_init_ack(_Actor :: binary(), boolean(), _ReplyTo :: emqx_types:message()) ->
+    emqx_types:message().
+mk_actor_init_ack(Actor, NeedBootstrap, MsgIn) ->
+    Payload = #{
+        ?F_OPERATION => ?OP_ACTOR_INIT_ACK,
+        ?F_PROTO_VER => ?PROTO_VER,
+        ?F_ACTOR => Actor,
+        ?F_RESULT => ok,
+        ?F_NEED_BOOTSTRAP => NeedBootstrap
+    },
+    mk_response(?QOS_1, Payload, MsgIn).
+
+-spec mk_actor_init_ack_error(_Actor :: binary(), {error, _}, _ReplyTo :: emqx_types:message()) ->
+    emqx_types:message().
+mk_actor_init_ack_error(Actor, Error, MsgIn) ->
+    Payload = #{
+        ?F_OPERATION => ?OP_ACTOR_INIT_ACK,
+        ?F_PROTO_VER => ?PROTO_VER,
+        ?F_ACTOR => Actor,
+        ?F_RESULT => Error,
+        ?F_NEED_BOOTSTRAP => undefined
+    },
+    mk_response(?QOS_1, Payload, MsgIn).
+
+mk_response(QoS, Payload, MsgIn) ->
+    #{
+        'Response-Topic' := RespTopic,
+        'Correlation-Data' := ReqId
+    } = emqx_message:get_header(properties, MsgIn),
+    emqx_message:make(
+        undefined,
+        QoS,
+        RespTopic,
+        encode_payload(Payload),
+        #{},
+        #{properties => #{'Correlation-Data' => ReqId}}
+    ).
+
+decode_route_op(Payload) ->
+    decode_route_op1(decode_payload(Payload)).
+
+decode_route_op1(#{
+    ?F_OPERATION := ?OP_ACTOR_INIT,
+    ?F_PROTO_VER := ProtoVer,
+    ?F_TARGET_CLUSTER := TargetCluster,
+    ?F_ACTOR := Actor,
+    ?F_INCARNATION := Incr
+}) ->
+    Info = #{
+        target_cluster => TargetCluster,
+        proto_ver => ProtoVer
+    },
+    {actor_init, #{actor => Actor, incarnation => Incr}, Info};
+decode_route_op1(#{
+    ?F_OPERATION := ?OP_ROUTE,
+    ?F_ACTOR := Actor,
+    ?F_INCARNATION := Incr,
+    ?F_ROUTES := RouteOps
+}) ->
+    RouteOps1 = lists:map(fun(Op) -> decode_field(route, Op) end, RouteOps),
+    {route_updates, #{actor => Actor, incarnation => Incr}, RouteOps1};
+decode_route_op1(#{
+    ?F_OPERATION := ?OP_HEARTBEAT,
+    ?F_ACTOR := Actor,
+    ?F_INCARNATION := Incr
+}) ->
+    {heartbeat, #{actor => Actor, incarnation => Incr}};
+decode_route_op1(Payload) ->
+    {error, {unknown_payload, Payload}}.
+
+decode_resp(Payload) ->
+    decode_resp1(decode_payload(Payload)).
+
+decode_resp1(#{
+    ?F_OPERATION := ?OP_ACTOR_INIT_ACK,
+    ?F_ACTOR := Actor,
+    ?F_PROTO_VER := ProtoVer,
+    ?F_RESULT := InitResult,
+    ?F_NEED_BOOTSTRAP := NeedBootstrap
+}) ->
+    {actor_init_ack, #{
+        actor => Actor, result => InitResult, proto_ver => ProtoVer, need_bootstrap => NeedBootstrap
+    }}.
+
+decode_forwarded_msg(Payload) ->
+    case decode_payload(Payload) of
+        #message{} = Msg ->
+            Msg;
+        _ ->
+            ?SLOG(warning, #{
+                msg => "unexpected_cluster_link_forwarded_msg_payload",
+                payload => Payload
+            }),
+            {error, Payload}
+    end.
+
+encode_field(route, {add, Route = {_Topic, _ID}}) ->
+    Route;
+encode_field(route, {delete, {Topic, ID}}) ->
+    {?ROUTE_DELETE, Topic, ID}.
+
+decode_field(route, {?ROUTE_DELETE, Topic, ID}) ->
+    {delete, {Topic, ID}};
+decode_field(route, Route = {_Topic, _ID}) ->
+    {add, Route}.
+
+encode_payload(Payload) ->
+    %% NOTE
+    %% Producing compressed binary. Beneficial almost only for messages with large
+    %% compressible payloads.
+    erlang:term_to_binary(Payload, [compressed]).
+
+decode_payload(Payload) ->
+    erlang:binary_to_term(Payload, [safe]).
+
+%%--------------------------------------------------------------------
+%% emqx_external_broker
+%%--------------------------------------------------------------------
+
+forward(ClusterName, #delivery{message = Msg}) ->
+    %% NOTE
+    %% Attaching pick key to the message to pick forwarding connection accordingly.
+    #{query_opts := QueryOpts} = emqx_cluster_link_config:link(ClusterName),
+    Key = choose_pick_key(QueryOpts),
+    %% Publish outcome headers describe this cluster: the remote cluster counts
+    %% its own deliveries, and an older remote cannot decode them.
+    FwdMsg0 = emqx_message:remove_header(message_persisted, Msg),
+    FwdMsg = FwdMsg0#message{extra = Key},
+    emqx_resource:query(?MSG_RES_ID(ClusterName), FwdMsg, QueryOpts#{pick_key => Key}).
+
+choose_pick_key(#{buffer_worker_dispatch_strategy := random}) ->
+    %% NOTE: Cheap and has high rate of change.
+    erlang:monotonic_time();
+choose_pick_key(_LinkConf) ->
+    self().

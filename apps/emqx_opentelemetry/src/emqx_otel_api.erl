@@ -1,0 +1,194 @@
+%%--------------------------------------------------------------------
+%% Copyright (c) 2020-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
+%%--------------------------------------------------------------------
+-module(emqx_otel_api).
+
+-behaviour(minirest_api).
+
+-include_lib("hocon/include/hoconsc.hrl").
+-include_lib("emqx_utils/include/emqx_http_api.hrl").
+-include_lib("emqx_utils/include/emqx_api_key_scopes.hrl").
+
+-import(emqx_utils, [redact/1]).
+
+-export([
+    api_spec/0,
+    paths/0,
+    schema/1
+]).
+
+-export([config/2]).
+-export([scopes/0]).
+
+-define(TAGS, [<<"Monitor">>]).
+
+api_spec() ->
+    emqx_dashboard_swagger:spec(?MODULE, #{check_schema => true}).
+
+scopes() -> ?SCOPE_SYSTEM.
+
+paths() ->
+    [
+        "/opentelemetry"
+    ].
+
+schema("/opentelemetry") ->
+    #{
+        'operationId' => config,
+        get =>
+            #{
+                description => ?DESC("get_config"),
+                tags => ?TAGS,
+                responses =>
+                    #{200 => otel_config_schema()}
+            },
+        put =>
+            #{
+                description => ?DESC("update_config"),
+                tags => ?TAGS,
+                'requestBody' => otel_config_schema(),
+                responses =>
+                    #{
+                        200 => otel_config_schema(),
+                        400 =>
+                            emqx_dashboard_swagger:error_codes(
+                                [?BAD_REQUEST], ?DESC("update_config_failed")
+                            )
+                    }
+            }
+    }.
+
+%%--------------------------------------------------------------------
+%% API Handler funcs
+%%--------------------------------------------------------------------
+
+config(get, _Params) ->
+    {200, redact(get_config())};
+config(put, #{body := Body}) ->
+    %% Restore the values that the GET response masked, so that submitting them
+    %% back does not overwrite the stored configuration.
+    case emqx_otel_config:update(emqx_utils:deobfuscate(Body, get_stored_config())) of
+        {ok, NewConfig} ->
+            {200, redact(NewConfig)};
+        {error, Reason} ->
+            %% The update request has been deobfuscated, so redact the error
+            %% details before echoing them back.
+            Message = list_to_binary(
+                io_lib:format("Update config failed ~p", [redact(Reason)])
+            ),
+            {400, ?BAD_REQUEST, Message}
+    end.
+
+%%--------------------------------------------------------------------
+%% Internal funcs
+%%--------------------------------------------------------------------
+
+get_config() ->
+    filled_config(#{obfuscate_sensitive_values => true}).
+
+%% Old configuration with defaults, without obfuscation: the base used to
+%% restore the values masked by the GET response.
+get_stored_config() ->
+    filled_config(#{}).
+
+filled_config(Opts) ->
+    Path = <<"opentelemetry">>,
+    #{Path := Conf} =
+        emqx_config:fill_defaults(#{Path => emqx_conf:get_raw([Path])}, Opts),
+    Conf.
+
+otel_config_schema() ->
+    emqx_dashboard_swagger:schema_with_examples(
+        emqx_otel_schema:root_type(),
+        #{
+            ~"generic" =>
+                #{
+                    summary => ?DESC("example_generic"),
+                    value => otel_config_example()
+                },
+            ~"dynatrace" =>
+                #{
+                    summary => ?DESC("example_dynatrace"),
+                    value => dynatrace_config_example()
+                }
+        }
+    ).
+
+otel_config_example() ->
+    #{
+        type => ~"generic",
+        exporter => #{
+            endpoint => "http://localhost:4317",
+            headers => #{},
+            ssl_options => #{}
+        },
+        logs => #{
+            enable => true,
+            level => warning
+        },
+        metrics => #{
+            enable => true
+        },
+        traces => #{
+            enable => true,
+            max_queue_size => 2048,
+            scheduled_delay => "5s",
+            filter => #{
+                trace_all => false,
+                trace_mode => legacy,
+                e2e_tracing_options => #{
+                    cluster_identifier => "emqxcl",
+                    msg_trace_level => 0,
+                    clientid_match_rules_max => 30,
+                    topic_match_rules_max => 30,
+                    sample_ratio => "10%",
+                    client_connect_disconnect => true,
+                    client_subscribe_unsubscribe => true,
+                    client_messaging => true,
+                    follow_traceparent => true
+                }
+            }
+        }
+    }.
+
+dynatrace_config_example() ->
+    #{
+        type => ~"dynatrace",
+        exporter => #{
+            endpoint => "https://xxxx.live.dynatrace.com/api/v2/otlp",
+            auth => #{
+                ~"enable" => true,
+                ~"kind" => ~"dynatrace_oauth2",
+                ~"client_id" => ~"myclientid",
+                ~"client_secret" => ~"******",
+                ~"resource" => ~"someres",
+                ~"token_endpoint" => ~"https://127.0.0.1:9998/sso/oauth2/token"
+            },
+            headers => #{},
+            ssl_options => #{}
+        },
+        logs => #{
+            enable => true,
+            level => warning
+        },
+        traces => #{
+            enable => true,
+            max_queue_size => 2048,
+            scheduled_delay => "5s",
+            filter => #{
+                trace_all => false,
+                trace_mode => legacy,
+                e2e_tracing_options => #{
+                    cluster_identifier => "emqxcl",
+                    msg_trace_level => 0,
+                    clientid_match_rules_max => 30,
+                    topic_match_rules_max => 30,
+                    sample_ratio => "10%",
+                    client_connect_disconnect => true,
+                    client_subscribe_unsubscribe => true,
+                    client_messaging => true,
+                    follow_traceparent => true
+                }
+            }
+        }
+    }.

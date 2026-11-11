@@ -1,0 +1,1332 @@
+%%--------------------------------------------------------------------
+%% Copyright (c) 2020-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
+%%--------------------------------------------------------------------
+
+-module(emqx_bridge_http_connector).
+
+-include_lib("emqx_resource/include/emqx_resource.hrl").
+-include_lib("typerefl/include/types.hrl").
+-include_lib("hocon/include/hoconsc.hrl").
+-include_lib("emqx/include/logger.hrl").
+-include_lib("snabbkaffe/include/snabbkaffe.hrl").
+-include_lib("emqx/include/emqx_trace.hrl").
+
+-behaviour(emqx_resource).
+
+%% callbacks of behaviour emqx_resource
+-export([
+    resource_type/0,
+    callback_mode/0,
+    on_start/2,
+    on_stop/2,
+    on_query/3,
+    on_query_async/4,
+    on_get_status/2,
+    on_get_status/3,
+    on_add_channel/4,
+    on_remove_channel/3,
+    on_get_channels/1,
+    on_get_channel_status/3,
+    on_format_query_result/1
+]).
+
+-export([reply_delegator/3]).
+-export([render_template/2, render_template/3]).
+
+-export([
+    roots/0,
+    fields/1,
+    desc/1,
+    namespace/0
+]).
+
+%% Internal exports (for other http-like connectors.)
+-export([redact_request/1, parse_headers/1, render_headers/1, render_headers/2]).
+
+-export([validate_method/1, formalize_request/2, transform_result/1]).
+
+-define(DEFAULT_PIPELINE_SIZE, 100).
+-define(DEFAULT_REQUEST_TIMEOUT_MS, 30_000).
+-define(DEFAULT_MAX_INACTIVE, 10_000).
+
+-define(IS_RECOVERABLE_STATUS_CODE(StatusCode),
+    StatusCode =:= 429;
+    StatusCode =:= 502;
+    StatusCode =:= 503;
+    StatusCode =:= 504
+).
+
+-define(READACT_REQUEST_NOTE, "the request body is redacted due to security reasons").
+
+%%=====================================================================
+%% Hocon schema
+
+namespace() -> "connector_http".
+
+roots() ->
+    fields(config).
+
+fields(config) ->
+    [
+        {connect_timeout,
+            sc(
+                emqx_schema:timeout_duration_ms(),
+                #{
+                    default => <<"15s">>,
+                    desc => ?DESC("connect_timeout")
+                }
+            )},
+        {max_retries,
+            sc(
+                non_neg_integer(),
+                #{deprecated => {since, "5.0.4"}}
+            )},
+        {retry_interval,
+            sc(
+                emqx_schema:timeout_duration(),
+                #{deprecated => {since, "5.0.4"}}
+            )},
+        {pool_type,
+            sc(
+                hoconsc:enum([random, hash]),
+                #{
+                    default => random,
+                    desc => ?DESC("pool_type")
+                }
+            )},
+        {pool_size,
+            sc(
+                pos_integer(),
+                #{
+                    default => 8,
+                    desc => ?DESC("pool_size")
+                }
+            )},
+        {enable_pipelining,
+            sc(
+                pos_integer(),
+                #{
+                    default => ?DEFAULT_PIPELINE_SIZE,
+                    desc => ?DESC("enable_pipelining")
+                }
+            )},
+        emqx_connector_schema:ehttpc_max_inactive_sc(),
+        {request,
+            hoconsc:mk(
+                ref("request"),
+                #{
+                    default => undefined,
+                    required => false,
+                    desc => ?DESC("request")
+                }
+            )}
+    ] ++ emqx_connector_schema_lib:ssl_fields();
+fields("request") ->
+    [
+        {method,
+            hoconsc:mk(binary(), #{
+                required => false,
+                desc => ?DESC("method"),
+                validator => fun ?MODULE:validate_method/1
+            })},
+        {path, hoconsc:mk(emqx_schema:template(), #{required => false, desc => ?DESC("path")})},
+        {body, hoconsc:mk(emqx_schema:template(), #{required => false, desc => ?DESC("body")})},
+        {headers,
+            hoconsc:mk(map(), #{required => false, desc => ?DESC("headers"), is_template => true})},
+        {max_retries,
+            sc(
+                non_neg_integer(),
+                #{
+                    required => false,
+                    desc => ?DESC("max_retries")
+                }
+            )},
+        {request_timeout,
+            sc(
+                emqx_schema:timeout_duration_ms(),
+                #{
+                    required => false,
+                    desc => ?DESC("request_timeout")
+                }
+            )}
+    ].
+
+desc(config) ->
+    "";
+desc("request") ->
+    "";
+desc(_) ->
+    undefined.
+
+validate_method(M) when
+    M =:= <<"post">>;
+    M =:= <<"put">>;
+    M =:= <<"get">>;
+    M =:= <<"delete">>;
+    M =:= post;
+    M =:= put;
+    M =:= get;
+    M =:= delete
+->
+    ok;
+validate_method(M) ->
+    case string:find(M, "${") of
+        nomatch ->
+            {error,
+                <<"Invalid method, should be one of 'post', 'put', 'get', 'delete' or variables in ${field} format.">>};
+        _ ->
+            ok
+    end.
+
+sc(Type, Meta) -> hoconsc:mk(Type, Meta).
+ref(Field) -> hoconsc:ref(?MODULE, Field).
+
+%% ===================================================================
+resource_type() -> webhook.
+
+callback_mode() -> async_if_possible.
+
+on_start(
+    InstId,
+    #{
+        request_base := #{
+            scheme := Scheme,
+            host := Host,
+            port := Port
+        },
+        connect_timeout := ConnectTimeout,
+        pool_type := PoolType,
+        pool_size := PoolSize
+    } = Config
+) ->
+    ?SLOG(info, #{
+        msg => "starting_http_connector",
+        connector => InstId,
+        config => redact(Config)
+    }),
+    {Transport, TransportOpts} =
+        case Scheme of
+            http ->
+                {tcp, []};
+            https ->
+                SSLConf = maps:get(ssl, Config),
+                %% force enable ssl
+                SSLOpts = emqx_tls_lib:to_client_opts(SSLConf#{enable => true}),
+                {tls, SSLOpts}
+        end,
+    NTransportOpts = emqx_utils:ipv6_probe(TransportOpts),
+    PoolOpts = [
+        {host, Host},
+        {port, Port},
+        {connect_timeout, ConnectTimeout},
+        {keepalive, 30_000},
+        {pool_type, PoolType},
+        {pool_size, PoolSize},
+        {transport, Transport},
+        {transport_opts, NTransportOpts},
+        {max_inactive, maps:get(max_inactive, Config, ?DEFAULT_MAX_INACTIVE)},
+        {enable_pipelining, maps:get(enable_pipelining, Config, ?DEFAULT_PIPELINE_SIZE)}
+    ],
+    State = #{
+        pool_name => InstId,
+        pool_type => PoolType,
+        host => Host,
+        port => Port,
+        connect_timeout => ConnectTimeout,
+        scheme => Scheme,
+        active_health_check => preprocess_active_health_check(InstId, Config),
+        request => preprocess_request(maps:get(request, Config, undefined)),
+        installed_actions => #{}
+    },
+    case start_pool(InstId, PoolOpts) of
+        ok ->
+            case do_get_status(InstId, ConnectTimeout) of
+                ok ->
+                    case maybe_start_health_check_pool(InstId, State, PoolOpts) of
+                        ok ->
+                            {ok, maybe_register_oauth2(InstId, Config, State)};
+                        Error ->
+                            ok = on_stop(InstId, State),
+                            Error
+                    end;
+                Error ->
+                    ok = ehttpc_sup:stop_pool(InstId),
+                    Error
+            end;
+        Error ->
+            Error
+    end.
+
+maybe_start_health_check_pool(
+    InstId, #{active_health_check := #{enable := true, pool := Pool}}, Opts
+) ->
+    ok = emqx_resource:allocate_resource(InstId, ?MODULE, http_health_check_pool, Pool),
+    ProbeOpts = [{pool_size, 1}, {pool_type, random}, {enable_pipelining, 1} | Opts],
+    start_pool(Pool, ProbeOpts);
+maybe_start_health_check_pool(_, _, _) ->
+    ok.
+
+%% When OAuth2 (Client Credentials) is enabled, register the connector
+%% instance with the shared token manager so an `access_token' is fetched,
+%% cached and refreshed before expiry.  The token is injected into outgoing
+%% requests in `maybe_inject_oauth_token/2'.
+maybe_register_oauth2(InstId, Config, State) ->
+    case maps:get(oauth2, Config, undefined) of
+        #{enable := true} = Oauth2 ->
+            ok = emqx_connector_oauth2:register(InstId, Oauth2),
+            State#{oauth2 => #{enable => true}};
+        _ ->
+            State
+    end.
+
+start_pool(PoolName, PoolOpts) ->
+    case ehttpc_sup:start_pool(PoolName, PoolOpts) of
+        {ok, _} ->
+            ok;
+        {error, {already_started, _}} ->
+            ?SLOG(warning, #{
+                msg => "emqx_connector_on_start_already_started",
+                connector => PoolName,
+                pool_name => PoolName
+            }),
+            ok;
+        Error ->
+            Error
+    end.
+
+on_add_channel(
+    _InstId,
+    OldState,
+    ActionId,
+    ActionConfig
+) ->
+    case validate_action_oauth2_headers(OldState, ActionConfig) of
+        ok ->
+            InstalledActions = maps:get(installed_actions, OldState, #{}),
+            {ok, ActionState} = do_create_http_action(ActionConfig),
+            RenderTmplFunc = maps:get(
+                render_template_func, ActionConfig, fun ?MODULE:render_template/3
+            ),
+            ActionState1 = ActionState#{render_template_func => RenderTmplFunc},
+            NewInstalledActions = maps:put(ActionId, ActionState1, InstalledActions),
+            NewState = maps:put(installed_actions, NewInstalledActions, OldState),
+            {ok, NewState};
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+validate_action_oauth2_headers(State, ActionConfig) ->
+    Headers = emqx_utils_maps:deep_get([parameters, headers], ActionConfig, #{}),
+    Oauth2 = maps:get(oauth2, State, undefined),
+    emqx_connector_oauth2_schema:validate(Headers, Oauth2).
+
+do_create_http_action(#{parameters := Params} = ActionConfig) ->
+    case preprocess_request(Params) of
+        undefined = ActionState0 ->
+            {ok, ActionState0};
+        #{} = ActionState0 ->
+            RequestTimeout = emqx_utils_maps:deep_get(
+                [resource_opts, request_ttl],
+                ActionConfig,
+                ?DEFAULT_REQUEST_TIMEOUT_MS
+            ),
+            ActionState = maps:put(request_timeout, RequestTimeout, ActionState0),
+            {ok, ActionState}
+    end.
+
+on_stop(InstId, _State) ->
+    ?SLOG(info, #{
+        msg => "stopping_http_connector",
+        connector => InstId
+    }),
+    ok = emqx_connector_oauth2:unregister(InstId),
+    case emqx_resource:get_allocated_resources(InstId) of
+        #{http_health_check_pool := Pool} -> ok = ehttpc_sup:stop_pool(Pool);
+        _ -> ok
+    end,
+    Res = ehttpc_sup:stop_pool(InstId),
+    ?tp(emqx_connector_http_stopped, #{instance_id => InstId}),
+    Res.
+
+prepare_request(Method, Request, State) ->
+    case maybe_inject_oauth_token(Request, State) of
+        {ok, RequestWithToken, Ref} -> {ok, formalize_request(Method, RequestWithToken), Ref};
+        {error, _Reason} = Error -> Error
+    end.
+
+%% Injects the OAuth2 `Authorization: Bearer <token>' header into the request
+%% just before it is sent.  Called from the sync and async query chokepoints
+%% so it covers bridge V1/V2 actions as well as `authn_http'/`authz_http'
+%% queries.  Any pre-existing `authorization' header is replaced (the config
+%% validator already rejects a conflicting header at the connector / authn /
+%% authz level; this also defends against action-level headers).
+maybe_inject_oauth_token(Request, #{oauth2 := #{enable := true}, pool_name := ResourceId}) ->
+    case emqx_connector_oauth2:get_token_with_ref(ResourceId) of
+        {ok, Token, Ref} ->
+            {ok, inject_authorization(Request, Token), Ref};
+        {error, Reason} ->
+            {error, {recoverable_error, {oauth2_token_unavailable, Reason}}}
+    end;
+maybe_inject_oauth_token(Request, _State) ->
+    {ok, Request, undefined}.
+
+inject_authorization({Path, Headers}, Token) ->
+    {Path, set_authorization_header(Headers, Token)};
+inject_authorization({Path, Headers, Body}, Token) ->
+    {Path, set_authorization_header(Headers, Token), Body}.
+
+set_authorization_header(Headers, Token) ->
+    Filtered = [{K, V} || {K, V} <- Headers, not is_authorization_header(K)],
+    [{<<"authorization">>, <<"Bearer ", Token/binary>>} | Filtered].
+
+is_authorization_header(K) ->
+    try iolist_to_binary(string:lowercase(K)) of
+        Lower -> Lower =:= <<"authorization">>
+    catch
+        _:_ -> false
+    end.
+
+on_remove_channel(
+    _InstId,
+    OldState = #{installed_actions := InstalledActions},
+    ActionId
+) ->
+    NewInstalledActions = maps:remove(ActionId, InstalledActions),
+    NewState = maps:put(installed_actions, NewInstalledActions, OldState),
+    {ok, NewState}.
+
+on_query(
+    InstId,
+    {ActionId, Msg},
+    State = #{installed_actions := InstalledActions}
+) when is_binary(ActionId) ->
+    case {maps:get(request, State, undefined), maps:get(ActionId, InstalledActions, undefined)} of
+        {undefined, _} ->
+            ?SLOG(error, #{msg => "arg_request_not_found", connector => InstId}),
+            {error, arg_request_not_found};
+        {_, undefined} ->
+            ?SLOG(error, #{msg => "action_not_found", connector => InstId, action_id => ActionId}),
+            {error, action_not_found};
+        {Request, ActionState} ->
+            #{
+                method := Method,
+                path := Path,
+                body := Body,
+                headers := Headers,
+                request_timeout := Timeout,
+                max_retries := Retry
+            } = process_request_and_action(Request, ActionState, Msg),
+            ClientId = clientid(Msg),
+            on_query(
+                InstId,
+                {ActionId, ClientId, Method, {Path, Headers, Body}, Timeout, Retry},
+                State
+            )
+    end;
+on_query(InstId, {Method, Request}, State) ->
+    %% TODO: Get retry from State
+    on_query(InstId, {undefined, undefined, Method, Request, 5000, _Retry = 2}, State);
+on_query(InstId, {Method, Request, Timeout}, State) ->
+    %% TODO: Get retry from State
+    on_query(InstId, {undefined, undefined, Method, Request, Timeout, _Retry = 2}, State);
+on_query(
+    InstId,
+    {ActionId, KeyOrNum, Method, Request0, Timeout, Retry},
+    #{host := Host, port := Port, scheme := Scheme} = State
+) ->
+    ?TRACE(
+        "QUERY",
+        "http_connector_received",
+        #{
+            request => redact_request(Request0),
+            note => ?READACT_REQUEST_NOTE,
+            connector => InstId,
+            action_id => ActionId,
+            state => redact(State)
+        }
+    ),
+    case prepare_request(Method, Request0, State) of
+        {ok, NRequest, TokenRef} ->
+            trace_rendered_action_template(ActionId, Scheme, Host, Port, Method, NRequest, Timeout),
+            ?tp(http_connector_request, #{
+                connector => InstId,
+                query_mode => sync,
+                attempt => 1,
+                max_attempts => max_attempts(Retry)
+            }),
+            Result0 = request_with_oauth_retry(
+                KeyOrNum, Method, NRequest, Timeout, Retry, State, TokenRef
+            ),
+            Result = transform_result(Result0),
+            case Result of
+                {error, {recoverable_error, Reason}} ->
+                    ?SLOG(warning, #{
+                        msg => "http_connector_do_request_failed",
+                        reason => Reason,
+                        connector => InstId
+                    }),
+                    {error, {recoverable_error, Reason}};
+                {error, #{status_code := StatusCode}} ->
+                    ?SLOG(error, #{
+                        msg => "http_connector_do_request_received_error_response",
+                        note => ?READACT_REQUEST_NOTE,
+                        request => redact_request(NRequest),
+                        connector => InstId,
+                        status_code => StatusCode
+                    }),
+                    Result;
+                {error, Reason} ->
+                    ?SLOG(error, #{
+                        msg => "http_connector_do_request_failed",
+                        note => ?READACT_REQUEST_NOTE,
+                        request => redact_request(NRequest),
+                        reason => Reason,
+                        connector => InstId
+                    }),
+                    Result;
+                _Success ->
+                    Result
+            end;
+        {error, _Reason} = Error ->
+            Error
+    end.
+
+%% BridgeV1 entrypoint
+on_query_async(InstId, {send_message, Msg}, ReplyFunAndArgs, State) ->
+    case maps:get(request, State, undefined) of
+        undefined ->
+            ?SLOG(error, #{msg => "arg_request_not_found", connector => InstId}),
+            {error, arg_request_not_found};
+        Request ->
+            #{
+                method := Method,
+                path := Path,
+                body := Body,
+                headers := Headers,
+                request_timeout := Timeout,
+                max_retries := Retry
+            } = process_request(Request, Msg),
+            ClientId = maps:get(clientid, Msg, undefined),
+            on_query_async(
+                InstId,
+                {undefined, ClientId, Method, {Path, Headers, Body}, Timeout, max_attempts(Retry)},
+                ReplyFunAndArgs,
+                State
+            )
+    end;
+%% BridgeV2 entrypoint
+on_query_async(
+    InstId,
+    {ActionId, Msg},
+    ReplyFunAndArgs,
+    State = #{installed_actions := InstalledActions}
+) when is_binary(ActionId) ->
+    case {maps:get(request, State, undefined), maps:get(ActionId, InstalledActions, undefined)} of
+        {undefined, _} ->
+            ?SLOG(error, #{msg => "arg_request_not_found", connector => InstId}),
+            {error, arg_request_not_found};
+        {_, undefined} ->
+            ?SLOG(error, #{msg => "action_not_found", connector => InstId, action_id => ActionId}),
+            {error, action_not_found};
+        {Request, ActionState} ->
+            #{
+                method := Method,
+                path := Path,
+                body := Body,
+                headers := Headers,
+                request_timeout := Timeout,
+                max_retries := Retry
+            } = process_request_and_action(Request, ActionState, Msg),
+            ClientId = clientid(Msg),
+            on_query_async(
+                InstId,
+                {ActionId, ClientId, Method, {Path, Headers, Body}, Timeout, max_attempts(Retry)},
+                ReplyFunAndArgs,
+                State
+            )
+    end;
+on_query_async(
+    InstId,
+    {ActionId, KeyOrNum, Method, Request0, Timeout},
+    ReplyFunAndArgs,
+    State
+) ->
+    on_query_async(
+        InstId,
+        {ActionId, KeyOrNum, Method, Request0, Timeout, 3},
+        ReplyFunAndArgs,
+        State
+    );
+on_query_async(
+    InstId,
+    {ActionId, KeyOrNum, Method, Request0, Timeout, MaxAttempts},
+    ReplyFunAndArgs,
+    #{host := Host, port := Port, scheme := Scheme} = State
+) ->
+    ?TRACE(
+        "QUERY_ASYNC",
+        "http_connector_received",
+        #{
+            request => redact_request(Request0),
+            note => ?READACT_REQUEST_NOTE,
+            connector => InstId,
+            state => redact(State)
+        }
+    ),
+    case prepare_request(Method, Request0, State) of
+        {ok, NRequest, TokenRef} ->
+            Worker = resolve_pool_worker(State, KeyOrNum),
+            trace_rendered_action_template(ActionId, Scheme, Host, Port, Method, NRequest, Timeout),
+            Context0 = #{
+                attempt => 1,
+                max_attempts => MaxAttempts,
+                state => State,
+                key_or_num => KeyOrNum,
+                method => Method,
+                request => Request0,
+                timeout => Timeout,
+                trace_metadata => logger:get_process_metadata()
+            },
+            Context = maybe_add_oauth_context(Context0, TokenRef),
+            ?tp(http_connector_request, #{
+                connector => InstId, query_mode => async, attempt => 1, max_attempts => MaxAttempts
+            }),
+            ok = ehttpc:request_async(
+                Worker,
+                Method,
+                NRequest,
+                Timeout,
+                {fun ?MODULE:reply_delegator/3, [Context, ReplyFunAndArgs]}
+            ),
+            {ok, Worker};
+        {error, _Reason} = Error ->
+            Error
+    end.
+
+maybe_add_oauth_context(Context, undefined) ->
+    Context;
+maybe_add_oauth_context(Context, TokenRef) ->
+    Context#{
+        oauth2_token_ref => TokenRef,
+        oauth2_retried => maps:get(oauth2_retried, Context, false)
+    }.
+
+request_with_oauth_retry(KeyOrNum, Method, Request, Timeout, Retry, State, undefined) ->
+    Worker = resolve_pool_worker(State, KeyOrNum),
+    ehttpc:request(Worker, Method, Request, Timeout, Retry);
+request_with_oauth_retry(KeyOrNum, Method, Request, Timeout, Retry, State, TokenRef) ->
+    Worker = resolve_pool_worker(State, KeyOrNum),
+    %% Keep the remaining transport budget visible when a 401 triggers an OAuth2 retry.
+    Result = ehttpc:request(Worker, Method, Request, Timeout, 0),
+    case Result of
+        {error, {ehttpc_worker_down, _}} ->
+            Result;
+        {error, _} when Retry > 0 ->
+            request_with_oauth_retry(
+                KeyOrNum, Method, Request, Timeout, Retry - 1, State, TokenRef
+            );
+        {ok, 401, _Headers} ->
+            retry_oauth_request(KeyOrNum, Method, Request, Timeout, Retry, State, TokenRef);
+        {ok, 401, _Headers, _Body} ->
+            retry_oauth_request(KeyOrNum, Method, Request, Timeout, Retry, State, TokenRef);
+        _ ->
+            Result
+    end.
+
+retry_oauth_request(KeyOrNum, Method, Request, Timeout, Retry, State, TokenRef) ->
+    maybe
+        ok ?= ensure_oauth_token_for_retry(State, TokenRef),
+        {ok, NRequest, _Ref} ?= prepare_request(Method, Request, State),
+        Worker = resolve_pool_worker(State, KeyOrNum),
+        ehttpc:request(Worker, Method, NRequest, Timeout, Retry)
+    end.
+
+ensure_oauth_token_for_retry(#{pool_name := ResourceId}, TokenRef) ->
+    case emqx_connector_oauth2:get_token_for_retry(ResourceId, TokenRef) of
+        {ok, _Token} -> ok;
+        {error, Reason} -> {error, {recoverable_error, {oauth2_token_unavailable, Reason}}}
+    end.
+
+trace_rendered_action_template(ActionId, Scheme, Host, Port, Method, NRequest, Timeout) ->
+    case NRequest of
+        {Path, Headers} ->
+            emqx_trace:rendered_action_template(
+                ActionId,
+                #{
+                    host => Host,
+                    port => Port,
+                    path => Path,
+                    method => Method,
+                    headers => #emqx_trace_format_func_data{
+                        function = fun emqx_utils_redact:redact_headers/1,
+                        data = Headers
+                    },
+                    timeout => Timeout,
+                    url => #emqx_trace_format_func_data{
+                        function = fun render_url/1,
+                        data = {Scheme, Host, Port, Path}
+                    }
+                }
+            );
+        {Path, Headers, Body} ->
+            emqx_trace:rendered_action_template(
+                ActionId,
+                #{
+                    host => Host,
+                    port => Port,
+                    path => Path,
+                    method => Method,
+                    headers => #emqx_trace_format_func_data{
+                        function = fun emqx_utils_redact:redact_headers/1,
+                        data = Headers
+                    },
+                    timeout => Timeout,
+                    body => #emqx_trace_format_func_data{
+                        function = fun log_format_body/1,
+                        data = Body
+                    },
+                    url => #emqx_trace_format_func_data{
+                        function = fun render_url/1,
+                        data = {Scheme, Host, Port, Path}
+                    }
+                }
+            )
+    end.
+
+render_url({Scheme, Host, Port, Path}) ->
+    SchemeStr =
+        case Scheme of
+            http ->
+                <<"http://">>;
+            https ->
+                <<"https://">>
+        end,
+    unicode:characters_to_binary([
+        SchemeStr,
+        Host,
+        <<":">>,
+        erlang:integer_to_binary(Port),
+        Path
+    ]).
+
+log_format_body(Body) ->
+    unicode:characters_to_binary(Body).
+
+resolve_pool_worker(State, undefined) ->
+    resolve_pool_worker(State, self());
+resolve_pool_worker(#{pool_name := PoolName} = State, Key) ->
+    case maps:get(pool_type, State, random) of
+        random ->
+            ehttpc_pool:pick_worker(PoolName);
+        hash ->
+            ehttpc_pool:pick_worker(PoolName, Key)
+    end.
+
+on_get_channels(ResId) ->
+    emqx_bridge_v2:get_channels_for_connector(ResId).
+
+on_get_status(InstId, #{active_health_check := #{enable := true} = Check} = State) ->
+    http_health_check(InstId, Check, State);
+on_get_status(InstId, State) ->
+    on_get_status(InstId, State, fun default_health_checker/2).
+
+preprocess_active_health_check(
+    InstId, #{active_health_check := #{enable := true} = Check} = Config
+) ->
+    StaticHeaders = [
+        {Key, Value}
+     || {Key, Value} <- parse_headers(maps:get(headers, Config, #{})),
+        emqx_template:is_const(Key),
+        emqx_template:is_const(emqx_secret:unwrap(Value))
+    ],
+    Check#{
+        headers => StaticHeaders,
+        timeout => emqx_resource:get_health_check_timeout(Config),
+        pool => <<InstId/binary, ":health_check">>
+    };
+preprocess_active_health_check(_, _) ->
+    #{enable => false}.
+
+http_health_check(InstId, #{timeout := Timeout} = Check, State) ->
+    Deadline = erlang:monotonic_time(millisecond) + Timeout,
+    Probe = fun() ->
+        maybe
+            ok ?= do_get_status(InstId, health_check_remaining(Deadline)),
+            active_http_probe(Check, State, Deadline, false)
+        end
+    end,
+    try emqx_utils:nolink_apply(Probe, Timeout) of
+        ok -> ?status_connected;
+        {error, still_connecting} -> {?status_connecting, still_connecting};
+        {error, Reason} -> {?status_disconnected, {http_health_check_failed, Reason}}
+    catch
+        exit:timeout -> {?status_disconnected, {http_health_check_failed, timeout}}
+    end.
+
+active_http_probe(Check, State, Deadline, Retried) ->
+    #{method := Method, path := Path, headers := Headers0} = Check,
+    Headers = render_headers(Headers0),
+    Request = {Path, Headers},
+    maybe
+        {ok, PreparedRequest, TokenRef} ?= prepare_request(Method, Request, State),
+        Result = health_check_request(Check, Method, PreparedRequest, Deadline),
+        case Result of
+            {ok, 401} when TokenRef =/= undefined, not Retried ->
+                retry_health_check_oauth(Check, State, Deadline, TokenRef);
+            _ ->
+                health_check_result(Result)
+        end
+    end.
+
+retry_health_check_oauth(Check, State, Deadline, TokenRef) ->
+    maybe
+        ok ?= ensure_oauth_token_for_retry(State, TokenRef),
+        active_http_probe(Check, State, Deadline, true)
+    end.
+
+health_check_result({ok, Status}) when Status >= 200, Status < 300 ->
+    ok;
+health_check_result({ok, Status}) ->
+    {error, #{status_code => Status}};
+health_check_result({error, {ehttpc_worker_down, _} = Reason}) ->
+    {error, drop_ehttpc_worker_down_call_args(Reason)};
+health_check_result({error, Reason}) ->
+    {error, Reason}.
+
+health_check_request(#{pool := Pool}, Method, Request, Deadline) ->
+    maybe
+        ok ?= ehttpc:check_pool_integrity(Pool),
+        [{_, Worker}] ?= ehttpc:workers(Pool),
+        case ehttpc:request(Worker, Method, Request, health_check_remaining(Deadline), 0) of
+            {ok, Status, _Headers} -> {ok, Status};
+            {ok, Status, _Headers, _Body} -> {ok, Status};
+            {error, _} = RequestError -> RequestError
+        end
+    else
+        [] ->
+            {error, still_connecting};
+        {error, _} = Error ->
+            Error
+    end.
+
+health_check_remaining(Deadline) ->
+    case Deadline - erlang:monotonic_time(millisecond) of
+        Remaining when Remaining > 0 -> Remaining;
+        _ -> exit(timeout)
+    end.
+
+on_get_status(InstId, #{pool_name := InstId, connect_timeout := Timeout} = State, DoPerWorker) ->
+    case do_get_status(InstId, Timeout, DoPerWorker) of
+        ok ->
+            check_oauth2_status(InstId, State);
+        {error, still_connecting} ->
+            {?status_connecting, still_connecting};
+        {error, Reason} ->
+            {?status_disconnected, Reason}
+    end.
+
+%% When OAuth2 is enabled, the connection-level check alone is not enough: the
+%% connector also needs a usable `access_token'.  Probe the token manager on
+%% every health check so a misconfigured or unreachable token endpoint surfaces
+%% as `disconnected' instead of being discovered only on the first request.
+%% `get_token/1' reads the ETS cache first (cheap) and only fetches from the
+%% token endpoint on a miss/expiry, so this also warms the cache right after
+%% the connector starts.
+check_oauth2_status(InstId, State) ->
+    case maps:get(oauth2, State, undefined) of
+        #{enable := true} ->
+            case emqx_connector_oauth2:get_token(InstId) of
+                {ok, _Token} ->
+                    ?status_connected;
+                {error, Reason} ->
+                    {?status_disconnected, {oauth2_token_unavailable, Reason}}
+            end;
+        _ ->
+            ?status_connected
+    end.
+
+do_get_status(PoolName, Timeout) ->
+    do_get_status(PoolName, Timeout, fun default_health_checker/2).
+
+do_get_status(PoolName, Timeout, DoPerWorker) ->
+    case ehttpc:check_pool_integrity(PoolName) of
+        ok ->
+            do_get_status1(PoolName, Timeout, DoPerWorker);
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+do_get_status1(PoolName, Timeout, DoPerWorker) ->
+    Workers = [Worker || {_WorkerName, Worker} <- ehttpc:workers(PoolName)],
+    try emqx_utils:pmap(fun(Worker) -> DoPerWorker(Worker, Timeout) end, Workers, Timeout) of
+        [] ->
+            {error, still_connecting};
+        [_ | _] = Results ->
+            case [E || {error, _} = E <- Results] of
+                [] ->
+                    ok;
+                [{error, Reason} | _] ->
+                    ?SLOG(info, #{
+                        msg => "health_check_failed",
+                        reason => redact(Reason),
+                        connector => PoolName
+                    }),
+                    {error, Reason}
+            end
+    catch
+        exit:timeout ->
+            ?SLOG(info, #{
+                msg => "health_check_failed",
+                reason => timeout,
+                connector => PoolName
+            }),
+            {error, timeout}
+    end.
+
+default_health_checker(Worker, Timeout) ->
+    case ehttpc:health_check(Worker, Timeout) of
+        ok ->
+            ok;
+        {error, _} = Error ->
+            Error
+    end.
+
+on_get_channel_status(
+    _InstId,
+    _ChannelId,
+    _State
+) ->
+    ?status_connected.
+
+on_format_query_result({ok, Status, Headers, Body}) ->
+    #{
+        result => ok,
+        response => #{
+            status => Status,
+            headers => Headers,
+            body => Body
+        }
+    };
+on_format_query_result({ok, Status, Headers}) ->
+    #{
+        result => ok,
+        response => #{
+            status => Status,
+            headers => Headers
+        }
+    };
+on_format_query_result(Result) ->
+    Result.
+
+%%--------------------------------------------------------------------
+%% Internal exports (for other http-like connectors.)
+%%--------------------------------------------------------------------
+
+%% because the body may contain some sensitive data
+%% and at the same time the redact function will not scan the binary data
+%% and we also can't know the body format and where the sensitive data will be
+%% so the easy way to keep data security is redacted the whole body
+redact_request({Path, Headers}) ->
+    {Path, emqx_utils_redact:redact_headers(Headers)};
+redact_request({Path, Headers, _Body}) ->
+    {Path, emqx_utils_redact:redact_headers(Headers), <<"******">>}.
+
+%% An `ehttpc_worker_down' exit reason carries the original `gen_server:call'
+%% arguments of the in-flight request, including the raw request headers. Drop
+%% the call args entirely, keeping the worker-down classification and stop
+%% reason for diagnostics; for any other sub-shape fall back to a bare atom.
+drop_ehttpc_worker_down_call_args(
+    {ehttpc_worker_down, {Stop, {gen_server, call, _Args}}}
+) ->
+    {ehttpc_worker_down, {Stop, {gen_server, call, '...'}}};
+drop_ehttpc_worker_down_call_args({ehttpc_worker_down, _}) ->
+    ehttpc_worker_down.
+
+render_headers(HeadersTemplate) ->
+    render_headers(HeadersTemplate, _Msg = #{}).
+
+render_headers(HeadersTemplate, Msg) ->
+    RenderTemplateFn = fun render_template/3,
+    render_headers(HeadersTemplate, RenderTemplateFn, Msg).
+
+%%--------------------------------------------------------------------
+%% Internal functions
+%%--------------------------------------------------------------------
+
+max_attempts(MaxRetries) ->
+    MaxRetries + 1.
+
+preprocess_request(undefined) ->
+    undefined;
+preprocess_request(Req) when map_size(Req) == 0 ->
+    undefined;
+preprocess_request(#{method := Method} = Req) ->
+    Path = maps:get(path, Req, <<>>),
+    Headers = maps:get(headers, Req, []),
+    #{
+        method => parse_template(to_bin(Method)),
+        path => parse_template(Path),
+        body => maybe_parse_template(body, Req),
+        headers => parse_headers(Headers),
+        request_timeout => maps:get(request_timeout, Req, ?DEFAULT_REQUEST_TIMEOUT_MS),
+        max_retries => maps:get(max_retries, Req, 2)
+    }.
+
+parse_headers(Headers) when is_map(Headers) ->
+    maps:fold(
+        fun(K, V, Acc) -> [parse_header(K, V) | Acc] end,
+        [],
+        Headers
+    );
+parse_headers(Headers) when is_list(Headers) ->
+    lists:map(
+        fun({K, V}) -> parse_header(K, V) end,
+        Headers
+    ).
+
+parse_header(K, V) ->
+    KStr = to_bin(K),
+    VTpl = parse_template(to_bin(V)),
+    {parse_template(KStr), maybe_wrap_auth_header(KStr, VTpl)}.
+
+maybe_wrap_auth_header(Key, VTpl) ->
+    case is_sensitive_wire_header(try_bin_to_lower(Key)) of
+        true ->
+            emqx_secret:wrap(VTpl);
+        false ->
+            VTpl
+    end.
+
+%% Conventionally-sensitive header names whose values are stored as secrets so
+%% they are not printed when the connector state is emitted at trace/debug level.
+is_sensitive_wire_header(<<"authorization">>) -> true;
+is_sensitive_wire_header(<<"proxy-authorization">>) -> true;
+is_sensitive_wire_header(<<"api-key">>) -> true;
+is_sensitive_wire_header(<<"x-api-key">>) -> true;
+is_sensitive_wire_header(<<"x-auth-token">>) -> true;
+is_sensitive_wire_header(<<"cookie">>) -> true;
+is_sensitive_wire_header(_Other) -> false.
+
+try_bin_to_lower(Bin) ->
+    try iolist_to_binary(string:lowercase(Bin)) of
+        LowercaseBin -> LowercaseBin
+    catch
+        _:_ -> Bin
+    end.
+
+maybe_parse_template(Key, Conf) ->
+    case maps:get(Key, Conf, undefined) of
+        undefined -> undefined;
+        Val -> parse_template(Val)
+    end.
+
+parse_template(String) ->
+    emqx_template:parse(String).
+
+process_request_and_action(Request, ActionState, Msg) ->
+    MethodTemplate = maps:get(method, ActionState),
+    RenderTmplFunc = maps:get(render_template_func, ActionState),
+    Method = make_method(render_template_string(method, MethodTemplate, RenderTmplFunc, Msg)),
+    PathPrefix = unicode:characters_to_list(RenderTmplFunc(path, maps:get(path, Request), Msg)),
+    PathSuffix = unicode:characters_to_list(RenderTmplFunc(path, maps:get(path, ActionState), Msg)),
+
+    Path =
+        case PathSuffix of
+            "" -> PathPrefix;
+            _ -> emqx_utils_uri:join_path(PathPrefix, PathSuffix)
+        end,
+
+    ActionHaders = maps:get(headers, ActionState),
+    BaseHeaders = maps:get(headers, Request),
+    Headers = merge_headers(
+        render_headers(ActionHaders, RenderTmplFunc, Msg),
+        render_headers(BaseHeaders, RenderTmplFunc, Msg)
+    ),
+    BodyTemplate = maps:get(body, ActionState),
+    Body = render_request_body(BodyTemplate, RenderTmplFunc, Msg),
+    #{
+        method => Method,
+        path => Path,
+        body => Body,
+        headers => Headers,
+        request_timeout => maps:get(request_timeout, ActionState),
+        max_retries => maps:get(max_retries, ActionState)
+    }.
+
+merge_headers([], Result) ->
+    Result;
+merge_headers([{K, V} | Rest], Result) ->
+    R = lists:keydelete(K, 1, Result),
+    merge_headers(Rest, [{K, V} | R]).
+
+process_request(
+    #{
+        method := MethodTemplate,
+        path := PathTemplate,
+        body := BodyTemplate,
+        headers := HeadersTemplate,
+        request_timeout := ReqTimeout
+    } = Conf,
+    Msg
+) ->
+    RenderTemplateFun = fun render_template/3,
+    Conf#{
+        method => make_method(
+            render_template_string(method, MethodTemplate, RenderTemplateFun, Msg)
+        ),
+        path => unicode:characters_to_list(RenderTemplateFun(path, PathTemplate, Msg)),
+        body => render_request_body(BodyTemplate, RenderTemplateFun, Msg),
+        headers => render_headers(HeadersTemplate, RenderTemplateFun, Msg),
+        request_timeout => ReqTimeout
+    }.
+
+render_request_body(undefined, _, Msg) ->
+    emqx_utils_json:encode(Msg);
+render_request_body(BodyTks, RenderTmplFunc, Msg) ->
+    RenderTmplFunc(body, BodyTks, Msg).
+
+render_headers(HeaderTks, RenderTmplFunc, Msg) ->
+    lists:filtermap(
+        fun({KTks, VTks}) ->
+            K = render_template_string(header, KTks, RenderTmplFunc, Msg),
+            V = render_template_string(header, emqx_secret:unwrap(VTks), RenderTmplFunc, Msg),
+            case safe_http_header(K, V) of
+                true ->
+                    {true, {K, V}};
+                {false, Reason} ->
+                    ?SLOG(warning, #{
+                        msg => "http_header_dropped",
+                        header_name => K,
+                        reason => Reason
+                    }),
+                    false
+            end
+        end,
+        HeaderTks
+    ).
+
+%% Defense-in-depth: a templated header value can interpolate message-level
+%% bytes that originated from an MQTT publisher. Reject CR/LF/NUL so a
+%% malicious payload cannot split the outgoing HTTP request to the bridge
+%% destination.
+safe_http_header(K, V) ->
+    case emqx_utils:http_header_byte_check(K) of
+        ok ->
+            case emqx_utils:http_header_byte_check(V) of
+                ok -> true;
+                {error, Reason} -> {false, Reason}
+            end;
+        {error, Reason} ->
+            {false, Reason}
+    end.
+
+render_template(Template, Msg) ->
+    % NOTE: ignoring errors here, missing variables will be rendered as `"undefined"`.
+    {String, _Errors} = emqx_template:render(Template, {emqx_jsonish, Msg}),
+    String.
+
+%% The `render_template_func' contract: the first argument tells the render
+%% function which part of the request is being rendered.
+render_template(_RenderContext, Template, Msg) ->
+    render_template(Template, Msg).
+
+render_template_string(RenderContext, Template, RenderTmplFunc, Msg) ->
+    unicode:characters_to_binary(RenderTmplFunc(RenderContext, Template, Msg)).
+
+make_method(M) when M == <<"POST">>; M == <<"post">> -> post;
+make_method(M) when M == <<"PUT">>; M == <<"put">> -> put;
+make_method(M) when M == <<"GET">>; M == <<"get">> -> get;
+make_method(M) when M == <<"DELETE">>; M == <<"delete">> -> delete.
+
+formalize_request(Method, Request) ->
+    formalize_request(Method, "/", Request).
+
+formalize_request(Method, BasePath, {Path, Headers, _Body}) when
+    Method =:= get; Method =:= delete
+->
+    formalize_request(Method, BasePath, {Path, Headers});
+formalize_request(_Method, BasePath, {Path, Headers, Body}) ->
+    {emqx_utils_uri:join_path(BasePath, Path), Headers, Body};
+formalize_request(_Method, BasePath, {Path, Headers}) ->
+    {emqx_utils_uri:join_path(BasePath, Path), Headers}.
+
+to_bin(Bin) when is_binary(Bin) ->
+    Bin;
+to_bin(Str) when is_list(Str) ->
+    list_to_binary(Str);
+to_bin(Atom) when is_atom(Atom) ->
+    atom_to_binary(Atom, utf8).
+
+reply_delegator(
+    #{trace_metadata := TraceMetadata} = Context,
+    ReplyFunAndArgs,
+    Result0
+) ->
+    spawn(fun() ->
+        logger:set_process_metadata(TraceMetadata),
+        Result = transform_result(Result0),
+        logger:unset_process_metadata(),
+        maybe_retry(Result, Context, ReplyFunAndArgs)
+    end).
+
+transform_result(Result) ->
+    case Result of
+        %% The normal reason happens when the HTTP connection times out before
+        %% the request has been fully processed
+        {error, {shutdown, Reason}} ->
+            transform_result({error, Reason});
+        {error, {error, Reason}} ->
+            transform_result({error, Reason});
+        {error, {ehttpc_worker_down, _} = Reason} ->
+            %% The reason carries the `gen_server:call' arguments of the request
+            %% that was in flight when the worker died, which include the raw
+            %% request headers. Drop the call args before the reason is logged.
+            {error, drop_ehttpc_worker_down_call_args(Reason)};
+        {error, {closed, {error, {connection_error, protocol_error, _}}} = Reason} ->
+            {error, {unrecoverable_error, Reason}};
+        {error, Reason} when
+            Reason =:= econnrefused;
+            Reason =:= nxdomain;
+            Reason =:= timeout;
+            Reason =:= normal;
+            Reason =:= closed;
+            Reason =:= closing;
+            %% {closed, "The connection was lost."}
+            element(1, Reason) =:= closed
+        ->
+            {error, {recoverable_error, Reason}};
+        {error, _Reason} ->
+            Result;
+        {ok, StatusCode, _} when StatusCode >= 200, StatusCode < 300 ->
+            Result;
+        {ok, StatusCode, _, _} when StatusCode >= 200, StatusCode < 300 ->
+            Result;
+        {ok, StatusCode, Headers} when ?IS_RECOVERABLE_STATUS_CODE(StatusCode) ->
+            {error, {recoverable_error, #{status_code => StatusCode, headers => Headers}}};
+        {ok, StatusCode, Headers} ->
+            {error, {unrecoverable_error, #{status_code => StatusCode, headers => Headers}}};
+        {ok, StatusCode, Headers, Body} when ?IS_RECOVERABLE_STATUS_CODE(StatusCode) ->
+            {error,
+                {recoverable_error, #{
+                    status_code => StatusCode, headers => Headers, body => Body
+                }}};
+        {ok, StatusCode, Headers, Body} ->
+            {error,
+                {unrecoverable_error, #{
+                    status_code => StatusCode, headers => Headers, body => Body
+                }}}
+    end.
+
+maybe_retry(
+    {error, {unrecoverable_error, #{status_code := 401}}},
+    #{oauth2_token_ref := TokenRef, oauth2_retried := false, state := State} = Context,
+    ReplyFunAndArgs
+) when TokenRef =/= undefined ->
+    case ensure_oauth_token_for_retry(State, TokenRef) of
+        ok ->
+            retry_async(Context#{oauth2_retried := true}, ReplyFunAndArgs);
+        {error, _Reason} = Error ->
+            emqx_resource:apply_reply_fun(ReplyFunAndArgs, Error)
+    end;
+maybe_retry(Result, _Context = #{attempt := N, max_attempts := Max}, ReplyFunAndArgs) when
+    N >= Max
+->
+    emqx_resource:apply_reply_fun(ReplyFunAndArgs, Result);
+maybe_retry(
+    {error, {_ErrorType, #{status_code := _}}} = Result, _Context, ReplyFunAndArgs
+) ->
+    %% Let the buffer retry recoverable HTTP responses.
+    emqx_resource:apply_reply_fun(ReplyFunAndArgs, Result);
+maybe_retry({error, Reason}, Context, ReplyFunAndArgs) ->
+    #{attempt := Attempt, state := State} = Context,
+    %% TODO: reset the expiration time for free retries?
+    IsFreeRetry =
+        case Reason of
+            {recoverable_error, normal} -> true;
+            {recoverable_error, {shutdown, normal}} -> true;
+            _ -> false
+        end,
+    NContext =
+        case IsFreeRetry of
+            true -> Context;
+            false -> Context#{attempt := Attempt + 1}
+        end,
+    ?tp(http_will_retry_async, #{
+        connector => maps:get(pool_name, State),
+        attempt => maps:get(attempt, NContext),
+        max_attempts => maps:get(max_attempts, NContext)
+    }),
+    retry_async(NContext, ReplyFunAndArgs);
+maybe_retry(Result, _Context, ReplyFunAndArgs) ->
+    emqx_resource:apply_reply_fun(ReplyFunAndArgs, Result).
+
+retry_async(Context, ReplyFunAndArgs) ->
+    #{
+        state := State,
+        key_or_num := KeyOrNum,
+        method := Method,
+        request := Request,
+        timeout := Timeout
+    } = Context,
+    case prepare_request(Method, Request, State) of
+        {ok, NRequest, TokenRef} ->
+            Worker = resolve_pool_worker(State, KeyOrNum),
+            NContext = maybe_add_oauth_context(Context, TokenRef),
+            ok = ehttpc:request_async(
+                Worker,
+                Method,
+                NRequest,
+                Timeout,
+                {fun ?MODULE:reply_delegator/3, [NContext, ReplyFunAndArgs]}
+            );
+        {error, _Reason} = Error ->
+            emqx_resource:apply_reply_fun(ReplyFunAndArgs, Error)
+    end,
+    ok.
+
+%% Function that will do a deep traversal of Data and remove sensitive
+%% information (i.e., passwords)
+redact(Data) ->
+    emqx_utils:redact(Data).
+
+clientid(Msg) -> maps:get(clientid, Msg, undefined).
+
+-ifdef(TEST).
+-include_lib("eunit/include/eunit.hrl").
+
+%% Defense-in-depth: a templated header whose rendered name or value
+%% contains NUL, CR or LF must be dropped, not emitted. An MQTT publisher
+%% could otherwise smuggle headers into the bridge destination via a
+%% template such as `${client_attrs.tns}'.
+drop_unsafe_headers_test() ->
+    Preprocessed = preprocess_request(#{
+        method => <<"post">>,
+        path => <<"/ingest">>,
+        headers => #{
+            <<"content-type">> => <<"application/json">>,
+            <<"x-clean">> => <<"${good}">>,
+            <<"x-tns">> => <<"${tns}">>
+        }
+    }),
+    #{headers := HeadersTemplate} = Preprocessed,
+    Msg = #{
+        <<"good">> => <<"alice">>,
+        <<"tns">> => <<"alice\r\nX-Override: allow">>
+    },
+    Rendered = render_headers(HeadersTemplate, fun render_template/3, Msg),
+    Names = [K || {K, _} <- Rendered],
+    ?assert(lists:member(<<"x-clean">>, Names)),
+    ?assertNot(lists:member(<<"x-tns">>, Names)).
+
+redact_test_() ->
+    TestData = #{
+        headers => [
+            {<<"content-type">>, <<"application/json">>},
+            {<<"Authorization">>, <<"Basic YWxhZGRpbjpvcGVuc2VzYW1l">>}
+        ]
+    },
+    [
+        ?_assertNotEqual(TestData, redact(TestData))
+    ].
+
+-endif.

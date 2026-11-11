@@ -1,0 +1,738 @@
+%%--------------------------------------------------------------------
+%% Copyright (c) 2020-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
+%%--------------------------------------------------------------------
+
+-module(emqx_authn_mysql_SUITE).
+
+-compile(nowarn_export_all).
+-compile(export_all).
+
+-include("../../emqx_connector/include/emqx_connector.hrl").
+-include_lib("emqx_auth/include/emqx_authn.hrl").
+-include_lib("eunit/include/eunit.hrl").
+-include_lib("common_test/include/ct.hrl").
+
+-define(MYSQL_HOST, "mysql").
+-define(MYSQL_RESOURCE, <<"emqx_authn_mysql_SUITE">>).
+-define(PROXY_HOST, "toxiproxy").
+-define(PROXY_PORT, 8474).
+-define(PROXY_NAME, "mysql_tcp").
+
+-define(PATH, [authentication]).
+-define(ResourceID, <<"password_based:mysql">>).
+
+all() -> emqx_common_test_helpers:all(?MODULE).
+
+init_per_testcase(_, Config) ->
+    emqx_authn_test_lib:delete_authenticators(
+        [authentication],
+        ?GLOBAL
+    ),
+    ok = init_seeds(),
+    Config.
+
+end_per_testcase(_TestCase, _Config) ->
+    ok = drop_seeds(),
+    _ = emqx_auth_cache:reset(?AUTHN_CACHE),
+    ok = emqx_authn_test_lib:enable_node_cache(false),
+    emqx_authn_test_lib:delete_authenticators(
+        ?PATH,
+        ?GLOBAL
+    ),
+    ok.
+
+init_per_suite(Config) ->
+    Apps = emqx_cth_suite:start(
+        [
+            {emqx_conf, emqx_authn_test_lib:emqx_appspec()},
+            emqx_auth,
+            emqx_auth_mnesia,
+            emqx_auth_mysql
+        ],
+        #{work_dir => ?config(priv_dir, Config)}
+    ),
+    {ok, _} = emqx_resource:create_local(
+        ?MYSQL_RESOURCE,
+        ?AUTHN_RESOURCE_GROUP,
+        emqx_auth_mysql_connector,
+        mysql_config(),
+        #{}
+    ),
+    [{apps, Apps} | Config].
+
+end_per_suite(Config) ->
+    emqx_authn_test_lib:delete_authenticators(
+        [authentication],
+        ?GLOBAL
+    ),
+    ok = emqx_resource:remove_local(?MYSQL_RESOURCE),
+    ok = emqx_cth_suite:stop(?config(apps, Config)),
+    ok.
+
+%%------------------------------------------------------------------------------
+%% Tests
+%%------------------------------------------------------------------------------
+
+t_create(_Config) ->
+    AuthConfig = raw_mysql_auth_config(),
+
+    {ok, _} = emqx:update_config(
+        ?PATH,
+        {create_authenticator, ?GLOBAL, AuthConfig}
+    ),
+
+    {ok, [#{provider := emqx_authn_mysql}]} = emqx_authn_chains:list_authenticators(?GLOBAL),
+    emqx_authn_test_lib:delete_config(?ResourceID).
+
+t_create_invalid(_Config) ->
+    AuthConfig = raw_mysql_auth_config(),
+
+    InvalidConfigs =
+        [
+            AuthConfig#{<<"server">> => <<"unknownhost:3333">>},
+            AuthConfig#{<<"password">> => <<"wrongpass">>},
+            AuthConfig#{<<"database">> => <<"wrongdatabase">>}
+        ],
+
+    lists:foreach(
+        fun(Config) ->
+            {ok, _} = emqx:update_config(
+                ?PATH,
+                {create_authenticator, ?GLOBAL, Config}
+            ),
+            emqx_authn_test_lib:delete_config(?ResourceID),
+            ?assertEqual(
+                {error, {not_found, {chain, ?GLOBAL}}},
+                emqx_authn_chains:list_authenticators(?GLOBAL)
+            )
+        end,
+        InvalidConfigs
+    ).
+
+t_authenticate(_Config) ->
+    ok = lists:foreach(
+        fun(Sample) ->
+            emqx_authn_test_lib:with_security_profiles(Sample, fun(ProfileSample) ->
+                ct:pal("test_user_auth sample: ~p", [ProfileSample]),
+                test_user_auth(ProfileSample)
+            end)
+        end,
+        cases()
+    ).
+
+test_user_auth(
+    #{
+        credentials := Credentials0,
+        config_params := SpecificConfigParams,
+        result := Result
+    } = Sample
+) ->
+    AuthConfig = maps:merge(raw_mysql_auth_config(), SpecificConfigParams),
+
+    {ok, _} = emqx:update_config(
+        ?PATH,
+        {create_authenticator, ?GLOBAL, AuthConfig}
+    ),
+
+    Credentials = Credentials0#{
+        listener => 'tcp:default',
+        protocol => mqtt
+    },
+
+    Auth = fun() -> ?assertEqual(Result, emqx_access_control:authenticate(Credentials)) end,
+    run(Sample, Credentials, Auth),
+
+    emqx_authn_test_lib:delete_authenticators(
+        [authentication],
+        ?GLOBAL
+    ).
+
+t_destroy(_Config) ->
+    emqx_authn_test_lib:with_security_profiles(#{}, fun(Sample) ->
+        run(Sample, #{}, fun() -> test_destroy(Sample) end)
+    end).
+
+test_destroy(#{security_profile := Profile}) ->
+    AuthConfig = raw_mysql_auth_config(),
+
+    {ok, _} = emqx:update_config(
+        ?PATH,
+        {create_authenticator, ?GLOBAL, AuthConfig}
+    ),
+
+    {ok, [#{provider := emqx_authn_mysql, state := State}]} =
+        emqx_authn_chains:list_authenticators(?GLOBAL),
+
+    {ok, _} = emqx_authn_mysql:authenticate(
+        #{
+            username => <<"plain">>,
+            password => <<"plain">>
+        },
+        State
+    ),
+
+    emqx_authn_test_lib:delete_authenticators(
+        [authentication],
+        ?GLOBAL
+    ),
+
+    % Authenticator should not be usable anymore
+    Expected =
+        case Profile of
+            legacy -> ignore;
+            hardened -> {error, not_authorized}
+        end,
+    ?assertEqual(
+        Expected,
+        emqx_authn_mysql:authenticate(
+            #{
+                username => <<"plain">>,
+                password => <<"plain">>
+            },
+            State
+        )
+    ).
+
+t_update(_Config) ->
+    CorrectConfig = raw_mysql_auth_config(),
+    IncorrectConfig =
+        CorrectConfig#{
+            <<"query">> =>
+                ~b"""
+                SELECT password_hash, salt, is_superuser_str as is_superuser
+                FROM wrong_table where username = ${username} LIMIT 1
+                """
+        },
+
+    {ok, _} = emqx:update_config(
+        ?PATH,
+        {create_authenticator, ?GLOBAL, IncorrectConfig}
+    ),
+
+    {error, not_authorized} = emqx_access_control:authenticate(
+        #{
+            username => <<"plain">>,
+            password => <<"plain">>,
+            listener => 'tcp:default',
+            protocol => mqtt
+        }
+    ),
+
+    % We update with config with correct query, provider should update and work properly
+    {ok, _} = emqx:update_config(
+        ?PATH,
+        {update_authenticator, ?GLOBAL, <<"password_based:mysql">>, CorrectConfig}
+    ),
+
+    {ok, _} = emqx_access_control:authenticate(
+        #{
+            username => <<"plain">>,
+            password => <<"plain">>,
+            listener => 'tcp:default',
+            protocol => mqtt
+        }
+    ).
+
+t_node_cache(_Config) ->
+    ok = create_user(#{
+        username => <<"node_cache_user">>, password_hash => <<"password">>, salt => <<"">>
+    }),
+    Config = maps:merge(
+        raw_mysql_auth_config(),
+        #{
+            <<"query">> =>
+                <<"SELECT password_hash, salt FROM users where username = ${username} LIMIT 1">>
+        }
+    ),
+    {ok, _} = emqx:update_config(
+        ?PATH,
+        {create_authenticator, ?GLOBAL, Config}
+    ),
+    ok = emqx_authn_test_lib:enable_node_cache(true),
+    Credentials = #{
+        listener => 'tcp:default',
+        protocol => mqtt,
+        username => <<"node_cache_user">>,
+        password => <<"password">>
+    },
+
+    %% First time should be a miss, second time should be a hit
+    ?assertMatch(
+        {ok, #{is_superuser := false}},
+        emqx_access_control:authenticate(Credentials)
+    ),
+    ?assertMatch(
+        {ok, #{is_superuser := false}},
+        emqx_access_control:authenticate(Credentials)
+    ),
+    ?assertMatch(
+        #{hits := #{value := 1}, misses := #{value := 1}},
+        emqx_auth_cache:metrics(?AUTHN_CACHE)
+    ),
+
+    %% Change a variable in the query, should be a miss
+    _ = emqx_access_control:authenticate(Credentials#{username => <<"user2">>}),
+    ?assertMatch(
+        #{hits := #{value := 1}, misses := #{value := 2}},
+        emqx_auth_cache:metrics(?AUTHN_CACHE)
+    ).
+
+-doc """
+Checks that, if an authentication backend returns the `clientid_override` attribute, it's
+used to override.
+""".
+t_clientid_override(TCConfig) when is_list(TCConfig) ->
+    OverriddenClientId = <<"overridden_clientid">>,
+    Username = <<"overriden_clientid">>,
+    Password = <<"password">>,
+    MkConfigFn = fun() ->
+        ok = create_user(#{
+            username => Username,
+            password_hash => Password,
+            salt => <<"">>,
+            clientid_override => OverriddenClientId
+        }),
+        maps:merge(
+            raw_mysql_auth_config(),
+            #{
+                <<"query">> =>
+                    iolist_to_binary([
+                        "SELECT ",
+                        ["'", OverriddenClientId, "' as clientid_override, "],
+                        "password_hash, salt FROM users ",
+                        "where username = ${username} LIMIT 1"
+                    ])
+            }
+        )
+    end,
+    Opts = #{
+        client_opts => #{
+            username => Username,
+            password => Password
+        },
+        mk_config_fn => MkConfigFn,
+        overridden_clientid => OverriddenClientId
+    },
+    emqx_authn_test_lib:t_clientid_override(TCConfig, Opts),
+    ok.
+
+-doc """
+Checks that columns aliased to `client_attrs.<name>' become client attributes.
+""".
+t_client_attrs(TCConfig) when is_list(TCConfig) ->
+    Username = <<"client_attrs_user">>,
+    Password = <<"password">>,
+    MkConfigFn = fun() ->
+        ok = create_user(#{
+            username => Username,
+            password_hash => Password,
+            salt => <<"">>
+        }),
+        maps:merge(
+            raw_mysql_auth_config(),
+            #{
+                <<"query">> =>
+                    ~b"""
+                    SELECT password_hash, salt, 'gold' as `client_attrs.tier`
+                    FROM users where username = ${username} LIMIT 1
+                    """
+            }
+        )
+    end,
+    Opts = #{
+        client_opts => #{
+            username => Username,
+            password => Password
+        },
+        mk_config_fn => MkConfigFn,
+        expected_attrs => #{<<"tier">> => <<"gold">>}
+    },
+    emqx_authn_test_lib:t_client_attrs(TCConfig, Opts),
+    ok.
+
+%%------------------------------------------------------------------------------
+%% Helpers
+%%------------------------------------------------------------------------------
+
+raw_mysql_auth_config() ->
+    #{
+        <<"mechanism">> => <<"password_based">>,
+        <<"password_hash_algorithm">> => #{
+            <<"name">> => <<"plain">>,
+            <<"salt_position">> => <<"suffix">>
+        },
+        <<"enable">> => <<"true">>,
+
+        <<"backend">> => <<"mysql">>,
+        <<"database">> => <<"mqtt">>,
+        <<"username">> => <<"root">>,
+        <<"password">> => <<"public">>,
+
+        <<"query">> =>
+            ~b"""
+            SELECT password_hash, salt, is_superuser_str as is_superuser
+            FROM users where username = ${username} LIMIT 1
+            """,
+        <<"server">> => mysql_server()
+    }.
+
+cases() ->
+    [
+        #{
+            data => #{
+                username => "plain",
+                password_hash => "plainsalt",
+                salt => "salt",
+                is_superuser_str => "1"
+            },
+            credentials => #{
+                username => <<"plain">>,
+                password => <<"plain">>
+            },
+            config_params => #{},
+            result => {ok, #{is_superuser => true}}
+        },
+
+        #{
+            data => #{
+                username => "backend_failure_legacy",
+                password_hash => "backend_failure_legacy",
+                salt => "",
+                is_superuser_str => "1"
+            },
+            credentials => #{
+                username => <<"backend_failure_legacy">>,
+                password => <<"backend_failure_legacy">>
+            },
+            config_params => #{<<"server">> => <<"toxiproxy:3306">>},
+            add_permissive => true,
+            backend_failure => true,
+            security_profile => legacy,
+            result => {ok, #{is_superuser => false}}
+        },
+
+        #{
+            data => #{
+                username => "backend_failure_hardened",
+                password_hash => "backend_failure_hardened",
+                salt => "",
+                is_superuser_str => "1"
+            },
+            credentials => #{
+                username => <<"backend_failure_hardened">>,
+                password => <<"backend_failure_hardened">>
+            },
+            config_params => #{<<"server">> => <<"toxiproxy:3306">>},
+            add_permissive => true,
+            backend_failure => true,
+            security_profile => hardened,
+            result => {error, not_authorized}
+        },
+
+        #{
+            data => #{
+                username => "md5",
+                password_hash => "9b4d0c43d206d48279e69b9ad7132e22",
+                salt => "salt",
+                is_superuser_str => "0"
+            },
+            credentials => #{
+                username => <<"md5">>,
+                password => <<"md5">>
+            },
+            config_params => #{
+                <<"password_hash_algorithm">> => #{
+                    <<"name">> => <<"md5">>,
+                    <<"salt_position">> => <<"suffix">>
+                }
+            },
+            result => {ok, #{is_superuser => false}}
+        },
+
+        #{
+            data => #{
+                username => "sha256",
+                password_hash => "ac63a624e7074776d677dd61a003b8c803eb11db004d0ec6ae032a5d7c9c5caf",
+                salt => "salt",
+                is_superuser_int => 1
+            },
+            credentials => #{
+                clientid => <<"sha256">>,
+                password => <<"sha256">>
+            },
+            config_params => #{
+                <<"query">> =>
+                    ~b"""
+                    SELECT password_hash, salt, is_superuser_int as is_superuser
+                    FROM users where username = ${clientid} LIMIT 1
+                    """,
+                <<"password_hash_algorithm">> => #{
+                    <<"name">> => <<"sha256">>,
+                    <<"salt_position">> => <<"prefix">>
+                }
+            },
+            result => {ok, #{is_superuser => true}}
+        },
+
+        %% strip double quote support
+        #{
+            data => #{
+                username => "sha256",
+                password_hash => "ac63a624e7074776d677dd61a003b8c803eb11db004d0ec6ae032a5d7c9c5caf",
+                salt => "salt",
+                is_superuser_int => 1
+            },
+            credentials => #{
+                username => <<"sha256">>,
+                password => <<"sha256">>
+            },
+            config_params => #{
+                <<"query">> =>
+                    ~b"""
+                    SELECT password_hash, salt, is_superuser_int as is_superuser
+                    FROM users where username = "${username}" LIMIT 1
+                    """,
+                <<"password_hash_algorithm">> => #{
+                    <<"name">> => <<"sha256">>,
+                    <<"salt_position">> => <<"prefix">>
+                }
+            },
+            result => {ok, #{is_superuser => true}}
+        },
+
+        #{
+            data => #{
+                username => "sha256",
+                password_hash => "ac63a624e7074776d677dd61a003b8c803eb11db004d0ec6ae032a5d7c9c5caf",
+                cert_subject => <<"cert_subject_data">>,
+                cert_common_name => <<"cert_common_name_data">>,
+                salt => "salt",
+                is_superuser_int => 1
+            },
+            credentials => #{
+                clientid => <<"sha256">>,
+                password => <<"sha256">>,
+                cert_subject => <<"cert_subject_data">>,
+                cert_common_name => <<"cert_common_name_data">>
+            },
+            config_params => #{
+                <<"query">> =>
+                    ~b"""
+                    SELECT password_hash, salt, is_superuser_int as is_superuser
+                    FROM users where cert_subject = ${cert_subject} AND
+                    cert_common_name = ${cert_common_name} LIMIT 1
+                    """,
+                <<"password_hash_algorithm">> => #{
+                    <<"name">> => <<"sha256">>,
+                    <<"salt_position">> => <<"prefix">>
+                }
+            },
+            result => {ok, #{is_superuser => true}}
+        },
+
+        #{
+            data => #{
+                username => <<"bcrypt">>,
+                password_hash => "$2b$12$wtY3h20mUjjmeaClpqZVveDWGlHzCGsvuThMlneGHA7wVeFYyns2u",
+                salt => "$2b$12$wtY3h20mUjjmeaClpqZVve",
+                is_superuser_int => 0
+            },
+            credentials => #{
+                username => <<"bcrypt">>,
+                password => <<"bcrypt">>
+            },
+            config_params => #{
+                <<"query">> =>
+                    ~b"""
+                    SELECT password_hash, salt, is_superuser_int as is_superuser
+                    FROM users where username = ${username} LIMIT 1
+                    """,
+                <<"password_hash_algorithm">> => #{<<"name">> => <<"bcrypt">>}
+            },
+            result => {ok, #{is_superuser => false}}
+        },
+
+        #{
+            data => #{
+                username => <<"bcrypt">>,
+                password_hash => "$2b$12$wtY3h20mUjjmeaClpqZVveDWGlHzCGsvuThMlneGHA7wVeFYyns2u",
+                salt => "$2b$12$wtY3h20mUjjmeaClpqZVve"
+            },
+            credentials => #{
+                username => <<"bcrypt">>,
+                password => <<"bcrypt">>
+            },
+            config_params => #{
+                <<"query">> =>
+                    ~b"""
+                    SELECT password_hash, salt, is_superuser_int as is_superuser
+                    FROM users where username = ${username} LIMIT 1
+                    """,
+                <<"password_hash_algorithm">> => #{<<"name">> => <<"bcrypt">>}
+            },
+            result => {ok, #{is_superuser => false}}
+        },
+
+        #{
+            data => #{
+                username => <<"bcrypt0">>,
+                password_hash => "$2b$12$wtY3h20mUjjmeaClpqZVveDWGlHzCGsvuThMlneGHA7wVeFYyns2u",
+                salt => "$2b$12$wtY3h20mUjjmeaClpqZVve",
+                is_superuser_str => "0"
+            },
+            credentials => #{
+                username => <<"bcrypt0">>,
+                password => <<"bcrypt">>
+            },
+            config_params => #{
+                % clientid variable & username credentials
+                <<"query">> =>
+                    ~b"""
+                    SELECT password_hash, salt, is_superuser_int as is_superuser
+                    FROM users where username = ${clientid} LIMIT 1
+                    """,
+                <<"password_hash_algorithm">> => #{<<"name">> => <<"bcrypt">>}
+            },
+            result => {error, not_authorized}
+        },
+
+        #{
+            data => #{
+                username => <<"bcrypt1">>,
+                password_hash => "$2b$12$wtY3h20mUjjmeaClpqZVveDWGlHzCGsvuThMlneGHA7wVeFYyns2u",
+                salt => "$2b$12$wtY3h20mUjjmeaClpqZVve",
+                is_superuser_str => "0"
+            },
+            credentials => #{
+                username => <<"bcrypt1">>,
+                password => <<"bcrypt">>
+            },
+            config_params => #{
+                % Bad keys in query
+                <<"query">> =>
+                    ~b"""
+                    SELECT 1 AS unknown_field
+                    FROM users where username = ${username} LIMIT 1
+                    """,
+                <<"password_hash_algorithm">> => #{<<"name">> => <<"bcrypt">>}
+            },
+            result => {error, not_authorized}
+        },
+
+        #{
+            data => #{
+                username => <<"bcrypt2">>,
+                password_hash => "$2b$12$wtY3h20mUjjmeaClpqZVveDWGlHzCGsvuThMlneGHA7wVeFYyns2u",
+                salt => "$2b$12$wtY3h20mUjjmeaClpqZVve",
+                is_superuser => "0"
+            },
+            credentials => #{
+                username => <<"bcrypt2">>,
+                % Wrong password
+                password => <<"wrongpass">>
+            },
+            config_params => #{
+                <<"password_hash_algorithm">> => #{<<"name">> => <<"bcrypt">>}
+            },
+            result => {error, bad_username_or_password}
+        }
+    ].
+
+init_seeds() ->
+    ok = drop_seeds(),
+    ok = q(
+        ~b"""
+        CREATE TABLE users(
+        username VARCHAR(255),
+        password_hash VARCHAR(255),
+        salt VARCHAR(255),
+        cert_subject VARCHAR(255),
+        cert_common_name VARCHAR(255),
+        is_superuser_str VARCHAR(255),
+        is_superuser_int TINYINT)
+        """
+    ),
+
+    lists:foreach(
+        fun(#{data := Values}) ->
+            create_user(Values)
+        end,
+        cases()
+    ).
+
+create_user(Values) ->
+    Fields = [
+        username,
+        password_hash,
+        salt,
+        cert_subject,
+        cert_common_name,
+        is_superuser_str,
+        is_superuser_int
+    ],
+    InsertQuery =
+        ~b"""
+        INSERT INTO users(username, password_hash, salt, cert_subject, cert_common_name,
+        is_superuser_str, is_superuser_int) VALUES(?, ?, ?, ?, ?, ?, ?)
+        """,
+    Params = [maps:get(F, Values, null) || F <- Fields],
+    ok = q(InsertQuery, Params).
+
+q(Sql) ->
+    emqx_resource:simple_sync_query(
+        ?MYSQL_RESOURCE,
+        {query, Sql}
+    ).
+
+q(Sql, Params) ->
+    emqx_resource:simple_sync_query(
+        ?MYSQL_RESOURCE,
+        {query, Sql, Params}
+    ).
+
+drop_seeds() ->
+    ok = q("DROP TABLE IF EXISTS users").
+
+run(Sample, Credentials, Auth) ->
+    run([failure, profile, permissive_auth], Sample, Credentials, Auth).
+
+run([failure | Rest], #{backend_failure := true} = Sample, Credentials, Auth) ->
+    emqx_common_test_helpers:with_failure(
+        down,
+        ?PROXY_NAME,
+        ?PROXY_HOST,
+        ?PROXY_PORT,
+        fun() -> run(Rest, Sample, Credentials, Auth) end
+    );
+run([failure | Rest], Sample, Credentials, Auth) ->
+    run(Rest, Sample, Credentials, Auth);
+run([profile | Rest], #{security_profile := Profile} = Sample, Credentials, Auth) ->
+    emqx_common_test_helpers:with_security_profile(Profile, fun() ->
+        run(Rest, Sample, Credentials, Auth)
+    end);
+run([profile | Rest], Sample, Credentials, Auth) ->
+    run(Rest, Sample, Credentials, Auth);
+run([permissive_auth | Rest], #{add_permissive := true} = Sample, Credentials, Auth) ->
+    #{username := Username, password := Password} = Credentials,
+    ok = emqx_authn_test_lib:add_permissive_builtin_authenticator(
+        ?PATH, ?GLOBAL, Username, Password
+    ),
+    run(Rest, Sample, Credentials, Auth);
+run([permissive_auth | Rest], Sample, Credentials, Auth) ->
+    run(Rest, Sample, Credentials, Auth);
+run([], _Sample, _Credentials, Auth) ->
+    Auth().
+
+mysql_server() ->
+    iolist_to_binary(io_lib:format("~s", [?MYSQL_HOST])).
+
+mysql_config() ->
+    #{
+        auto_reconnect => true,
+        database => <<"mqtt">>,
+        username => <<"root">>,
+        password => <<"public">>,
+        pool_size => 8,
+        server => <<?MYSQL_HOST>>,
+        ssl => #{enable => false}
+    }.

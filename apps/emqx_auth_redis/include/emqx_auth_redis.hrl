@@ -1,23 +1,19 @@
+%%--------------------------------------------------------------------
+%% Copyright (c) 2020-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
+%%--------------------------------------------------------------------
 
--define(APP, emqx_auth_redis).
+-ifndef(EMQX_AUTH_REDIS_HRL).
+-define(EMQX_AUTH_REDIS_HRL, true).
 
--record(auth_metrics, {
-        success = 'client.auth.success',
-        failure = 'client.auth.failure',
-        ignore = 'client.auth.ignore'
-    }).
+-define(AUTHZ_TYPE, redis).
+-define(AUTHZ_TYPE_BIN, <<"redis">>).
 
--record(acl_metrics, {
-        allow = 'client.acl.allow',
-        deny = 'client.acl.deny',
-        ignore = 'client.acl.ignore'
-    }).
+-define(AUTHN_MECHANISM, password_based).
+-define(AUTHN_MECHANISM_BIN, <<"password_based">>).
 
--define(METRICS(Type), tl(tuple_to_list(#Type{}))).
--define(METRICS(Type, K), #Type{}#Type.K).
+-define(AUTHN_BACKEND, redis).
+-define(AUTHN_BACKEND_BIN, <<"redis">>).
 
--define(AUTH_METRICS, ?METRICS(auth_metrics)).
--define(AUTH_METRICS(K), ?METRICS(auth_metrics, K)).
+-define(AUTHN_TYPE, {?AUTHN_MECHANISM, ?AUTHN_BACKEND}).
 
--define(ACL_METRICS, ?METRICS(acl_metrics)).
--define(ACL_METRICS(K), ?METRICS(acl_metrics, K)).
+-endif.

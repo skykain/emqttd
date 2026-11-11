@@ -1,0 +1,605 @@
+%%--------------------------------------------------------------------
+%% Copyright (c) 2020-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
+%%--------------------------------------------------------------------
+
+-module(emqx_dashboard).
+
+%% `listener_name/1' builds the listener id atom from a fixed set of protocols.
+-elvis([{elvis_style, no_common_caveats_call, disable}]).
+
+-moduledoc "Dashboard listener management, authorization, and Minirest wiring.".
+
+%% dialyzer cannot see through emqx_mgmt_auth:authorize/4's return value
+%% because the scope-check helper check_scopes/2 is marked no_return
+%% (minirest HandlerInfo's `path` key is narrowed away by upstream pattern
+%% matches). Silence the unreachable-clause warnings in the caller.
+-dialyzer({no_match, [api_key_authorize/4]}).
+
+-export([
+    start_listeners/0,
+    start_listeners/1,
+    stop_listeners/1,
+    stop_listeners/0,
+    list_listeners/0,
+    listeners_status/0,
+    regenerate_dispatch_after_config_update/0
+]).
+
+%% The release version that the REST API reports
+-export([reported_version/0, reported_version/1]).
+
+%% Authorization
+-export([authorize/2]).
+-export([parse_authorization_header/1]).
+-export([get_namespace/1]).
+
+%% Exported for tests.
+-export([ensure_ssl_cert/1]).
+
+-include_lib("emqx/include/logger.hrl").
+-include_lib("emqx_dashboard/include/emqx_dashboard.hrl").
+-include_lib("emqx_dashboard/include/emqx_dashboard_rbac.hrl").
+-include_lib("emqx_utils/include/emqx_http_api.hrl").
+-include_lib("emqx/include/emqx_release.hrl").
+-include_lib("snabbkaffe/include/snabbkaffe.hrl").
+-include_lib("emqx/include/emqx_config.hrl").
+
+-define(EMQX_MIDDLE, emqx_dashboard_middleware).
+
+-define(API_DESCRIPTION, <<
+    "A request accepts at most 100 query parameters in total, "
+    "including repeated and pagination parameters."
+>>).
+
+-type listener_name() :: atom().
+-type listener_configs() :: #{listener_name() => emqx_config:config()}.
+
+%% See `minirest_handler:do_authorize`.
+-type handler_info() :: #{
+    method := atom(),
+    module := module(),
+    function := atom()
+}.
+%% Todo: refine keys/values.
+-type request() :: map().
+
+-type auth_meta() :: #{
+    auth_type := jwt_token | api_key,
+    source := dashboard_username(),
+    namespace := ?global_ns | binary(),
+    actor := emqx_dashboard_rbac:actor_context()
+}.
+
+-export_type([listener_name/0, listener_configs/0, handler_info/0, request/0]).
+
+%%--------------------------------------------------------------------
+%% Start/Stop Listeners
+%%--------------------------------------------------------------------
+
+-spec start_listeners() -> ok | {error, [listener_name()]}.
+start_listeners() ->
+    start_listeners(listeners()).
+
+-spec stop_listeners() -> ok.
+stop_listeners() ->
+    stop_listeners(listeners()).
+
+-spec start_listeners(listener_configs()) ->
+    ok | {error, [listener_name()]}.
+start_listeners(Listeners) ->
+    %% NOTE
+    %% Before starting the listeners, we do not generate the full dispatch upfront,
+    %% because the listeners may fail to start and the generation may appear useless.
+    InitDispatch = init_dispatch(),
+    {Listeners1, CertErrListeners} = ensure_ssl_cert_or_drop(Listeners),
+    {OkListeners, ErrListeners} =
+        lists:foldl(
+            fun({Name, Protocol, Bind, RanchOptions, ProtoOpts}, {OkAcc, ErrAcc}) ->
+                Options = #{
+                    dispatch => InitDispatch,
+                    swagger_support => emqx:get_config([dashboard, swagger_support], true),
+                    protocol => Protocol,
+                    protocol_options => ProtoOpts
+                },
+                Minirest = minirest_option(Options),
+                case minirest:start(Name, RanchOptions, Minirest) of
+                    {ok, _} ->
+                        ?ULOG("Listener ~ts on ~ts started.~n", [
+                            Name, emqx_listeners:format_bind(Bind)
+                        ]),
+                        {[Name | OkAcc], ErrAcc};
+                    {error, _Reason} ->
+                        %% NOTE
+                        %% Don't record the reason because minirest already does(too much logs noise).
+                        {OkAcc, [Name | ErrAcc]}
+                end
+            end,
+            {[], CertErrListeners},
+            listeners(Listeners1)
+        ),
+    ok = emqx_dashboard_dispatch:regenerate_dispatch(OkListeners),
+    case ErrListeners of
+        [] ->
+            ok;
+        _ ->
+            {error, ErrListeners}
+    end.
+
+-spec stop_listeners(listener_configs()) -> ok.
+stop_listeners(Listeners) ->
+    lists:foreach(
+        fun({Name, _, Bind, _, _}) ->
+            case minirest:stop(Name) of
+                ok ->
+                    ?ULOG("Stop listener ~ts on ~ts successfully.~n", [
+                        Name, emqx_listeners:format_bind(Bind)
+                    ]);
+                {error, not_found} ->
+                    ?SLOG(warning, #{msg => "stop_listener_failed", name => Name, bind => Bind})
+            end
+        end,
+        listeners(Listeners)
+    ).
+
+-spec listeners_status() -> #{started := [listener_name()], stopped := [listener_name()]}.
+listeners_status() ->
+    ListenerNames = [
+        Name
+     || {Name, _Protocol, _Bind, _RanchOptions, _ProtoOpts} <- list_listeners()
+    ],
+    {Started, Stopped} = lists:partition(fun is_listener_started/1, ListenerNames),
+    #{started => Started, stopped => Stopped}.
+
+-spec regenerate_dispatch_after_config_update() -> ok.
+regenerate_dispatch_after_config_update() ->
+    #{started := Listeners} = listeners_status(),
+    ok = emqx_dashboard_dispatch:regenerate_dispatch_after_config_update(Listeners).
+
+%%--------------------------------------------------------------------
+%% internal
+%%--------------------------------------------------------------------
+
+is_listener_started(Name) ->
+    try ranch_server:get_listener_sup(Name) of
+        _ -> true
+    catch
+        error:badarg -> false
+    end.
+
+init_dispatch() ->
+    static_dispatch(emqx:get_config([dashboard, swagger_support], true)) ++ dynamic_dispatch().
+
+minirest_option(Options) ->
+    Authorization = {?MODULE, authorize},
+    GlobalSpec = #{
+        openapi => "3.0.0",
+        info => #{
+            title => emqx_api_name(),
+            version => reported_version(),
+            description => ?API_DESCRIPTION
+        },
+        servers => [#{url => emqx_dashboard_swagger:base_path()}],
+        components => #{
+            schemas => #{},
+            'securitySchemes' => #{
+                'basicAuth' => #{
+                    type => http,
+                    scheme => basic,
+                    description =>
+                        <<"Authorize with [API Keys](https://www.emqx.io/docs/en/v5.0/admin/api.html#api-keys)">>
+                },
+                'bearerAuth' => #{
+                    type => http,
+                    scheme => bearer,
+                    description => <<"Authorize with Bearer Token">>
+                }
+            }
+        }
+    },
+    Base =
+        #{
+            base_path => emqx_dashboard_swagger:base_path(),
+            modules => minirest_api:find_api_modules(apps()),
+            authorization => Authorization,
+            log => audit_log_fun(),
+            security => [#{'basicAuth' => []}, #{'bearerAuth' => []}],
+            swagger_global_spec => GlobalSpec,
+            dispatch => static_dispatch(maps:get(swagger_support, Options, true)),
+            middlewares => [?EMQX_MIDDLE, cowboy_router, cowboy_handler],
+            swagger_support => true
+        },
+    maps:merge(Base, Options).
+
+apps() ->
+    [
+        App
+     || {App, _, _} <- application:loaded_applications(),
+        emqx_machine_boot:is_umbrella_app(App),
+        emqx_machine_features:is_umbrella_application_enabled(App)
+    ].
+
+listeners(Listeners) ->
+    lists:filtermap(
+        fun
+            ({_Protocol, #{bind := 0}}) ->
+                false;
+            ({Protocol, Conf = #{}}) ->
+                {Conf1, Bind} = ip_port(Protocol, Conf),
+                {true, {
+                    listener_name(Protocol),
+                    Protocol,
+                    Bind,
+                    ranch_opts(Conf1),
+                    proto_opts(Conf1)
+                }}
+        end,
+        maps:to_list(Listeners)
+    ).
+
+list_listeners() ->
+    listeners(listeners()).
+
+%% http
+ip_port(http = _Protocol, #{bind := Port} = Opts) when is_integer(Port) ->
+    case emqx_default_address:resolve(dashboard) of
+        any ->
+            {maps:without([bind], Opts#{port => Port}), Port};
+        loopback ->
+            IP = loopback_ip(Opts),
+            {maps:without([bind], Opts#{port => Port, ip => IP}), {IP, Port}};
+        IP ->
+            {maps:without([bind], Opts#{port => Port, ip => IP}), {IP, Port}}
+    end;
+ip_port(http = _Protocol, #{bind := {IP, Port} = Bind} = Opts) ->
+    {maps:without([bind], Opts#{port => Port, ip => IP}), Bind};
+ip_port(http = Protocol, Opts) ->
+    ip_port(Protocol, Opts#{bind => 18083});
+%% https
+ip_port(https = _Protocol, #{bind := Port} = Opts) when is_integer(Port) ->
+    {maps:without([bind], Opts#{port => Port}), Port};
+ip_port(https = _Protocol, #{bind := {IP, Port} = Bind} = Opts) ->
+    {maps:without([bind], Opts#{port => Port, ip => IP}), Bind};
+ip_port(https = Protocol, Opts) ->
+    ip_port(Protocol, Opts#{bind => 18084}).
+
+loopback_ip(#{inet6 := true}) -> {0, 0, 0, 0, 0, 0, 0, 1};
+loopback_ip(_Opts) -> {127, 0, 0, 1}.
+
+ranch_opts(Options) ->
+    Keys = [
+        handshake_timeout,
+        connection_type,
+        max_connections,
+        num_acceptors,
+        shutdown,
+        socket
+    ],
+    RanchOpts = maps:with(Keys, Options),
+    SocketOpts = maps:fold(
+        fun filter_false/3,
+        [],
+        maps:without([inet6, ipv6_v6only, proxy_header, user_lookup_fun | Keys], Options)
+    ),
+    InetOpts =
+        case Options of
+            #{inet6 := true, ipv6_v6only := true} ->
+                [inet6, {ipv6_v6only, true}];
+            #{inet6 := true, ipv6_v6only := false} ->
+                [inet6];
+            #{ip := {_, _, _, _, _, _, _, _}} ->
+                %% IPv6 bind address implies inet6 even if not explicitly set
+                [inet6];
+            _ ->
+                [inet]
+        end,
+    RanchOpts#{socket_opts => InetOpts ++ SocketOpts}.
+
+init_proto_opts() ->
+    %% cowboy_stream_h is required by default
+    %% will integrate cowboy_telemetry_h when OTEL trace is ready
+    #{stream_handlers => [cowboy_stream_h]}.
+
+proto_opts(Opts) ->
+    Init = init_proto_opts(),
+    proxy_header_opt(Init, Opts).
+
+proxy_header_opt(Init, #{proxy_header := ProxyHeader}) ->
+    Init#{proxy_header => ProxyHeader};
+proxy_header_opt(Init, _Opts) ->
+    Init.
+
+filter_false(_K, false, S) -> S;
+filter_false(K, V, S) -> [{K, V} | S].
+
+listener_name(Protocol) ->
+    list_to_atom(atom_to_list(Protocol) ++ ":dashboard").
+
+audit_log_fun() ->
+    emqx_dashboard_audit:log_fun().
+
+-spec authorize(request(), handler_info()) -> {ok, auth_meta()} | {integer(), term(), term()}.
+authorize(Req, HandlerInfo) ->
+    case parse_authorization_header(Req) of
+        {basic, Username, Password} ->
+            api_key_authorize(Req, HandlerInfo, Username, Password);
+        {bearer, Token} ->
+            jwt_token_bearer_authorize(Req, HandlerInfo, Token);
+        _ ->
+            %% Fallback to emqx_auth cookie (set by dashboard for plugin UI iframes).
+            case is_plugin_api(Req) of
+                true ->
+                    cookie_authorize(Req, HandlerInfo);
+                false ->
+                    return_unauthorized(
+                        <<"AUTHORIZATION_HEADER_ERROR">>,
+                        authorization_header_error_message(HandlerInfo)
+                    )
+            end
+    end.
+
+-doc """
+Parse the `Authorization` header of a request.
+Return `undefined` when the header is absent or when Cowboy cannot parse it.
+""".
+-spec parse_authorization_header(request()) ->
+    {basic, binary(), binary()} | {bearer, binary()} | {digest, list()} | undefined.
+parse_authorization_header(Req) ->
+    undefined_on_request_error(fun() -> cowboy_req:parse_header(<<"authorization">>, Req) end).
+
+is_plugin_api(Req) ->
+    case cowboy_req:path(Req) of
+        <<"/api/v5/plugin_api/", _/binary>> -> true;
+        _ -> false
+    end.
+
+%% A header cowboy cannot parse counts as absent. `cowboy_req:parse_header/2`
+%% and `cowboy_req:match_cookies/2` signal a malformed header with
+%% `exit:{request_error, _, _}`, re-raised with the stacktrace of the cowlib
+%% parse failure. That stacktrace holds the header value, so an escaping
+%% exception writes the caller's credential to the error log. `undefined`
+%% sends the caller to the 401 branch a missing header already takes.
+undefined_on_request_error(Fun) ->
+    try
+        Fun()
+    catch
+        exit:{request_error, _, _} -> undefined
+    end.
+
+cookie_authorize(Req, HandlerInfo) ->
+    Cookies = undefined_on_request_error(
+        fun() -> cowboy_req:match_cookies([{emqx_auth, [], undefined}], Req) end
+    ),
+    case Cookies of
+        #{emqx_auth := Token} when is_binary(Token), Token =/= <<>> ->
+            jwt_token_bearer_authorize(Req, HandlerInfo, Token);
+        _ ->
+            return_unauthorized(
+                <<"AUTHORIZATION_HEADER_ERROR">>,
+                authorization_header_error_message(HandlerInfo)
+            )
+    end.
+
+%% @doc Whether HandlerInfo's endpoint accepts API keys decides which auth-error
+%% messages may mention API keys — an endpoint that rejects them must not send a
+%% caller looking for one, and vice versa.
+with_api_key_hint(HandlerInfo, LoginOnlyMessage, ApiKeyAllowedMessage) ->
+    case emqx_mgmt_auth:is_api_key_allowed(HandlerInfo) of
+        true -> ApiKeyAllowedMessage;
+        false -> LoginOnlyMessage
+    end.
+
+authorization_header_error_message(HandlerInfo) ->
+    with_api_key_hint(
+        HandlerInfo,
+        <<"Missing authorization header. Get a bearer token from POST /api/v5/login.">>,
+        <<
+            "Missing authorization header. Use Basic auth with an API key, "
+            "or get a bearer token from POST /api/v5/login."
+        >>
+    ).
+
+token_timeout_message(HandlerInfo) ->
+    with_api_key_hint(
+        HandlerInfo,
+        <<"Token expired. Get a new token by POST /api/v5/login.">>,
+        <<"Token expired. Get a new token by POST /api/v5/login, or use an API key with Basic auth.">>
+    ).
+
+bad_token_message(HandlerInfo) ->
+    with_api_key_hint(
+        HandlerInfo,
+        <<"Invalid bearer token. Get a new token by POST /api/v5/login.">>,
+        <<
+            "Invalid bearer token. Get a new token by POST /api/v5/login, "
+            "or use an API key with Basic auth."
+        >>
+    ).
+
+return_unauthorized(Code, Message) ->
+    {401,
+        #{
+            <<"WWW-Authenticate">> =>
+                <<"Basic Realm=\"emqx-dashboard\"">>
+        },
+        #{code => Code, message => Message}}.
+
+get_namespace(#{auth_meta := #{?namespace := Namespace}} = _Request) when is_binary(Namespace) ->
+    Namespace;
+get_namespace(#{} = _Request) ->
+    ?global_ns.
+
+listeners() ->
+    emqx_conf:get([dashboard, listeners], #{}).
+
+api_key_authorize(Req, HandlerInfo, Key, Secret) ->
+    case emqx_mgmt_auth:authorize(HandlerInfo, Req, Key, Secret) of
+        {ok, ActorContext} ->
+            AuthnMeta = #{
+                auth_type => api_key,
+                source => Key,
+                namespace => maps:get(?namespace, ActorContext, ?global_ns),
+                actor => ActorContext
+            },
+            {ok, AuthnMeta};
+        {error, <<"not_allowed">>, Resource} ->
+            return_unauthorized(
+                ?API_KEY_NOT_ALLOW,
+                <<"Please use bearer Token instead, using API key/secret in ", Resource/binary,
+                    " path is not permitted">>
+            );
+        {error, {unauthorized_role, Msg}} when is_binary(Msg) ->
+            ok = audit_rbac_denied(Req, api_key, Key),
+            {403, 'UNAUTHORIZED_ROLE', Msg};
+        {error, _} ->
+            return_unauthorized(
+                ?BAD_API_KEY_OR_SECRET,
+                <<"Check api_key/api_secret">>
+            )
+    end.
+
+jwt_token_bearer_authorize(Req, HandlerInfo, Token) ->
+    case emqx_dashboard_admin:verify_token(Req, HandlerInfo, Token) of
+        {ok, #{actor := Username} = ActorContext} ->
+            %% Use the JWT-resolved admin key (SSO tuple for SSO users,
+            %% plain binary otherwise) so handlers can lookup_user/1
+            %% without re-deriving backend from path / query.
+            Source =
+                case emqx_dashboard_token:resolve_admin_key(Token) of
+                    undefined -> Username;
+                    K -> K
+                end,
+            AuthnMeta = #{
+                auth_type => jwt_token,
+                source => Source,
+                namespace => maps:get(?namespace, ActorContext, ?global_ns),
+                actor => ActorContext
+            },
+            {ok, AuthnMeta};
+        {error, token_timeout} ->
+            {401, 'TOKEN_TIME_OUT', token_timeout_message(HandlerInfo)};
+        {error, not_found} ->
+            {401, 'BAD_TOKEN', bad_token_message(HandlerInfo)};
+        {error, {unauthorized_role, Msg, AdminKey}} when is_binary(Msg) ->
+            ok = audit_rbac_denied(Req, jwt_token, AdminKey),
+            {403, 'UNAUTHORIZED_ROLE', Msg}
+    end.
+
+%% RBAC denies the request after the caller has been authenticated, so the
+%% actor is known. minirest never reaches its own meta-producing code on a
+%% failed authorization, so write the actor and the path parameters into the
+%% audit meta here. Only the routing bindings are added - no headers, no body.
+%%
+%% `update_log_meta/1' merges into the per-request meta that minirest
+%% initialises before it calls this authorizer. It does nothing when there is
+%% no request to audit, for example when a test calls `authorize/2' directly.
+audit_rbac_denied(Req, AuthType, Source) ->
+    minirest_handler:update_log_meta(#{
+        auth_type => AuthType,
+        source => Source,
+        bindings => cowboy_req:bindings(Req)
+    }).
+
+%% Leaves out the HTTPS listener when it cannot be given a certificate, rather
+%% than letting the failure stop the others: plain HTTP still starts, and the
+%% dashboard reports HTTPS as the listener that failed.
+ensure_ssl_cert_or_drop(Listeners) ->
+    case ensure_ssl_cert(Listeners) of
+        {ok, Listeners1} ->
+            {Listeners1, []};
+        {error, Reason} ->
+            ?SLOG(error, #{
+                msg => "dashboard_https_listener_not_started",
+                reason => Reason
+            }),
+            {maps:remove(https, Listeners), [listener_name(https)]}
+    end.
+
+%% `listeners/1' drops a listener bound to port 0, so it never starts and needs no
+%% certificate. Generating one here would create a key for a server that does not
+%% run, and again after every restart once an operator deleted it.
+ensure_ssl_cert(Listeners = #{https := #{bind := 0}}) ->
+    {ok, Listeners};
+ensure_ssl_cert(Listeners = #{https := Https0 = #{ssl_options := SslOpts0}}) ->
+    maybe
+        {ok, SslOpts} ?= emqx_tls_lib:ensure_default_certs(SslOpts0),
+        SslOpt1 = maps:from_list(emqx_tls_lib:to_server_opts(tls, SslOpts)),
+        Https1 = maps:remove(ssl_options, Https0),
+        {ok, Listeners#{https => maps:merge(Https1, SslOpt1)}}
+    end;
+ensure_ssl_cert(Listeners) ->
+    {ok, Listeners}.
+
+static_dispatch(SwaggerSupport) ->
+    StaticFiles = ["/editor.worker.js", "/json.worker.js", "/version"],
+    [
+        {"/", cowboy_static, {priv_file, emqx_dashboard, "www/index.html"}},
+        {"/static/[...]", cowboy_static, {priv_dir, emqx_dashboard, "www/static"}}
+    ] ++
+        [{Path, cowboy_static, {priv_file, emqx_dashboard, "www" ++ Path}} || Path <- StaticFiles] ++
+        maybe_swagger_dispatch(SwaggerSupport).
+
+maybe_swagger_dispatch(true) ->
+    api_spec_dispatch();
+maybe_swagger_dispatch(false) ->
+    [].
+
+%% Routes for the focused API spec endpoints.
+%% These are added as raw cowboy routes (not minirest trails) so they do not
+%% appear in the swagger spec they serve. They bypass minirest auth middleware
+%% and instead enforce authentication inside the handler itself, returning a
+%% minimal OpenAPI document (or markdown equivalent) on 401.
+%%
+%% `/api-docs/swagger.json` is preserved (returning the full OpenAPI JSON
+%% spec) so external Swagger UI deployments that load EMQX's spec by URL
+%% keep working. `/api-docs` and `/api-docs/index.html` are 308 redirects
+%% to the in-tree explorer. Other `/api-docs/*` paths used to serve the
+%% bundled Swagger UI assets which were removed in cowboy_swagger 3.0.0;
+%% those now 404.
+api_spec_dispatch() ->
+    ToApiSpec = #{location => <<"/api-spec.html">>},
+    [
+        {"/api-docs", emqx_dashboard_redirect_handler, ToApiSpec},
+        {"/api-docs/index.html", emqx_dashboard_redirect_handler, ToApiSpec},
+        {"/api-docs/swagger.json", emqx_dashboard_api_spec_handler, #{}},
+        {"/api-spec.html", emqx_dashboard_api_spec_handler, #{}},
+        {"/api-spec.md", emqx_dashboard_api_spec_handler, #{}},
+        {"/api-spec.json", emqx_dashboard_api_spec_handler, #{}},
+        {"/api-spec/:tag", emqx_dashboard_api_spec_handler, #{}},
+        {"/api-spec/:tag/:name", emqx_dashboard_api_spec_handler, #{}}
+    ].
+
+dynamic_dispatch() ->
+    [
+        {emqx_mgmt_api_status:path(), emqx_mgmt_api_status, []},
+        {'_', emqx_dashboard_not_found, []}
+    ].
+
+emqx_api_name() ->
+    emqx_release:description() ++ " API".
+
+-doc """
+Return the release version that the REST API reports.
+See `reported_version/1`.
+""".
+-spec reported_version() -> string().
+reported_version() ->
+    reported_version(emqx_release:version()).
+
+-doc """
+Return `Vsn` as the REST API reports it.
+When `dashboard.show_preview_version` is `false`, the `-preview.N` suffix is
+removed, for example `6.1.5-preview.1` becomes `6.1.5`.
+Use this only for the version in a REST API response. Other code must use
+`emqx_release:version/0`, which always returns the real version.
+""".
+-spec reported_version(Vsn) -> Vsn when Vsn :: string() | binary().
+reported_version(Vsn) ->
+    case emqx:get_config([dashboard, show_preview_version], true) of
+        true -> Vsn;
+        false -> strip_preview_suffix(Vsn)
+    end.
+
+strip_preview_suffix(Vsn) when is_binary(Vsn) ->
+    re:replace(Vsn, "-preview\\.[0-9]+", "", [{return, binary}]);
+strip_preview_suffix(Vsn) when is_list(Vsn) ->
+    re:replace(Vsn, "-preview\\.[0-9]+", "", [{return, list}]).

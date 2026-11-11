@@ -1,0 +1,277 @@
+#!/usr/bin/env python3
+"""Print the download URLs for every package produced for a release.
+
+Steering users to https://www.emqx.com/downloads/... (rather than the GitHub
+release assets) keeps download statistics visible.
+
+This script is pure enumeration: it never touches the network. It reads the
+checked-out tree -- the release version (./pkg-vsn.sh --release), the platform
+matrix (scripts/rel/build_matrix.py), and the plugin versions -- and expands
+them into URLs, so it can run at any point in the release cycle without secrets.
+It uses only the Python standard library so CI does not need jq or yq installed.
+
+Two families of URLs are printed:
+  - EMQX packages, served from the emqx.com download CDN.
+  - Plugin packages, also served from the emqx.com CDN, under
+    /downloads/emqx-plugins/<version>/. Each plugin under plugins/
+    ships a VERSION file that gives its package version.
+
+With --s3, the URLs point at the public S3 bucket the release workflow uploads
+to (see .github/workflows/build_packages.yaml) rather than the CDN. These serve
+the same objects, and are useful when a download must bypass the CDN, for
+example to check what was actually published before a cache invalidation lands.
+
+Note: snap packages are published to the Snap Store, not to emqx.com, so they
+are intentionally omitted here.
+
+Output is a plain list of URLs; --md prints markdown tables instead.
+
+Usage:
+  print-download-links.py [version]
+  print-download-links.py [--version <version>] [--md]
+                          [--profile emqx-enterprise] [--s3]
+
+The version defaults to ./pkg-vsn.sh --release when omitted.
+
+Examples:
+  print-download-links.py
+  print-download-links.py 6.0.3
+  print-download-links.py --md
+  print-download-links.py 6.0.3 --s3 --md
+"""
+
+import argparse
+import subprocess
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import build_matrix  # noqa: E402 (sibling module, path set above)
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+EDITIONS = {"emqx-enterprise": "enterprise"}
+
+# The emqx.com download CDN. Packages live under the edition name, plugins
+# under emqx-plugins/.
+CDN_BASE_URL = "https://www.emqx.com/downloads"
+CDN_PLUGINS_DIR = "emqx-plugins"
+
+# The public S3 bucket the release workflow uploads to, and the top-level
+# prefix each profile lands under. The prefixes mirror the `aws s3 cp` targets
+# in .github/workflows/build_packages.yaml and the `s3dir` output in
+# .github/workflows/release.yaml.
+S3_BASE_URL = "https://packages.emqx.io"
+S3_DIRS = {"emqx-enterprise": "emqx-ee"}
+S3_PLUGINS_DIR = "emqx-plugins"
+
+
+def linux_pkg_ext(os_token):
+    """Native package extension for a linux os token.
+
+    Mirrors the PKGERDIR logic in scripts/buildx.sh / build.
+    """
+    if os_token.startswith(("ubuntu", "debian", "raspbian")):
+        return "deb"
+    return "rpm"
+
+
+def release_version():
+    """The release version of the checked-out tree, via ./pkg-vsn.sh --release."""
+    return subprocess.run(
+        [str(REPO_ROOT / "pkg-vsn.sh"), "--release"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
+def parse_args(argv):
+    parser = argparse.ArgumentParser(
+        add_help=True,
+        usage="%(prog)s [version] [--md] [--profile <profile>] [--s3]",
+    )
+    parser.add_argument(
+        "version_pos",
+        nargs="?",
+        metavar="version",
+        help="release version; defaults to ./pkg-vsn.sh --release",
+    )
+    parser.add_argument("--version", dest="version_opt")
+    parser.add_argument(
+        "--md",
+        action="store_true",
+        help="print markdown tables instead of a plain URL list",
+    )
+    parser.add_argument(
+        "--profile", default="emqx-enterprise", choices=list(EDITIONS)
+    )
+    parser.add_argument(
+        "--s3",
+        action="store_true",
+        help="link to the public S3 bucket instead of the CDN",
+    )
+    args = parser.parse_args(argv)
+
+    args.version = args.version_opt or args.version_pos or release_version()
+    return args
+
+
+def plugin_rows(repo_root):
+    """(name, version) for every plugin under plugins/ that ships a VERSION file.
+
+    Sorted by plugin name for stable output.
+    """
+    plugins_dir = repo_root / "plugins"
+    rows = []
+    for version_file in sorted(plugins_dir.glob("*/VERSION")):
+        name = version_file.parent.name
+        version = version_file.read_text().strip()
+        rows.append((name, version))
+    return rows
+
+
+class UrlBuilder:
+    def __init__(self, base_url, plugins_base_url, profile, version):
+        self.base_url = base_url
+        self.plugins_base_url = plugins_base_url
+        self.profile = profile
+        self.version = version
+
+    def pkg_url(self, os_token, arch, ext):
+        # <os>-<arch>.<ext> style (linux/mac)
+        return (
+            f"{self.base_url}/{self.profile}-{self.version}-"
+            f"{os_token}-{arch}.{ext}"
+        )
+
+    def plugin_url(self, name, plugin_version):
+        # <name>-<plugin_version>.tar.gz under the release-version directory.
+        return (
+            f"{self.plugins_base_url}/{self.version}/"
+            f"{name}-{plugin_version}.tar.gz"
+        )
+
+    def plugin_sha256_url(self, name, plugin_version):
+        # Note the naming differs from EMQX packages: the `emqx.plugin' mix
+        # task writes <name>-<vsn>.sha256, replacing the extension, whereas
+        # `build' writes <package>.sha256, appending to it.
+        return (
+            f"{self.plugins_base_url}/{self.version}/"
+            f"{name}-{plugin_version}.sha256"
+        )
+
+
+def emit_text(matrix, plugins, urls):
+    lines = []
+    for row in matrix["linux"]:
+        ext = linux_pkg_ext(row["os"])
+        lines.append(urls.pkg_url(row["os"], row["arch"], ext))
+        lines.append(urls.pkg_url(row["os"], row["arch"], "tar.gz"))
+    for row in matrix["mac"]:
+        lines.append(urls.pkg_url(row["os"], row["arch"], "zip"))
+    for name, version in plugins:
+        lines.append(urls.plugin_url(name, version))
+    return "\n".join(lines)
+
+
+def md_link(label, url):
+    return f"[{label}]({url})"
+
+
+def md_table(headers, rows):
+    """A GitHub-flavoured markdown table. Returns [] when there are no rows."""
+    if not rows:
+        return []
+    sep = ["---"] * len(headers)
+    out = ["| " + " | ".join(headers) + " |", "| " + " | ".join(sep) + " |"]
+    out += ["| " + " | ".join(cells) + " |" for cells in rows]
+    return out
+
+
+def emit_markdown(matrix, plugins, urls):
+    lines = ["## Download", ""]
+
+    def pkg_links(os_token, arch, ext):
+        """Link to a package, followed by its .sha256 sidecar.
+
+        `build' writes <package>.sha256 next to every package it produces, and
+        both are published together.
+        """
+        url = urls.pkg_url(os_token, arch, ext)
+        return f"{md_link(f'.{ext}', url)} ({md_link('sha256', url + '.sha256')})"
+
+    def linux_row(row):
+        ext = linux_pkg_ext(row["os"])
+        return [
+            f"`{row['os']}`",
+            row["arch"],
+            pkg_links(row["os"], row["arch"], ext),
+            pkg_links(row["os"], row["arch"], "tar.gz"),
+        ]
+
+    def linux_section(title, prefixes):
+        rows = [
+            linux_row(row)
+            for row in matrix["linux"]
+            if row["os"].startswith(prefixes)
+        ]
+        if not rows:
+            return
+        lines.append(f"### {title}")
+        lines.append("")
+        lines.extend(md_table(["OS", "Arch", "Package", "Tarball"], rows))
+        lines.append("")
+
+    linux_section("Ubuntu / Debian", ("ubuntu", "debian"))
+    linux_section("RHEL / Rocky / Amazon Linux", ("el", "amzn"))
+
+    mac_rows = [
+        [f"`{row['os']}`", row["arch"], pkg_links(row["os"], row["arch"], "zip")]
+        for row in matrix["mac"]
+    ]
+    if mac_rows:
+        lines.append("### macOS")
+        lines.append("")
+        lines.extend(md_table(["OS", "Arch", "Package"], mac_rows))
+        lines.append("")
+
+    if plugins:
+        lines.append("### Plugins")
+        lines.append("")
+        # Plugin packages are always .tar.gz, so the ext is implied.
+        plugin_rows_md = [
+            [
+                f"`{name}`",
+                version,
+                f"{md_link('.tar.gz', urls.plugin_url(name, version))} "
+                f"({md_link('sha256', urls.plugin_sha256_url(name, version))})",
+            ]
+            for name, version in plugins
+        ]
+        lines.extend(md_table(["Plugin", "Version", "Package"], plugin_rows_md))
+        lines.append("")
+
+    return "\n".join(lines).rstrip("\n")
+
+
+def main(argv):
+    args = parse_args(argv)
+    if args.s3:
+        base_url = f"{S3_BASE_URL}/{S3_DIRS[args.profile]}/{args.version}"
+        plugins_base_url = f"{S3_BASE_URL}/{S3_PLUGINS_DIR}"
+    else:
+        base_url = f"{CDN_BASE_URL}/{EDITIONS[args.profile]}/{args.version}"
+        plugins_base_url = f"{CDN_BASE_URL}/{CDN_PLUGINS_DIR}"
+    urls = UrlBuilder(base_url, plugins_base_url, args.profile, args.version)
+    matrix = build_matrix.matrix()
+    plugins = plugin_rows(REPO_ROOT)
+
+    if args.md:
+        print(emit_markdown(matrix, plugins, urls))
+    else:
+        print(emit_text(matrix, plugins, urls))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

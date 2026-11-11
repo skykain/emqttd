@@ -2,7 +2,27 @@
 
 set -euo pipefail
 
-VERSION="$1"
+[ "${DEBUG:-0}" -eq 1 ] && set -x
+
+OTP_VSN="${OTP_VSN:-$(./scripts/get-otp-vsn.sh)}"
+case ${OTP_VSN} in
+    25*)
+        VERSION="3.19.0-emqx-9"
+        ;;
+    26*)
+        VERSION="3.20.0-emqx-5"
+        ;;
+    27*)
+        VERSION="3.24.0-emqx-1"
+        ;;
+    28*)
+        VERSION="3.25.1-emqx-1"
+        ;;
+    *)
+        echo "Unsupported Erlang/OTP version $OTP_VSN"
+        exit 1
+        ;;
+esac
 
 # ensure dir
 cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
@@ -10,7 +30,8 @@ cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
 DOWNLOAD_URL='https://github.com/emqx/rebar3/releases/download'
 
 download() {
-    curl -f -L "${DOWNLOAD_URL}/${VERSION}/rebar3" -o ./rebar3
+    echo "downloading rebar3 ${VERSION}"
+    curl -sS -f -L "${DOWNLOAD_URL}/${VERSION}/rebar3" -o ./rebar3
 }
 
 # get the version number from the second line of the escript

@@ -1,0 +1,47 @@
+defmodule EMQXUtils.MixProject do
+  use Mix.Project
+
+  alias EMQXUmbrella.MixProject, as: UMP
+
+  def project do
+    [
+      app: :emqx_utils,
+      version: "7.0.0",
+      build_path: "../../_build",
+      compilers: [:yecc, :leex] ++ Mix.compilers(),
+      erlc_options: UMP.erlc_options(),
+      erlc_paths: ["etc" | UMP.erlc_paths()],
+      deps_path: "../../deps",
+      lockfile: "../../mix.lock",
+      elixir: "~> 1.14",
+      start_permanent: Mix.env() == :prod,
+      deps: UMP.common_deps() ++ deps() ++ test_deps()
+    ]
+  end
+
+  def application do
+    [
+      extra_applications: [:public_key] ++ UMP.extra_applications()
+    ]
+  end
+
+  def deps() do
+    UMP.deps([
+      :jiffy,
+      :emqx_http_lib,
+      :snabbkaffe,
+      :erlang_qq,
+      :hocon
+    ])
+  end
+
+  defp test_deps() do
+    if UMP.test_env?() do
+      [
+        UMP.common_dep(:cowboy)
+      ]
+    else
+      []
+    end
+  end
+end

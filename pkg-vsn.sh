@@ -6,16 +6,123 @@ set -euo pipefail
 # ensure dir
 cd -P -- "$(dirname -- "$0")"
 
-if [ -f EMQX_ENTERPRISE ]; then
-    EDITION='enterprise'
-else
-    EDITION='opensource'
+help() {
+    echo
+    echo "$0 [options]"
+    echo
+    echo "-h|--help:       To display this usage information"
+    echo "--release:       Print release version from emqx_release.hrl"
+    echo
+    echo "--long:          Print long vsn number. e.g. 6.0.0-ubuntu24.04-amd64"
+    echo "                 Otherwise short e.g. 6.0.0"
+    echo "--vsn_matcher:   For --long option, replace the EMQX version with '*'"
+    echo "                 so it can be used in find commands"
+}
+
+# PROFILE is no longer in use, TODO: clean up
+case ${1:-} in
+    enterprise)
+        shift
+        ;;
+    emqx-*)
+        shift
+        ;;
+    *)
+        ;;
+esac
+
+while [ "$#" -gt 0 ]; do
+    case $1 in
+    -h|--help)
+        help
+        exit 0
+        ;;
+    --release)
+        RELEASE_VERSION='yes'
+        shift 1
+        ;;
+    --long)
+        LONG_VERSION='yes'
+        shift 1
+        ;;
+    --vsn_matcher)
+        IS_MATCHER='yes'
+        shift 1
+        ;;
+    *)
+      echo "WARN: Unknown arg (ignored): $1"
+      exit 1
+      ;;
+  esac
+done
+
+# return immediately if version is already set
+if [[ "${PKG_VSN:-novalue}" != novalue && "${LONG_VERSION:-novalue}" != 'yes' ]]; then
+    echo "$PKG_VSN"
+    exit 0
 fi
 
-RELEASE="$(grep -E "define.+EMQX_RELEASE.+${EDITION}" include/emqx_release.hrl | cut -d '"' -f2)"
+RELEASE_EDITION="EMQX_RELEASE_EE"
 
-if [ -d .git ] && ! git describe --tags --match "[e|v]${RELEASE}" --exact >/dev/null 2>&1; then
-    SUFFIX="-$(git rev-parse HEAD | cut -b1-8)"
+## emqx_release.hrl is the single source of truth for release version
+RELEASE="$(grep -E "define.+${RELEASE_EDITION}" apps/emqx/include/emqx_release.hrl | cut -d '"' -f2)"
+
+if [ "${RELEASE_VERSION:-}" = 'yes' ]; then
+    echo "$RELEASE"
+    exit 0
 fi
 
-echo "${RELEASE}${SUFFIX:-}"
+if [ "${PKG_VSN:-novalue}" = 'novalue' ]; then
+    git_exact_vsn() {
+        git describe --tags --exact 2>/dev/null || true
+    }
+
+    GIT_EXACT_VSN="$(git_exact_vsn)"
+    if [ "$GIT_EXACT_VSN" != '' ]; then
+        if [ "$GIT_EXACT_VSN" != "$RELEASE" ]; then
+            echo "ERROR: Tagged $GIT_EXACT_VSN, but $RELEASE in include/emqx_release.hrl" 1>&2
+            exit 1
+        fi
+        SUFFIX=''
+    else
+        GIT_REV="$(git rev-parse HEAD 2>/dev/null | cut -b1-8 || true)"
+        if [ -n "$GIT_REV" ]; then
+            SUFFIX="-g${GIT_REV}"
+        else
+            SUFFIX=""
+        fi
+    fi
+
+    PKG_VSN="${RELEASE}${SUFFIX}"
+fi
+
+if [ "${LONG_VERSION:-}" != 'yes' ]; then
+    echo "$PKG_VSN"
+    exit 0
+fi
+
+### --long LONG_VERSION handling start
+
+if [ "${IS_MATCHER:-}" = 'yes' ]; then
+    PKG_VSN='*'
+fi
+
+SYSTEM="$(./scripts/get-distro.sh)"
+
+UNAME_M="$(uname -m)"
+case "$UNAME_M" in
+    x86_64)
+        ARCH='amd64'
+        ;;
+    aarch64)
+        ARCH='arm64'
+        ;;
+    arm64)
+        ARCH='arm64'
+        ;;
+    arm*)
+        ARCH='arm'
+        ;;
+esac
+
+echo "${PKG_VSN}-${SYSTEM}-${ARCH}"

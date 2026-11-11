@@ -1,0 +1,114 @@
+%%--------------------------------------------------------------------
+%% Copyright (c) 2020-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
+%%--------------------------------------------------------------------
+
+-module(emqx_authz_api_settings_SUITE).
+
+-compile(nowarn_export_all).
+-compile(export_all).
+
+-import(emqx_mgmt_api_test_util, [request/3, uri/1]).
+
+-include_lib("emqx/include/emqx.hrl").
+-include_lib("eunit/include/eunit.hrl").
+-include_lib("common_test/include/ct.hrl").
+
+all() ->
+    emqx_common_test_helpers:all(?MODULE).
+
+groups() ->
+    [].
+
+init_per_suite(Config) ->
+    Apps = emqx_cth_suite:start(
+        [
+            {emqx_conf, #{
+                config => #{
+                    authorization =>
+                        #{
+                            cache => #{enable => true},
+                            no_match => allow,
+                            sources => []
+                        }
+                }
+            }},
+            emqx_auth,
+            emqx_management,
+            emqx_mgmt_api_test_util:emqx_dashboard()
+        ],
+        #{work_dir => emqx_cth_suite:work_dir(Config)}
+    ),
+    [{apps, Apps} | Config].
+
+end_per_suite(Config) ->
+    Apps = ?config(apps, Config),
+    emqx_cth_suite:stop(Apps),
+    ok.
+
+%%------------------------------------------------------------------------------
+%% Testcases
+%%------------------------------------------------------------------------------
+
+t_api(_) ->
+    DefaultIncludeMountpoint = emqx_security_profile:policy(authz_default_include_mountpoint),
+    Settings1Put = #{
+        <<"no_match">> => <<"deny">>,
+        <<"deny_action">> => <<"disconnect">>,
+        <<"cache">> => #{
+            <<"enable">> => false,
+            <<"max_size">> => 32,
+            <<"ttl">> => <<"60s">>,
+            <<"excludes">> => [<<"nocache/#">>]
+        },
+        <<"include_mountpoint">> => true,
+        <<"ignore_backend_failures">> => true,
+        <<"ignore_rule_render_failures">> => false
+    },
+    Settings1Get = Settings1Put,
+
+    {ok, 200, Result1} = request(put, uri(["authorization", "settings"]), Settings1Put),
+    {ok, 200, Result1} = request(get, uri(["authorization", "settings"]), []),
+    ?assertEqual(Settings1Get, emqx_utils_json:decode(Result1)),
+
+    #{<<"cache">> := Cache} =
+        Settings2Put = #{
+            <<"no_match">> => <<"allow">>,
+            <<"deny_action">> => <<"ignore">>,
+            <<"cache">> => #{
+                <<"enable">> => true,
+                <<"max_size">> => 32,
+                <<"ttl">> => <<"60s">>
+            }
+        },
+
+    Settings2Get = Settings2Put#{
+        <<"cache">> := Cache#{<<"excludes">> => []},
+        <<"include_mountpoint">> => DefaultIncludeMountpoint,
+        <<"ignore_backend_failures">> => <<"per_security_profile">>,
+        <<"ignore_rule_render_failures">> => <<"per_security_profile">>
+    },
+
+    {ok, 200, Result2} = request(put, uri(["authorization", "settings"]), Settings2Put),
+    {ok, 200, Result2} = request(get, uri(["authorization", "settings"]), []),
+    ?assertEqual(Settings2Get, emqx_utils_json:decode(Result2)),
+
+    lists:foreach(
+        fun({Key, Value}) ->
+            Put = Settings2Get#{Key => Value},
+            {ok, 200, Result3} = request(put, uri(["authorization", "settings"]), Put),
+            {ok, 200, Result3} = request(get, uri(["authorization", "settings"]), []),
+            ?assertEqual(Put, emqx_utils_json:decode(Result3)),
+            %% The GET response must be accepted back unchanged.
+            {ok, 200, Result3} = request(put, uri(["authorization", "settings"]), Put)
+        end,
+        [
+            {Key, Value}
+         || Key <- [<<"ignore_backend_failures">>, <<"ignore_rule_render_failures">>],
+            Value <- [false, true, <<"per_security_profile">>]
+        ]
+    ),
+
+    ok.
+
+stop_apps(Apps) ->
+    lists:foreach(fun application:stop/1, Apps).

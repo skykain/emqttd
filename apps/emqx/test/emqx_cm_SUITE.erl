@@ -1,0 +1,807 @@
+%%--------------------------------------------------------------------
+%% Copyright (c) 2018-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
+%%--------------------------------------------------------------------
+
+-module(emqx_cm_SUITE).
+
+-compile(export_all).
+-compile(nowarn_export_all).
+
+-include_lib("emqx/include/emqx_cm.hrl").
+-include_lib("emqx/include/emqx_channel.hrl").
+-include_lib("eunit/include/eunit.hrl").
+-include_lib("snabbkaffe/include/snabbkaffe.hrl").
+-include_lib("emqx/include/asserts.hrl").
+
+-define(CM, emqx_cm).
+-define(PROC_STATS_KEYS, [mailbox_len, heap_size, total_heap_size, reductions, memory]).
+-define(ChanInfo, #{
+    conninfo =>
+        #{
+            socktype => tcp,
+            peername => {{127, 0, 0, 1}, 5000},
+            sockname => {{127, 0, 0, 1}, 1883},
+            peercert => nossl,
+            conn_mod => emqx_connection,
+            receive_maximum => 100,
+            expiry_interval => 0
+        }
+}).
+
+-define(WAIT(PATTERN, TIMEOUT, RET),
+    fun() ->
+        receive
+            PATTERN -> RET
+        after TIMEOUT -> error({timeout, ?LINE})
+        end
+    end()
+).
+
+%%--------------------------------------------------------------------
+%% CT callbacks
+%%--------------------------------------------------------------------
+suite() -> [{timetrap, {minutes, 2}}].
+
+all() -> emqx_common_test_helpers:all(?MODULE).
+
+init_per_suite(Config) ->
+    Apps = emqx_cth_suite:start([emqx], #{work_dir => emqx_cth_suite:work_dir(Config)}),
+    [{apps, Apps} | Config].
+
+end_per_suite(Config) ->
+    emqx_cth_suite:stop(proplists:get_value(apps, Config)).
+
+%%--------------------------------------------------------------------
+%% Helper fns
+%%--------------------------------------------------------------------
+
+open_session(CleanStart, ClientInfo, ConnInfo) ->
+    emqx_cm:open_session(CleanStart, ClientInfo, ConnInfo, _WillMsg = undefined).
+
+%%--------------------------------------------------------------------
+%% TODO: Add more test cases
+%%--------------------------------------------------------------------
+
+t_reg_unreg_channel(_) ->
+    #{conninfo := ConnInfo} = ?ChanInfo,
+    ok = emqx_cm:register_channel(<<"clientid">>, self(), ConnInfo),
+    ok = emqx_cm:insert_channel_info(<<"clientid">>, ?ChanInfo, emqx_chan_stats:new([])),
+    ?assertEqual([self()], emqx_cm:lookup_channels(<<"clientid">>)),
+    ok = emqx_cm:unregister_channel(<<"clientid">>),
+    ?assertEqual([], emqx_cm:lookup_channels(<<"clientid">>)).
+
+t_get_set_chan_info(_) ->
+    Info = #{conninfo := ConnInfo} = ?ChanInfo,
+    ok = emqx_cm:register_channel(<<"clientid">>, self(), ConnInfo),
+    ok = emqx_cm:insert_channel_info(<<"clientid">>, ?ChanInfo, emqx_chan_stats:new([])),
+
+    ?assertEqual(Info, emqx_cm:get_chan_info(<<"clientid">>)),
+    Info1 = Info#{proto_ver => 5},
+    true = emqx_cm:set_chan_info(<<"clientid">>, Info1),
+    ?assertEqual(Info1, emqx_cm:get_chan_info(<<"clientid">>)),
+    ok = emqx_cm:unregister_channel(<<"clientid">>),
+    ?assertEqual(undefined, emqx_cm:get_chan_info(<<"clientid">>)),
+
+    ?assertError(
+        function_clause,
+        emqx_cm:insert_channel_info(undefined, #{}, emqx_chan_stats:new([]))
+    ),
+    ?assertError(
+        function_clause,
+        emqx_cm:insert_channel_info(<<"clientid">>, #{}, [])
+    ).
+
+t_disconnected_sessions_stat(_) ->
+    ClientId = <<"disconnected-sessions-stat">>,
+    #{conninfo := ConnInfo} = ?ChanInfo,
+    ok = emqx_cm:stats_fun(),
+    Baseline = emqx_stats:getstat('disconnected_sessions.count'),
+    ok = emqx_cm:register_channel(ClientId, self(), ConnInfo),
+    ok = emqx_cm:stats_fun(),
+    %% A registered channel with a live connection is not disconnected.
+    ?assertEqual(Baseline, emqx_stats:getstat('disconnected_sessions.count')),
+    ok = emqx_cm:mark_channel_disconnected(self()),
+    ok = emqx_cm:stats_fun(),
+    ?assertEqual(Baseline + 1, emqx_stats:getstat('disconnected_sessions.count')),
+    ok = emqx_cm:unregister_channel(ClientId),
+    ok = emqx_cm:stats_fun(),
+    ?assertEqual(Baseline, emqx_stats:getstat('disconnected_sessions.count')).
+
+-doc """
+The stats of a channel come from its stats array: the keys the channel has
+reported, with the channel metrics from the start, and nothing of the row
+until the channel reports it. The process stats of the channel process come
+last, read from the process.
+""".
+t_get_set_chan_stats(_) ->
+    ClientId = <<"clientid">>,
+    Info = #{conninfo := ConnInfo} = ?ChanInfo,
+    ok = emqx_cm:register_channel(ClientId, self(), ConnInfo),
+    ok = emqx_cm:insert_channel_info(ClientId, Info, emqx_chan_stats:new([])),
+    ?assertEqual(connection_stats([]), array_stats(emqx_cm:get_chan_stats(ClientId))),
+    Stats = [{recv_oct, 10}, {send_oct, 8}],
+    ok = emqx_chan_stats:report(ClientId, Stats),
+    ?assertEqual(connection_stats(Stats), array_stats(emqx_cm:get_chan_stats(ClientId))),
+    Stats1 = [{recv_oct, 20}, {send_oct, 8}, {mqueue_len, 3}],
+    ok = emqx_chan_stats:report(ClientId, Stats1),
+    ?assertEqual(connection_stats(Stats1), array_stats(emqx_cm:get_chan_stats(ClientId))),
+    ?assertEqual(connection_stats(Stats1), array_stats(emqx_cm:get_chan_stats(ClientId, self()))),
+    ?assertEqual(
+        lists:sort(?PROC_STATS_KEYS),
+        lists:sort(
+            proplists:get_keys(emqx_cm:get_chan_stats(ClientId)) -- emqx_chan_stats:keys()
+        )
+    ),
+
+    ?assertError(
+        function_clause,
+        emqx_chan_stats:report(undefined, [])
+    ),
+
+    ok = emqx_cm:unregister_channel(ClientId),
+    ?assertEqual(undefined, emqx_cm:get_chan_stats(ClientId)).
+
+-doc """
+The stats of a row are the stats array alone: `get_chan_stats/1,2` and
+`lookup_client/1` return the same list, and the session attributes that do
+not change with traffic are in the `session` entry of the info map, not in
+the stats.
+""".
+t_chan_stats_readers(_) ->
+    ClientId = <<"stats-readers">>,
+    Info0 = #{conninfo := ConnInfo} = ?ChanInfo,
+    Info = Info0#{
+        session => #{
+            created_at => 1,
+            impl => emqx_session_mem,
+            is_persistent => true,
+            durable => false,
+            subscriptions_max => infinity,
+            awaiting_rel_max => 100,
+            inflight_max => 32,
+            mqueue_max => 1000
+        }
+    },
+    ok = emqx_cm:register_channel(ClientId, self(), ConnInfo),
+    try
+        ok = emqx_cm:insert_channel_info(ClientId, Info, emqx_chan_stats:new([])),
+        ok = emqx_chan_stats:report(ClientId, [{subscriptions_cnt, 2}, {mqueue_len, 0}]),
+        Expected = connection_stats([{subscriptions_cnt, 2}]),
+        ?assertEqual(Expected, array_stats(emqx_cm:get_chan_stats(ClientId))),
+        ?assertEqual(Expected, array_stats(emqx_cm:get_chan_stats(ClientId, self()))),
+        lists:foreach(
+            fun(Key) ->
+                [{{ClientId, _}, Info, Found}] = emqx_cm:lookup_client(Key),
+                ?assertEqual(Expected, array_stats(Found), Key)
+            end,
+            [{clientid, ClientId}, {chan_pid, self()}]
+        ),
+        ?assertError(badarg, emqx_chan_stats:report(ClientId, [{mqueue_len, infinity}])),
+        ?assertError(
+            {unknown_chan_stats_key, subscriptions_max},
+            emqx_chan_stats:report(ClientId, [{subscriptions_max, infinity}])
+        )
+    after
+        ok = emqx_cm:unregister_channel(ClientId)
+    end.
+
+%% The stats of a `connection` array after the given writes: every key, 0 unless written.
+connection_stats(Written) ->
+    [{Key, proplists:get_value(Key, Written, 0)} || Key <- emqx_chan_stats:keys()].
+
+%% The stats without the process stats that a reader appends.
+array_stats(Stats) ->
+    [KV || {K, _} = KV <- Stats, not lists:member(K, ?PROC_STATS_KEYS)].
+
+-doc """
+The stats of a TCP connection read from the channel info table have the keys
+and the values of the stats the connection process reports, which are the ones
+`GET /clients` lists.
+""".
+t_chan_stats_keys_tcp(_) ->
+    assert_chan_stats_keys(<<"stats-keys-tcp">>, fun emqtt:connect/1, []).
+
+-doc """
+The stats of a WebSocket connection read from the channel info table have the
+keys and the values of the stats the connection process reports.
+""".
+t_chan_stats_keys_ws(_) ->
+    assert_chan_stats_keys(<<"stats-keys-ws">>, fun emqtt:ws_connect/1, [{port, 8083}]).
+
+assert_chan_stats_keys(ClientId, Connect, Opts) ->
+    {ok, C} = emqtt:start_link([{clientid, ClientId} | Opts]),
+    {ok, _} = Connect(C),
+    try
+        [ChanPid] = emqx_cm:lookup_channels(ClientId),
+        #{conninfo := #{conn_mod := ConnMod}} = emqx_cm:get_chan_info(ClientId),
+        FromProcess = ConnMod:stats(ChanPid),
+        FromTable = emqx_cm:get_chan_stats(ClientId),
+        ?assertEqual(
+            lists:sort(proplists:get_keys(FromProcess)),
+            lists:sort(proplists:get_keys(FromTable)),
+            ConnMod
+        ),
+        %% The packet counters and the subscription count do not change
+        %% between the two reads.
+        Stable = [recv_pkt, send_pkt, subscriptions_cnt],
+        ?assertEqual(
+            [{K, proplists:get_value(K, FromProcess)} || K <- Stable],
+            [{K, proplists:get_value(K, FromTable)} || K <- Stable],
+            ConnMod
+        ),
+        ?assertMatch(#{recv_pkt := 1, send_pkt := 1}, maps:from_list(FromTable), ConnMod)
+    after
+        ok = emqtt:disconnect(C)
+    end.
+
+t_report_logs_session_buffer_high_watermark(_) ->
+    ClientId = <<"session-buffer-check">>,
+    Stats = [{mqueue_len, 1}, {inflight_cnt, 1}, {total_payload_bytes, 2}],
+    Info = #{conninfo := ConnInfo} = ?ChanInfo,
+    ok = emqx_cm:register_channel(ClientId, self(), ConnInfo),
+    ok = emqx_cm:insert_channel_info(ClientId, Info, emqx_chan_stats:new([])),
+    Path = [sysmon, session, total_payload_bytes_high_watermark],
+    PreviousHighWatermark = emqx_config:get(Path, 0),
+    try
+        ChanPid = self(),
+        ok = emqx_config:put(Path, 1),
+        Logs = emqx_cth_log_capture:capture(fun() ->
+            ok = emqx_chan_stats:report(ClientId, Stats)
+        end),
+        ?assertMatch(
+            [
+                #{
+                    msg := session_buffer_high_watermark,
+                    clientid := ClientId,
+                    pid := ChanPid,
+                    mqueue_length := 1,
+                    inflight_count := 1,
+                    total_payload_bytes := 2,
+                    total_payload_bytes_high_watermark := 1
+                }
+            ],
+            [Log || #{msg := session_buffer_high_watermark} = Log <- Logs]
+        )
+    after
+        ok = emqx_config:put(Path, PreviousHighWatermark),
+        ok = emqx_cm:unregister_channel(ClientId)
+    end.
+
+t_open_session(_) ->
+    ok = meck:new(emqx_connection, [passthrough, no_history]),
+    ok = meck:expect(emqx_connection, call, fun(_, _) -> ok end),
+    ok = meck:expect(emqx_connection, call, fun(_, _, _) -> ok end),
+
+    ClientInfo = #{
+        zone => default,
+        listener => 'tcp:default',
+        clientid => <<"clientid">>,
+        username => <<"username">>,
+        peerhost => {127, 0, 0, 1}
+    },
+    ConnInfo = #{
+        socktype => tcp,
+        peername => {{127, 0, 0, 1}, 5000},
+        sockname => {{127, 0, 0, 1}, 1883},
+        peercert => nossl,
+        conn_mod => emqx_connection,
+        expiry_interval => 0,
+        receive_maximum => 100
+    },
+    {ok, #{session := Session1, present := false}} =
+        open_session(true, ClientInfo, ConnInfo),
+    ?assertEqual(100, emqx_session:info(inflight_max, Session1)),
+    {ok, #{session := Session2, present := false}} =
+        open_session(true, ClientInfo, ConnInfo),
+    ?assertEqual(100, emqx_session:info(inflight_max, Session2)),
+
+    emqx_cm:unregister_channel(<<"clientid">>),
+    ok = meck:unload(emqx_connection).
+
+rand_client_id() ->
+    list_to_binary("client-id-" ++ integer_to_list(erlang:system_time())).
+
+t_open_session_race_condition(_) ->
+    ClientId = rand_client_id(),
+    ClientInfo = #{
+        zone => default,
+        listener => 'tcp:default',
+        clientid => ClientId,
+        username => <<"username">>,
+        peerhost => {127, 0, 0, 1}
+    },
+    ConnInfo = #{
+        socktype => tcp,
+        peername => {{127, 0, 0, 1}, 5000},
+        sockname => {{127, 0, 0, 1}, 1883},
+        peercert => nossl,
+        conn_mod => emqx_connection,
+        expiry_interval => 0,
+        receive_maximum => 100
+    },
+
+    Parent = self(),
+    OpenASession = fun() ->
+        timer:sleep(rand:uniform(100)),
+        OpenR = open_session(true, ClientInfo, ConnInfo),
+        Parent ! OpenR,
+        case OpenR of
+            {ok, _} ->
+                ok = emqx_cm:register_channel(ClientId, self(), ConnInfo),
+                receive
+                    {'$gen_call', From, discard} ->
+                        gen_server:reply(From, ok),
+                        ok
+                end;
+            {error, Reason} ->
+                exit(Reason)
+        end
+    end,
+    N = 1000,
+    Pids = lists:flatten([
+        [spawn_monitor(OpenASession), spawn_monitor(OpenASession)]
+     || _ <- lists:seq(1, N)
+    ]),
+
+    WaitingRecv = fun
+        _Wr(N1, N2, 0) ->
+            {N1, N2};
+        _Wr(N1, N2, Rest) ->
+            receive
+                {ok, _} -> _Wr(N1 + 1, N2, Rest - 1);
+                {error, _} -> _Wr(N1, N2 + 1, Rest - 1)
+            end
+    end,
+
+    {Succeeded, Failed} = WaitingRecv(0, 0, 2 * N),
+    ct:pal("Race condition status: succeeded=~p failed=~p~n", [Succeeded, Failed]),
+    ?assertEqual(2 * N, length(Pids)),
+    WaitForDowns =
+        fun
+            _Wd([{Pid, _Ref}]) ->
+                Pid;
+            _Wd(Pids0) ->
+                receive
+                    {'DOWN', DownRef, process, DownPid, _} ->
+                        ?assert(lists:member({DownPid, DownRef}, Pids0)),
+                        _Wd(lists:delete({DownPid, DownRef}, Pids0))
+                after 10000 ->
+                    RemainingPids = lists:map(
+                        fun({Pid, _Ref}) -> Pid end,
+                        Pids0
+                    ),
+                    case emqx_cm:lookup_channels(ClientId) -- RemainingPids of
+                        [] ->
+                            %% @FIXME: EMQX-14081
+                            ct:comment("BUG: >1 winners found, winners: ~p~n", [RemainingPids]),
+                            bug_triggered;
+                        More ->
+                            exit({timeout, More})
+                    end
+                end
+        end,
+    case WaitForDowns(Pids) of
+        bug_triggered ->
+            ok;
+        Winner when is_pid(Winner) ->
+            ?assertMatch(
+                [_],
+                ?retry(
+                    _Interval = 100,
+                    _NTimes = 10,
+                    [_] = ets:lookup(?CHAN_TAB, ClientId)
+                )
+            ),
+            ?assertEqual([Winner], emqx_cm:lookup_channels(ClientId)),
+            ?assertMatch([_], ets:lookup(?CHAN_CONN_TAB, Winner)),
+            ?assertMatch([_], ets:lookup(?CHAN_REG_TAB, ClientId)),
+
+            exit(Winner, kill),
+            receive
+                {'DOWN', _, process, Winner, _} -> ok
+            end,
+            %% sync
+            ignored = gen_server:call(?CM, ignore, infinity),
+            ok = emqx_pool:flush_async_tasks(?CM_POOL),
+            ?assertEqual([], emqx_cm:lookup_channels(ClientId))
+    end.
+
+t_kick_session_discard_normal(_) ->
+    test_stepdown_session(discard, normal).
+
+t_kick_session_discard_shutdown(_) ->
+    test_stepdown_session(discard, shutdown).
+
+t_kick_session_discard_shutdown_with_reason(_) ->
+    test_stepdown_session(discard, {shutdown, discard}).
+
+t_kick_session_discard_timeout(_) ->
+    test_stepdown_session(discard, timeout).
+
+t_kick_session_discard_noproc(_) ->
+    test_stepdown_session(discard, noproc).
+
+t_kick_session_kick_normal(_) ->
+    test_stepdown_session(kick, normal).
+
+t_kick_session_kick_shutdown(_) ->
+    test_stepdown_session(kick, shutdown).
+
+t_kick_session_kick_shutdown_with_reason(_) ->
+    test_stepdown_session(kick, {shutdown, kicked}).
+
+t_kick_session_kick_timeout(_) ->
+    test_stepdown_session(kick, timeout).
+
+t_kick_session_kick_noproc(_) ->
+    test_stepdown_session(kick, noproc).
+
+t_stepdown_session_takeover_begin_normal(_) ->
+    test_stepdown_session({takeover, 'begin'}, normal).
+
+t_stepdown_session_takeover_begin_shutdown(_) ->
+    test_stepdown_session({takeover, 'begin'}, shutdown).
+
+t_stepdown_session_takeover_begin_shutdown_with_reason(_) ->
+    test_stepdown_session({takeover, 'begin'}, {shutdown, kicked}).
+
+t_stepdown_session_takeover_begin_timeout(_) ->
+    test_stepdown_session({takeover, 'begin'}, timeout).
+
+t_stepdown_session_takeover_begin_noproc(_) ->
+    test_stepdown_session({takeover, 'begin'}, noproc).
+
+t_stepdown_session_takeover_end_normal(_) ->
+    test_stepdown_session({takeover, 'end'}, normal).
+
+t_stepdown_session_takeover_end_shutdown(_) ->
+    test_stepdown_session({takeover, 'end'}, shutdown).
+
+t_stepdown_session_takeover_end_shutdown_with_reason(_) ->
+    test_stepdown_session({takeover, 'end'}, {shutdown, kicked}).
+
+t_stepdown_session_takeover_end_timeout(_) ->
+    test_stepdown_session({takeover, 'end'}, timeout).
+
+t_stepdown_session_takeover_end_noproc(_) ->
+    test_stepdown_session({takeover, 'end'}, noproc).
+
+test_stepdown_session(Action, Reason) ->
+    ClientId = rand_client_id(),
+    #{conninfo := ConnInfo} = ?ChanInfo,
+    FakeSessionFun =
+        fun Loop() ->
+            receive
+                {'$gen_call', From, A} when
+                    A =:= kick orelse
+                        A =:= discard orelse
+                        A =:= {takeover, 'begin'} orelse
+                        A =:= {takeover, 'end'}
+                ->
+                    case Reason of
+                        normal when A =:= kick orelse A =:= discard ->
+                            gen_server:reply(From, ok);
+                        timeout ->
+                            %% no response to the call
+                            Loop();
+                        _ ->
+                            exit(Reason)
+                    end;
+                Msg ->
+                    ct:pal("(~p) fake_session_discarded ~p", [Action, Msg]),
+                    Loop()
+            end
+        end,
+    {Pid1, _} = spawn_monitor(FakeSessionFun),
+    {Pid2, _} = spawn_monitor(FakeSessionFun),
+    ok = emqx_cm:register_channel(ClientId, Pid1, ConnInfo),
+    ok = emqx_cm:register_channel(ClientId, Pid1, ConnInfo),
+    ok = emqx_cm:register_channel(ClientId, Pid2, ConnInfo),
+    ?assertEqual(lists:sort([Pid1, Pid2]), lists:sort(emqx_cm:lookup_channels(ClientId))),
+    case Reason of
+        noproc ->
+            exit(Pid1, kill),
+            exit(Pid2, kill);
+        _ ->
+            ok
+    end,
+    ok =
+        case Action of
+            kick ->
+                emqx_cm:kick_session(ClientId);
+            discard ->
+                emqx_cm:discard_session(ClientId);
+            {takeover, _} ->
+                none = emqx_cm:takeover_session_begin(ClientId),
+                ok
+        end,
+    case Reason =:= timeout orelse Reason =:= noproc of
+        true ->
+            ?assertEqual(killed, ?WAIT({'DOWN', _, process, Pid1, R}, 2_000, R)),
+            ?assertEqual(killed, ?WAIT({'DOWN', _, process, Pid2, R}, 2_000, R));
+        false ->
+            ?assertEqual(Reason, ?WAIT({'DOWN', _, process, Pid1, R}, 2_000, R)),
+            ?assertEqual(Reason, ?WAIT({'DOWN', _, process, Pid2, R}, 2_000, R))
+    end,
+    % sync
+    ignored = gen_server:call(?CM, ignore, infinity),
+    ok = emqx_pool:flush_async_tasks(?CM_POOL),
+    ?assertEqual([], emqx_cm:lookup_channels(ClientId)).
+
+t_discard_session_race(_) ->
+    ClientId = rand_client_id(),
+    ?check_trace(
+        #{timetrap => 60000},
+        begin
+            #{conninfo := ConnInfo0} = ?ChanInfo,
+            ConnInfo = ConnInfo0#{conn_mod := emqx_ws_connection},
+            {Pid, Ref} = spawn_monitor(fun() ->
+                receive
+                    stop -> exit(normal)
+                end
+            end),
+            ok = emqx_cm:register_channel(ClientId, Pid, ConnInfo),
+            Pid ! stop,
+            receive
+                {'DOWN', Ref, process, Pid, normal} -> ok
+            end,
+            ?assertMatch(ok, emqx_cm:discard_session(ClientId))
+        end,
+        []
+    ).
+
+t_takeover_session(_) ->
+    #{conninfo := ConnInfo} = ?ChanInfo,
+    ClientId = <<"clientid">>,
+    none = emqx_cm:takeover_session_begin(ClientId),
+    Parent = self(),
+    _ChanPid = erlang:spawn_link(fun() ->
+        ok = emqx_cm:register_channel(ClientId, self(), ConnInfo),
+        Parent ! registered,
+        receive
+            {'$gen_call', From1, {takeover, 'begin'}} ->
+                gen_server:reply(From1, test),
+                receive
+                    {'$gen_call', From2, {takeover, 'end'}} ->
+                        gen_server:reply(From2, _Pendings = [hello])
+                end
+        end
+    end),
+    receive
+        registered -> ok
+    end,
+    {ok, ChanRef, test} = emqx_cm:takeover_session_begin(ClientId),
+    {ok, [hello]} = emqx_cm:takeover_session_end(ChanRef),
+    emqx_cm:unregister_channel(ClientId).
+
+t_takeover_session_process_gone(_) ->
+    #{conninfo := ConnInfo} = ?ChanInfo,
+    ClientIDTcp = <<"clientidTCP">>,
+    ClientIDWs = <<"clientidWs">>,
+    ClientIDRpc = <<"clientidRPC">>,
+    none = emqx_cm:takeover_session_begin(ClientIDTcp),
+    none = emqx_cm:takeover_session_begin(ClientIDWs),
+    meck:new(emqx_connection, [passthrough, no_history]),
+    meck:expect(
+        emqx_connection,
+        call,
+        fun
+            (Pid, {takeover, 'begin'}, _) ->
+                exit({noproc, {gen_server, call, [Pid, takeover_session]}});
+            (Pid, What, Args) ->
+                meck:passthrough([Pid, What, Args])
+        end
+    ),
+    ok = emqx_cm:register_channel(ClientIDTcp, self(), ConnInfo),
+    none = emqx_cm:takeover_session_begin(ClientIDTcp),
+    meck:expect(
+        emqx_connection,
+        call,
+        fun
+            (_Pid, {takeover, 'begin'}, _) ->
+                exit(noproc);
+            (Pid, What, Args) ->
+                meck:passthrough([Pid, What, Args])
+        end
+    ),
+    ok = emqx_cm:register_channel(ClientIDWs, self(), ConnInfo),
+    none = emqx_cm:takeover_session_begin(ClientIDWs),
+    meck:expect(
+        emqx_connection,
+        call,
+        fun
+            (Pid, {takeover, 'begin'}, _) ->
+                exit({noproc, {gen_server, call, [Pid, takeover_session]}});
+            (Pid, What, Args) ->
+                meck:passthrough([Pid, What, Args])
+        end
+    ),
+    ok = emqx_cm:register_channel(ClientIDRpc, self(), ConnInfo),
+    none = emqx_cm:takeover_session_begin(ClientIDRpc),
+    emqx_cm:unregister_channel(ClientIDTcp),
+    emqx_cm:unregister_channel(ClientIDWs),
+    emqx_cm:unregister_channel(ClientIDRpc),
+    meck:unload(emqx_connection).
+
+t_all_channels(_) ->
+    ?assertEqual(true, is_list(emqx_cm:all_channels())).
+
+t_lock_clientid(_) ->
+    {true, Nodes} = emqx_cm_locker:lock(<<"clientid">>),
+    ?assertEqual({true, Nodes}, emqx_cm_locker:lock(<<"clientid">>)),
+    ?assertEqual({true, Nodes}, emqx_cm_locker:unlock(<<"clientid">>)),
+    ?assertEqual({true, Nodes}, emqx_cm_locker:unlock(<<"clientid">>)).
+
+t_message(_) ->
+    ?CM ! testing,
+    gen_server:cast(?CM, testing),
+    gen_server:call(?CM, testing).
+
+t_live_connection_stream(_) ->
+    Chans1 = spawn_dummy_chann(emqx_connection, 50),
+    Chans2 = spawn_dummy_chann(emqx_ws_connection, 50),
+    lists:foreach(
+        fun({ClientId, Pid, ChanInfo}) ->
+            ok = emqx_cm:register_channel(ClientId, Pid, ChanInfo)
+        end,
+        Chans1
+    ),
+    lists:foreach(
+        fun({ClientId, Pid, ChanInfo}) ->
+            ok = emqx_cm:register_channel(ClientId, Pid, ChanInfo)
+        end,
+        Chans2
+    ),
+    Stream = emqx_cm:live_connection_stream([emqx_connection, emqx_ws_connection]),
+    Pids = emqx_utils_stream:fold(fun(Pid, Acc) -> [Pid | Acc] end, [], Stream),
+    StreamedPids = lists:sort(Pids),
+    ExpectedPids = lists:sort(lists:map(fun({_, Pid, _}) -> Pid end, Chans1 ++ Chans2)),
+    lists:foreach(
+        fun(Pid) ->
+            unlink(Pid),
+            exit(Pid, kill)
+        end,
+        ExpectedPids
+    ),
+    ?assertEqual(100, length(StreamedPids)),
+    ?assertEqual(ExpectedPids, StreamedPids),
+    ok.
+
+%% Stub the channel registry with a local dead pid to verify
+%% that emqx_cm:open_session will return client_id_unavailable error
+t_clientid_registration_throttled(_) ->
+    ClientId = atom_to_binary(?FUNCTION_NAME),
+    ClientInfo = #{
+        zone => default,
+        listener => 'tcp:default',
+        clientid => ClientId,
+        username => <<"username">>,
+        peerhost => {127, 0, 0, 1}
+    },
+    {DeadPid, MRef} = spawn_monitor(fun() -> exit(normal) end),
+    ChanInfo = ?ChanInfo,
+    #{conninfo := ConnInfo} = ChanInfo,
+    ?assertReceive({'DOWN', MRef, process, DeadPid, _}),
+    %% Suspend emqx_cm so it cannot process the {registered, DeadPid} monitor +
+    %% subsequent DOWN that would asynchronously clean up the dead pid's
+    %% conn-mod row. Otherwise that cleanup can race ahead of the throttle check
+    %% below, which then sees no stale row and lets the session open.
+    ok = sys:suspend(emqx_cm),
+    ok = emqx_cm:register_channel(ClientId, DeadPid, ChanInfo#{conn_mod => emqx_connection}),
+    ?assertEqual({error, client_id_unavailable}, open_session(true, ClientInfo, ConnInfo)),
+    ok = sys:resume(emqx_cm),
+    ok = emqx_cm:do_unregister_channel({ClientId, DeadPid}).
+
+%% Stale registry rows can survive a partition + autoheal (the unregister
+%% dirty_delete was on the loser side and got thrown away). When a kick or
+%% takeover-kick RPC subsequently lands on the node owning the dead pid,
+%% the local channel-conn table has no entry for it, so the handler used to
+%% return ok and leave the registry row behind. The handler must now delete
+%% the row so the duplicate doesn't persist.
+t_do_kick_session_cleans_stale_dead_pid(_) ->
+    ClientId = atom_to_binary(?FUNCTION_NAME),
+    {DeadPid, MRef} = spawn_monitor(fun() -> exit(normal) end),
+    ?assertReceive({'DOWN', MRef, process, DeadPid, _}),
+    ok = mria:dirty_write(?CHAN_REG_TAB, #channel{chid = ClientId, pid = DeadPid}),
+    ?assertEqual([DeadPid], emqx_cm_registry:lookup_all_channels(ClientId)),
+    ok = emqx_cm:do_kick_session(discard, ClientId, DeadPid),
+    ?assertEqual([], emqx_cm_registry:lookup_all_channels(ClientId)).
+
+t_do_takeover_kick_session_cleans_stale_dead_pid(_) ->
+    ClientId = atom_to_binary(?FUNCTION_NAME),
+    {DeadPid, MRef} = spawn_monitor(fun() -> exit(normal) end),
+    ?assertReceive({'DOWN', MRef, process, DeadPid, _}),
+    ok = mria:dirty_write(?CHAN_REG_TAB, #channel{chid = ClientId, pid = DeadPid}),
+    ?assertEqual([DeadPid], emqx_cm_registry:lookup_all_channels(ClientId)),
+    ok = emqx_cm:do_takeover_kick_session_v3(ClientId, DeadPid),
+    ?assertEqual([], emqx_cm_registry:lookup_all_channels(ClientId)).
+
+%% If the registry points at a still-living process that this node knows
+%% nothing about (no chan_conn entry), do NOT delete the row, since the
+%% process might be a real channel in some weird half-state.
+t_do_kick_session_keeps_alive_pid(_) ->
+    ClientId = atom_to_binary(?FUNCTION_NAME),
+    AlivePid = erlang:spawn_link(fun() -> timer:sleep(60000) end),
+    try
+        ok = mria:dirty_write(?CHAN_REG_TAB, #channel{chid = ClientId, pid = AlivePid}),
+        ok = emqx_cm:do_kick_session(discard, ClientId, AlivePid),
+        ?assertEqual([AlivePid], emqx_cm_registry:lookup_all_channels(ClientId))
+    after
+        mria:dirty_delete_object(?CHAN_REG_TAB, #channel{chid = ClientId, pid = AlivePid}),
+        unlink(AlivePid),
+        exit(AlivePid, kill)
+    end.
+
+%% The open_session throttle protects against a real race: a channel exited,
+%% its DOWN is queued at emqx_cm, the cm pool is about to unregister it. The
+%% chan-conn table still has its conn_mod row. Reconnect must wait.
+t_open_session_throttled_on_inflight_local_cleanup(_) ->
+    ClientId = atom_to_binary(?FUNCTION_NAME),
+    ClientInfo = #{
+        zone => default,
+        listener => 'tcp:default',
+        clientid => ClientId,
+        username => <<"username">>,
+        peerhost => {127, 0, 0, 1}
+    },
+    {DeadPid, MRef} = spawn_monitor(fun() -> exit(normal) end),
+    ChanInfo = ?ChanInfo,
+    #{conninfo := ConnInfo} = ChanInfo,
+    ?assertReceive({'DOWN', MRef, process, DeadPid, _}),
+    %% Suspend emqx_cm so the {registered, DeadPid} cast from
+    %% register_channel sits in its mailbox: the monitor is not set up,
+    %% no DOWN fires, the cm-pool cleanup cannot race us, the chan-conn
+    %% row stays, and the throttle has the conditions it is meant to
+    %% detect.
+    ok = sys:suspend(emqx_cm),
+    try
+        ok = emqx_cm:register_channel(
+            ClientId, DeadPid, ChanInfo#{conn_mod => emqx_connection}
+        ),
+        ?assertEqual(
+            {error, client_id_unavailable},
+            open_session(true, ClientInfo, ConnInfo)
+        )
+    after
+        ok = sys:resume(emqx_cm),
+        %% Idempotent cleanup in case cm pool didn't get there first.
+        ok = emqx_cm:do_unregister_channel({ClientId, DeadPid})
+    end.
+
+%% A stale local tombstone (registry row pointing at a dead pid that this
+%% node never registered) used to block the same clientid on this node
+%% forever: lookup_all_channels reports a local-down pid, throttle fires,
+%% no DOWN is ever queued, retry blocks again. The throttle must now
+%% recognize the row is stale (no chan-conn entry), reap it, and let the
+%% connect proceed. (open_session creates the session record; the new
+%% channel pid registers itself later via emqx_channel.)
+t_open_session_reaps_local_tombstone(_) ->
+    ClientId = atom_to_binary(?FUNCTION_NAME),
+    ClientInfo = #{
+        zone => default,
+        listener => 'tcp:default',
+        clientid => ClientId,
+        username => <<"username">>,
+        peerhost => {127, 0, 0, 1}
+    },
+    #{conninfo := ConnInfo} = ?ChanInfo,
+    {DeadPid, MRef} = spawn_monitor(fun() -> exit(normal) end),
+    ?assertReceive({'DOWN', MRef, process, DeadPid, _}),
+    ok = mria:dirty_write(?CHAN_REG_TAB, #channel{chid = ClientId, pid = DeadPid}),
+    ?assertEqual([DeadPid], emqx_cm_registry:lookup_all_channels(ClientId)),
+    ?assertMatch({ok, _}, open_session(true, ClientInfo, ConnInfo)),
+    %% Stale tombstone is gone; open_session does not register the new pid
+    %% (that happens later in the channel's connect handler).
+    ?assertEqual([], emqx_cm_registry:lookup_all_channels(ClientId)).
+
+spawn_dummy_chann(Mod, Count) ->
+    #{conninfo := ConnInfo0} = ?ChanInfo,
+    ConnInfo = ConnInfo0#{conn_mod => Mod},
+    lists:map(
+        fun(I) ->
+            ClientId = list_to_binary(atom_to_list(Mod) ++ integer_to_list(I)),
+            Pid = spawn_link(fun() -> timer:sleep(1000000) end),
+            {ClientId, Pid, ConnInfo}
+        end,
+        lists:seq(1, Count)
+    ).

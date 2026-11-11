@@ -1,0 +1,102 @@
+name: 'Create MacOS packages'
+description: 'Build MacOS packages'
+inputs:
+  profile: # emqx-enterprise
+    required: false
+    default: emqx-enterprise
+  otp:
+    required: true
+  elixir:
+    required: true
+  os:
+    required: false
+    default: macos-15
+  apple_id_password:
+    required: false
+  apple_developer_identity:
+    required: false
+  apple_developer_id_bundle:
+    required: false
+  apple_developer_id_bundle_password:
+    required: false
+  notarize:
+    required: false
+    default: 'false'
+
+runs:
+  using: composite
+  steps:
+    - uses: emqx/macos-erlang@ba422615283f3ec8d3885a2f4f475c65157f4705 # v1.2.2
+      with:
+        otp-version: ${{ inputs.otp }}
+        install-elixir: true
+        elixir-version: ${{ inputs.elixir }}
+    - name: build
+      shell: bash
+      env:
+        PROFILE: ${{ inputs.profile }}
+        OTP_VERSION: ${{ inputs.otp }}
+        APPLE_SIGN_BINARIES: 1
+        APPLE_NOTARIZE_PACKAGE: ${{ inputs.notarize }}
+        APPLE_ID: developers@emqx.io
+        APPLE_TEAM_ID: 26N6HYJLZA
+        APPLE_ID_PASSWORD: ${{ inputs.apple_id_password }}
+        APPLE_DEVELOPER_IDENTITY: ${{ inputs.apple_developer_identity }}
+        APPLE_DEVELOPER_ID_BUNDLE: ${{ inputs.apple_developer_id_bundle }}
+        APPLE_DEVELOPER_ID_BUNDLE_PASSWORD: ${{ inputs.apple_developer_id_bundle_password }}
+        QUICER_TLS_VER: quictls
+        HOMEBREW_NO_AUTO_UPDATE: 1
+        HOMEBREW_NO_INSTALL_CLEANUP: 1
+      run: |
+        erl -s init stop
+        elixir -e "System.version() |> IO.puts()"
+        # needed by greptimedb-ingester-erlnif
+        if ! command -v protoc >/dev/null 2>&1; then
+          brew install protobuf
+        fi
+        if ! command -v gsha256sum >/dev/null 2>&1; then
+          brew install coreutils
+        fi
+        for coreutils_bin in \
+          /opt/homebrew/opt/coreutils/libexec/gnubin \
+          /usr/local/opt/coreutils/libexec/gnubin
+        do
+          if [ -d "$coreutils_bin" ]; then
+            export PATH="$coreutils_bin:$PATH"
+          fi
+        done
+        sha256sum --version | head -1 || true
+        make ensure-rebar3
+        mkdir -p $HOME/bin
+        cp rebar3 $HOME/bin/rebar3
+        export PATH="$HOME/bin:$PATH"
+        # needed in latest macos-15 runner
+        export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
+        # needed because https://github.com/emqx/mnesia_rocksdb/blame/a791148c3f195a87260dfa7ee3e8735a3461c378/rebar.config.script#L4 may overwrite it
+        export ERLANG_ROCKSDB_OPTS='-DWITH_BUNDLE_LZ4=ON -DWITH_BUNDLE_SNAPPY=ON'
+        make $PROFILE-tgz
+    - name: test ${{ inputs.profile }}
+      shell: bash
+      env:
+        PROFILE: ${{ inputs.profile }}
+      run: |
+        pkg_name=$(find _packages/$PROFILE -mindepth 1 -maxdepth 1 -iname \*.zip)
+        mkdir emqx
+        unzip -d emqx $pkg_name > /dev/null
+        set -e
+        export EMQX_NODE__COOKIE='ci-smoke-test-cookie'
+        export EMQX_DASHBOARD__DEFAULT_PASSWORD='CiSm0kePass1'
+        export EMQX_SMOKE_PASSWORD="$EMQX_DASHBOARD__DEFAULT_PASSWORD"
+        ./emqx/bin/emqx start
+        ./scripts/test/emqx-smoke-test.sh 127.0.0.1 18083
+        ./emqx/bin/emqx ping
+        ./emqx/bin/emqx help
+        ./emqx/bin/emqx ctl status
+        ./emqx/bin/emqx eval 'emqx_conf:check_dynamic_desc()'
+        ./emqx/bin/emqx stop
+    - name: show logs
+      shell: bash
+      if: failure()
+      run: |
+        cat emqx/log/erlang.log.1
+        cat emqx/log/emqx.log.1

@@ -1,0 +1,1311 @@
+%%--------------------------------------------------------------------
+%% Copyright (c) 2025-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
+%%--------------------------------------------------------------------
+-module(emqx_dashboard_sso_oidc_SUITE).
+
+-compile(nowarn_export_all).
+-compile(export_all).
+
+-include_lib("eunit/include/eunit.hrl").
+-include_lib("common_test/include/ct.hrl").
+-include_lib("snabbkaffe/include/snabbkaffe.hrl").
+-include_lib("emqx_dashboard/include/emqx_dashboard_rbac.hrl").
+-include_lib("emqx/include/emqx_config.hrl").
+-include_lib("emqx/include/emqx_hooks.hrl").
+-include_lib("emqx_dashboard/include/emqx_dashboard.hrl").
+
+-define(OIDC_ADMIN_USER, <<"admin_oidc_test">>).
+-define(OIDC_ADMIN_PASS, <<"admin_pass_123!">>).
+
+%%------------------------------------------------------------------------------
+%% Defs
+%%------------------------------------------------------------------------------
+
+-import(emqx_common_test_helpers, [on_exit/1]).
+
+-define(ON(NODE, BODY), erpc:call(NODE, fun() -> BODY end)).
+-define(ON_ALL(NODES, BODY), erpc:multicall(NODES, fun() -> BODY end)).
+
+-define(AUTH_HEADER_FN_PD_KEY, {?MODULE, auth_header_fn}).
+-define(OIDC_PATH_PREFIX, "/oidc").
+
+%%------------------------------------------------------------------------------
+%% CT boilerplate
+%%------------------------------------------------------------------------------
+
+all() ->
+    emqx_common_test_helpers:all(?MODULE).
+
+init_per_suite(TCConfig) ->
+    TCConfig.
+
+end_per_suite(_TCConfig) ->
+    ok.
+
+init_per_testcase(_TestCase, TCConfig) ->
+    TCConfig.
+
+end_per_testcase(_TestCase, _TCConfig) ->
+    emqx_common_test_helpers:call_janitor(),
+    ok.
+
+%%------------------------------------------------------------------------------
+%% Helper fns
+%%------------------------------------------------------------------------------
+
+start_apps(TestCase, TCConfig) ->
+    AppSpecs = [
+        emqx_conf,
+        emqx_management,
+        emqx_mgmt_api_test_util:emqx_dashboard(),
+        {emqx_dashboard_sso, #{
+            after_start => fun() ->
+                #{started := Started} = emqx_dashboard:listeners_status(),
+                ok = emqx_dashboard_dispatch:regenerate_dispatch(Started),
+                ok
+            end
+        }}
+    ],
+    Apps = emqx_cth_suite:start(
+        AppSpecs,
+        #{work_dir => emqx_cth_suite:work_dir(TestCase, TCConfig)}
+    ),
+    on_exit(fun() -> ok = emqx_cth_suite:stop(Apps) end),
+    ok.
+
+mk_cluster(TestCase, #{n := NumNodes} = _Opts, TCConfig) ->
+    AppSpecs = [
+        emqx_conf,
+        emqx_management
+    ],
+    MkDashApp = fun(N) ->
+        Port = 18083 + N - 1,
+        PortStr = integer_to_list(Port),
+        [
+            emqx_mgmt_api_test_util:emqx_dashboard(
+                "dashboard.listeners.http.bind = " ++ PortStr
+            ),
+            {emqx_dashboard_sso, #{
+                after_start => fun() ->
+                    #{started := Started} = emqx_dashboard:listeners_status(),
+                    ok = emqx_dashboard_dispatch:regenerate_dispatch(Started),
+                    ok
+                end
+            }}
+        ]
+    end,
+    NodeSpecs0 = lists:map(
+        fun(N) ->
+            Name = mk_node_name(TestCase, N),
+            {Name, #{apps => AppSpecs ++ MkDashApp(N)}}
+        end,
+        lists:seq(1, NumNodes)
+    ),
+    Nodes = emqx_cth_cluster:start(
+        NodeSpecs0,
+        #{work_dir => emqx_cth_suite:work_dir(TestCase, TCConfig)}
+    ),
+    on_exit(fun() -> ok = emqx_cth_cluster:stop(Nodes) end),
+    Nodes.
+
+mk_node_name(TestCase, N) ->
+    Name0 = iolist_to_binary([atom_to_binary(TestCase), "_", integer_to_binary(N)]),
+    binary_to_atom(Name0).
+
+simple_request(Params) ->
+    emqx_mgmt_api_test_util:simple_request(Params).
+
+auth_header() ->
+    case get_auth_header_getter() of
+        Fun when is_function(Fun, 0) ->
+            Fun();
+        _ ->
+            create_bearer_token()
+    end.
+
+%% SSO endpoints are denied for API Keys (scope deny list).
+%% Use a dashboard admin Bearer Token instead.
+create_bearer_token() ->
+    _ = emqx_dashboard_admin:add_user(
+        ?OIDC_ADMIN_USER, ?OIDC_ADMIN_PASS, ?ROLE_SUPERUSER, <<"admin for oidc test">>
+    ),
+    {ok, #{token := Token}} = emqx_dashboard_admin:sign_token(
+        ?OIDC_ADMIN_USER, ?OIDC_ADMIN_PASS
+    ),
+    {"Authorization", "Bearer " ++ binary_to_list(Token)}.
+
+get_auth_header_getter() ->
+    get(?AUTH_HEADER_FN_PD_KEY).
+
+%% Note: must be set in init_per_testcase, as this is stored in process dictionary.
+set_auth_header_getter(Fun) ->
+    _ = put(?AUTH_HEADER_FN_PD_KEY, Fun),
+    ok.
+
+clear_auth_header_getter() ->
+    _ = erase(?AUTH_HEADER_FN_PD_KEY),
+    ok.
+
+get_http_dashboard_port(Node) ->
+    ?ON(Node, emqx_config:get([dashboard, listeners, http, bind])).
+
+host(Port) ->
+    "http://127.0.0.1:" ++ integer_to_list(Port).
+
+url(Node, Parts) ->
+    Port = get_http_dashboard_port(Node),
+    Host = host(Port),
+    emqx_mgmt_api_test_util:api_path(Host, Parts).
+
+get_ssos(Node, Opts) ->
+    URL = url(Node, ["sso"]),
+    simple_request(#{
+        method => get,
+        url => URL,
+        auth_header => auth_header_lazy(Opts)
+    }).
+
+%% Create or update, actually...
+create_backend(Node, Params, Opts) ->
+    URL = url(Node, ["sso", "oidc"]),
+    simple_request(#{
+        method => put,
+        url => URL,
+        body => Params,
+        auth_header => auth_header_lazy(Opts)
+    }).
+
+get_backend(Node, Opts) ->
+    URL = url(Node, ["sso", "oidc"]),
+    simple_request(#{
+        method => get,
+        url => URL,
+        auth_header => auth_header_lazy(Opts)
+    }).
+
+delete_backend(Node, Opts) ->
+    URL = url(Node, ["sso", "oidc"]),
+    simple_request(#{
+        method => delete,
+        url => URL,
+        auth_header => auth_header_lazy(Opts)
+    }).
+
+login_sso(Node, Opts) ->
+    URL = url(Node, ["sso", "login", "oidc"]),
+    simple_request(#{
+        return_headers => true,
+        http_opts => [{autoredirect, false}],
+        method => post,
+        url => URL,
+        body => #{<<"backend">> => <<"oidc">>},
+        auth_header => auth_header_lazy(Opts)
+    }).
+
+oidc_mock_server_auth_req(QueryString) ->
+    URL = "https://authn-server:5556/dex/auth/mock",
+    simple_request(#{
+        return_headers => true,
+        http_opts => [{autoredirect, false}, {ssl, [{verify, verify_none}]}],
+        method => get,
+        url => URL,
+        query_params => QueryString,
+        auth_header => {"x", "x"}
+    }).
+
+oidc_callback_req(QueryString) ->
+    URL = "https://authn-server:5556/dex/callback",
+    simple_request(#{
+        return_headers => true,
+        http_opts => [{autoredirect, false}],
+        method => get,
+        url => URL,
+        query_params => QueryString,
+        auth_header => {"x", "x"}
+    }).
+
+oidc_approve_req(QueryString) ->
+    URL = "https://authn-server:5556/dex/approval",
+    #{"req" := Req} = maps:from_list(uri_string:dissect_query(QueryString)),
+    Body =
+        {raw,
+            iolist_to_binary(
+                uri_string:compose_query([{"req", Req}, {"approval", "approve"}])
+            )},
+    simple_request(#{
+        return_headers => true,
+        http_opts => [{autoredirect, false}],
+        'content-type' => "application/x-www-form-urlencoded",
+        method => post,
+        url => URL,
+        body => Body,
+        query_params => QueryString,
+        auth_header => [{"x", "x"}]
+    }).
+
+simple_login_get(URL) ->
+    simple_login_get(URL, undefined).
+
+simple_login_get(URL, Cookie) ->
+    ExtraHeaders =
+        case Cookie of
+            undefined -> [];
+            _ -> [{"cookie", Cookie}]
+        end,
+    simple_request(#{
+        return_headers => true,
+        http_opts => [{autoredirect, false}],
+        method => get,
+        url => URL,
+        extra_headers => ExtraHeaders,
+        auth_header => [{"x", "x"}]
+    }).
+
+%% The `set-cookie' header of the login start response, verbatim.
+find_set_cookie(Headers) ->
+    {"set-cookie", SetCookie} = lists:keyfind("set-cookie", 1, Headers),
+    SetCookie.
+
+%% The `name=value' pair of that header, ready to be sent back as `cookie'.
+browser_binding_cookie(Headers) ->
+    [NameValue | _] = string:split(find_set_cookie(Headers), ";"),
+    NameValue.
+
+get_nodes(Node, Opts) ->
+    URL = url(Node, ["nodes"]),
+    simple_request(#{
+        method => get,
+        url => URL,
+        auth_header => auth_header_lazy(Opts)
+    }).
+
+auth_header_lazy(TCConfig) when is_list(TCConfig) ->
+    auth_header_lazy(maps:from_list(TCConfig));
+auth_header_lazy(#{} = Opts) ->
+    emqx_utils_maps:get_lazy(
+        auth_header,
+        Opts,
+        fun auth_header/0
+    ).
+
+oidc_provider_params() ->
+    #{
+        <<"enable">> => true,
+        <<"backend">> => <<"oidc">>,
+
+        %% See `.ci/docker-compose-file/dex/config.dev.yaml`
+        <<"clientid">> => <<"example-app">>,
+        <<"issuer">> => <<"https://authn-server:5556/dex">>,
+        <<"secret">> => <<"ZXhhbXBsZS1hcHAtc2VjcmV0">>,
+
+        <<"client_jwks">> => <<"none">>,
+        <<"dashboard_addr">> => <<"http://emqx_lb:18083">>,
+        <<"fallback_methods">> => [<<"RS256">>],
+        <<"name_var">> => <<"${sub}">>,
+        <<"name_var_source">> => <<"userinfo">>,
+        <<"preferred_auth_methods">> => [
+            <<"client_secret_post">>,
+            <<"client_secret_basic">>,
+            <<"none">>
+        ],
+        <<"provider">> => <<"generic">>,
+        <<"require_pkce">> => false,
+        <<"scopes">> => [<<"openid">>],
+        <<"session_expiry">> => 30,
+
+        <<"ssl">> => #{
+            <<"enable">> => true,
+            <<"cacertfile">> => ci_cert(<<"cacert.pem">>)
+        }
+    }.
+
+%% Dex serves `.ci/docker-compose-file/certs/cert.pem', so this is the CA that
+%% signed it.
+ci_cert(Name) ->
+    iolist_to_binary(
+        filename:join([
+            emqx_common_test_helpers:proj_root(), ".ci", "docker-compose-file", "certs", Name
+        ])
+    ).
+
+oidc_provider_params(Issuer) ->
+    (oidc_provider_params())#{<<"issuer">> => emqx_utils_conv:bin(Issuer)}.
+
+login_flow(InitiatorNode, LoginNode) ->
+    login_flow(InitiatorNode, LoginNode, LoginNode).
+
+%% Everything up to (but excluding) the callback request to emqx: start the
+%% login, walk the OP, and return the emqx callback URL together with the
+%% browser binding cookie that emqx set on the login start response.
+authorize_flow(InitiatorNode, LoginNode) ->
+    maybe
+        ct:pal("initial sso login in emqx"),
+        {Status1, Headers1, Resp1} ?= login_sso(InitiatorNode, #{}),
+        ct:pal("returned headers1:\n  ~p\nbody:\n  ~p\n", [Headers1, Resp1]),
+        true ?= Status1 == 302 orelse {error, login_sso_emqx, #{code => Status1}},
+        {"location", OIDCURL1} = lists:keyfind("location", 1, Headers1),
+        ct:pal("redirected to oidc server"),
+        #{query := QueryParams1} = uri_string:parse(OIDCURL1),
+        {Status2, Headers2, Resp2} = oidc_mock_server_auth_req(QueryParams1),
+        ct:pal("returned headers2:\n  ~p\nbody:\n  ~p\n", [Headers2, Resp2]),
+        true ?= Status2 == 302 orelse {error, mock_server_auth_req, #{code => Status2}},
+        {"location", OIDCURL2} = lists:keyfind("location", 1, Headers2),
+        ct:pal("redirected again to oidc server (from itself)"),
+        #{query := QueryParams2} = uri_string:parse(OIDCURL2),
+        {Status3, Headers3, Resp3} = oidc_callback_req(QueryParams2),
+        ct:pal("returned headers3:\n  ~p\nbody:\n  ~p\n", [Headers3, Resp3]),
+        true ?= Status3 == 303 orelse {error, oidc_callback_req, #{code => Status3}},
+        {"location", OIDCURL3} = lists:keyfind("location", 1, Headers3),
+        ct:pal("approve login request on oidc server"),
+        #{query := QueryParams3} = uri_string:parse(OIDCURL3),
+        {Status4, Headers4, Resp4} = oidc_approve_req(QueryParams3),
+        ct:pal("returned headers4:\n  ~p\nbody:\n  ~p\n", [Headers4, Resp4]),
+        true ?= Status4 == 303 orelse {error, oidc_callback_req, #{code => Status4}},
+        {"location", LoginURL1} = lists:keyfind("location", 1, Headers4),
+        ct:pal("redirected back to emqx with token"),
+        %% Ensure callback falls onto login node
+        CallbackURI = uri_string:parse(LoginURL1),
+        LoginNodePort = get_http_dashboard_port(LoginNode),
+        LoginURL1B = uri_string:recompose(CallbackURI#{
+            host := "127.0.0.1",
+            port := LoginNodePort
+        }),
+        {ok, #{
+            callback_url => LoginURL1B,
+            cookie => browser_binding_cookie(Headers1),
+            set_cookie => find_set_cookie(Headers1)
+        }}
+    end.
+
+login_flow(InitiatorNode, LoginNode, FinalReqNode) ->
+    maybe
+        {ok, #{callback_url := LoginURL1B, cookie := Cookie}} ?=
+            authorize_flow(InitiatorNode, LoginNode),
+        {Status5, Headers5, Resp5} = simple_login_get(LoginURL1B, Cookie),
+        ct:pal("returned headers5:\n  ~p\nbody:\n  ~p\n", [Headers5, Resp5]),
+        true ?= Status5 == 302 orelse
+            {error, callback_response_to_emqx, #{
+                code => Status5,
+                resp_body => Resp5
+            }},
+        {"location", LoginURL2} = lists:keyfind("location", 1, Headers5),
+        ct:pal("parsing final results"),
+        #{query := QueryParams4} = uri_string:parse(LoginURL2),
+        #{"login_meta" := Token0} = maps:from_list(uri_string:dissect_query(QueryParams4)),
+        ct:pal("token0: ~s", [Token0]),
+        #{<<"code">> := SsoCode, <<"username">> := SsoUsername, <<"backend">> := SsoBackend} =
+            emqx_utils_json:decode(base64:decode(Token0, #{mode => urlsafe, padding => false})),
+        ExchangeURL = url(FinalReqNode, ["sso", "token_exchange"]),
+        {200, ExchangeResp} = simple_request(#{
+            method => post,
+            url => ExchangeURL,
+            body => #{
+                <<"code">> => SsoCode,
+                <<"username">> => SsoUsername,
+                <<"backend">> => SsoBackend
+            },
+            auth_header => [{"x", "x"}]
+        }),
+        ct:pal("exchange response: ~p", [ExchangeResp]),
+        #{<<"token">> := Token1} = ExchangeResp,
+        {ok, #{
+            final_token => Token1,
+            emqx_redirect_login_url => LoginURL1B,
+            cookie => Cookie
+        }}
+    end.
+
+get_new_dashboard_users(Node) ->
+    DefaultUser = <<"admin">>,
+    BearerTokenUser = ?OIDC_ADMIN_USER,
+    ?ON(
+        Node,
+        lists:filter(
+            fun(#{username := Username}) ->
+                Username /= DefaultUser andalso Username /= BearerTokenUser
+            end,
+            emqx_dashboard_admin:all_users()
+        )
+    ).
+
+on_api_actor_pre_create(#{?namespace := ?global_ns} = _APIActor, Acc, _Agent) ->
+    Acc;
+on_api_actor_pre_create(#{?namespace := Ns} = APIActor, Acc, Agent) ->
+    KnownNSs = emqx_utils_agent:get(Agent),
+    case KnownNSs of
+        #{Ns := true} ->
+            ct:pal("namespace check ok: ~p", [APIActor]),
+            Acc;
+        _ ->
+            ct:pal("namespace check failed: ~p", [APIActor]),
+            {stop, {error, unknown_namespace}}
+    end.
+
+oidc_content_type_handler(
+    #{method := <<"GET">>, path := <<?OIDC_PATH_PREFIX, "/.well-known/openid-configuration">>} =
+        Req0,
+    State
+) ->
+    Port = cowboy_req:port(Req0),
+    Issuer = iolist_to_binary(host(Port) ++ ?OIDC_PATH_PREFIX),
+    Body = emqx_utils_json:encode(#{
+        issuer => Issuer,
+        jwks_uri => <<Issuer/binary, "/jwks">>,
+        authorization_endpoint => <<Issuer/binary, "/authorize">>,
+        scopes_supported => [<<"openid">>],
+        response_types_supported => [<<"code">>],
+        subject_types_supported => [<<"public">>],
+        id_token_signing_alg_values_supported => [<<"RS256">>]
+    }),
+    Req = cowboy_req:reply(
+        200,
+        #{<<"content-type">> => <<"application/json">>},
+        Body,
+        Req0
+    ),
+    {ok, Req, State};
+oidc_content_type_handler(
+    #{method := <<"GET">>, path := <<?OIDC_PATH_PREFIX, "/jwks">>} = Req0,
+    State
+) ->
+    Req = cowboy_req:reply(
+        200,
+        #{<<"content-type">> => <<"application/jwk-set+json; charset=utf-8">>},
+        emqx_utils_json:encode(#{keys => []}),
+        Req0
+    ),
+    {ok, Req, State};
+oidc_content_type_handler(Req0, State) ->
+    Req = cowboy_req:reply(404, #{}, <<>>, Req0),
+    {ok, Req, State}.
+%% `emqx_utils_http_test_server' only ever serves plain http; ssl must be
+%% disabled to match, or the config is rejected up front (see
+%% `emqx_dashboard_sso_oidc:check_ssl_opts/1').
+oidc_provider_params_local_mock(Issuer) ->
+    (oidc_provider_params(Issuer))#{<<"ssl">> => #{<<"enable">> => false}}.
+
+%%------------------------------------------------------------------------------
+%% Test cases
+%%------------------------------------------------------------------------------
+
+%% Smoke test for performing OIDC login with a single-node cluster.
+t_smoke_single_node(TCConfig) ->
+    Opts = #{n => 1, repeat => 2},
+    do_smoke_tests(?FUNCTION_NAME, Opts, TCConfig).
+
+%% Smoke test for performing OIDC login with a three-node cluster.
+t_smoke_three_nodes(TCConfig) ->
+    Opts = #{n => 3, repeat => 5},
+    do_smoke_tests(?FUNCTION_NAME, Opts, TCConfig).
+
+%% Smoke test for using the id token as the username source.
+t_smoke_name_var_source_id_token(TCConfig) ->
+    Opts = #{
+        n => 1,
+        repeat => 1,
+        oidc_provider_param_overrides => #{<<"name_var_source">> => <<"id_token">>}
+    },
+    do_smoke_tests(?FUNCTION_NAME, Opts, TCConfig).
+
+do_smoke_tests(TestCase, Opts, TCConfig) ->
+    #{n := NumNodes} = Opts,
+    Repeat = maps:get(repeat, Opts, 1),
+    case mk_cluster(TestCase, #{n => NumNodes}, TCConfig) of
+        [Node] ->
+            LoginNode = Node,
+            FinalReqNode = Node;
+        [Node, LoginNode] ->
+            FinalReqNode = Node;
+        [Node, LoginNode, FinalReqNode] ->
+            ok
+    end,
+    AuthHeader = ?ON(Node, begin
+        _ = emqx_dashboard_admin:add_user(
+            ?OIDC_ADMIN_USER, ?OIDC_ADMIN_PASS, ?ROLE_SUPERUSER, <<"admin for oidc test">>
+        ),
+        {ok, #{token := Tok}} = emqx_dashboard_admin:sign_token(
+            ?OIDC_ADMIN_USER, ?OIDC_ADMIN_PASS
+        ),
+        {"Authorization", "Bearer " ++ binary_to_list(Tok)}
+    end),
+    set_auth_header_getter(fun() -> AuthHeader end),
+    lists:foreach(
+        fun(_) ->
+            do_smoke_tests1(Node, LoginNode, FinalReqNode, Opts, TCConfig)
+        end,
+        lists:seq(1, Repeat)
+    ).
+
+do_smoke_tests1(Node, LoginNode, FinalReqNode, Opts, _TCConfig) ->
+    %% Create the provider
+    ProviderParams0 = oidc_provider_params(),
+    ProviderParams1 = maps:get(oidc_provider_param_overrides, Opts, #{}),
+    ProviderParams = emqx_utils_maps:deep_merge(ProviderParams0, ProviderParams1),
+    BadParams = ProviderParams#{<<"issuer">> => <<"httpx://authn-server">>},
+    ?assertMatch({400, _}, create_backend(Node, BadParams, #{})),
+    ?assertMatch({200, _}, create_backend(Node, ProviderParams, #{})),
+    ?assertMatch(
+        {200, [
+            #{
+                <<"backend">> := <<"oidc">>,
+                <<"running">> := true
+            }
+        ]},
+        get_ssos(Node, #{})
+    ),
+
+    %% Login
+    {ok, #{
+        final_token := Token1,
+        emqx_redirect_login_url := LoginURL1B,
+        cookie := Cookie
+    }} =
+        login_flow(Node, LoginNode, FinalReqNode),
+
+    %% Finally, can now perform actions in the API
+    FinalAuthHeader = {"Authorization", "Bearer " ++ binary_to_list(Token1)},
+    ?assertMatch({200, _}, get_nodes(FinalReqNode, #{auth_header => FinalAuthHeader})),
+
+    %% State must be deleted afterwards, so that it's not reusable, and does not leak
+    %% resources.  Replay with the same browser cookie, so that the state lookup is
+    %% what rejects it.
+    ?assertMatch({401, _, _}, simple_login_get(LoginURL1B, Cookie)),
+    ?assertEqual(
+        lists:duplicate(3, {ok, []}),
+        ?ON_ALL([Node, LoginNode, FinalReqNode], emqx_dashboard_sso_oidc_session:all())
+    ),
+
+    ok.
+
+-doc """
+The callback must only complete a login in the browser that started it.
+
+A callback URL replayed with no cookie, or with the cookie of another login,
+must be rejected before any dashboard user, login code or token is created, and
+must leave the pending login intact for the browser that owns it.
+""".
+t_reject_callback_from_another_browser(TCConfig) ->
+    start_apps(?FUNCTION_NAME, TCConfig),
+    Node = node(),
+    ?assertMatch({200, _}, create_backend(Node, oidc_provider_params(), #{})),
+
+    {ok, #{callback_url := CallbackURL, cookie := Cookie, set_cookie := SetCookie}} =
+        authorize_flow(Node, Node),
+
+    %% The cookie is scoped to the SSO endpoints and hidden from scripts.
+    ct:pal("set-cookie: ~s", [SetCookie]),
+    ?assertMatch({match, _}, re:run(SetCookie, "^emqx_sso_oidc_[0-9a-f]{16}=")),
+    ?assertMatch({match, _}, re:run(SetCookie, "Path=/api/v5/sso")),
+    ?assertMatch({match, _}, re:run(SetCookie, "HttpOnly")),
+    ?assertMatch({match, _}, re:run(SetCookie, "SameSite=Lax")),
+
+    %% Another browser replaying the callback URL carries no cookie.
+    ?assertMatch(
+        {403, _, #{<<"code">> := <<"FORBIDDEN">>}},
+        simple_login_get(CallbackURL)
+    ),
+    %% A cookie from an unrelated login does not help either.
+    ?assertMatch(
+        {403, _, #{<<"code">> := <<"FORBIDDEN">>}},
+        simple_login_get(CallbackURL, "emqx_sso_oidc=not-the-right-state")
+    ),
+
+    %% Nothing was created, and the pending login is still there.
+    ?assertEqual([], get_new_dashboard_users(Node)),
+    ?assertMatch([_], ?ON(Node, emqx_dashboard_sso_oidc_session:all())),
+
+    %% The browser that started the login still completes it.
+    ?assertMatch({302, _, _}, simple_login_get(CallbackURL, Cookie)),
+    ?assertMatch([_], get_new_dashboard_users(Node)),
+
+    ok.
+
+-doc """
+Two tabs of one browser each start an OIDC login. Both logins complete, the one
+started last first, while the browser sends both cookies on every callback.
+""".
+t_concurrent_logins_in_one_browser(TCConfig) ->
+    start_apps(?FUNCTION_NAME, TCConfig),
+    Node = node(),
+    ?assertMatch({200, _}, create_backend(Node, oidc_provider_params(), #{})),
+
+    {ok, #{callback_url := CallbackA, cookie := CookieA}} = authorize_flow(Node, Node),
+    {ok, #{callback_url := CallbackB, cookie := CookieB}} = authorize_flow(Node, Node),
+    ?assertNotEqual(CookieA, CookieB),
+    Jar = CookieA ++ "; " ++ CookieB,
+
+    %% The login started last completes first. It deletes only its own cookie.
+    {302, HeadersB, _} = simple_login_get(CallbackB, Jar),
+    {"location", LocationB} = lists:keyfind("location", 1, HeadersB),
+    ?assertMatch({match, _}, re:run(LocationB, "login_meta=")),
+    [NameB | _] = string:split(CookieB, "="),
+    ?assertMatch(
+        [_],
+        [V || {"set-cookie", V} <- HeadersB, string:prefix(V, NameB ++ "=;") =/= nomatch]
+    ),
+
+    %% The login started first still completes with its own cookie.
+    {302, HeadersA, _} = simple_login_get(CallbackA, CookieA),
+    {"location", LocationA} = lists:keyfind("location", 1, HeadersA),
+    ?assertMatch({match, _}, re:run(LocationA, "login_meta=")),
+
+    ok.
+
+-doc """
+With `skip_login_cookie_check` enabled, a callback without the login cookie
+completes the login.
+""".
+t_skip_login_cookie_check(TCConfig) ->
+    start_apps(?FUNCTION_NAME, TCConfig),
+    Node = node(),
+    Params = (oidc_provider_params())#{<<"skip_login_cookie_check">> => true},
+    ?assertMatch({200, _}, create_backend(Node, Params, #{})),
+    ?assertMatch({200, #{<<"skip_login_cookie_check">> := true}}, get_backend(Node, #{})),
+
+    {ok, #{callback_url := CallbackURL}} = authorize_flow(Node, Node),
+    {302, Headers, _} = simple_login_get(CallbackURL),
+    {"location", Location} = lists:keyfind("location", 1, Headers),
+    ?assertMatch({match, _}, re:run(Location, "login_meta=")),
+
+    ok.
+
+%% Checks that we actually stop workers when disabling oidc.
+t_stop_cleanup(TCConfig) ->
+    start_apps(?FUNCTION_NAME, TCConfig),
+    N = node(),
+
+    %% Initially, there should be no worker process under the supervisor.
+    ?assertEqual([], supervisor:which_children(emqx_dashboard_sso_oidc_sup)),
+
+    %% Create enabled; should start workers.
+    ProviderParams = oidc_provider_params(),
+    ?assertMatch({200, _}, create_backend(N, ProviderParams, #{})),
+
+    ?assertMatch([_ | _], supervisor:which_children(emqx_dashboard_sso_oidc_sup)),
+
+    %% Update to disabled; should stop workers.
+    ?assertMatch({200, _}, create_backend(N, ProviderParams#{<<"enable">> => false}, #{})),
+    ?assertEqual([], supervisor:which_children(emqx_dashboard_sso_oidc_sup)),
+
+    %% Re-enable.
+    ?assertMatch({200, _}, create_backend(N, ProviderParams, #{})),
+    ?assertMatch([_ | _], supervisor:which_children(emqx_dashboard_sso_oidc_sup)),
+
+    %% Delete; should stop workers.
+    ?assertMatch({204, _}, delete_backend(N, #{})),
+    ?assertEqual([], supervisor:which_children(emqx_dashboard_sso_oidc_sup)),
+
+    ok.
+
+-doc """
+Smoke test that checks that we can use a `jq` expression to extract the desired role from
+the OIDC response data.
+""".
+t_role_expr(TCConfig) ->
+    start_apps(?FUNCTION_NAME, TCConfig),
+    N = node(),
+
+    SetupBackend = fun(Overrides) ->
+        Params = emqx_utils_maps:deep_merge(oidc_provider_params(), Overrides),
+        ?assertMatch({200, _}, create_backend(N, Params, #{}))
+    end,
+
+    SetupBackend(#{
+        <<"role_source">> => <<"id_token">>,
+        <<"role_expr">> => <<" \"administrator\" ">>
+    }),
+
+    {ok, _} = login_flow(N, N),
+
+    ?assertMatch(
+        [#{role := ?ROLE_SUPERUSER, namespace := ?global_ns}],
+        get_new_dashboard_users(N)
+    ),
+
+    ok.
+
+-doc """
+Verifies that, whenever the role expression returns anything but a single valid role,
+access is denied.
+""".
+t_bad_role_expr(TCConfig) ->
+    start_apps(?FUNCTION_NAME, TCConfig),
+    N = node(),
+
+    AssertFailure = fun(Label, Overrides) ->
+        ct:pal(Label),
+        Params = emqx_utils_maps:deep_merge(oidc_provider_params(), Overrides),
+        ?assertMatch({200, _}, create_backend(N, Params, #{})),
+        ?assertMatch(
+            {error, callback_response_to_emqx, #{
+                code := 401,
+                resp_body := #{
+                    <<"code">> := <<"BAD_USERNAME_OR_PWD">>,
+                    <<"message">> := <<"role expression returned an invalid result; access denied">>
+                }
+            }},
+            login_flow(N, N)
+        ),
+        ?assertMatch([], get_new_dashboard_users(N)),
+        ok
+    end,
+
+    lists:foreach(
+        fun({Label, Overrides}) ->
+            AssertFailure(Label, Overrides)
+        end,
+        [
+            {"produces no results", #{
+                <<"role_source">> => <<"id_token">>,
+                <<"role_expr">> => <<"empty">>
+            }},
+            {"produces more than 1 result", #{
+                <<"role_source">> => <<"id_token">>,
+                <<"role_expr">> => <<"[1,2]">>
+            }},
+            {"bad type", #{
+                <<"role_source">> => <<"id_token">>,
+                <<"role_expr">> => <<"1">>
+            }},
+            {"bad role", #{
+                <<"role_source">> => <<"id_token">>,
+                <<"role_expr">> => <<"\"mega_admin\"">>
+            }}
+        ]
+    ),
+
+    ok.
+
+-doc """
+Smoke test that checks that we can use a `jq` expression to extract the desired namespace
+from the OIDC response data.
+""".
+t_namespace_expr(TCConfig) ->
+    start_apps(?FUNCTION_NAME, TCConfig),
+    N = node(),
+
+    on_exit(fun() ->
+        emqx_hooks:del('api_actor.pre_create', {?MODULE, on_api_actor_pre_create})
+    end),
+    Ns = <<"some_ns">>,
+    {ok, Agent} = emqx_utils_agent:start_link(#{Ns => true}),
+    ok = emqx_hooks:add(
+        'api_actor.pre_create', {?MODULE, on_api_actor_pre_create, [Agent]}, ?HP_LOWEST
+    ),
+
+    SetupBackend = fun(Overrides) ->
+        Params = emqx_utils_maps:deep_merge(oidc_provider_params(), Overrides),
+        ?assertMatch({200, _}, create_backend(N, Params, #{}))
+    end,
+
+    SetupBackend(#{
+        <<"namespace_source">> => <<"userinfo">>,
+        <<"namespace_expr">> => emqx_utils_json:encode(Ns)
+    }),
+
+    {ok, _} = login_flow(N, N),
+
+    ?assertMatch(
+        [#{role := ?ROLE_VIEWER, namespace := Ns}],
+        get_new_dashboard_users(N)
+    ),
+
+    ok.
+
+-doc """
+Verifies that, whenever the namespace expression returns anything but a single valid role,
+access is denied.
+""".
+t_bad_namespace_expr(TCConfig) ->
+    start_apps(?FUNCTION_NAME, TCConfig),
+    N = node(),
+
+    on_exit(fun() ->
+        emqx_hooks:del('api_actor.pre_create', {?MODULE, on_api_actor_pre_create})
+    end),
+    {ok, Agent} = emqx_utils_agent:start_link(#{}),
+    ok = emqx_hooks:add(
+        'api_actor.pre_create', {?MODULE, on_api_actor_pre_create, [Agent]}, ?HP_LOWEST
+    ),
+
+    AssertFailure = fun(Label, Overrides, Opts) ->
+        ct:pal(Label),
+        Params = emqx_utils_maps:deep_merge(oidc_provider_params(), Overrides),
+        ?assertMatch({200, _}, create_backend(N, Params, #{})),
+        ExpectedErrorMsg = maps:get(
+            expected_error_msg,
+            Opts,
+            <<"namespace expression returned an invalid result; access denied">>
+        ),
+        ?assertMatch(
+            {error, callback_response_to_emqx, #{
+                code := 401,
+                resp_body := #{
+                    <<"code">> := <<"BAD_USERNAME_OR_PWD">>,
+                    <<"message">> := ExpectedErrorMsg
+                }
+            }},
+            login_flow(N, N)
+        ),
+        ?assertMatch([], get_new_dashboard_users(N)),
+        ok
+    end,
+
+    lists:foreach(
+        fun({Label, Overrides, Opts}) ->
+            AssertFailure(Label, Overrides, Opts)
+        end,
+        [
+            {"produces no results",
+                #{
+                    <<"namespace_source">> => <<"id_token">>,
+                    <<"namespace_expr">> => <<"empty">>
+                },
+                #{}},
+            {"produces more than 1 result",
+                #{
+                    <<"namespace_source">> => <<"userinfo">>,
+                    <<"namespace_expr">> => <<"[1,2]">>
+                },
+                #{}},
+            {"bad type",
+                #{
+                    <<"namespace_source">> => <<"id_token">>,
+                    <<"namespace_expr">> => <<"1">>
+                },
+                #{}},
+            {"unknown namespace",
+                #{
+                    <<"namespace_source">> => <<"id_token">>,
+                    <<"namespace_expr">> => <<"\"unknown_ns\"">>
+                },
+                #{expected_error_msg => <<"unknown_namespace">>}}
+        ]
+    ),
+
+    ok.
+
+-doc """
+Verifies that, if the username already exists in EMQX and its backend is the same, their
+role and namespace are updated to the new role and namespace **only if there is a defined
+expression**, even if the role and namespace expressions resolve to different values.  If
+there is no extraction expression, the old value should be retained.
+""".
+t_existing_user(TCConfig) ->
+    start_apps(?FUNCTION_NAME, TCConfig),
+    N = node(),
+
+    on_exit(fun() ->
+        emqx_hooks:del('api_actor.pre_create', {?MODULE, on_api_actor_pre_create})
+    end),
+    Ns = <<"some_ns">>,
+    {ok, Agent} = emqx_utils_agent:start_link(#{Ns => true}),
+    ok = emqx_hooks:add(
+        'api_actor.pre_create', {?MODULE, on_api_actor_pre_create, [Agent]}, ?HP_LOWEST
+    ),
+
+    %% This makes all users resolve to the global namespace and be viewers.
+    Params1 = emqx_utils_maps:deep_merge(oidc_provider_params(), #{}),
+    ?assertMatch({200, _}, create_backend(N, Params1, #{})),
+
+    %% Now we attempt the sso login flow.
+    {ok, _} = login_flow(N, N),
+    ?assertMatch(
+        [#{role := ?ROLE_VIEWER, namespace := ?global_ns}],
+        get_new_dashboard_users(N)
+    ),
+
+    %% This makes all users resolve to the `Ns` namespace and be admins.
+    Params2 = emqx_utils_maps:deep_merge(oidc_provider_params(), #{
+        <<"namespace_source">> => <<"userinfo">>,
+        <<"namespace_expr">> => emqx_utils_json:encode(Ns),
+        <<"role_source">> => <<"userinfo">>,
+        <<"role_expr">> => emqx_utils_json:encode(?ROLE_SUPERUSER)
+    }),
+    ?assertMatch({200, _}, create_backend(N, Params2, #{})),
+
+    %% Role and namespace change to the new values
+    {ok, _} = login_flow(N, N),
+    ?assertMatch(
+        [#{role := ?ROLE_SUPERUSER, namespace := Ns}],
+        get_new_dashboard_users(N)
+    ),
+
+    %% Now, we change back to no expressions defined.  If the user logs in again, it
+    %% should retain the existing role and namespace.
+    ?assertMatch({200, _}, create_backend(N, Params1, #{})),
+
+    {ok, _} = login_flow(N, N),
+    ?assertMatch(
+        [#{role := ?ROLE_SUPERUSER, namespace := Ns}],
+        get_new_dashboard_users(N)
+    ),
+
+    ok.
+
+-doc """
+Checks that we attempt to parse the provided role and namespace expressions for syntax errors.
+""".
+t_role_namespace_expr_validation(TCConfig) ->
+    start_apps(?FUNCTION_NAME, TCConfig),
+    N = node(),
+
+    Params1 = emqx_utils_maps:deep_merge(oidc_provider_params(), #{
+        <<"namespace_source">> => <<"userinfo">>,
+        <<"namespace_expr">> => <<". .">>
+    }),
+    ?assertMatch(
+        {400, #{
+            <<"message">> := #{
+                <<"kind">> := <<"validation_error">>,
+                <<"reason">> := <<"jq: error: syntax error,", _/binary>>
+            }
+        }},
+        create_backend(N, Params1, #{})
+    ),
+
+    Params2 = emqx_utils_maps:deep_merge(oidc_provider_params(), #{
+        <<"role_source">> => <<"userinfo">>,
+        <<"role_expr">> => <<". .">>
+    }),
+    ?assertMatch(
+        {400, #{
+            <<"message">> := #{
+                <<"kind">> := <<"validation_error">>,
+                <<"reason">> := <<"jq: error: syntax error,", _/binary>>
+            }
+        }},
+        create_backend(N, Params2, #{})
+    ),
+
+    ok.
+
+-doc """
+Verifies that a more friendly error message is returned when the returned login query
+string does not contain the expected `code`.
+""".
+t_error_login_callback(TCConfig) ->
+    start_apps(?FUNCTION_NAME, TCConfig),
+    N = node(),
+
+    Params = emqx_utils_maps:deep_merge(oidc_provider_params(), #{
+        <<"scopes">> => [<<"openid">>, <<"idontexist">>]
+    }),
+    ?assertMatch({200, _}, create_backend(N, Params, #{})),
+
+    %% This error flow is slightly different from the one in `login_flow/2`.  At the
+    %% `oidc_mock_server_auth_req` step, the returned code is 303 (at least for the `dex`
+    %% test server being used here) and it redirects back to emqx's login callback instead
+    %% of itself.  Therefore, we inline these steps here instead of using `login_flow`.
+    ct:pal("initial sso login in emqx"),
+    {302, Headers1, Resp1} = login_sso(N, #{}),
+    ct:pal("returned headers1:\n  ~p\nbody:\n  ~p\n", [Headers1, Resp1]),
+    Cookie = browser_binding_cookie(Headers1),
+    {"location", OIDCURL1} = lists:keyfind("location", 1, Headers1),
+
+    ct:pal("redirected to oidc server"),
+    #{query := QueryParams1} = uri_string:parse(OIDCURL1),
+    {303, Headers2, Resp2} = oidc_mock_server_auth_req(QueryParams1),
+    ct:pal("returned headers2:\n  ~p\nbody:\n  ~p\n", [Headers2, Resp2]),
+    {"location", OIDCURL2} = lists:keyfind("location", 1, Headers2),
+
+    CallbackURI = uri_string:parse(OIDCURL2),
+    LoginNodePort = get_http_dashboard_port(N),
+    LoginURL1 = uri_string:recompose(CallbackURI#{
+        host := "127.0.0.1",
+        port := LoginNodePort
+    }),
+    %% This shouldn't be a 500
+    ?assertMatch(
+        {401, _, #{
+            <<"code">> := <<"BAD_USERNAME_OR_PWD">>,
+            <<"message">> := #{
+                <<"error">> := <<"invalid_scope">>,
+                <<"error_description">> := _
+            }
+        }},
+        simple_login_get(LoginURL1, Cookie)
+    ),
+
+    ok.
+
+-doc """
+`PUT /api/v5/sso/oidc' must reject an `https' issuer combined with
+`ssl.enable = false' with a clear error at config-write time, instead of
+accepting it and failing every login attempt later with an opaque TLS error
+(see `emqx_dashboard_sso_oidc:check_ssl_opts/1').
+""".
+t_reject_https_issuer_with_ssl_disabled(TCConfig) ->
+    start_apps(?FUNCTION_NAME, TCConfig),
+    Node = node(),
+    ProviderParams = (oidc_provider_params())#{
+        <<"ssl">> => #{<<"enable">> => false}
+    },
+    {400, #{<<"message">> := Message}} = create_backend(Node, ProviderParams, #{}),
+    ?assertNotEqual(nomatch, binary:match(Message, <<"invalid_ssl_opts">>)),
+    ?assertNotEqual(
+        nomatch,
+        binary:match(Message, <<"required to enable the TLS option">>)
+    ),
+    %% The rejected config must not have been persisted or started.
+    ?assertEqual([], supervisor:which_children(emqx_dashboard_sso_oidc_sup)),
+    ok.
+
+-doc """
+`PUT /api/v5/sso/oidc' must reject a `http' issuer combined with
+`ssl.enable = true' with a clear error at config-write time. oidcc always
+attaches the TLS options to its httpc request regardless of URL scheme, but
+httpc only ever uses them for a `https' URL (see `httpc_handler:socket_type/1'),
+so the TLS options would be silently ignored, not applied.
+""".
+t_reject_http_issuer_with_ssl_enabled(TCConfig) ->
+    start_apps(?FUNCTION_NAME, TCConfig),
+    Node = node(),
+    ProviderParams = oidc_provider_params("http://authn-server:5556/dex"),
+    {400, #{<<"message">> := Message}} = create_backend(Node, ProviderParams, #{}),
+    ?assertNotEqual(nomatch, binary:match(Message, <<"invalid_ssl_opts">>)),
+    ?assertNotEqual(
+        nomatch,
+        binary:match(Message, <<"must not be enabled">>)
+    ),
+    ?assertEqual([], supervisor:which_children(emqx_dashboard_sso_oidc_sup)),
+    ok.
+
+-doc """
+`GET /api/v5/sso/oidc' must return `client_jwks' as `none' when no client
+JWKS is configured (the default), while a configured file JWKS and the
+client secret must stay masked in both the GET and update responses. Masking
+must only replace the `file' leaf, not the whole `client_jwks' object, or the
+value stops matching the `client_file_jwks' union member and PUT rejects it
+(see `t_client_jwks_update_roundtrip').
+""".
+t_client_jwks_redaction(TCConfig) ->
+    start_apps(?FUNCTION_NAME, TCConfig),
+    Node = node(),
+    {ok, {Port, _Pid}} = emqx_utils_http_test_server:start_link(random, "/[...]"),
+    on_exit(fun() -> ok = emqx_utils_http_test_server:stop() end),
+    ok = emqx_utils_http_test_server:set_handler(fun oidc_content_type_handler/2),
+    Issuer = host(Port) ++ ?OIDC_PATH_PREFIX,
+    ProviderParams = oidc_provider_params_local_mock(Issuer),
+
+    ?assertMatch({200, _}, create_backend(Node, ProviderParams, #{})),
+    ?assertMatch(
+        {200, #{<<"client_jwks">> := <<"none">>, <<"secret">> := <<"******">>}},
+        get_backend(Node, #{})
+    ),
+
+    JwksContent = <<"{\"keys\":[{\"kty\":\"oct\",\"k\":\"c2VjcmV0\"}]}">>,
+    ParamsWithJwks = ProviderParams#{
+        <<"client_jwks">> => #{<<"type">> => <<"file">>, <<"file">> => JwksContent}
+    },
+    ?assertMatch(
+        {200, #{<<"client_jwks">> := #{<<"type">> := <<"file">>, <<"file">> := <<"******">>}}},
+        create_backend(Node, ParamsWithJwks, #{})
+    ),
+    ?assertMatch(
+        {200, #{
+            <<"client_jwks">> := #{<<"type">> := <<"file">>, <<"file">> := <<"******">>},
+            <<"secret">> := <<"******">>
+        }},
+        get_backend(Node, #{})
+    ),
+    ok.
+
+-doc """
+Resubmitting the exact `GET' response as a `PUT' body must succeed and keep
+the configured JWKS. Before the fix, the redacted `client_jwks: "******"'
+failed schema validation (`matched_no_union_member') before the handler's
+de-obfuscation logic ever ran.
+""".
+t_client_jwks_update_roundtrip(TCConfig) ->
+    start_apps(?FUNCTION_NAME, TCConfig),
+    Node = node(),
+    {ok, {Port, _Pid}} = emqx_utils_http_test_server:start_link(random, "/[...]"),
+    on_exit(fun() -> ok = emqx_utils_http_test_server:stop() end),
+    ok = emqx_utils_http_test_server:set_handler(fun oidc_content_type_handler/2),
+    Issuer = host(Port) ++ ?OIDC_PATH_PREFIX,
+    ProviderParams = oidc_provider_params_local_mock(Issuer),
+
+    JwksContent = <<"{\"keys\":[{\"kty\":\"oct\",\"k\":\"c2VjcmV0\"}]}">>,
+    ParamsWithJwks = ProviderParams#{
+        <<"client_jwks">> => #{<<"type">> => <<"file">>, <<"file">> => JwksContent}
+    },
+    ?assertMatch({200, _}, create_backend(Node, ParamsWithJwks, #{})),
+
+    {200, GetResp} = get_backend(Node, #{}),
+    ?assertMatch(
+        #{<<"client_jwks">> := #{<<"type">> := <<"file">>, <<"file">> := <<"******">>}},
+        GetResp
+    ),
+
+    %% Resubmit verbatim: only `enable' changes, everything else -- including
+    %% the redacted `client_jwks' -- is exactly what GET returned.
+    PutBody = GetResp#{<<"enable">> => false},
+    ?assertMatch({200, _}, create_backend(Node, PutBody, #{})),
+
+    ?assertMatch(
+        {200, #{
+            <<"enable">> := false,
+            <<"client_jwks">> := #{<<"type">> := <<"file">>, <<"file">> := <<"******">>}
+        }},
+        get_backend(Node, #{})
+    ),
+
+    %% The stored JWKS was preserved, not overwritten with the placeholder.
+    Config = ?ON(Node, emqx:get_config([dashboard, sso, oidc])),
+    ?assertMatch(#{client_jwks := #{type := file, file := _}}, Config),
+    #{client_jwks := #{file := StoredFile}} = Config,
+    ?assertEqual({ok, JwksContent}, file:read_file(StoredFile)),
+    ok.
+
+-doc """
+Explicitly setting `client_jwks' to `none' -- as opposed to resubmitting the
+redacted placeholder -- must remove the configured JWKS. The redacted
+placeholder means "unchanged"; an explicit `none' means "remove", and the two
+must stay distinguishable.
+""".
+t_client_jwks_explicit_none_removes(TCConfig) ->
+    start_apps(?FUNCTION_NAME, TCConfig),
+    Node = node(),
+    {ok, {Port, _Pid}} = emqx_utils_http_test_server:start_link(random, "/[...]"),
+    on_exit(fun() -> ok = emqx_utils_http_test_server:stop() end),
+    ok = emqx_utils_http_test_server:set_handler(fun oidc_content_type_handler/2),
+    Issuer = host(Port) ++ ?OIDC_PATH_PREFIX,
+    ProviderParams = oidc_provider_params_local_mock(Issuer),
+
+    JwksContent = <<"{\"keys\":[{\"kty\":\"oct\",\"k\":\"c2VjcmV0\"}]}">>,
+    ParamsWithJwks = ProviderParams#{
+        <<"client_jwks">> => #{<<"type">> => <<"file">>, <<"file">> => JwksContent}
+    },
+    ?assertMatch({200, _}, create_backend(Node, ParamsWithJwks, #{})),
+    ?assertMatch(
+        #{client_jwks := #{type := file}},
+        ?ON(Node, emqx:get_config([dashboard, sso, oidc]))
+    ),
+
+    ?assertMatch(
+        {200, #{<<"client_jwks">> := <<"none">>}},
+        create_backend(Node, ProviderParams#{<<"client_jwks">> => <<"none">>}, #{})
+    ),
+    ?assertMatch(
+        #{client_jwks := none},
+        ?ON(Node, emqx:get_config([dashboard, sso, oidc]))
+    ),
+    ok.
+
+t_jwks_content_type_suffix(TCConfig) ->
+    start_apps(?FUNCTION_NAME, TCConfig),
+    Node = node(),
+    {ok, {Port, _Pid}} = emqx_utils_http_test_server:start_link(random, "/[...]"),
+    on_exit(fun() -> ok = emqx_utils_http_test_server:stop() end),
+    ok = emqx_utils_http_test_server:set_handler(fun oidc_content_type_handler/2),
+
+    Issuer = host(Port) ++ ?OIDC_PATH_PREFIX,
+    ProviderParams = oidc_provider_params_local_mock(Issuer),
+    ?assertMatch({200, _}, create_backend(Node, ProviderParams, #{})),
+
+    ?retry(
+        20,
+        100,
+        begin
+            {302, Headers, _Body} = login_sso(Node, #{}),
+            ?assertMatch({_, _}, lists:keyfind("location", 1, Headers))
+        end
+    ).
+
+-doc """
+Discovery doc that ships a Cache-Control header with `max-age=0' (as Kanidm
+does) must drive the worker to a healthy state: the SSO login redirect must
+work and the OIDC sup must still hold its children.
+""".
+t_kanidm_cache_control_max_age_zero(TCConfig) ->
+    start_apps(?FUNCTION_NAME, TCConfig),
+    Node = node(),
+    {ok, {Port, _Pid}} = emqx_utils_http_test_server:start_link(random, "/[...]"),
+    on_exit(fun() -> ok = emqx_utils_http_test_server:stop() end),
+    ok = emqx_utils_http_test_server:set_handler(fun oidc_kanidm_shape_handler/2),
+
+    Issuer = host(Port) ++ ?OIDC_PATH_PREFIX,
+    ProviderParams = oidc_provider_params_local_mock(Issuer),
+    ?assertMatch({200, _}, create_backend(Node, ProviderParams, #{})),
+
+    ?retry(
+        20,
+        100,
+        begin
+            {302, Headers, _Body} = login_sso(Node, #{}),
+            ?assertMatch({_, _}, lists:keyfind("location", 1, Headers))
+        end
+    ),
+    ?assertMatch([_ | _], supervisor:which_children(emqx_dashboard_sso_oidc_sup)),
+    ok.
+
+%% Mirrors a Kanidm-style discovery response: ES256 signing, `none' auth on the
+%% revocation / introspection endpoints, and a `Cache-Control: max-age=0' on
+%% the discovery (and JWKS) response.
+oidc_kanidm_shape_handler(
+    #{method := <<"GET">>, path := <<?OIDC_PATH_PREFIX, "/.well-known/openid-configuration">>} =
+        Req0,
+    State
+) ->
+    Port = cowboy_req:port(Req0),
+    Issuer = iolist_to_binary(host(Port) ++ ?OIDC_PATH_PREFIX),
+    %% `userinfo_endpoint' is intentionally omitted: oidcc's strict parser
+    %% requires it to be HTTPS, and our test server is plain HTTP. The
+    %% regression we are exercising is in the cache-control handling, not
+    %% the OAuth callback flow, so the OpenID redirect path is enough.
+    Body = emqx_utils_json:encode(#{
+        issuer => Issuer,
+        jwks_uri => <<Issuer/binary, "/jwks">>,
+        authorization_endpoint => <<Issuer/binary, "/authorize">>,
+        token_endpoint => <<Issuer/binary, "/token">>,
+        revocation_endpoint => <<Issuer/binary, "/revoke">>,
+        introspection_endpoint => <<Issuer/binary, "/introspect">>,
+        scopes_supported => [<<"groups">>, <<"openid">>, <<"profile">>],
+        response_types_supported => [<<"code">>],
+        response_modes_supported => [<<"query">>, <<"fragment">>],
+        grant_types_supported => [
+            <<"authorization_code">>,
+            <<"urn:ietf:params:oauth:grant-type:token-exchange">>
+        ],
+        subject_types_supported => [<<"public">>],
+        id_token_signing_alg_values_supported => [<<"ES256">>],
+        token_endpoint_auth_methods_supported =>
+            [<<"client_secret_basic">>, <<"client_secret_post">>],
+        display_values_supported => [<<"page">>],
+        claim_types_supported => [<<"normal">>],
+        claims_parameter_supported => false,
+        request_parameter_supported => false,
+        request_uri_parameter_supported => false,
+        require_request_uri_registration => false,
+        code_challenge_methods_supported => [<<"S256">>],
+        revocation_endpoint_auth_methods_supported => [<<"none">>],
+        introspection_endpoint_auth_methods_supported => [<<"none">>]
+    }),
+    Req = cowboy_req:reply(
+        200,
+        #{
+            <<"content-type">> => <<"application/json">>,
+            <<"cache-control">> => <<"max-age=0, no-store">>
+        },
+        Body,
+        Req0
+    ),
+    {ok, Req, State};
+oidc_kanidm_shape_handler(
+    #{method := <<"GET">>, path := <<?OIDC_PATH_PREFIX, "/jwks">>} = Req0,
+    State
+) ->
+    Req = cowboy_req:reply(
+        200,
+        #{
+            <<"content-type">> => <<"application/jwk-set+json">>,
+            <<"cache-control">> => <<"max-age=0, no-store">>
+        },
+        emqx_utils_json:encode(#{keys => []}),
+        Req0
+    ),
+    {ok, Req, State};
+oidc_kanidm_shape_handler(Req0, State) ->
+    Req = cowboy_req:reply(404, #{}, <<>>, Req0),
+    {ok, Req, State}.

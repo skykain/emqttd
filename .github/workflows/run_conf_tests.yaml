@@ -1,0 +1,57 @@
+name: Run Configuration tests
+
+concurrency:
+  group: conftest-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  workflow_call:
+    inputs:
+      builder:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+# Every job below sets `timeout-minutes: 30`.
+#
+# The slowest test job measured takes 18 minutes and the 90th percentile is
+# under 10, so 30 minutes is a wide margin. Without it a job inherits the
+# GitHub default of 360 minutes, and a hung suite holds a runner for hours.
+#
+# When a job that passes needs more than 30 minutes, split or refactor the
+# suite. Do not raise the limit.
+jobs:
+  run_conf_tests:
+    timeout-minutes: 30
+    runs-on: ubuntu-22.04
+    container: ${{ inputs.builder }}
+    env:
+      PROFILE: ${{ matrix.profile }}
+    strategy:
+      fail-fast: false
+      matrix:
+        profile:
+          - emqx-enterprise
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ matrix.profile }}-release
+      - name: extract artifact
+        run: |
+          unzip -o -q ${{ matrix.profile }}-release.zip
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - run: make ${{ matrix.profile }}
+      - run: ./scripts/test/check-example-configs.sh
+      - run: ./scripts/conf-test/run.sh
+      - name: print erlang log
+        if: failure()
+        run: |
+          cat _build/${{ matrix.profile }}/rel/emqx/log/erlang.log.*
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: failure()
+        with:
+          name: conftest-logs-${{ matrix.profile }}
+          path: _build/${{ matrix.profile }}/rel/emqx/log
+          retention-days: 7

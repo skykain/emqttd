@@ -1,0 +1,923 @@
+%%--------------------------------------------------------------------
+%% Copyright (c) 2020-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
+%%--------------------------------------------------------------------
+
+-module(emqx_authn_chains_SUITE).
+
+-behaviour(emqx_authn_provider).
+
+-compile(export_all).
+-compile(nowarn_export_all).
+
+-include_lib("emqx/include/emqx_hooks.hrl").
+
+-include_lib("common_test/include/ct.hrl").
+-include_lib("eunit/include/eunit.hrl").
+-include("emqx_authn_chains.hrl").
+
+-define(AUTHN, emqx_authn_chains).
+-define(config(KEY),
+    (fun() ->
+        {KEY, _V_} = lists:keyfind(KEY, 1, Config),
+        _V_
+    end)()
+).
+-define(CONF_ROOT, ?EMQX_AUTHENTICATION_CONFIG_ROOT_NAME_ATOM).
+-define(NOT_SUPERUSER, #{is_superuser => false}).
+-define(assertAuthSuccessForUser(User),
+    ?assertMatch(
+        {ok, _},
+        emqx_access_control:authenticate(ClientInfo#{username => atom_to_binary(User)})
+    )
+).
+-define(assertAuthFailureForUser(User),
+    ?assertMatch(
+        {error, _},
+        emqx_access_control:authenticate(ClientInfo#{username => atom_to_binary(User)})
+    )
+).
+
+%%------------------------------------------------------------------------------
+%% Callbacks
+%%------------------------------------------------------------------------------
+
+create(_AuthenticatorID, Config) ->
+    {ok, #{mark => 1, config => Config}}.
+
+update(Config, _State) ->
+    {ok, #{mark => 2, config => Config}}.
+
+authenticate(#{username := <<"good">>}, _State) ->
+    {ok, #{is_superuser => true}};
+authenticate(#{username := <<"ignore">>}, _State) ->
+    ignore;
+authenticate(
+    #{username := <<"backend_failure">>},
+    #{config := #{backend := built_in_database}}
+) ->
+    emqx_authn_utils:backend_failure_result();
+authenticate(#{username := <<"backend_failure">>}, _State) ->
+    {ok, #{is_superuser => true}};
+authenticate(#{username := <<"emqx_authn_ignore_for_hook_good">>}, _State) ->
+    ignore;
+authenticate(#{username := <<"emqx_authn_ignore_for_hook_bad">>}, _State) ->
+    ignore;
+authenticate(#{username := <<"authn_clientid_override">>}, _State) ->
+    {ok, #{clientid_override => <<"overridden_clientid">>}};
+authenticate(#{username := <<"hook_clientid_override">>}, _State) ->
+    ignore;
+authenticate(
+    #{username := <<"is_jwt_precondition">>, password := Password},
+    #{config := #{mechanism := Mechanism}}
+) ->
+    case Mechanism of
+        jwt ->
+            %% mock of the JWT authenticator: only the good token verifies,
+            %% anything else is a verification failure
+            case Password =:= good_jwt() of
+                true -> {ok, #{is_superuser => true}};
+                false -> emqx_authn_utils:backend_failure_result()
+            end;
+        password_based ->
+            %% permissive fallback authenticator
+            {ok, #{is_superuser => false}}
+    end;
+authenticate(#{username := _}, _State) ->
+    {error, bad_username_or_password}.
+
+hook_authenticate(#{username := <<"hook_user_good">>}, _AuthResult) ->
+    {ok, {ok, ?NOT_SUPERUSER}};
+hook_authenticate(#{username := <<"hook_user_bad">>}, _AuthResult) ->
+    {ok, {error, invalid_username}};
+hook_authenticate(#{username := <<"hook_user_finally_good">>}, _AuthResult) ->
+    {stop, {ok, ?NOT_SUPERUSER}};
+hook_authenticate(#{username := <<"hook_user_finally_bad">>}, _AuthResult) ->
+    {stop, {error, invalid_username}};
+hook_authenticate(#{username := <<"emqx_authn_ignore_for_hook_good">>}, _AuthResult) ->
+    {ok, {ok, ?NOT_SUPERUSER}};
+hook_authenticate(#{username := <<"emqx_authn_ignore_for_hook_bad">>}, _AuthResult) ->
+    {stop, {error, invalid_username}};
+hook_authenticate(#{username := <<"hook_clientid_override">>}, _AuthResult) ->
+    {ok, {ok, #{clientid_override => <<"overridden_clientid">>}}};
+hook_authenticate(_ClientId, AuthResult) ->
+    {ok, AuthResult}.
+
+destroy(_State) ->
+    ok.
+
+all() ->
+    ProfileCases = profile_cases(),
+    [{group, legacy}, {group, hardened}] ++
+        (emqx_common_test_helpers:all(?MODULE) -- ProfileCases).
+
+groups() ->
+    ProfileCases = profile_cases(),
+    [{legacy, [], ProfileCases}, {hardened, [], ProfileCases}].
+
+init_per_group(Profile, Config) when Profile =:= legacy; Profile =:= hardened ->
+    ok = emqx_common_test_helpers:set_security_profile(Profile),
+    [{security_profile, Profile} | Config].
+
+end_per_group(Profile, _Config) when Profile =:= legacy; Profile =:= hardened ->
+    emqx_common_test_helpers:clear_security_profile().
+
+init_per_suite(Config) ->
+    Apps = emqx_cth_suite:start(
+        [
+            {emqx_conf, emqx_authn_test_lib:emqx_appspec()},
+            emqx_auth
+        ],
+        #{work_dir => ?config(priv_dir)}
+    ),
+    ok = emqx_access_control:set_default_authn_restrictive(),
+    ok = deregister_providers(),
+    [{apps, Apps} | Config].
+
+end_per_suite(Config) ->
+    ok = emqx_access_control:set_default_authn_permissive(),
+    emqx_cth_suite:stop(?config(apps)),
+    ok.
+
+init_per_testcase(Case, Config) ->
+    ?MODULE:Case({'init', Config}).
+
+end_per_testcase(Case, Config) ->
+    _ = ?MODULE:Case({'end', Config}),
+    ok.
+
+%%=================================================================================
+%% Testcases
+%%=================================================================================
+
+t_chain({'init', Config}) ->
+    Config;
+t_chain(Config) when is_list(Config) ->
+    % CRUD of authentication chain
+    ChainName = 'test',
+    ?assertMatch({ok, []}, ?AUTHN:list_chains()),
+    ?assertMatch({ok, []}, ?AUTHN:list_chain_names()),
+
+    %% to create a chain we need create an authenticator
+    AuthenticatorConfig = #{
+        mechanism => password_based,
+        backend => built_in_database,
+        enable => true
+    },
+    register_provider({password_based, built_in_database}, ?MODULE),
+    ?AUTHN:create_authenticator(ChainName, AuthenticatorConfig),
+
+    ?assertMatch({ok, #{name := ChainName, authenticators := [_]}}, ?AUTHN:lookup_chain(ChainName)),
+    ?assertMatch({ok, [#{name := ChainName}]}, ?AUTHN:list_chains()),
+    ?assertEqual({ok, [ChainName]}, ?AUTHN:list_chain_names()),
+    ?assertEqual(ok, ?AUTHN:delete_chain(ChainName)),
+    ?assertMatch({error, {not_found, {chain, ChainName}}}, ?AUTHN:lookup_chain(ChainName)),
+    ok;
+t_chain({'end', _Config}) ->
+    ?AUTHN:delete_chain(test),
+    ?AUTHN:deregister_providers([{password_based, built_in_database}]),
+    ok.
+
+t_authenticator({'init', Config}) ->
+    [
+        {"auth1", {password_based, built_in_database}},
+        {"auth2", {password_based, mysql}}
+        | Config
+    ];
+t_authenticator(Config) when is_list(Config) ->
+    ChainName = 'test',
+    AuthenticatorConfig1 = #{
+        mechanism => password_based,
+        backend => built_in_database,
+        enable => true
+    },
+
+    % Create an authenticator when the provider does not exist
+
+    ?assertEqual(
+        {error, #{cause => "no_available_provider", type => {password_based, built_in_database}}},
+        ?AUTHN:create_authenticator(ChainName, AuthenticatorConfig1)
+    ),
+
+    AuthNType1 = ?config("auth1"),
+    register_provider(AuthNType1, ?MODULE),
+    ID1 = <<"password_based:built_in_database">>,
+
+    % CRUD of authenticator
+    ?assertMatch(
+        {ok, #{id := ID1, state := #{mark := 1}}},
+        ?AUTHN:create_authenticator(ChainName, AuthenticatorConfig1)
+    ),
+
+    ?assertMatch({ok, #{id := ID1}}, ?AUTHN:lookup_authenticator(ChainName, ID1)),
+    ?assertMatch({ok, [#{id := ID1}]}, ?AUTHN:list_authenticators(ChainName)),
+
+    ?assertEqual(
+        {error, {already_exists, {authenticator, ID1}}},
+        ?AUTHN:create_authenticator(ChainName, AuthenticatorConfig1)
+    ),
+
+    ?assertMatch(
+        {ok, #{id := ID1, state := #{mark := 2}}},
+        ?AUTHN:update_authenticator(ChainName, ID1, AuthenticatorConfig1)
+    ),
+
+    %% delete an unknown authenticator is allowed, do not epxect not_found
+    ?assertEqual(ok, ?AUTHN:delete_authenticator(ChainName, <<"password_based:http">>)),
+    %% the deletion of the last authenticator in the chain should result in
+    %% an implict deletion of the chain
+    ?assertEqual(ok, ?AUTHN:delete_authenticator(ChainName, ID1)),
+    %% expected not_found for the chain
+    ?assertEqual(
+        {error, {not_found, {chain, test}}},
+        ?AUTHN:update_authenticator(ChainName, ID1, AuthenticatorConfig1)
+    ),
+
+    ?assertEqual(
+        {error, {not_found, {chain, test}}},
+        ?AUTHN:update_authenticator(ChainName, ID1, AuthenticatorConfig1)
+    ),
+
+    ?assertMatch(
+        {error, {not_found, {chain, ChainName}}},
+        ?AUTHN:list_authenticators(ChainName)
+    ),
+
+    % Multiple authenticators exist at the same time
+    AuthNType2 = ?config("auth2"),
+    register_provider(AuthNType2, ?MODULE),
+    ID2 = <<"password_based:mysql">>,
+    AuthenticatorConfig2 = #{
+        mechanism => 'password_based',
+        backend => mysql,
+        enable => true
+    },
+
+    ?assertMatch(
+        {ok, #{id := ID1}},
+        ?AUTHN:create_authenticator(ChainName, AuthenticatorConfig1)
+    ),
+
+    ?assertMatch(
+        {ok, #{id := ID2}},
+        ?AUTHN:create_authenticator(ChainName, AuthenticatorConfig2)
+    ),
+
+    % Move authenticator
+    ?assertMatch({ok, [#{id := ID1}, #{id := ID2}]}, ?AUTHN:list_authenticators(ChainName)),
+
+    ?assertEqual(ok, ?AUTHN:move_authenticator(ChainName, ID2, ?CMD_MOVE_FRONT)),
+    ?assertMatch({ok, [#{id := ID2}, #{id := ID1}]}, ?AUTHN:list_authenticators(ChainName)),
+
+    ?assertEqual(ok, ?AUTHN:move_authenticator(ChainName, ID2, ?CMD_MOVE_REAR)),
+    ?assertMatch({ok, [#{id := ID1}, #{id := ID2}]}, ?AUTHN:list_authenticators(ChainName)),
+
+    ?assertEqual(ok, ?AUTHN:move_authenticator(ChainName, ID2, ?CMD_MOVE_BEFORE(ID1))),
+    ?assertMatch({ok, [#{id := ID2}, #{id := ID1}]}, ?AUTHN:list_authenticators(ChainName)),
+
+    ?assertEqual(ok, ?AUTHN:move_authenticator(ChainName, ID2, ?CMD_MOVE_AFTER(ID1))),
+    ?assertMatch({ok, [#{id := ID1}, #{id := ID2}]}, ?AUTHN:list_authenticators(ChainName));
+t_authenticator({'end', Config}) ->
+    ?AUTHN:delete_chain(test),
+    ?AUTHN:deregister_providers([?config("auth1"), ?config("auth2")]),
+    ok.
+
+t_authenticate({init, Config}) ->
+    [
+        {listener_id, 'tcp:default'},
+        {authn_type, {password_based, built_in_database}}
+        | Config
+    ];
+t_authenticate(Config) when is_list(Config) ->
+    ListenerID = ?config(listener_id),
+    AuthNType = ?config(authn_type),
+    ClientInfo = #{
+        zone => default,
+        listener => ListenerID,
+        protocol => mqtt,
+        username => <<"good">>,
+        password => <<"any">>
+    },
+    Expected =
+        case ?config(security_profile) of
+            legacy -> {ok, #{is_superuser => false}};
+            hardened -> {error, not_authorized}
+        end,
+    ?assertEqual(Expected, emqx_access_control:authenticate(ClientInfo)),
+
+    register_provider(AuthNType, ?MODULE),
+
+    AuthenticatorConfig = #{
+        mechanism => password_based,
+        backend => built_in_database,
+        enable => true
+    },
+    ?assertMatch({ok, _}, ?AUTHN:create_authenticator(ListenerID, AuthenticatorConfig)),
+
+    ?assertEqual(
+        {ok, #{is_superuser => true}},
+        emqx_access_control:authenticate(ClientInfo)
+    ),
+
+    ?assertEqual(
+        {error, bad_username_or_password},
+        emqx_access_control:authenticate(ClientInfo#{username => <<"bad">>})
+    );
+t_authenticate({'end', Config}) ->
+    ?AUTHN:delete_chain(?config(listener_id)),
+    ?AUTHN:deregister_provider(?config(authn_type)),
+    ok.
+
+-doc "A per-authenticator rejection is logged at warning level with the authenticator id.".
+t_authenticate_rejection_log({init, Config}) ->
+    [
+        {listener_id, 'tcp:default'},
+        {authn_type, {password_based, mysql}}
+        | Config
+    ];
+t_authenticate_rejection_log(Config) when is_list(Config) ->
+    ListenerID = ?config(listener_id),
+    AuthNType = ?config(authn_type),
+    ok = register_provider(AuthNType, ?MODULE),
+    AuthenticatorConfig = #{
+        mechanism => password_based,
+        backend => mysql,
+        enable => true
+    },
+    {ok, _} = ?AUTHN:create_authenticator(ListenerID, AuthenticatorConfig),
+    ClientInfo = #{
+        zone => default,
+        listener => ListenerID,
+        protocol => mqtt,
+        username => <<"bad">>,
+        password => <<"any">>
+    },
+    Logs = emqx_cth_log_capture:capture(fun() ->
+        ?assertEqual(
+            {error, bad_username_or_password},
+            emqx_access_control:authenticate(ClientInfo)
+        )
+    end),
+    ?assertMatch(
+        [
+            #{
+                msg := authenticator_rejection,
+                authenticator := <<"password_based:mysql">>,
+                provider := _,
+                reason := bad_username_or_password
+            }
+            | _
+        ],
+        [M || #{msg := authenticator_rejection} = M <- Logs]
+    );
+t_authenticate_rejection_log({'end', Config}) ->
+    ?AUTHN:delete_chain(?config(listener_id)),
+    ?AUTHN:deregister_provider(?config(authn_type)),
+    ok.
+
+t_update_config({init, Config}) ->
+    Global = 'mqtt:global',
+    AuthNType1 = {password_based, built_in_database},
+    AuthNType2 = {password_based, mysql},
+    [
+        {global, Global},
+        {"auth1", AuthNType1},
+        {"auth2", AuthNType2}
+        | Config
+    ];
+t_update_config(Config) when is_list(Config) ->
+    emqx_config_handler:add_handler([?CONF_ROOT], emqx_authn_config),
+    ok = emqx_config_handler:add_handler(
+        [listeners, '?', '?', ?CONF_ROOT], emqx_authn_config
+    ),
+    ok = register_provider(?config("auth1"), ?MODULE),
+    ok = register_provider(?config("auth2"), ?MODULE),
+    Global = ?config(global),
+    %% We mocked provider implementation, but did't mock the schema
+    %% so we should provide full config
+    AuthenticatorConfig1 = #{
+        <<"mechanism">> => <<"password_based">>,
+        <<"backend">> => <<"built_in_database">>,
+        <<"enable">> => true
+    },
+    AuthenticatorConfig2 = #{
+        <<"mechanism">> => <<"password_based">>,
+        <<"backend">> => <<"mysql">>,
+        <<"query">> => <<"SELECT password_hash, salt FROM users WHERE username = ?">>,
+        <<"server">> => <<"127.0.0.1:5432">>,
+        <<"database">> => <<"emqx">>,
+        <<"enable">> => true
+    },
+    ID1 = <<"password_based:built_in_database">>,
+    ID2 = <<"password_based:mysql">>,
+
+    ?assertMatch({ok, []}, ?AUTHN:list_chains()),
+
+    ?assertMatch(
+        {ok, _},
+        update_config([?CONF_ROOT], {create_authenticator, Global, AuthenticatorConfig1})
+    ),
+
+    ?assertMatch(
+        {ok, #{id := ID1, state := #{mark := 1}}},
+        ?AUTHN:lookup_authenticator(Global, ID1)
+    ),
+
+    ?assertMatch(
+        {ok, _},
+        update_config([?CONF_ROOT], {create_authenticator, Global, AuthenticatorConfig2})
+    ),
+
+    ?assertMatch(
+        {ok, #{id := ID2, state := #{mark := 1}}},
+        ?AUTHN:lookup_authenticator(Global, ID2)
+    ),
+
+    ?assertMatch(
+        {ok, _},
+        update_config(
+            [?CONF_ROOT],
+            {update_authenticator, Global, ID1, AuthenticatorConfig1#{<<"enable">> => false}}
+        )
+    ),
+
+    ?assertMatch(
+        {ok, #{id := ID1, state := #{mark := 2}}},
+        ?AUTHN:lookup_authenticator(Global, ID1)
+    ),
+
+    ?assertMatch(
+        {ok, _},
+        update_config([?CONF_ROOT], {move_authenticator, Global, ID2, ?CMD_MOVE_FRONT})
+    ),
+
+    ?assertMatch({ok, [#{id := ID2}, #{id := ID1}]}, ?AUTHN:list_authenticators(Global)),
+
+    [Raw2, Raw1] = emqx:get_raw_config([?CONF_ROOT]),
+    ?assertMatch({ok, _}, update_config([?CONF_ROOT], [Raw1, Raw2])),
+    ?assertMatch({ok, [#{id := ID1}, #{id := ID2}]}, ?AUTHN:list_authenticators(Global)),
+
+    ?assertMatch({ok, _}, update_config([?CONF_ROOT], {delete_authenticator, Global, ID1})),
+    ?assertEqual(
+        {error, {not_found, {authenticator, ID1}}},
+        ?AUTHN:lookup_authenticator(Global, ID1)
+    ),
+
+    ?assertMatch(
+        {ok, _},
+        update_config([?CONF_ROOT], {delete_authenticator, Global, ID2})
+    ),
+
+    ?assertEqual(
+        {error, {not_found, {chain, Global}}},
+        ?AUTHN:lookup_authenticator(Global, ID2)
+    ),
+
+    ListenerID = 'tcp:default',
+    ConfKeyPath = [listeners, tcp, default, ?CONF_ROOT],
+
+    ?assertMatch(
+        {ok, _},
+        update_config(
+            ConfKeyPath,
+            {create_authenticator, ListenerID, AuthenticatorConfig1}
+        )
+    ),
+
+    ?assertMatch(
+        {ok, #{id := ID1, state := #{mark := 1}}},
+        ?AUTHN:lookup_authenticator(ListenerID, ID1)
+    ),
+
+    ?assertMatch(
+        {ok, _},
+        update_config(
+            ConfKeyPath,
+            {create_authenticator, ListenerID, AuthenticatorConfig2}
+        )
+    ),
+
+    ?assertMatch(
+        {ok, #{id := ID2, state := #{mark := 1}}},
+        ?AUTHN:lookup_authenticator(ListenerID, ID2)
+    ),
+
+    ?assertMatch(
+        {ok, _},
+        update_config(
+            ConfKeyPath,
+            {update_authenticator, ListenerID, ID1, AuthenticatorConfig1#{<<"enable">> => false}}
+        )
+    ),
+
+    ?assertMatch(
+        {ok, #{id := ID1, state := #{mark := 2}}},
+        ?AUTHN:lookup_authenticator(ListenerID, ID1)
+    ),
+
+    ?assertMatch(
+        {ok, _},
+        update_config(ConfKeyPath, {move_authenticator, ListenerID, ID2, ?CMD_MOVE_FRONT})
+    ),
+    ?assertMatch(
+        {ok, [#{id := ID2}, #{id := ID1}]},
+        ?AUTHN:list_authenticators(ListenerID)
+    ),
+    [LRaw2, LRaw1] = emqx:get_raw_config(ConfKeyPath),
+    ?assertMatch({ok, _}, update_config(ConfKeyPath, [LRaw1, LRaw2])),
+    ?assertMatch(
+        {ok, [#{id := ID1}, #{id := ID2}]},
+        ?AUTHN:list_authenticators(ListenerID)
+    ),
+
+    ?assertMatch(
+        {ok, _},
+        update_config(ConfKeyPath, {delete_authenticator, ListenerID, ID1})
+    ),
+
+    ?assertEqual(
+        {error, {not_found, {authenticator, ID1}}},
+        ?AUTHN:lookup_authenticator(ListenerID, ID1)
+    );
+t_update_config({'end', Config}) ->
+    ?AUTHN:delete_chain(?config(global)),
+    ?AUTHN:deregister_providers([?config("auth1"), ?config("auth2")]),
+    ok.
+
+t_restart({'init', Config}) ->
+    Config;
+t_restart(Config) when is_list(Config) ->
+    ?assertEqual({ok, []}, ?AUTHN:list_chain_names()),
+
+    %% to create a chain we need create an authenticator
+    AuthenticatorConfig = #{
+        mechanism => password_based,
+        backend => built_in_database,
+        enable => true
+    },
+    register_provider({password_based, built_in_database}, ?MODULE),
+    ?AUTHN:create_authenticator(test_chain, AuthenticatorConfig),
+
+    ?assertEqual({ok, [test_chain]}, ?AUTHN:list_chain_names()),
+
+    ok = supervisor:terminate_child(emqx_authn_sup, ?AUTHN),
+    {ok, _} = supervisor:restart_child(emqx_authn_sup, ?AUTHN),
+
+    ?assertEqual({ok, [test_chain]}, ?AUTHN:list_chain_names());
+t_restart({'end', _Config}) ->
+    ?AUTHN:delete_chain(test_chain),
+    ?AUTHN:deregister_providers([{password_based, built_in_database}]),
+    ok.
+
+t_combine_authn_and_callback({init, Config}) ->
+    [
+        {listener_id, 'tcp:default'},
+        {authn_type, {password_based, built_in_database}}
+        | Config
+    ];
+t_combine_authn_and_callback(Config) when is_list(Config) ->
+    ListenerID = ?config(listener_id),
+    ClientInfo = #{
+        zone => default,
+        listener => ListenerID,
+        protocol => mqtt,
+        password => <<"any">>
+    },
+
+    %% no emqx_authn_chains authenticators
+    assert_authn_profile_result(
+        Config,
+        emqx_access_control:authenticate(ClientInfo#{username => <<"bad">>})
+    ),
+
+    AuthNType = ?config(authn_type),
+    register_provider(AuthNType, ?MODULE),
+
+    AuthenticatorConfig = #{
+        mechanism => password_based,
+        backend => built_in_database,
+        enable => true
+    },
+    {ok, _} = ?AUTHN:create_authenticator(ListenerID, AuthenticatorConfig),
+
+    %% emqx_authn_chains alone
+    ?assertAuthSuccessForUser(good),
+    ?assertAuthFailureForUser(ignore),
+    ?assertAuthFailureForUser(bad),
+
+    %% add hook with higher priority
+    ok = hook(?HP_AUTHN + 1),
+
+    %% for hook unrelataed users everything is the same
+    ?assertAuthSuccessForUser(good),
+    ?assertAuthFailureForUser(ignore),
+    ?assertAuthFailureForUser(bad),
+
+    %% higher-priority hook can permit access with {ok,...},
+    %% then emqx_authn_chains overrides the result
+    ?assertAuthFailureForUser(hook_user_good),
+    ?assertAuthFailureForUser(hook_user_bad),
+
+    %% higher-priority hook can permit and return {stop,...},
+    %% then emqx_authn_chains cannot override the result
+    ?assertAuthSuccessForUser(hook_user_finally_good),
+    ?assertAuthFailureForUser(hook_user_finally_bad),
+
+    ok = unhook(),
+
+    %% add hook with lower priority
+    ok = hook(?HP_AUTHN - 1),
+
+    %% for hook unrelataed users
+    ?assertAuthSuccessForUser(good),
+    ?assertAuthFailureForUser(bad),
+    ?assertAuthFailureForUser(ignore),
+
+    %% lower-priority hook can overrride emqx_authn_chains result
+    %% for ignored users
+    ?assertAuthSuccessForUser(emqx_authn_ignore_for_hook_good),
+    ?assertAuthFailureForUser(emqx_authn_ignore_for_hook_bad),
+
+    %% lower-priority hook cannot overrride
+    %% successful/unsuccessful emqx_authn_chains result
+    ?assertAuthFailureForUser(hook_user_finally_good),
+    ?assertAuthFailureForUser(hook_user_finally_bad),
+    ?assertAuthFailureForUser(hook_user_good),
+    ?assertAuthFailureForUser(hook_user_bad),
+
+    %% clientid override in authn results
+    ?assertMatch(
+        {ok, #{clientid_override := <<"overridden_clientid">>}},
+        emqx_access_control:authenticate(ClientInfo#{username => <<"authn_clientid_override">>})
+    ),
+    ?assertMatch(
+        {ok, #{clientid_override := <<"overridden_clientid">>}},
+        emqx_access_control:authenticate(ClientInfo#{username => <<"hook_clientid_override">>})
+    ),
+
+    ok = unhook();
+t_combine_authn_and_callback({'end', Config}) ->
+    ?AUTHN:delete_chain(?config(listener_id)),
+    ?AUTHN:deregister_provider(?config(authn_type)),
+    ok.
+
+t_authn_not_configured_missing_chain({'init', Config}) ->
+    Config;
+t_authn_not_configured_missing_chain(Config) when is_list(Config) ->
+    ok = cleanup_authn_not_configured_chains(),
+    ClientInfo = authn_not_configured_clientinfo(),
+
+    assert_authn_profile_result(Config, emqx_access_control:authenticate(ClientInfo)),
+    ok;
+t_authn_not_configured_missing_chain({'end', _Config}) ->
+    cleanup_authn_not_configured_chains().
+
+t_authn_not_configured_empty_chain({'init', Config}) ->
+    Config;
+t_authn_not_configured_empty_chain(Config) when is_list(Config) ->
+    ListenerID = 'tcp:default',
+    AuthNType = {password_based, built_in_database},
+    ok = cleanup_authn_not_configured_chains(),
+    register_provider(AuthNType, ?MODULE),
+    AuthenticatorConfig = #{
+        mechanism => password_based,
+        backend => built_in_database,
+        enable => false
+    },
+    {ok, _} = ?AUTHN:create_authenticator(ListenerID, AuthenticatorConfig),
+    ClientInfo = authn_not_configured_clientinfo(),
+
+    assert_authn_profile_result(Config, emqx_access_control:authenticate(ClientInfo)),
+    ok;
+t_authn_not_configured_empty_chain({'end', _Config}) ->
+    ok = cleanup_authn_not_configured_chains(),
+    ?AUTHN:deregister_provider({password_based, built_in_database}).
+
+t_authn_backend_failure({'init', Config}) ->
+    setup_backend_failure_chain(),
+    Config;
+t_authn_backend_failure(Config) when is_list(Config) ->
+    ClientInfo = backend_failure_clientinfo(),
+    Expected =
+        case ?config(security_profile) of
+            legacy -> {ok, #{is_superuser => true}};
+            hardened -> {error, not_authorized}
+        end,
+    ?assertEqual(Expected, emqx_access_control:authenticate(ClientInfo)),
+    ok;
+t_authn_backend_failure({'end', _Config}) ->
+    cleanup_backend_failure_chain().
+
+-doc """
+Checks that each `ignore_backend_failures` value decides the authentication
+backend-failure outcome in the current security profile.
+""".
+t_authn_backend_failure_setting({'init', Config}) ->
+    setup_backend_failure_chain(),
+    Config;
+t_authn_backend_failure_setting(Config) when is_list(Config) ->
+    ClientInfo = backend_failure_clientinfo(),
+    Ignored = {ok, #{is_superuser => true}},
+    Denied = {error, not_authorized},
+    ProfileDefault =
+        case ?config(security_profile) of
+            legacy -> ignore;
+            hardened -> deny
+        end,
+    lists:foreach(
+        fun({Value, Policy}) ->
+            {ok, _} = emqx:update_config([authentication_settings, ignore_backend_failures], Value),
+            Expected =
+                case Policy of
+                    ignore -> Ignored;
+                    deny -> Denied
+                end,
+            ?assertEqual(
+                {Value, Policy}, {Value, emqx_authn_utils:authn_backend_failure_policy()}
+            ),
+            ?assertEqual({Value, Expected}, {Value, emqx_access_control:authenticate(ClientInfo)})
+        end,
+        [{per_security_profile, ProfileDefault}, {true, ignore}, {false, deny}]
+    );
+t_authn_backend_failure_setting({'end', _Config}) ->
+    cleanup_backend_failure_chain().
+
+-doc """
+Under the hardened profile, a JWT authenticator with precondition
+`is_jwt(password)` is skipped (chain falls through) for credentials that are
+not structurally JWTs — including an absent password — while structurally
+valid JWTs still go through JWT verification and are denied on failure.
+""".
+t_is_jwt_precondition_hardened({'init', Config}) ->
+    setup_is_jwt_precondition_chain(),
+    Config;
+t_is_jwt_precondition_hardened(Config) when is_list(Config) ->
+    ClientInfo = is_jwt_precondition_clientinfo(),
+    emqx_common_test_helpers:with_security_profile("hardened", fun() ->
+        %% non-JWT password: precondition not met, JWT authenticator skipped,
+        %% the permissive second authenticator authenticates the client
+        ?assertMatch(
+            {ok, #{is_superuser := false}},
+            emqx_access_control:authenticate(ClientInfo#{password => <<"a-plain-password">>})
+        ),
+        %% no password at all: precondition renders false (not an error), skip as well
+        ?assertMatch(
+            {ok, #{is_superuser := false}},
+            emqx_access_control:authenticate(ClientInfo#{password => undefined})
+        ),
+        %% structurally valid JWT that fails verification: precondition met,
+        %% JWT authenticator runs, its backend-failure result aborts the chain
+        ?assertEqual(
+            {error, not_authorized},
+            emqx_access_control:authenticate(ClientInfo#{password => bad_signature_jwt()})
+        ),
+        %% valid JWT: authenticated by the JWT authenticator
+        ?assertMatch(
+            {ok, #{is_superuser := true}},
+            emqx_access_control:authenticate(ClientInfo#{password => good_jwt()})
+        )
+    end),
+    ok;
+t_is_jwt_precondition_hardened({'end', _Config}) ->
+    cleanup_is_jwt_precondition_chain().
+
+%%=================================================================================
+%% Helpers fns
+%%=================================================================================
+
+authn_not_configured_clientinfo() ->
+    #{
+        zone => default,
+        listener => 'tcp:default',
+        protocol => mqtt,
+        username => <<"bad">>,
+        password => <<"any">>
+    }.
+
+cleanup_authn_not_configured_chains() ->
+    _ = ?AUTHN:delete_chain('tcp:default'),
+    _ = ?AUTHN:delete_chain('mqtt:global'),
+    ok.
+
+profile_cases() ->
+    [
+        t_authenticate,
+        t_combine_authn_and_callback,
+        t_authn_not_configured_missing_chain,
+        t_authn_not_configured_empty_chain,
+        t_authn_backend_failure,
+        t_authn_backend_failure_setting
+    ].
+
+assert_authn_profile_result(Config, Result) ->
+    case ?config(security_profile) of
+        legacy -> ?assertMatch({ok, _}, Result);
+        hardened -> ?assertEqual({error, not_authorized}, Result)
+    end.
+
+backend_failure_clientinfo() ->
+    #{
+        zone => default,
+        listener => 'tcp:default',
+        protocol => mqtt,
+        username => <<"backend_failure">>,
+        password => <<"any">>
+    }.
+
+setup_backend_failure_chain() ->
+    ListenerID = 'tcp:default',
+    AuthNType1 = {password_based, built_in_database},
+    AuthNType2 = {password_based, mysql},
+    ok = register_provider(AuthNType1, ?MODULE),
+    ok = register_provider(AuthNType2, ?MODULE),
+    {ok, _} = ?AUTHN:create_authenticator(ListenerID, #{
+        mechanism => password_based,
+        backend => built_in_database,
+        enable => true
+    }),
+    {ok, _} = ?AUTHN:create_authenticator(ListenerID, #{
+        mechanism => password_based,
+        backend => mysql,
+        enable => true
+    }),
+    ok.
+
+%% header {"alg":"HS256","typ":"JWT"}, payload {"sub":"good"}
+good_jwt() ->
+    <<"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJnb29kIn0.c2ln">>.
+
+%% header {"alg":"HS256","typ":"JWT"}, payload {"sub":"bad"}
+bad_signature_jwt() ->
+    <<"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJiYWQifQ.c2ln">>.
+
+is_jwt_precondition_clientinfo() ->
+    #{
+        zone => default,
+        listener => 'tcp:default',
+        protocol => mqtt,
+        username => <<"is_jwt_precondition">>,
+        password => <<"any">>
+    }.
+
+setup_is_jwt_precondition_chain() ->
+    ListenerID = 'tcp:default',
+    ok = register_provider(jwt, ?MODULE),
+    ok = register_provider({password_based, built_in_database}, ?MODULE),
+    {ok, _} = ?AUTHN:create_authenticator(ListenerID, #{
+        mechanism => jwt,
+        enable => true,
+        precondition => <<"is_jwt(password)">>
+    }),
+    {ok, _} = ?AUTHN:create_authenticator(ListenerID, #{
+        mechanism => password_based,
+        backend => built_in_database,
+        enable => true
+    }),
+    ok.
+
+cleanup_is_jwt_precondition_chain() ->
+    ok = ?AUTHN:delete_chain('tcp:default'),
+    ok = ?AUTHN:deregister_provider(jwt),
+    ok = ?AUTHN:deregister_provider({password_based, built_in_database}),
+    emqx_common_test_helpers:clear_security_profile().
+
+cleanup_backend_failure_chain() ->
+    ok = ?AUTHN:delete_chain('tcp:default'),
+    ok = ?AUTHN:deregister_provider({password_based, built_in_database}),
+    ok = ?AUTHN:deregister_provider({password_based, mysql}),
+    {ok, _} = emqx:update_config(
+        [authentication_settings, ignore_backend_failures], per_security_profile
+    ),
+    ok.
+
+hook(Priority) ->
+    ok = emqx_hooks:put(
+        'client.authenticate', {?MODULE, hook_authenticate, []}, Priority
+    ).
+
+unhook() ->
+    ok = emqx_hooks:del('client.authenticate', {?MODULE, hook_authenticate}).
+
+update_config(Path, ConfigRequest) ->
+    emqx:update_config(Path, ConfigRequest, #{rawconf_with_defaults => true}).
+
+certs(Certs) ->
+    CertsPath = emqx_common_test_helpers:ensure_test_certs(),
+    lists:foldl(
+        fun({Key, Filename}, Acc) ->
+            {ok, Bin} = file:read_file(filename:join([CertsPath, Filename])),
+            Acc#{Key => Bin}
+        end,
+        #{},
+        Certs
+    ).
+
+register_provider(Type, Module) ->
+    ok = ?AUTHN:register_providers([{Type, Module}]).
+
+deregister_providers() ->
+    lists:foreach(
+        fun({Type, _Module}) ->
+            ok = ?AUTHN:deregister_provider(Type)
+        end,
+        maps:to_list(?AUTHN:get_providers())
+    ).

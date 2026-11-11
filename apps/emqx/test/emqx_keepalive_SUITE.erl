@@ -1,0 +1,253 @@
+%%--------------------------------------------------------------------
+%% Copyright (c) 2018-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
+%%--------------------------------------------------------------------
+
+-module(emqx_keepalive_SUITE).
+
+-compile(export_all).
+-compile(nowarn_export_all).
+
+-include_lib("emqx/include/emqx.hrl").
+-include_lib("eunit/include/eunit.hrl").
+-include_lib("common_test/include/ct.hrl").
+
+all() -> emqx_common_test_helpers:all(?MODULE).
+
+init_per_suite(Config) ->
+    Apps = emqx_cth_suite:start(
+        [
+            {emqx,
+                "listeners {"
+                "tcp.default.bind = 1883,"
+                "ssl.default = marked_for_deletion,"
+                "quic.default = marked_for_deletion,"
+                "ws.default = marked_for_deletion,"
+                "wss.default = marked_for_deletion"
+                "}"}
+        ],
+        #{work_dir => emqx_cth_suite:work_dir(Config)}
+    ),
+    [{apps, Apps} | Config].
+
+end_per_suite(Config) ->
+    emqx_cth_suite:stop(?config(apps, Config)).
+
+t_check_keepalive_default_timeout(_) ->
+    emqx_config:put_zone_conf(default, [mqtt, keepalive_multiplier], 1.5),
+    emqx_config:put_zone_conf(default, [mqtt, keepalive_check_interval], 30000),
+    erlang:process_flag(trap_exit, true),
+    ClientID = <<"default">>,
+    KeepaliveSec = 10,
+    {ok, C} = emqtt:start_link([
+        {keepalive, KeepaliveSec},
+        {clientid, binary_to_list(ClientID)}
+    ]),
+    {ok, _} = emqtt:connect(C),
+    emqtt:pause(C),
+    [ChannelPid] = emqx_cm:lookup_channels(ClientID),
+    erlang:link(ChannelPid),
+    CheckInterval = emqx_utils:clamp(keepalive_check_interval(), 1000, 5000),
+    ?assertMatch(5000, CheckInterval),
+    %% when keepalive_check_interval is 30s and keepalive_multiplier is 1.5
+    %% connect T0(packet = 1, idle_milliseconds = 0)
+    %% check1 T1(packet = 1, idle_milliseconds = 1 * CheckInterval = 5000)
+    %% check2 T2(packet = 1, idle_milliseconds = 2 * CheckInterval = 10000)
+    %% check2 T3(packet = 1, idle_milliseconds = 3 * CheckInterval = 15000) -> timeout
+    Timeout = CheckInterval * 3,
+    %% connector but not send a packet.
+    ?assertMatch(
+        no_keepalive_timeout_received,
+        receive_msg_in_time(ChannelPid, C, Timeout - 200),
+        Timeout - 200
+    ),
+    ?assertMatch(ok, receive_msg_in_time(ChannelPid, C, 1200)).
+
+t_check_keepalive_other_timeout(_) ->
+    emqx_config:put_zone_conf(default, [mqtt, keepalive_multiplier], 1.5),
+    emqx_config:put_zone_conf(default, [mqtt, keepalive_check_interval], 2000),
+    erlang:process_flag(trap_exit, true),
+    ClientID = <<"other">>,
+    KeepaliveSec = 10,
+    {ok, C} = emqtt:start_link([
+        {keepalive, KeepaliveSec},
+        {clientid, binary_to_list(ClientID)}
+    ]),
+    {ok, _} = emqtt:connect(C),
+    emqtt:pause(C),
+    {ok, _, [0]} = emqtt:subscribe(C, <<"mytopic">>, []),
+    [ChannelPid] = emqx_cm:lookup_channels(ClientID),
+    erlang:link(ChannelPid),
+    %%CheckInterval = ceil(keepalive_check_factor() * KeepaliveSec * 1000),
+    CheckInterval = emqx_utils:clamp(keepalive_check_interval(), 1000, 5000),
+    ?assertMatch(2000, CheckInterval),
+    %% when keepalive_check_interval is 2s and keepalive_multiplier is 1.5
+    %% connect T0(packet = 1, idle_milliseconds = 0)
+    %% subscribe T1(packet = 2, idle_milliseconds = 0)
+    %% check1 T2(packet = 2, idle_milliseconds = 1 * CheckInterval = 2000)
+    %% check2 T3(packet = 2, idle_milliseconds = 2 * CheckInterval = 4000)
+    %% check3 T4(packet = 2, idle_milliseconds = 3 * CheckInterval = 6000)
+    %% check4 T5(packet = 2, idle_milliseconds = 4 * CheckInterval = 8000)
+    %% check4 T6(packet = 2, idle_milliseconds = 5 * CheckInterval = 10000)
+    %% check4 T7(packet = 2, idle_milliseconds = 6 * CheckInterval = 12000)
+    %% check4 T8(packet = 2, idle_milliseconds = 7 * CheckInterval = 14000)
+    %% check4 T9(packet = 2, idle_milliseconds = 8 * CheckInterval = 16000) > 15000 timeout
+    Timeout = CheckInterval * 9,
+    ?assertMatch(
+        no_keepalive_timeout_received,
+        receive_msg_in_time(ChannelPid, C, Timeout - 200),
+        Timeout - 200
+    ),
+    ?assertMatch(ok, receive_msg_in_time(ChannelPid, C, 1200), Timeout).
+
+t_check_keepalive_ping_reset_timer(_) ->
+    emqx_config:put_zone_conf(default, [mqtt, keepalive_multiplier], 1.5),
+    emqx_config:put_zone_conf(default, [mqtt, keepalive_check_interval], 100000),
+    erlang:process_flag(trap_exit, true),
+    ClientID = <<"ping_reset">>,
+    KeepaliveSec = 10,
+    {ok, C} = emqtt:start_link([
+        {keepalive, KeepaliveSec},
+        {clientid, binary_to_list(ClientID)}
+    ]),
+    {ok, _} = emqtt:connect(C),
+    emqtt:pause(C),
+    ct:sleep(1000),
+    emqtt:resume(C),
+    pong = emqtt:ping(C),
+    emqtt:pause(C),
+    [ChannelPid] = emqx_cm:lookup_channels(ClientID),
+    erlang:link(ChannelPid),
+    CheckInterval = emqx_utils:clamp(keepalive_check_interval(), 1000, 5000),
+    ?assertMatch(5000, CheckInterval),
+    %% when keepalive_check_interval is 30s and keepalive_multiplier is 1.5
+    %% connect T0(packet = 1, idle_milliseconds = 0)
+    %% sleep 1000ms
+    %% ping (packet = 2, idle_milliseconds = 0) restart timer
+    %% check1 T1(packet = 1, idle_milliseconds = 1 * CheckInterval = 5000)
+    %% check2 T2(packet = 1, idle_milliseconds = 2 * CheckInterval = 10000)
+    %% check2 T3(packet = 1, idle_milliseconds = 3 * CheckInterval = 15000) -> timeout
+    Timeout = CheckInterval * 3,
+    ?assertMatch(
+        no_keepalive_timeout_received,
+        receive_msg_in_time(ChannelPid, C, Timeout - 200),
+        Timeout - 200
+    ),
+    ?assertMatch(ok, receive_msg_in_time(ChannelPid, C, 1200)).
+
+t_check(_) ->
+    emqx_config:put_zone_conf(default, [mqtt, keepalive_multiplier], 1.5),
+    emqx_config:put_zone_conf(default, [mqtt, keepalive_check_interval], 30000),
+    Keepalive = emqx_keepalive:init(60),
+    ?assertEqual(30000, emqx_keepalive:info(check_interval, Keepalive)),
+    ?assertEqual(0, emqx_keepalive:info(statval, Keepalive)),
+    Info = emqx_keepalive:info(Keepalive),
+    ?assertEqual(
+        #{
+            check_interval => 30000,
+            statval => 0,
+            idle_milliseconds => 0,
+            %% 60 * 1.5 * 1000
+            max_idle_millisecond => 90000
+        },
+        Info
+    ),
+    {ok, Keepalive1} = emqx_keepalive:check(1, Keepalive),
+    ?assertEqual(1, emqx_keepalive:info(statval, Keepalive1)),
+    {ok, Keepalive2} = emqx_keepalive:check(1, Keepalive1),
+    ?assertEqual(1, emqx_keepalive:info(statval, Keepalive2)),
+    {ok, Keepalive3} = emqx_keepalive:check(1, Keepalive2),
+    ?assertEqual(1, emqx_keepalive:info(statval, Keepalive3)),
+    ?assertEqual({error, timeout}, emqx_keepalive:check(1, Keepalive3)),
+
+    Keepalive4 = emqx_keepalive:init(90),
+    ?assertEqual(30000, emqx_keepalive:info(check_interval, Keepalive4)),
+
+    Keepalive5 = emqx_keepalive:init(1),
+    ?assertEqual(1000, emqx_keepalive:info(check_interval, Keepalive5)),
+    ok.
+
+-doc """
+`hibernate/2` arms the rest of `max_idle_millisecond`. When the deadline
+fires, `wakeup/2` credits all of it, and `check_deadline/1` decides from the
+counter.
+""".
+t_hibernate_deadline(_) ->
+    KA0 = init_deadline_keepalive(),
+    %% 1 s idle so far, 10 s since the last check.
+    {ok, KA1} = emqx_keepalive:check(KA0),
+    {TillDeadline, KA2} = emqx_keepalive:hibernate(10000, KA1),
+    ?assertEqual(15000 - 1000 - 10000, TillDeadline),
+    ?assertEqual({error, timeout}, emqx_keepalive:check_deadline(emqx_keepalive:wakeup(0, KA2))),
+    %% A packet since the last check: the deadline is the whole max idle.
+    set_stat(1),
+    {15000, KA3} = emqx_keepalive:hibernate(500, KA1),
+    %% A packet after the deadline fired, before it is checked.
+    KA4 = emqx_keepalive:wakeup(0, KA3),
+    set_stat(2),
+    {ok, KA5} = emqx_keepalive:check_deadline(KA4),
+    ?assertEqual(#{statval => 2, idle_milliseconds => 0}, idle_info(KA5)).
+
+-doc "The deadline is never zero or negative, even when the idle time already exceeds it.".
+t_hibernate_deadline_clamped(_) ->
+    KA0 = init_deadline_keepalive(),
+    {ok, KA1} = emqx_keepalive:check(KA0),
+    ?assertMatch({1, _}, emqx_keepalive:hibernate(60000, KA1)).
+
+-doc "`wakeup/2` credits the time the process was hibernated.".
+t_wakeup_credits_elapsed(_) ->
+    KA0 = init_deadline_keepalive(),
+    {TillDeadline, KA1} = emqx_keepalive:hibernate(0, KA0),
+    KA2 = emqx_keepalive:wakeup(TillDeadline - 4000, KA1),
+    ?assertEqual(#{statval => 0, idle_milliseconds => 4000}, idle_info(KA2)),
+    %% A packet counted while hibernated resets the idle time.
+    {_, KA3} = emqx_keepalive:hibernate(0, KA0),
+    set_stat(1),
+    ?assertEqual(
+        #{statval => 1, idle_milliseconds => 0}, idle_info(emqx_keepalive:wakeup(100, KA3))
+    ).
+
+-doc """
+`update/3` after the deadline fired keeps the deadline that `wakeup/2`
+credited, and the next check times out.
+""".
+t_update_after_deadline(_) ->
+    KA0 = init_deadline_keepalive(),
+    {TillDeadline, KA1} = emqx_keepalive:hibernate(0, KA0),
+    KA2 = emqx_keepalive:update(default, 4, emqx_keepalive:wakeup(0, KA1)),
+    ?assertEqual(#{statval => 0, idle_milliseconds => TillDeadline}, idle_info(KA2)),
+    ?assertEqual({error, timeout}, emqx_keepalive:check(KA2)).
+
+%% Keepalive 10 s: `max_idle_millisecond` is 15 s and the check interval 1 s.
+init_deadline_keepalive() ->
+    emqx_config:put_zone_conf(default, [mqtt, keepalive_multiplier], 1.5),
+    emqx_config:put_zone_conf(default, [mqtt, keepalive_check_interval], 1000),
+    set_stat(0),
+    emqx_keepalive:init(default, {?MODULE, get_stat, []}, 10).
+
+set_stat(N) ->
+    put({?MODULE, stat}, N).
+
+get_stat() ->
+    get({?MODULE, stat}).
+
+idle_info(KA) ->
+    maps:with([statval, idle_milliseconds], emqx_keepalive:info(KA)).
+
+keepalive_multiplier() ->
+    emqx_config:get_zone_conf(default, [mqtt, keepalive_multiplier]).
+
+keepalive_check_interval() ->
+    emqx_config:get_zone_conf(default, [mqtt, keepalive_check_interval]).
+
+receive_msg_in_time(ChannelPid, C, Timeout) ->
+    receive
+        {'EXIT', ChannelPid, {shutdown, keepalive_timeout}} ->
+            receive
+                {'EXIT', C, {shutdown, tcp_closed}} ->
+                    ok
+            after 500 ->
+                throw(no_tcp_closed_from_mqtt_client)
+            end
+    after Timeout ->
+        no_keepalive_timeout_received
+    end.

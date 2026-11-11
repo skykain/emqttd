@@ -1,0 +1,113 @@
+emqx_mgmt_api_api_keys {
+
+api_key_list.desc:
+"""Return api_key list. This API can only be requested using a bearer token."""
+api_key_list.label:
+"""Return api_key list"""
+
+create_new_api_key.desc:
+"""Create new api_key. This API can only be requested using a bearer token."""
+create_new_api_key.label:
+"""Create new api_key"""
+
+get_api_key.desc:
+"""Return the specific api_key. This API can only be requested using a bearer token."""
+get_api_key.label:
+"""Return the specific api_key"""
+
+update_api_key.desc:
+"""Update the specific api_key. This API can only be requested using a bearer token."""
+update_api_key.label:
+"""Update the specific api_key"""
+
+delete_api_key.desc:
+"""Delete the specific api_key. This API can only be requested using a bearer token."""
+delete_api_key.label:
+"""Delete the specific api_key"""
+
+role.desc:
+"""Role for this API. A namespaced role is written as `ns:<namespace>::<role>`. Namespace names listed in `multi_tenancy.deny_namespaces` (default: `global`, `undefined`, `null`, `none`) cannot be used."""
+role.label:
+"""Role"""
+
+namespace_field.desc:
+"""Namespace to scope this API key to. This is an alternative to encoding the namespace inside the `role` string (`ns:<namespace>::<role>`). When both forms are supplied they must agree, otherwise the request is rejected. Omit for a global (non-namespaced) API key."""
+namespace_field.label:
+"""Namespace"""
+
+name_format.desc:
+"""API key name. Must start with a letter, may contain letters, digits, hyphen and underscore. Length 1-256 characters. Pattern: ^[A-Za-z]+[A-Za-z0-9-_]*$"""
+name_format.label:
+"""API key name"""
+
+name_pattern.desc:
+"""API key name. Must start with a letter, may contain letters, digits, hyphen and underscore. Length 1-256 characters."""
+name_pattern.label:
+"""API key name"""
+
+name_not_found.desc:
+"""API key with the given name does not exist."""
+name_not_found.label:
+"""Name not found"""
+
+api_key_desc.desc:
+"""The API key string. Used as the username in Basic authentication."""
+api_key_desc.label:
+"""API key"""
+
+api_secret_desc.desc:
+"""The API secret string. Used as the password in Basic authentication. Returned only when the key is created; cannot be retrieved later."""
+api_secret_desc.label:
+"""API secret"""
+
+expired_at_desc.desc:
+"""Expiration time. Either an ISO 8601 timestamp / epoch second, or `infinity` for keys that never expire."""
+expired_at_desc.label:
+"""Expired at"""
+
+created_at_desc.desc:
+"""Time the API key was created (ISO 8601 / epoch second)."""
+created_at_desc.label:
+"""Created at"""
+
+enable_desc.desc:
+"""Whether the API key is enabled. Disabled keys are rejected at authentication time."""
+enable_desc.label:
+"""Enable"""
+
+expired_desc.desc:
+"""Whether the API key has expired. Read-only; derived from `expired_at`."""
+expired_desc.label:
+"""Expired"""
+
+api_key_scopes_list.desc:
+"""List all available API key scopes. This API can only be requested using a bearer token."""
+api_key_scopes_list.label:
+"""List API key scopes"""
+
+api_key_scopes_request.desc:
+"""List of scope names to grant this API key. Each scope is a stable functional category (e.g., connections, publish, monitoring). When omitted on creation, the server materializes the role default: administrator/viewer get all management scopes, publisher gets `publish` only. The literal string `unset`, or a list equal to the role default, means "no explicit scope policy": the key is stored without a scope list and follows the role default (this lets a client re-submit the value a read returned without modification). Send an explicit empty list `[]` to create a deny-all key (only anonymous endpoints such as `/status` remain reachable)."""
+api_key_scopes_request.label:
+"""API key scopes (request)"""
+
+api_key_scopes_response.desc:
+"""List of scope names granted to this API key. Each scope is a stable functional category (e.g., connections, publish, monitoring). The literal string `unset` is a sentinel surfaced for records that hold no explicit scope list (created or updated with unset-equivalent scopes, or records that survived an upgrade from a release where the scopes feature did not exist); the runtime falls back to role default for such records, and a client should treat them as "no explicit scope policy". An empty list `[]` means deny-all (only anonymous endpoints such as `/status` remain reachable)."""
+api_key_scopes_response.label:
+"""API key scopes (response)"""
+
+scope_info_name.desc:
+"""Scope name, used as a stable identifier for a functional category of API endpoints."""
+scope_info_name.label:
+"""Scope name"""
+
+scope_info_desc.desc:
+"""Human-readable description of the scope's coverage."""
+scope_info_desc.label:
+"""Scope description"""
+
+scopes_response_scopes.desc:
+"""All available scopes with their names and descriptions."""
+scopes_response_scopes.label:
+"""Available scopes"""
+
+}

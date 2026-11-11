@@ -1,0 +1,2244 @@
+%%--------------------------------------------------------------------
+%% Copyright (c) 2020-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
+%%--------------------------------------------------------------------
+
+-module(emqx_authn_http_SUITE).
+
+-compile(nowarn_export_all).
+-compile(export_all).
+
+-include_lib("emqx_auth/include/emqx_authn.hrl").
+-include_lib("eunit/include/eunit.hrl").
+-include_lib("common_test/include/ct.hrl").
+-include_lib("emqx/include/logger.hrl").
+-include_lib("emqx/include/emqx_placeholder.hrl").
+-include_lib("emqx/include/emqx_mqtt.hrl").
+
+-import(emqx_common_test_helpers, [on_exit/1]).
+
+-define(PATH, [?CONF_NS_ATOM]).
+
+-define(HTTP_PATH, "/auth/[...]").
+-define(CREDENTIALS, #{
+    clientid => <<"clienta">>,
+    username => <<"plain">>,
+    password => <<"plain">>,
+    peerhost => {127, 0, 0, 1},
+    peerport => 12345,
+    peername => {{127, 0, 0, 1}, 12345},
+    listener => 'tcp:default',
+    protocol => mqtt,
+    cert_subject => <<"cert_subject_data">>,
+    cert_common_name => <<"cert_common_name_data">>,
+    cert_pem => <<"fake_raw_cert_to_be_base64_encoded">>,
+    client_attrs => #{<<"group">> => <<"g1">>}
+}).
+
+-define(SERVER_RESPONSE_JSON(Result), ?SERVER_RESPONSE_JSON(Result, false)).
+-define(SERVER_RESPONSE_JSON(Result, IsSuperuser),
+    emqx_utils_json:encode(#{
+        result => Result,
+        is_superuser => IsSuperuser
+    })
+).
+
+-define(SERVER_RESPONSE_WITH_ACL_JSON(ACL),
+    emqx_utils_json:encode(#{
+        result => allow,
+        acl => ACL
+    })
+).
+
+-define(SERVER_RESPONSE_WITH_ACL_JSON(ACL, Expire),
+    emqx_utils_json:encode(#{
+        result => allow,
+        acl => ACL,
+        expire_at => Expire
+    })
+).
+
+-define(SERVER_RESPONSE_URLENCODE(Result, IsSuperuser),
+    list_to_binary(
+        "result=" ++
+            uri_encode(Result) ++ "&" ++
+            "is_superuser=" ++
+            uri_encode(IsSuperuser)
+    )
+).
+
+-define(EXCEPTION_ALLOW, ?EXCEPTION_ALLOW(false)).
+-define(EXCEPTION_ALLOW(IsSuperuser), {ok, #{is_superuser := IsSuperuser}}).
+-define(EXCEPTION_DENY, {error, not_authorized}).
+-define(EXCEPTION_IGNORE, ignore).
+-define(CLIENTID(N), iolist_to_binary([atom_to_list(?FUNCTION_NAME), "-", integer_to_binary(N)])).
+
+all() ->
+    ProfileCases = profile_cases(),
+    [{group, legacy}, {group, hardened}] ++
+        (emqx_common_test_helpers:all_with_matrix(?MODULE) -- ProfileCases).
+
+groups() ->
+    ProfileCases = profile_cases(),
+    [
+        {legacy, [], ProfileCases},
+        {hardened, [], ProfileCases}
+        | emqx_common_test_helpers:groups_with_matrix(?MODULE)
+    ].
+
+init_per_group(Profile, Config) when Profile =:= legacy; Profile =:= hardened ->
+    ok = emqx_common_test_helpers:set_security_profile(Profile),
+    [{security_profile, Profile} | Config];
+init_per_group(_Group, Config) ->
+    Config.
+
+end_per_group(Profile, _Config) when Profile =:= legacy; Profile =:= hardened ->
+    emqx_common_test_helpers:clear_security_profile();
+end_per_group(_Group, _Config) ->
+    ok.
+
+init_per_suite(TCConfig) ->
+    emqx_utils:interactive_load(emqx_variform_bif),
+    Apps = emqx_cth_suite:start(
+        [
+            cowboy,
+            {emqx_conf, emqx_authn_test_lib:emqx_appspec()},
+            emqx_auth,
+            emqx_auth_mnesia,
+            emqx_auth_http
+        ],
+        #{
+            work_dir => ?config(priv_dir, TCConfig)
+        }
+    ),
+    [{apps, Apps} | TCConfig].
+
+end_per_suite(TCConfig) ->
+    emqx_authn_test_lib:delete_authenticators(
+        [authentication],
+        ?GLOBAL
+    ),
+    ok = emqx_cth_suite:stop(?config(apps, TCConfig)),
+    ok.
+
+init_per_testcase(Case, TCConfig0) ->
+    emqx_authn_test_lib:delete_authenticators(
+        [authentication],
+        ?GLOBAL
+    ),
+    HTTPPort = emqx_common_test_helpers:select_free_port(tcp),
+    {ok, _} = emqx_utils_http_test_server:start_link(HTTPPort, ?HTTP_PATH),
+    TCConfig = [{http_port, HTTPPort} | TCConfig0],
+    try
+        ?MODULE:Case(init, TCConfig)
+    catch
+        error:undef ->
+            TCConfig
+    end.
+
+end_per_testcase(Case, TCConfig) ->
+    try
+        ?MODULE:Case('end', TCConfig)
+    catch
+        error:undef ->
+            ok
+    end,
+    _ = emqx_auth_cache:reset(?AUTHN_CACHE),
+    ok = emqx_authn_test_lib:enable_node_cache(false),
+    ok = emqx_utils_http_test_server:stop(),
+    emqx_common_test_helpers:call_janitor(),
+    ok.
+
+%%------------------------------------------------------------------------------
+%% Tests
+%%------------------------------------------------------------------------------
+
+t_create(TCConfig) ->
+    AuthConfig = raw_http_auth_config(TCConfig),
+
+    {ok, _} = emqx:update_config(
+        ?PATH,
+        {create_authenticator, ?GLOBAL, AuthConfig}
+    ),
+
+    {ok, [#{provider := emqx_authn_http}]} = emqx_authn_chains:list_authenticators(?GLOBAL).
+
+t_create_invalid(TCConfig) ->
+    AuthConfig = raw_http_auth_config(TCConfig),
+
+    InvalidConfigs =
+        [
+            AuthConfig#{<<"headers">> => []},
+            AuthConfig#{<<"method">> => <<"delete">>},
+            AuthConfig#{<<"url">> => <<"localhost">>},
+            AuthConfig#{<<"url">> => <<"http://foo.com/xxx#fragment">>},
+            AuthConfig#{<<"url">> => <<"http://${foo}.com/xxx">>},
+            AuthConfig#{<<"url">> => <<"//foo.com/xxx">>},
+            AuthConfig#{<<"precondition">> => <<"not a valid precondition">>}
+        ],
+
+    lists:foreach(
+        fun(AuthConf) ->
+            ct:pal("creating authenticator with invalid config: ~p", [AuthConf]),
+            {error, _} =
+                try
+                    emqx:update_config(
+                        ?PATH,
+                        {create_authenticator, ?GLOBAL, AuthConf}
+                    )
+                catch
+                    throw:Error ->
+                        {error, Error}
+                end,
+            ?assertEqual(
+                {error, {not_found, {chain, ?GLOBAL}}},
+                emqx_authn_chains:list_authenticators(?GLOBAL)
+            )
+        end,
+        InvalidConfigs
+    ).
+
+t_oauth2_client_credentials(TCConfig) ->
+    Token = <<"authn-oauth2-token">>,
+    BaseURL = <<"http://127.0.0.1:", (http_port_bin(TCConfig))/binary>>,
+    ok = emqx_utils_http_test_server:set_handler(
+        fun(Req0, State) ->
+            case cowboy_req:path(Req0) of
+                <<"/auth/token">> ->
+                    {ok, Body, Req1} = cowboy_req:read_body(Req0),
+                    Form = uri_string:dissect_query(Body),
+                    ?assert(lists:member({<<"grant_type">>, <<"client_credentials">>}, Form)),
+                    Req = cowboy_req:reply(
+                        200,
+                        #{<<"content-type">> => <<"application/json">>},
+                        emqx_utils_json:encode(#{
+                            access_token => Token,
+                            expires_in => 3600,
+                            token_type => <<"Bearer">>
+                        }),
+                        Req1
+                    ),
+                    {ok, Req, State};
+                <<"/auth/check">> ->
+                    Headers = cowboy_req:headers(Req0),
+                    ?assertEqual(
+                        <<"Bearer ", Token/binary>>, maps:get(<<"authorization">>, Headers)
+                    ),
+                    Req = cowboy_req:reply(
+                        200,
+                        #{<<"content-type">> => <<"application/json">>},
+                        ?SERVER_RESPONSE_JSON(allow),
+                        Req0
+                    ),
+                    {ok, Req, State}
+            end
+        end
+    ),
+    AuthConfig = (raw_http_auth_config(TCConfig))#{
+        <<"url">> => <<BaseURL/binary, "/auth/check">>,
+        <<"oauth2">> => oauth2_config(<<BaseURL/binary, "/auth/token">>)
+    },
+    {ok, _} = emqx:update_config(?PATH, {create_authenticator, ?GLOBAL, AuthConfig}),
+    ?assertEqual(
+        {ok, #{is_superuser => false, client_attrs => #{}}},
+        emqx_access_control:authenticate(?CREDENTIALS)
+    ).
+
+t_oauth2_refresh_on_401(TCConfig) ->
+    BaseURL = <<"http://127.0.0.1:", (http_port_bin(TCConfig))/binary>>,
+    TestPid = self(),
+    Counter = counters:new(1, []),
+    Handler = fun(Req0, State) ->
+        {ok, _, Req1} = cowboy_req:read_body(Req0),
+        case cowboy_req:path(Req1) of
+            <<"/auth/token">> ->
+                counters:add(Counter, 1, 1),
+                Token = integer_to_binary(counters:get(Counter, 1)),
+                Body = emqx_utils_json:encode(#{access_token => Token, expires_in => 3600}),
+                {ok,
+                    cowboy_req:reply(
+                        200, #{<<"content-type">> => <<"application/json">>}, Body, Req1
+                    ),
+                    State};
+            <<"/auth/check">> ->
+                Header = cowboy_req:header(<<"authorization">>, Req1),
+                Status =
+                    case Header of
+                        <<"Bearer 1">> -> 401;
+                        <<"Bearer 2">> -> 200
+                    end,
+                TestPid ! {oauth2_response, Header, Status},
+                Body = emqx_utils_json:encode(#{result => allow}),
+                {ok,
+                    cowboy_req:reply(
+                        Status, #{<<"content-type">> => <<"application/json">>}, Body, Req1
+                    ),
+                    State}
+        end
+    end,
+    ok = emqx_utils_http_test_server:set_handler(Handler),
+    AuthConfig = (raw_http_auth_config(TCConfig))#{
+        <<"url">> => <<BaseURL/binary, "/auth/check">>,
+        <<"oauth2">> => oauth2_config(<<BaseURL/binary, "/auth/token">>)
+    },
+    {ok, _} = emqx:update_config(?PATH, {create_authenticator, ?GLOBAL, AuthConfig}),
+    {ok, Client} = emqtt:start_link([{username, <<"plain">>}, {password, <<"plain">>}]),
+    emqx_common_test_helpers:on_exit(fun() -> emqtt:stop(Client) end),
+    {ok, _} = emqtt:connect(Client),
+
+    receive
+        {oauth2_response, <<"Bearer 1">>, 401} -> ok
+    after 2_000 -> ct:fail(no_401)
+    end,
+    receive
+        {oauth2_response, <<"Bearer 2">>, 200} -> ok
+    after 2_000 -> ct:fail(no_retry)
+    end,
+    ?assertEqual(2, counters:get(Counter, 1)).
+
+t_oauth2_ssl_certs_are_saved(TCConfig) ->
+    BaseURL = <<"http://127.0.0.1:", (http_port_bin(TCConfig))/binary>>,
+    ok = set_oauth2_token_handler(<<"/auth/token">>),
+    SSL = inline_ssl_certs(),
+    AuthConfig = (raw_http_auth_config(TCConfig))#{
+        <<"oauth2">> =>
+            (oauth2_config(<<BaseURL/binary, "/auth/token">>))#{<<"ssl">> => SSL}
+    },
+    {ok, _} = emqx:update_config(?PATH, {create_authenticator, ?GLOBAL, AuthConfig}),
+    [#{<<"oauth2">> := #{<<"ssl">> := SavedSSL}}] = emqx:get_raw_config(?PATH),
+    assert_ssl_certs_are_saved(SSL, SavedSSL).
+
+t_oauth2_ssl_verify_none_allows_blank_certs(TCConfig) ->
+    BaseURL = <<"http://127.0.0.1:", (http_port_bin(TCConfig))/binary>>,
+    ok = set_oauth2_token_handler(<<"/auth/token">>),
+    AuthConfig = (raw_http_auth_config(TCConfig))#{
+        <<"oauth2">> =>
+            (oauth2_config(<<BaseURL/binary, "/auth/token">>))#{
+                <<"ssl">> => #{
+                    <<"enable">> => true,
+                    <<"verify">> => <<"verify_none">>,
+                    <<"cacertfile">> => <<>>,
+                    <<"certfile">> => <<>>,
+                    <<"keyfile">> => <<>>
+                }
+            }
+    },
+    {ok, _} = emqx:update_config(?PATH, {create_authenticator, ?GLOBAL, AuthConfig}).
+
+t_oauth2_start_timeout_keeps_authenticator(TCConfig) ->
+    ok = block_oauth2_token_endpoint(<<"/auth/token">>),
+    BaseURL = <<"http://127.0.0.1:", (http_port_bin(TCConfig))/binary>>,
+    Oauth2 = (oauth2_config(<<BaseURL/binary, "/auth/token">>))#{
+        <<"timeout">> => <<"30s">>
+    },
+    AuthConfig = (raw_http_auth_config(TCConfig))#{
+        <<"oauth2">> => Oauth2
+    },
+    try
+        {ok, _} = emqx:update_config(?PATH, {create_authenticator, ?GLOBAL, AuthConfig}),
+        ?assertMatch([#{backend := http}], emqx_conf:get(?PATH)),
+        {ok, #{state := #{resource_id := ResourceId}}} =
+            emqx_authn_chains:lookup_authenticator(?GLOBAL, <<"password_based:http">>),
+        ?assert(lists:member(ResourceId, emqx_resource:list_group_instances(?AUTHN_RESOURCE_GROUP)))
+    after
+        unblock_oauth2_token_endpoint()
+    end.
+
+t_oauth2_start_exception_removes_resource(TCConfig) ->
+    BaseURL = <<"http://127.0.0.1:", (http_port_bin(TCConfig))/binary>>,
+    AuthConfig = (raw_http_auth_config(TCConfig))#{
+        <<"oauth2">> => oauth2_config(<<BaseURL/binary, "/auth/token">>)
+    },
+    Error = emqx_common_test_helpers:with_mock(
+        emqx_resource,
+        start,
+        fun(_) -> error(start_failed) end,
+        fun() ->
+            emqx:update_config(?PATH, {create_authenticator, ?GLOBAL, AuthConfig})
+        end
+    ),
+    ?assertMatch({error, _}, Error),
+    ?assert(contains_term(start_failed, Error)),
+    ?assertEqual([], emqx_conf:get(?PATH)),
+    ?assertEqual([], emqx_resource:list_group_instances(?AUTHN_RESOURCE_GROUP)).
+
+t_authenticate(TCConfig) ->
+    ok = emqx_logger:set_primary_log_level(debug),
+    ok = lists:foreach(
+        fun(Sample) ->
+            ct:pal("test_user_auth sample: ~p", [Sample]),
+            test_user_auth(TCConfig, Sample)
+        end,
+        samples()
+    ).
+
+t_backend_failure(TCConfig) ->
+    ?assertEqual(
+        expected_authn_result(TCConfig),
+        authenticate_with_unexpected_status(TCConfig)
+    ).
+
+t_malformed_response(TCConfig) ->
+    Expected = expected_authn_result(TCConfig),
+    ?assertEqual(
+        Expected,
+        authenticate_with_http_handler(TCConfig, invalid_json_handler())
+    ),
+    ?assertEqual(
+        Expected,
+        authenticate_with_http_handler(TCConfig, invalid_result_handler(<<"unexpected">>))
+    ),
+    %% A near-miss of "deny_bad_credentials" is an unrecognized result,
+    %% handled as a backend failure.
+    ?assertEqual(
+        Expected,
+        authenticate_with_http_handler(TCConfig, invalid_result_handler(<<"deny_bad_credential">>))
+    ),
+    %% An "allow" response with a malformed field is handled as a backend failure.
+    ?assertEqual(
+        Expected,
+        authenticate_with_http_handler(
+            TCConfig,
+            json_response_handler(#{result => allow, acl => [#{<<"bad">> => <<"rule">>}]})
+        )
+    ),
+    ?assertEqual(
+        Expected,
+        authenticate_with_http_handler(
+            TCConfig,
+            json_response_handler(#{result => allow, expire_at => <<"not-an-epoch">>})
+        )
+    ).
+
+test_user_auth(
+    TCConfig,
+    #{
+        handler := Handler,
+        config_params := SpecificConfgParams,
+        result := Expect
+    } = Sample
+) ->
+    Credentials = maps:merge(?CREDENTIALS, maps:get(credentials, Sample, #{})),
+    Result = perform_user_auth(TCConfig, SpecificConfgParams, Handler, Credentials),
+    ?assertEqual(Expect, Result).
+
+perform_user_auth(TCConfig, SpecificConfgParams, Handler, Credentials) ->
+    AuthConfig = maps:merge(raw_http_auth_config(TCConfig), SpecificConfgParams),
+
+    {ok, _} = emqx:update_config(
+        ?PATH,
+        {create_authenticator, ?GLOBAL, AuthConfig}
+    ),
+
+    ok = emqx_utils_http_test_server:set_handler(Handler),
+
+    Result = emqx_access_control:authenticate(Credentials),
+
+    emqx_authn_test_lib:delete_authenticators(
+        [authentication],
+        ?GLOBAL
+    ),
+
+    Result.
+
+block_oauth2_token_endpoint(Path) ->
+    TestPid = self(),
+    emqx_utils_http_test_server:set_handler(fun(Req0, State) ->
+        Path = cowboy_req:path(Req0),
+        TestPid ! {oauth2_token_request, self()},
+        receive
+            unblock_oauth2_token_endpoint -> ok
+        end,
+        Req = cowboy_req:reply(
+            200,
+            #{<<"content-type">> => <<"application/json">>},
+            emqx_utils_json:encode(#{
+                access_token => <<"oauth2-token">>,
+                expires_in => 3600,
+                token_type => <<"Bearer">>
+            }),
+            Req0
+        ),
+        {ok, Req, State}
+    end).
+
+unblock_oauth2_token_endpoint() ->
+    receive
+        {oauth2_token_request, Pid} ->
+            Pid ! unblock_oauth2_token_endpoint,
+            ok
+    after 0 ->
+        ok
+    end.
+
+contains_term(Term, Term) ->
+    true;
+contains_term(Needle, Term) when is_map(Term) ->
+    contains_term(Needle, maps:to_list(Term));
+contains_term(Needle, Term) when is_tuple(Term) ->
+    contains_term(Needle, tuple_to_list(Term));
+contains_term(Needle, Term) when is_list(Term) ->
+    lists:any(fun(Element) -> contains_term(Needle, Element) end, Term);
+contains_term(_Needle, _Term) ->
+    false.
+
+t_authenticate_path_placeholders(TCConfig) ->
+    ok = emqx_utils_http_test_server:set_handler(
+        fun(Req0, State) ->
+            Req =
+                case cowboy_req:path(Req0) of
+                    <<"/auth/p%20ath//us+er/auth//">> ->
+                        cowboy_req:reply(
+                            200,
+                            #{<<"content-type">> => <<"application/json">>},
+                            emqx_utils_json:encode(#{result => allow, is_superuser => false}),
+                            Req0
+                        );
+                    Path ->
+                        ct:pal("Unexpected path: ~p", [Path]),
+                        cowboy_req:reply(403, Req0)
+                end,
+            {ok, Req, State}
+        end
+    ),
+
+    Credentials = maps:merge(?CREDENTIALS, #{
+        username => <<"us er">>
+    }),
+
+    AuthConfig = maps:merge(
+        raw_http_auth_config(TCConfig),
+        #{
+            <<"url">> =>
+                <<"http://127.0.0.1:", (http_port_bin(TCConfig))/binary,
+                    "/auth/p%20ath//${username}/auth//">>,
+            <<"body">> => #{}
+        }
+    ),
+    {ok, _} = emqx:update_config(
+        ?PATH,
+        {create_authenticator, ?GLOBAL, AuthConfig}
+    ),
+
+    ?assertMatch(
+        {ok, #{is_superuser := false}},
+        emqx_access_control:authenticate(Credentials)
+    ),
+
+    _ = emqx_authn_test_lib:delete_authenticators(
+        [authentication],
+        ?GLOBAL
+    ).
+
+t_no_value_for_placeholder(TCConfig) ->
+    Handler = fun(Req0, State) ->
+        {ok, RawBody, Req1} = cowboy_req:read_body(Req0),
+        #{
+            <<"cert_subject">> := <<"">>,
+            <<"cert_common_name">> := <<"">>,
+            <<"cert_pem">> := <<"">>
+        } = emqx_utils_json:decode(RawBody),
+        Req = cowboy_req:reply(
+            200,
+            #{<<"content-type">> => <<"application/json">>},
+            emqx_utils_json:encode(#{result => allow, is_superuser => false}),
+            Req1
+        ),
+        {ok, Req, State}
+    end,
+
+    SpecificConfgParams = #{
+        <<"method">> => <<"post">>,
+        <<"headers">> => #{<<"content-type">> => <<"application/json">>},
+        <<"body">> => #{
+            <<"cert_subject">> => ?PH_CERT_SUBJECT,
+            <<"cert_common_name">> => ?PH_CERT_CN_NAME,
+            <<"cert_pem">> => ?PH_CERT_PEM
+        }
+    },
+
+    AuthConfig = maps:merge(raw_http_auth_config(TCConfig), SpecificConfgParams),
+
+    {ok, _} = emqx:update_config(
+        ?PATH,
+        {create_authenticator, ?GLOBAL, AuthConfig}
+    ),
+
+    ok = emqx_utils_http_test_server:set_handler(Handler),
+
+    Credentials = maps:without([cert_subject, cert_common_name, cert_pem], ?CREDENTIALS),
+
+    ?assertMatch({ok, _}, emqx_access_control:authenticate(Credentials)),
+
+    emqx_authn_test_lib:delete_authenticators(
+        [authentication],
+        ?GLOBAL
+    ).
+
+t_disallowed_placeholders_preserved(TCConfig) ->
+    AuthConfig = #{
+        <<"method">> => <<"post">>,
+        <<"headers">> => #{<<"content-type">> => <<"application/json">>},
+        <<"body">> => #{
+            <<"username">> => ?PH_USERNAME,
+            <<"password">> => ?PH_PASSWORD,
+            <<"this">> => <<"${whatisthis}">>
+        }
+    },
+    Handler = fun(Req0, State) ->
+        {ok, Body, Req1} = cowboy_req:read_body(Req0),
+        #{
+            <<"username">> := <<"plain">>,
+            <<"password">> := <<"plain">>,
+            <<"this">> := <<"${whatisthis}">>
+        } = emqx_utils_json:decode(Body),
+        Req = cowboy_req:reply(
+            200,
+            #{<<"content-type">> => <<"application/json">>},
+            emqx_utils_json:encode(#{result => allow, is_superuser => false}),
+            Req1
+        ),
+        {ok, Req, State}
+    end,
+    ?assertMatch({ok, _}, perform_user_auth(TCConfig, AuthConfig, Handler, ?CREDENTIALS)),
+
+    % NOTE: disallowed placeholder left intact, which makes the URL invalid
+    AuthConfigUrl = AuthConfig#{
+        <<"url">> =>
+            <<"http://127.0.0.1:", (http_port_bin(TCConfig))/binary, "/auth/${whatisthis}">>
+    },
+    ?assertMatch({error, _}, perform_user_auth(TCConfig, AuthConfigUrl, Handler, ?CREDENTIALS)).
+
+t_destroy(TCConfig) ->
+    AuthConfig = raw_http_auth_config(TCConfig),
+
+    {ok, _} = emqx:update_config(
+        ?PATH,
+        {create_authenticator, ?GLOBAL, AuthConfig}
+    ),
+
+    Headers = #{<<"content-type">> => <<"application/json">>},
+    Response = ?SERVER_RESPONSE_JSON(allow),
+
+    ok = emqx_utils_http_test_server:set_handler(
+        fun(Req0, State) ->
+            Req = cowboy_req:reply(200, Headers, Response, Req0),
+            {ok, Req, State}
+        end
+    ),
+
+    {ok, [#{provider := emqx_authn_http, state := State}]} =
+        emqx_authn_chains:list_authenticators(?GLOBAL),
+
+    Credentials = maps:with([username, password], ?CREDENTIALS),
+
+    ?assertMatch(
+        ?EXCEPTION_ALLOW,
+        emqx_authn_http:authenticate(
+            Credentials,
+            State
+        )
+    ),
+
+    emqx_authn_test_lib:delete_authenticators(
+        [authentication],
+        ?GLOBAL
+    ),
+
+    % Authenticator should not be usable anymore
+    Expected =
+        case ?config(security_profile, TCConfig) of
+            legacy -> ?EXCEPTION_IGNORE;
+            hardened -> ?EXCEPTION_DENY
+        end,
+    ?assertMatch(
+        Expected,
+        emqx_authn_http:authenticate(
+            Credentials,
+            State
+        )
+    ).
+
+t_update(TCConfig) ->
+    CorrectConfig = raw_http_auth_config(TCConfig),
+    IncorrectConfig =
+        CorrectConfig#{
+            <<"url">> => <<"http://127.0.0.1:", (http_port_bin(TCConfig))/binary, "/invalid">>
+        },
+
+    {ok, _} = emqx:update_config(
+        ?PATH,
+        {create_authenticator, ?GLOBAL, IncorrectConfig}
+    ),
+
+    Headers = #{<<"content-type">> => <<"application/json">>},
+    Response = ?SERVER_RESPONSE_JSON(allow),
+
+    ok = emqx_utils_http_test_server:set_handler(
+        fun(Req0, State) ->
+            Req = cowboy_req:reply(200, Headers, Response, Req0),
+            {ok, Req, State}
+        end
+    ),
+
+    ?assertMatch(
+        ?EXCEPTION_DENY,
+        emqx_access_control:authenticate(?CREDENTIALS)
+    ),
+
+    % We update with config with correct query, provider should update and work properly
+    {ok, _} = emqx:update_config(
+        ?PATH,
+        {update_authenticator, ?GLOBAL, <<"password_based:http">>, CorrectConfig}
+    ),
+
+    ?assertMatch(
+        ?EXCEPTION_ALLOW,
+        emqx_access_control:authenticate(?CREDENTIALS)
+    ).
+
+t_resource_status(TCConfig) ->
+    EnabledConfig = raw_http_auth_config(TCConfig),
+    DisabledConfig =
+        EnabledConfig#{<<"enable">> => false},
+
+    %% Create enabled, update to disabled
+    {ok, _} = emqx:update_config(
+        ?PATH,
+        {create_authenticator, ?GLOBAL, EnabledConfig}
+    ),
+    {ok, #{state := #{resource_id := ResourceId0}}} = emqx_authn_chains:lookup_authenticator(
+        ?GLOBAL,
+        <<"password_based:http">>
+    ),
+    ?assertEqual({ok, connected}, emqx_resource:health_check(ResourceId0)),
+    {ok, _} = emqx:update_config(
+        ?PATH,
+        {update_authenticator, ?GLOBAL, <<"password_based:http">>, DisabledConfig}
+    ),
+    ?assertEqual({error, resource_is_stopped}, emqx_resource:health_check(ResourceId0)),
+
+    %% Cleanup
+    emqx_authn_test_lib:delete_authenticators(
+        [authentication],
+        ?GLOBAL
+    ),
+
+    %% Now, create disabled, update to enabled
+    {ok, _} = emqx:update_config(
+        ?PATH,
+        {create_authenticator, ?GLOBAL, DisabledConfig}
+    ),
+    {ok, #{state := #{resource_id := ResourceId1}}} = emqx_authn_chains:lookup_authenticator(
+        ?GLOBAL,
+        <<"password_based:http">>
+    ),
+    ?assertEqual({error, resource_is_stopped}, emqx_resource:health_check(ResourceId1)),
+    {ok, _} = emqx:update_config(
+        ?PATH,
+        {update_authenticator, ?GLOBAL, <<"password_based:http">>, EnabledConfig}
+    ),
+    ?assertEqual({ok, connected}, emqx_resource:health_check(ResourceId1)),
+
+    %% Cleanup
+    emqx_authn_test_lib:delete_authenticators(
+        [authentication],
+        ?GLOBAL
+    ).
+
+t_update_precondition(TCConfig) ->
+    %% always allow
+    ok = emqx_utils_http_test_server:set_handler(
+        fun(Req0, State) ->
+            Req = cowboy_req:reply(
+                200,
+                #{<<"content-type">> => <<"application/json">>},
+                ?SERVER_RESPONSE_JSON(allow),
+                Req0
+            ),
+            {ok, Req, State}
+        end
+    ),
+
+    CorrectConfig = raw_http_auth_config(TCConfig),
+    {ok, _} = emqx:update_config(
+        ?PATH,
+        {create_authenticator, ?GLOBAL, CorrectConfig}
+    ),
+    InvalidPreconditionConfig =
+        CorrectConfig#{<<"precondition">> => <<"not a valid precondition">>},
+
+    ?assertMatch(
+        {error, {post_config_update, emqx_authn_config, #{cause := "bad_precondition_expression"}}},
+        emqx:update_config(
+            ?PATH,
+            {update_authenticator, ?GLOBAL, <<"password_based:http">>, InvalidPreconditionConfig}
+        )
+    ),
+
+    Connect = fun(ClientId) ->
+        {ok, Pid} = emqtt:start_link([
+            {host, "127.0.0.1"},
+            {port, 1883},
+            {clean_start, true},
+            {clientid, ClientId},
+            {username, <<"plain">>},
+            {password, <<"plain">>}
+        ]),
+        unlink(Pid),
+        _ = monitor(process, Pid),
+        R =
+            case emqtt:connect(Pid) of
+                {ok, _} ->
+                    ok = emqtt:disconnect(Pid);
+                {error, _} = Err ->
+                    Err
+            end,
+        receive
+            {'DOWN', _Ref, process, Pid, _Reason} ->
+                ok
+        after 1000 ->
+            error(timeout)
+        end,
+        R
+    end,
+
+    %% allowed without precondition
+    ?assertMatch(ok, Connect(<<"c1-123">>)),
+    ?assertMatch(ok, Connect(<<"c2-123">>)),
+
+    %% allow only clientid starting with c1-
+    ValidPreconditionConfig =
+        CorrectConfig#{<<"precondition">> => <<"regex_match(clientid, 'c1-.*')">>},
+
+    {ok, _} = emqx:update_config(
+        ?PATH,
+        {update_authenticator, ?GLOBAL, <<"password_based:http">>, ValidPreconditionConfig}
+    ),
+    ?assertMatch(ok, Connect(<<"c1-123">>)),
+    ?assertMatch({error, {unauthorized_client, _}}, Connect(<<"c2-123">>)),
+    ok.
+
+t_node_cache(TCConfig) ->
+    AuthConfig = maps:merge(
+        raw_http_auth_config(TCConfig),
+        #{
+            <<"method">> => <<"get">>,
+            <<"url">> =>
+                <<"http://127.0.0.1:", (http_port_bin(TCConfig))/binary,
+                    "/auth/${clientid}?username=${username}">>,
+            <<"body">> => #{<<"password">> => <<"${password}">>}
+        }
+    ),
+    {ok, _} = emqx:update_config(
+        ?PATH,
+        {create_authenticator, ?GLOBAL, AuthConfig}
+    ),
+    ok = emqx_authn_test_lib:enable_node_cache(true),
+    Handler = fun(#{path := Path} = Req0, State) ->
+        Req =
+            case {Path, cowboy_req:match_qs([username, password], Req0)} of
+                {<<"/auth/clientid">>, #{username := <<"username">>, password := <<"password">>}} ->
+                    cowboy_req:reply(204, Req0);
+                _ ->
+                    cowboy_req:reply(403, Req0)
+            end,
+        {ok, Req, State}
+    end,
+    ok = emqx_utils_http_test_server:set_handler(Handler),
+
+    %% We authenticate twice, the second time should be cached
+    Credentials = maps:merge(?CREDENTIALS, #{
+        clientid => <<"clientid">>,
+        username => <<"username">>,
+        password => <<"password">>
+    }),
+    ?assertMatch(
+        ?EXCEPTION_ALLOW,
+        emqx_access_control:authenticate(Credentials)
+    ),
+    ?assertMatch(
+        ?EXCEPTION_ALLOW,
+        emqx_access_control:authenticate(Credentials)
+    ),
+    ?assertMatch(
+        #{hits := #{value := 1}, misses := #{value := 1}},
+        emqx_auth_cache:metrics(?AUTHN_CACHE)
+    ),
+
+    %% Now change a var in each interpolated part, the cache should NOT be hit
+    ?assertMatch(
+        ?EXCEPTION_DENY,
+        emqx_access_control:authenticate(Credentials#{username => <<"username2">>})
+    ),
+    ?assertMatch(
+        ?EXCEPTION_DENY,
+        emqx_access_control:authenticate(Credentials#{password => <<"password2">>})
+    ),
+    ?assertMatch(
+        ?EXCEPTION_DENY,
+        emqx_access_control:authenticate(Credentials#{clientid => <<"clientid2">>})
+    ),
+    ?assertMatch(
+        #{hits := #{value := 1}, misses := #{value := 4}},
+        emqx_auth_cache:metrics(?AUTHN_CACHE)
+    ).
+
+t_is_superuser(TCConfig) ->
+    AuthConfig = raw_http_auth_config(TCConfig),
+    {ok, _} = emqx:update_config(
+        ?PATH,
+        {create_authenticator, ?GLOBAL, AuthConfig}
+    ),
+
+    Checks = [
+        %% {ContentType, ExpectedIsSuperuser, ResponseIsSuperuser}
+        %% Is Superuser
+        {json, true, <<"1">>},
+        {json, true, 1},
+        {json, true, 123},
+        {json, true, <<"true">>},
+        {json, true, true},
+
+        %% Not Superuser
+        {json, false, <<"">>},
+        {json, false, <<"0">>},
+        {json, false, 0},
+        {json, false, null},
+        {json, false, undefined},
+        {json, false, <<"false">>},
+        {json, false, false},
+
+        {json, false, <<"val">>},
+
+        %% Is Superuser
+        {form, true, <<"1">>},
+        {form, true, 1},
+        {form, true, 123},
+        {form, true, <<"true">>},
+        {form, true, true},
+
+        %% Not Superuser
+        {form, false, <<"">>},
+        {form, false, <<"0">>},
+        {form, false, 0},
+
+        {form, false, null},
+        {form, false, undefined},
+        {form, false, <<"false">>},
+        {form, false, false},
+
+        {form, false, <<"val">>}
+    ],
+
+    lists:foreach(fun test_is_superuser/1, Checks).
+
+test_is_superuser({Kind, ExpectedValue, ServerResponse}) ->
+    {ContentType, Res} =
+        case Kind of
+            json ->
+                {<<"application/json; charset=utf-8">>,
+                    ?SERVER_RESPONSE_JSON(allow, ServerResponse)};
+            form ->
+                {<<"application/x-www-form-urlencoded; charset=utf-8">>,
+                    ?SERVER_RESPONSE_URLENCODE(allow, ServerResponse)}
+        end,
+
+    ok = emqx_utils_http_test_server:set_handler(
+        fun(Req0, State) ->
+            Req = cowboy_req:reply(
+                200,
+                #{<<"content-type">> => ContentType},
+                Res,
+                Req0
+            ),
+            {ok, Req, State}
+        end
+    ),
+
+    ?assertMatch(
+        ?EXCEPTION_ALLOW(ExpectedValue),
+        emqx_access_control:authenticate(?CREDENTIALS)
+    ).
+
+t_ignore_allow_deny(TCConfig) ->
+    AuthConfig = raw_http_auth_config(TCConfig),
+    {ok, _} = emqx:update_config(
+        ?PATH,
+        {create_authenticator, ?GLOBAL, AuthConfig}
+    ),
+
+    Checks = [
+        %% only one chain, ignore by authn http and deny by default
+        {deny, ?SERVER_RESPONSE_JSON(ignore)},
+
+        {{allow, true}, ?SERVER_RESPONSE_JSON(allow, true)},
+        {{allow, false}, ?SERVER_RESPONSE_JSON(allow)},
+        {{allow, false}, ?SERVER_RESPONSE_JSON(allow, false)},
+
+        {deny, ?SERVER_RESPONSE_JSON(deny)},
+        {deny, ?SERVER_RESPONSE_JSON(deny, true)},
+        {deny, ?SERVER_RESPONSE_JSON(deny, false)},
+
+        {bad_credentials, ?SERVER_RESPONSE_JSON(deny_bad_credentials)}
+    ],
+
+    lists:foreach(fun test_ignore_allow_deny/1, Checks).
+
+test_ignore_allow_deny({ExpectedValue, ServerResponse}) ->
+    ok = emqx_utils_http_test_server:set_handler(
+        fun(Req0, State) ->
+            Req = cowboy_req:reply(
+                200,
+                #{<<"content-type">> => <<"application/json">>},
+                ServerResponse,
+                Req0
+            ),
+            {ok, Req, State}
+        end
+    ),
+
+    case ExpectedValue of
+        {allow, IsSuperuser} ->
+            ?assertMatch(
+                ?EXCEPTION_ALLOW(IsSuperuser),
+                emqx_access_control:authenticate(?CREDENTIALS)
+            );
+        deny ->
+            ?assertMatch(
+                ?EXCEPTION_DENY,
+                emqx_access_control:authenticate(?CREDENTIALS)
+            );
+        bad_credentials ->
+            ?assertMatch(
+                {error, bad_username_or_password},
+                emqx_access_control:authenticate(?CREDENTIALS)
+            )
+    end.
+
+-doc """
+Checks the CONNACK reason code a real MQTT client observes for each deny result.
+'deny' yields not_authorized (0x87 for MQTT 5.0, return code 5 for MQTT 3.1.1).
+'deny_bad_credentials' yields bad_username_or_password (0x86 for MQTT 5.0,
+return code 4 for MQTT 3.1.1).
+emqtt maps each MQTT 3.1.1 return code to a distinct atom
+(4 -> malformed_username_or_password, 5 -> unauthorized_client),
+so the asserted atom proves the wire value.
+""".
+t_deny_connack_reason_code(TCConfig) ->
+    AuthConfig = raw_http_auth_config(TCConfig),
+    {ok, _} = emqx:update_config(
+        ?PATH,
+        {create_authenticator, ?GLOBAL, AuthConfig}
+    ),
+
+    Checks = [
+        {deny, v5, not_authorized},
+        {deny, v4, unauthorized_client},
+        {deny_bad_credentials, v5, bad_username_or_password},
+        {deny_bad_credentials, v4, malformed_username_or_password}
+    ],
+
+    lists:foreach(fun test_deny_connack_reason_code/1, Checks).
+
+test_deny_connack_reason_code({Result, ProtoVer, ExpectedError}) ->
+    ok = emqx_utils_http_test_server:set_handler(
+        fun(Req0, State) ->
+            Req = cowboy_req:reply(
+                200,
+                #{<<"content-type">> => <<"application/json">>},
+                ?SERVER_RESPONSE_JSON(Result),
+                Req0
+            ),
+            {ok, Req, State}
+        end
+    ),
+    {ok, C} = emqtt:start_link(
+        [
+            {clean_start, true},
+            {proto_ver, ProtoVer},
+            {clientid, <<"clientid">>},
+            {username, <<"plain">>},
+            {password, <<"plain">>}
+        ]
+    ),
+    unlink(C),
+    try
+        ?assertMatch({error, {ExpectedError, _}}, emqtt:connect(C))
+    after
+        catch emqtt:stop(C)
+    end.
+
+t_acl(TCConfig) ->
+    ACL = acl_rules(),
+    AuthConfig = raw_http_auth_config(TCConfig),
+    {ok, _} = emqx:update_config(
+        ?PATH,
+        {create_authenticator, ?GLOBAL, AuthConfig}
+    ),
+    ok = emqx_utils_http_test_server:set_handler(
+        fun(Req0, State) ->
+            Req = cowboy_req:reply(
+                200,
+                #{<<"content-type">> => <<"application/json">>},
+                ?SERVER_RESPONSE_WITH_ACL_JSON(ACL),
+                Req0
+            ),
+            {ok, Req, State}
+        end
+    ),
+    {ok, C} = emqtt:start_link(
+        [
+            {clean_start, true},
+            {proto_ver, v5},
+            {clientid, <<"clientid">>},
+            {username, <<"username">>},
+            {password, <<"password">>}
+        ]
+    ),
+    {ok, _} = emqtt:connect(C),
+    Cases = [
+        {allow, <<"http-authn-acl/#">>},
+        {deny, <<"http-authn-acl/1">>},
+        {deny, <<"t/#">>}
+    ],
+    try
+        lists:foreach(
+            fun(Case) ->
+                test_acl(Case, C)
+            end,
+            Cases
+        )
+    after
+        ok = emqtt:disconnect(C)
+    end.
+
+t_auth_expire(TCConfig) ->
+    ACL = acl_rules(),
+    AuthConfig = raw_http_auth_config(TCConfig),
+    {ok, _} = emqx:update_config(
+        ?PATH,
+        {create_authenticator, ?GLOBAL, AuthConfig}
+    ),
+    ExpireSec = 3,
+    ExpireMSec = timer:seconds(ExpireSec),
+    Tests = [
+        {<<"ok-to-connect-but-expire-on-pub">>, erlang:system_time(second) + ExpireSec, fun(C) ->
+            {ok, _} = emqtt:connect(C),
+            receive
+                {'DOWN', _Ref, process, C, Reason} ->
+                    ?assertMatch({shutdown, {disconnected, ?RC_NOT_AUTHORIZED, _}}, Reason)
+            after round(ExpireMSec * 1.5) ->
+                error(timeout)
+            end
+        end},
+        {<<"past">>, erlang:system_time(second) - 1, fun(C) ->
+            ?assertMatch({error, {not_authorized, _}}, emqtt:connect(C)),
+            receive
+                {'DOWN', _Ref, process, C, Reason} ->
+                    ?assertMatch({shutdown, not_authorized}, Reason)
+            end
+        end},
+        {<<"invalid">>, erlang:system_time(millisecond), fun(C) ->
+            ?assertMatch({error, {not_authorized, _}}, emqtt:connect(C)),
+            receive
+                {'DOWN', _Ref, process, C, Reason} ->
+                    ?assertMatch({shutdown, not_authorized}, Reason)
+            end
+        end}
+    ],
+    ok = emqx_utils_http_test_server:set_handler(
+        fun(Req0, State) ->
+            QS = cowboy_req:parse_qs(Req0),
+            {_, Username} = lists:keyfind(<<"username">>, 1, QS),
+            {_, ExpireTime, _} = lists:keyfind(Username, 1, Tests),
+            Req = cowboy_req:reply(
+                200,
+                #{<<"content-type">> => <<"application/json">>},
+                ?SERVER_RESPONSE_WITH_ACL_JSON(ACL, ExpireTime),
+                Req0
+            ),
+            {ok, Req, State}
+        end
+    ),
+    lists:foreach(fun test_auth_expire/1, Tests).
+
+test_auth_expire({Username, _ExpireTime, TestFn}) ->
+    {ok, C} = emqtt:start_link(
+        [
+            {clean_start, true},
+            {proto_ver, v5},
+            {clientid, <<"clientid">>},
+            {username, Username},
+            {password, <<"password">>}
+        ]
+    ),
+    _ = monitor(process, C),
+    unlink(C),
+    try
+        TestFn(C)
+    after
+        catch emqtt:stop(C)
+    end.
+
+test_acl({allow, Topic}, C) ->
+    ?assertMatch(
+        {ok, #{}, [0]},
+        emqtt:subscribe(C, Topic)
+    );
+test_acl({deny, Topic}, C) ->
+    ?assertMatch(
+        {ok, #{}, [?RC_NOT_AUTHORIZED]},
+        emqtt:subscribe(C, Topic)
+    ).
+
+t_precondition_check_listener_id(CTConfig) ->
+    AuthConfig = raw_http_auth_config(CTConfig),
+    AuthConfig1 = AuthConfig#{
+        <<"precondition">> => <<"str_eq(listener, 'tcp:default')">>
+    },
+
+    {ok, _} = emqx:update_config(
+        ?PATH,
+        {create_authenticator, ?GLOBAL, AuthConfig1}
+    ),
+
+    ok = emqx_utils_http_test_server:set_handler(
+        fun(Req0, State) ->
+            Req = cowboy_req:reply(
+                200,
+                #{<<"content-type">> => <<"application/json">>},
+                ?SERVER_RESPONSE_JSON(allow),
+                Req0
+            ),
+            {ok, Req, State}
+        end
+    ),
+
+    % Test TCP listener - should succeed
+    {ok, C1} = emqtt:start_link([
+        {host, "127.0.0.1"},
+        {port, 1883},
+        {clean_start, true},
+        {clientid, ?CLIENTID(1)},
+        {username, <<"plain">>},
+        {password, <<"plain">>}
+    ]),
+    {ok, _} = emqtt:connect(C1),
+    ok = emqtt:disconnect(C1),
+
+    % Test SSL listener - should fail
+    {ok, C2} = emqtt:start_link([
+        {host, "127.0.0.1"},
+        {port, 8883},
+        {clean_start, true},
+        {clientid, ?CLIENTID(2)},
+        {username, <<"plain">>},
+        {password, <<"plain">>},
+        {ssl, true},
+        {ssl_opts, [{verify, verify_none}]}
+    ]),
+    unlink(C2),
+    _ = monitor(process, C2),
+    ?assertMatch({error, {unauthorized_client, _}}, emqtt:connect(C2)),
+    receive
+        {'DOWN', _Ref, process, C2, Reason} ->
+            ?assertMatch({shutdown, unauthorized_client}, Reason)
+    after 1000 ->
+        error(timeout)
+    end,
+    ok.
+
+t_precondition_check_cert_cn(init, TCConfig) ->
+    %% Change the listener SSL configuration: require peer certificate.
+    {ok, _} = emqx:update_config(
+        [listeners, ssl, default],
+        {update, #{
+            <<"ssl_options">> => maps:merge(
+                #{
+                    <<"verify">> => verify_peer,
+                    <<"fail_if_no_peer_cert">> => true
+                },
+                emqx_common_test_helpers:listener_test_certs()
+            )
+        }}
+    ),
+    TCConfig;
+t_precondition_check_cert_cn('end', _TCConfig) ->
+    %% Restore the listener SSL configuration to default.
+    {ok, _} = emqx:update_config(
+        [listeners, ssl, default],
+        {update, #{
+            <<"ssl_options">> => #{
+                <<"verify">> => verify_none,
+                <<"fail_if_no_peer_cert">> => false
+            }
+        }}
+    ),
+    ok.
+
+t_precondition_check_cert_cn(TCConfig) ->
+    AuthConfig = raw_http_auth_config(TCConfig),
+    %% if cert_common_name is empty, the client will be denied
+    AuthConfig1 = AuthConfig#{
+        <<"precondition">> => <<"not(is_empty_val(cert_common_name))">>
+    },
+
+    {ok, _} = emqx:update_config(
+        ?PATH,
+        {create_authenticator, ?GLOBAL, AuthConfig1}
+    ),
+
+    ok = emqx_utils_http_test_server:set_handler(
+        fun(Req0, State) ->
+            Req = cowboy_req:reply(
+                200,
+                #{<<"content-type">> => <<"application/json">>},
+                ?SERVER_RESPONSE_JSON(allow),
+                Req0
+            ),
+            {ok, Req, State}
+        end
+    ),
+
+    % Test TCP listener - no cert_common_name, should be denied
+    {ok, C1} = emqtt:start_link([
+        {host, "127.0.0.1"},
+        {port, 1883},
+        {clean_start, true},
+        {clientid, ?CLIENTID(1)},
+        {username, <<"plain">>},
+        {password, <<"plain">>}
+    ]),
+    unlink(C1),
+    _ = monitor(process, C1),
+    ?assertMatch({error, {unauthorized_client, _}}, emqtt:connect(C1)),
+    receive
+        {'DOWN', _Ref, process, C1, Reason} ->
+            ?assertMatch({shutdown, unauthorized_client}, Reason)
+    after 1000 ->
+        error(timeout)
+    end,
+
+    % Test SSL listener - with cert_common_name, should be allowed
+    {ok, C2} = emqtt:start_link([
+        {host, "127.0.0.1"},
+        {port, 8883},
+        {clean_start, true},
+        {clientid, ?CLIENTID(2)},
+        {username, <<"plain">>},
+        {password, <<"plain">>},
+        {ssl, true},
+        {ssl_opts, [
+            {verify, verify_none},
+            {certfile, cert_path("client-cert.pem")},
+            {keyfile, cert_path("client-key.pem")}
+        ]}
+    ]),
+    {ok, _} = emqtt:connect(C2),
+    ok = emqtt:disconnect(C2).
+
+-doc """
+Checks that, if an authentication backend returns the `clientid_override` attribute, it's
+used to override.
+""".
+t_clientid_override(TCConfig) ->
+    OverriddenClientId = <<"overridden_clientid">>,
+    MkConfigFn = fun() -> raw_http_auth_config(TCConfig) end,
+    PostConfigFn = fun() ->
+        ok = emqx_utils_http_test_server:set_handler(
+            fun(Req0, State) ->
+                Req = cowboy_req:reply(
+                    200,
+                    #{<<"content-type">> => <<"application/json">>},
+                    emqx_utils_json:encode(#{
+                        result => allow,
+                        clientid_override => <<"overridden_clientid">>
+                    }),
+                    Req0
+                ),
+                {ok, Req, State}
+            end
+        )
+    end,
+    Opts = #{
+        mk_config_fn => MkConfigFn,
+        post_config_fn => PostConfigFn,
+        overridden_clientid => OverriddenClientId
+    },
+    emqx_authn_test_lib:t_clientid_override(TCConfig, Opts),
+    ok.
+
+-doc """
+Checks that, if an authentication backend returns the `zone_override` attribute, it's
+used to override the listener's zone.
+""".
+t_zone_override() ->
+    [{matrix, true}].
+t_zone_override(matrix) ->
+    [[tcp], [socket], [ws], [quic]];
+t_zone_override(TCConfig) ->
+    GroupPath = emqx_common_test_helpers:group_path(TCConfig, [tcp]),
+    maybe
+        [socket | _] ?= GroupPath,
+        Listener0 = emqx_config:get_raw([listeners, tcp, default]),
+        on_exit(fun() ->
+            {ok, _} = emqx:update_config([listeners, tcp, default], {update, Listener0})
+        end),
+        {ok, _} = emqx:update_config(
+            [listeners, tcp, default],
+            {update, Listener0#{<<"tcp_backend">> => <<"socket">>}}
+        ),
+        ok
+    end,
+    Opts0 =
+        case GroupPath of
+            [ws] ->
+                #{
+                    conn_fn => fun emqtt:ws_connect/1,
+                    client_opts => #{
+                        proto_ver => v5,
+                        port => 8083,
+                        ws_transport_options => [
+                            {protocols, [http]},
+                            {transport, tcp}
+                        ]
+                    }
+                };
+            [quic] ->
+                CertsPath = emqx_common_test_helpers:ensure_test_certs(),
+                QuicLConfig = #{
+                    <<"bind">> => <<"127.0.0.1:14567">>,
+                    <<"ssl_options">> => #{
+                        <<"keyfile">> => filename:join([CertsPath, "key.pem"]),
+                        <<"certfile">> => filename:join([CertsPath, "cert.pem"]),
+                        <<"cacertfile">> => filename:join([CertsPath, "cert.pem"])
+                    }
+                },
+                {ok, _} = emqx:update_config(
+                    [listeners, quic, default], {create, QuicLConfig}
+                ),
+                on_exit(fun() -> emqx:remove_config([listeners, quic, default]) end),
+                #{
+                    conn_fn => fun emqtt:quic_connect/1,
+                    client_opts => #{
+                        proto_ver => v5,
+                        hosts => [{"127.0.0.1", 14567}],
+                        ssl => true,
+                        ssl_opts => [
+                            {keyfile, filename:join([CertsPath, "key.pem"])},
+                            {certfile, filename:join([CertsPath, "cert.pem"])},
+                            {cacertfile, filename:join([CertsPath, "cacert.pem"])}
+                        ]
+                    }
+                };
+            _ ->
+                #{}
+        end,
+    OverriddenZone = new_zone,
+    MkConfigFn = fun() -> raw_http_auth_config(TCConfig) end,
+    PostConfigFn = fun() ->
+        ok = emqx_utils_http_test_server:set_handler(
+            fun(Req0, State) ->
+                Req = cowboy_req:reply(
+                    200,
+                    #{<<"content-type">> => <<"application/json">>},
+                    emqx_utils_json:encode(#{
+                        result => allow,
+                        zone_override => atom_to_binary(OverriddenZone)
+                    }),
+                    Req0
+                ),
+                {ok, Req, State}
+            end
+        )
+    end,
+    Opts = Opts0#{
+        mk_config_fn => MkConfigFn,
+        post_config_fn => PostConfigFn,
+        overridden_zone => OverriddenZone
+    },
+    emqx_authn_test_lib:t_zone_override(TCConfig, Opts),
+    ok.
+
+%%------------------------------------------------------------------------------
+%% Helpers
+%%------------------------------------------------------------------------------
+
+cert_path(FileName) ->
+    emqx_common_test_helpers:test_cert(FileName).
+
+%%------------------------------------------------------------------------------
+%% Templated host (one-off request) tests
+%%------------------------------------------------------------------------------
+
+-doc """
+A URL with a templated host renders the host from client attributes and sends a
+one-off request to the rendered (allowed) host; path/query/header templates
+keep working on this code path.
+""".
+t_templated_host_authenticate(TCConfig) ->
+    ok = emqx_utils_http_test_server:set_handler(
+        fun(Req0, State) ->
+            #{
+                username := <<"plain">>,
+                password := <<"plain">>
+            } = cowboy_req:match_qs([username, password], Req0),
+            ?assertEqual(<<"localhost">>, maps:get(<<"x-tenant">>, cowboy_req:headers(Req0))),
+            Req = cowboy_req:reply(
+                200,
+                #{<<"content-type">> => <<"application/json">>},
+                ?SERVER_RESPONSE_JSON(allow),
+                Req0
+            ),
+            {ok, Req, State}
+        end
+    ),
+    AuthConfig = raw_templated_host_auth_config(TCConfig),
+    {ok, _} = emqx:update_config(?PATH, {create_authenticator, ?GLOBAL, AuthConfig}),
+    ?assertMatch(
+        {ok, #{is_superuser := false}},
+        emqx_access_control:authenticate(templated_host_credentials())
+    ).
+
+-doc """
+The one-off request path serializes POST bodies the same way the pooled path
+does.
+""".
+t_templated_host_authenticate_post(TCConfig) ->
+    ok = emqx_utils_http_test_server:set_handler(
+        fun(Req0, State) ->
+            {ok, RawBody, Req1} = cowboy_req:read_body(Req0),
+            #{
+                <<"username">> := <<"plain">>,
+                <<"password">> := <<"plain">>
+            } = emqx_utils_json:decode(RawBody),
+            Req = cowboy_req:reply(
+                200,
+                #{<<"content-type">> => <<"application/json">>},
+                ?SERVER_RESPONSE_JSON(allow),
+                Req1
+            ),
+            {ok, Req, State}
+        end
+    ),
+    AuthConfig = (raw_templated_host_auth_config(TCConfig))#{
+        <<"method">> => <<"post">>,
+        <<"headers">> => #{<<"content-type">> => <<"application/json">>}
+    },
+    {ok, _} = emqx:update_config(?PATH, {create_authenticator, ?GLOBAL, AuthConfig}),
+    ?assertMatch(
+        {ok, #{is_superuser := false}},
+        emqx_access_control:authenticate(templated_host_credentials())
+    ).
+
+-doc """
+When the rendered host does not match any 'allowed_hosts' entry, authentication
+fails closed and no request reaches the server.
+""".
+t_templated_host_not_allowed(TCConfig) ->
+    ok = emqx_utils_http_test_server:set_handler(allow_handler()),
+    AuthConfig = (raw_templated_host_auth_config(TCConfig))#{
+        <<"allowed_hosts">> => [<<"other.example.com">>, <<"*.example.com">>]
+    },
+    {ok, _} = emqx:update_config(?PATH, {create_authenticator, ?GLOBAL, AuthConfig}),
+    %% The server would allow: an error result proves it was never contacted.
+    ?assertMatch(
+        {error, _},
+        emqx_access_control:authenticate(templated_host_credentials())
+    ).
+
+-doc """
+When a host template placeholder has no value, authentication fails closed and
+no request is made.
+""".
+t_templated_host_missing_var(TCConfig) ->
+    ok = emqx_utils_http_test_server:set_handler(allow_handler()),
+    AuthConfig = raw_templated_host_auth_config(TCConfig),
+    {ok, _} = emqx:update_config(?PATH, {create_authenticator, ?GLOBAL, AuthConfig}),
+    Credentials = maps:merge(?CREDENTIALS, #{client_attrs => #{}}),
+    ?assertMatch(
+        {error, _},
+        emqx_access_control:authenticate(Credentials)
+    ).
+
+-doc """
+A header template referencing a hyphenated client attribute key renders the
+attribute value into the request.
+""".
+t_hyphenated_client_attr(TCConfig) ->
+    ok = emqx_utils_http_test_server:set_handler(
+        fun(Req0, State) ->
+            #{
+                username := <<"plain">>,
+                password := <<"plain">>
+            } = cowboy_req:match_qs([username, password], Req0),
+            ?assertEqual(<<"tok-1">>, maps:get(<<"x-user-token">>, cowboy_req:headers(Req0))),
+            Req = cowboy_req:reply(
+                200,
+                #{<<"content-type">> => <<"application/json">>},
+                ?SERVER_RESPONSE_JSON(allow),
+                Req0
+            ),
+            {ok, Req, State}
+        end
+    ),
+    AuthConfig = (raw_http_auth_config(TCConfig))#{
+        <<"headers">> => #{<<"X-User-Token">> => <<"${client_attrs.user-token}">>}
+    },
+    {ok, _} = emqx:update_config(?PATH, {create_authenticator, ?GLOBAL, AuthConfig}),
+    Credentials = maps:merge(?CREDENTIALS, #{
+        client_attrs => #{<<"user-token">> => <<"tok-1">>}
+    }),
+    ?assertMatch(
+        {ok, #{is_superuser := false}},
+        emqx_access_control:authenticate(Credentials)
+    ).
+
+-doc """
+A templated host URL cannot be configured without a non-empty 'allowed_hosts'
+list.
+""".
+t_templated_host_requires_allowed_hosts(TCConfig) ->
+    AuthConfig0 = raw_templated_host_auth_config(TCConfig),
+    lists:foreach(
+        fun(AuthConfig) ->
+            ?assertMatch(
+                {error, _},
+                emqx:update_config(?PATH, {create_authenticator, ?GLOBAL, AuthConfig})
+            ),
+            ?assertEqual(
+                {error, {not_found, {chain, ?GLOBAL}}},
+                emqx_authn_chains:list_authenticators(?GLOBAL)
+            )
+        end,
+        [
+            maps:remove(<<"allowed_hosts">>, AuthConfig0),
+            %% templated host requires explicit hostname_resolution = dynamic
+            maps:remove(<<"hostname_resolution">>, AuthConfig0),
+            AuthConfig0#{<<"allowed_hosts">> => []},
+            AuthConfig0#{<<"allowed_hosts">> => [<<"bad host">>]},
+            AuthConfig0#{<<"oauth2">> => oauth2_config(<<"http://127.0.0.1:1/token">>)}
+        ]
+    ).
+
+-doc """
+Updating an authenticator between a static and a templated host URL correctly
+tears down and recreates the connector resource in both directions.
+""".
+t_templated_host_update_transitions(TCConfig) ->
+    ok = emqx_utils_http_test_server:set_handler(allow_handler()),
+    StaticConfig = raw_http_auth_config(TCConfig),
+    TemplatedConfig = raw_templated_host_auth_config(TCConfig),
+    ID = <<"password_based:http">>,
+    Credentials = templated_host_credentials(),
+
+    {ok, _} = emqx:update_config(?PATH, {create_authenticator, ?GLOBAL, StaticConfig}),
+    ?assertMatch({ok, _}, emqx_access_control:authenticate(Credentials)),
+    ?assertMatch([_], emqx_resource:list_group_instances(?AUTHN_RESOURCE_GROUP)),
+
+    {ok, _} = emqx:update_config(?PATH, {update_authenticator, ?GLOBAL, ID, TemplatedConfig}),
+    ?assertMatch({ok, _}, emqx_access_control:authenticate(Credentials)),
+    ?assertEqual([], emqx_resource:list_group_instances(?AUTHN_RESOURCE_GROUP)),
+
+    {ok, _} = emqx:update_config(?PATH, {update_authenticator, ?GLOBAL, ID, StaticConfig}),
+    ?assertMatch({ok, _}, emqx_access_control:authenticate(Credentials)),
+    ?assertMatch([_], emqx_resource:list_group_instances(?AUTHN_RESOURCE_GROUP)).
+
+-doc """
+'hostname_resolution = dynamic' forces per-request connections even when the
+URL host is a literal hostname: no connector resource is created,
+authentication works through the shared hackney pool sized by 'pool_size',
+and 'allowed_hosts' is not required. 'pool_size = 0' disables connection
+reuse and still works.
+""".
+t_dynamic_resolution_static_host(TCConfig) ->
+    ok = emqx_utils_http_test_server:set_handler(
+        fun(Req0, State) ->
+            #{
+                username := <<"plain">>,
+                password := <<"plain">>
+            } = cowboy_req:match_qs([username, password], Req0),
+            Req = cowboy_req:reply(
+                200,
+                #{<<"content-type">> => <<"application/json">>},
+                ?SERVER_RESPONSE_JSON(allow),
+                Req0
+            ),
+            {ok, Req, State}
+        end
+    ),
+    AuthConfig = (raw_http_auth_config(TCConfig))#{
+        <<"hostname_resolution">> => <<"dynamic">>,
+        <<"pool_size">> => 3
+    },
+    {ok, _} = emqx:update_config(?PATH, {create_authenticator, ?GLOBAL, AuthConfig}),
+    ?assertEqual([], emqx_resource:list_group_instances(?AUTHN_RESOURCE_GROUP)),
+    ?assertEqual(3, hackney_pool:max_connections(authn)),
+    ?assertMatch(
+        {ok, #{is_superuser := false}},
+        emqx_access_control:authenticate(?CREDENTIALS)
+    ),
+    %% pool_size = 0: no connection reuse, requests still work
+    {ok, _} = emqx:update_config(
+        ?PATH,
+        {update_authenticator, ?GLOBAL, <<"password_based:http">>, AuthConfig#{
+            <<"pool_size">> => 0
+        }}
+    ),
+    ?assertMatch(
+        {ok, #{is_superuser := false}},
+        emqx_access_control:authenticate(?CREDENTIALS)
+    ).
+
+-doc """
+With 'hostname_resolution = dynamic', authentication accepts a JSON response
+whether the server sends the header name as 'content-type' or 'Content-Type'.
+""".
+t_dynamic_resolution_content_type_name_case(TCConfig) ->
+    AuthConfig = (raw_http_auth_config(TCConfig))#{
+        <<"hostname_resolution">> => <<"dynamic">>
+    },
+    {ok, _} = emqx:update_config(?PATH, {create_authenticator, ?GLOBAL, AuthConfig}),
+    lists:foreach(
+        fun(HeaderName) ->
+            ok = emqx_utils_http_test_server:set_handler(
+                fun(Req0, State) ->
+                    Req = cowboy_req:reply(
+                        200,
+                        #{HeaderName => <<"application/json; charset=utf-8">>},
+                        ?SERVER_RESPONSE_JSON(allow),
+                        Req0
+                    ),
+                    {ok, Req, State}
+                end
+            ),
+            ?assertMatch(
+                {ok, #{is_superuser := false}},
+                emqx_access_control:authenticate(?CREDENTIALS),
+                HeaderName
+            )
+        end,
+        [<<"content-type">>, <<"Content-Type">>]
+    ).
+
+allow_handler() ->
+    fun(Req0, State) ->
+        Req = cowboy_req:reply(
+            200,
+            #{<<"content-type">> => <<"application/json">>},
+            ?SERVER_RESPONSE_JSON(allow),
+            Req0
+        ),
+        {ok, Req, State}
+    end.
+
+templated_host_credentials() ->
+    maps:merge(?CREDENTIALS, #{client_attrs => #{<<"group">> => <<"localhost">>}}).
+
+raw_templated_host_auth_config(TCConfig) ->
+    (raw_http_auth_config(TCConfig))#{
+        <<"url">> =>
+            <<"http://${client_attrs.group}:", (http_port_bin(TCConfig))/binary, "/auth">>,
+        <<"hostname_resolution">> => <<"dynamic">>,
+        <<"allowed_hosts">> => [<<"localhost">>],
+        <<"headers">> => #{<<"X-Tenant">> => <<"${client_attrs.group}">>}
+    }.
+
+raw_http_auth_config(TCConfig) ->
+    #{
+        <<"mechanism">> => <<"password_based">>,
+        <<"enable">> => <<"true">>,
+
+        <<"backend">> => <<"http">>,
+        <<"method">> => <<"get">>,
+        <<"max_inactive">> => <<"10s">>,
+        <<"url">> => <<"http://127.0.0.1:", (http_port_bin(TCConfig))/binary, "/auth">>,
+        <<"body">> => #{<<"username">> => ?PH_USERNAME, <<"password">> => ?PH_PASSWORD},
+        <<"headers">> => #{<<"X-Test-Header">> => <<"Test Value">>}
+    }.
+
+oauth2_config(TokenEndpoint) ->
+    #{
+        <<"enable">> => true,
+        <<"grant_type">> => <<"client_credentials">>,
+        <<"token_endpoint">> => TokenEndpoint,
+        <<"client_id">> => <<"client-id">>,
+        <<"client_secret">> => <<"client-secret">>
+    }.
+
+set_oauth2_token_handler(Path) ->
+    emqx_utils_http_test_server:set_handler(fun(Req0, State) ->
+        Path = cowboy_req:path(Req0),
+        Req = cowboy_req:reply(
+            200,
+            #{<<"content-type">> => <<"application/json">>},
+            emqx_utils_json:encode(#{
+                access_token => <<"oauth2-token">>,
+                expires_in => 3600,
+                token_type => <<"Bearer">>
+            }),
+            Req0
+        ),
+        {ok, Req, State}
+    end).
+
+inline_ssl_certs() ->
+    #{
+        <<"enable">> => true,
+        <<"verify">> => <<"verify_peer">>,
+        <<"cacertfile">> => pem("cacert.pem"),
+        <<"certfile">> => pem("client-cert.pem"),
+        <<"keyfile">> => pem("client-key.pem")
+    }.
+
+pem(Name) ->
+    {ok, Pem} = file:read_file(emqx_common_test_helpers:test_cert(Name)),
+    Pem.
+
+assert_ssl_certs_are_saved(SSL, SavedSSL) ->
+    lists:foreach(
+        fun(Key) ->
+            SavedPath = maps:get(Key, SavedSSL),
+            ?assertNotEqual(maps:get(Key, SSL), SavedPath),
+            ?assert(filelib:is_regular(SavedPath))
+        end,
+        [<<"cacertfile">>, <<"certfile">>, <<"keyfile">>]
+    ).
+
+samples() ->
+    [
+        %% simple get request
+        #{
+            handler => fun(Req0, State) ->
+                #{
+                    username := <<"plain">>,
+                    password := <<"plain">>
+                } = cowboy_req:match_qs([username, password], Req0),
+
+                Req = cowboy_req:reply(
+                    200,
+                    #{<<"content-type">> => <<"application/json">>},
+                    emqx_utils_json:encode(#{result => allow, is_superuser => false}),
+                    Req0
+                ),
+                {ok, Req, State}
+            end,
+            config_params => #{},
+            result => {ok, #{is_superuser => false, client_attrs => #{}}}
+        },
+
+        %% get request with json body response
+        #{
+            handler => fun(Req0, State) ->
+                Req = cowboy_req:reply(
+                    200,
+                    #{<<"content-type">> => <<"application/json">>},
+                    emqx_utils_json:encode(#{
+                        result => allow,
+                        is_superuser => true,
+                        client_attrs => #{
+                            fid => <<"n11">>,
+                            <<"#_bad_key">> => <<"v">>
+                        }
+                    }),
+                    Req0
+                ),
+                {ok, Req, State}
+            end,
+            config_params => #{},
+            result => {ok, #{is_superuser => true, client_attrs => #{<<"fid">> => <<"n11">>}}}
+        },
+
+        %% get request with non-utf8 password
+        #{
+            handler => fun(Req0, State) ->
+                #{
+                    password := <<255, 255, 255>>
+                } = cowboy_req:match_qs([password], Req0),
+                Req = cowboy_req:reply(
+                    200,
+                    #{<<"content-type">> => <<"application/json">>},
+                    emqx_utils_json:encode(#{
+                        result => allow,
+                        is_superuser => true,
+                        client_attrs => #{}
+                    }),
+                    Req0
+                ),
+                {ok, Req, State}
+            end,
+            config_params => #{},
+            credentials => #{
+                password => <<255, 255, 255>>
+            },
+            result => {ok, #{is_superuser => true, client_attrs => #{}}}
+        },
+
+        %% get request with url-form-encoded body response
+        #{
+            handler => fun(Req0, State) ->
+                Req = cowboy_req:reply(
+                    200,
+                    #{
+                        <<"content-type">> =>
+                            <<"application/x-www-form-urlencoded">>
+                    },
+                    <<"is_superuser=true&result=allow">>,
+                    Req0
+                ),
+                {ok, Req, State}
+            end,
+            config_params => #{},
+            result => {ok, #{is_superuser => true, client_attrs => #{}}}
+        },
+
+        %% get request with response of unknown encoding
+        #{
+            handler => fun(Req0, State) ->
+                Req = cowboy_req:reply(
+                    200,
+                    #{
+                        <<"content-type">> =>
+                            <<"test/plain">>
+                    },
+                    <<"is_superuser=true">>,
+                    Req0
+                ),
+                {ok, Req, State}
+            end,
+            config_params => #{},
+            %% only one chain, ignore by authn http and deny by default
+            result => {error, not_authorized}
+        },
+
+        %% simple post request, application/json
+        #{
+            handler => fun(Req0, State) ->
+                {ok, RawBody, Req1} = cowboy_req:read_body(Req0),
+                #{
+                    <<"username">> := <<"plain">>,
+                    <<"password">> := <<"plain">>
+                } = emqx_utils_json:decode(RawBody),
+                Req = cowboy_req:reply(
+                    200,
+                    #{<<"content-type">> => <<"application/json">>},
+                    emqx_utils_json:encode(#{result => allow, is_superuser => false}),
+                    Req1
+                ),
+                {ok, Req, State}
+            end,
+            config_params => #{
+                <<"method">> => <<"post">>,
+                <<"headers">> => #{<<"content-type">> => <<"application/json">>}
+            },
+            result => {ok, #{is_superuser => false, client_attrs => #{}}}
+        },
+
+        %% post request, no content-type header
+        #{
+            handler => fun(Req0, State) ->
+                {ok, RawBody, Req1} = cowboy_req:read_body(Req0),
+                #{
+                    <<"username">> := <<"plain">>,
+                    <<"password">> := <<"plain">>
+                } = emqx_utils_json:decode(RawBody),
+                <<"application/json">> = cowboy_req:header(<<"content-type">>, Req0),
+                Req = cowboy_req:reply(
+                    200,
+                    #{<<"content-type">> => <<"application/json">>},
+                    emqx_utils_json:encode(#{result => allow, is_superuser => false}),
+                    Req1
+                ),
+                {ok, Req, State}
+            end,
+            config_params => #{
+                <<"method">> => <<"post">>,
+                <<"headers">> => #{}
+            },
+            result => {ok, #{is_superuser => false, client_attrs => #{}}}
+        },
+
+        %% simple post request, application/x-www-form-urlencoded
+        #{
+            handler => fun(Req0, State) ->
+                {ok, PostVars, Req1} = cowboy_req:read_urlencoded_body(Req0),
+                #{
+                    <<"username">> := <<"plain">>,
+                    <<"password">> := <<"plain">>
+                } = maps:from_list(PostVars),
+                Req = cowboy_req:reply(
+                    200,
+                    #{<<"content-type">> => <<"application/json">>},
+                    emqx_utils_json:encode(#{result => allow, is_superuser => false}),
+                    Req1
+                ),
+                {ok, Req, State}
+            end,
+            config_params => #{
+                <<"method">> => <<"post">>,
+                <<"headers">> => #{
+                    <<"content-type">> =>
+                        <<"application/x-www-form-urlencoded">>
+                }
+            },
+            result => {ok, #{is_superuser => false, client_attrs => #{}}}
+        },
+
+        %% simple post request for placeholders, application/json
+        #{
+            handler => fun(Req0, State) ->
+                {ok, RawBody, Req1} = cowboy_req:read_body(Req0),
+                #{
+                    <<"username">> := <<"plain">>,
+                    <<"password">> := <<"plain">>,
+                    <<"clientid">> := <<"clienta">>,
+                    <<"peerhost">> := <<"127.0.0.1">>,
+                    <<"peerport">> := <<"12345">>,
+                    <<"peername">> := <<"127.0.0.1:12345">>,
+                    <<"cert_subject">> := <<"cert_subject_data">>,
+                    <<"cert_common_name">> := <<"cert_common_name_data">>,
+                    <<"cert_pem">> := CertPem,
+                    <<"the_group">> := <<"g1">>
+                } = emqx_utils_json:decode(RawBody),
+                <<"g1">> = cowboy_req:header(<<"the_group">>, Req0),
+                <<"fake_raw_cert_to_be_base64_encoded">> = base64:decode(CertPem),
+                Req = cowboy_req:reply(
+                    200,
+                    #{<<"content-type">> => <<"application/json">>},
+                    emqx_utils_json:encode(#{result => allow, is_superuser => false}),
+                    Req1
+                ),
+                {ok, Req, State}
+            end,
+            config_params => #{
+                <<"method">> => <<"post">>,
+                <<"headers">> => #{
+                    <<"content-type">> => <<"application/json">>,
+                    <<"the_group">> => <<"${client_attrs.group}">>
+                },
+                <<"body">> => #{
+                    <<"clientid">> => ?PH_CLIENTID,
+                    <<"username">> => ?PH_USERNAME,
+                    <<"password">> => ?PH_PASSWORD,
+                    <<"peerhost">> => ?PH_PEERHOST,
+                    <<"peerport">> => ?PH_PEERPORT,
+                    <<"peername">> => ?PH_PEERNAME,
+                    <<"cert_subject">> => ?PH_CERT_SUBJECT,
+                    <<"cert_common_name">> => ?PH_CERT_CN_NAME,
+                    <<"cert_pem">> => ?PH_CERT_PEM,
+                    <<"the_group">> => <<"${client_attrs.group}">>
+                }
+            },
+            result => {ok, #{is_superuser => false, client_attrs => #{}}}
+        },
+
+        %% post request with non-utf8 password, application/json
+        #{
+            handler => fun(Req0, State) ->
+                Req = cowboy_req:reply(
+                    200,
+                    #{<<"content-type">> => <<"application/json">>},
+                    emqx_utils_json:encode(#{result => allow, is_superuser => false}),
+                    Req0
+                ),
+                {ok, Req, State}
+            end,
+            config_params => #{
+                <<"method">> => <<"post">>,
+                <<"headers">> => #{<<"content-type">> => <<"application/json">>},
+                <<"body">> => #{
+                    <<"password">> => ?PH_PASSWORD
+                }
+            },
+            credentials => #{
+                password => <<255, 255, 255>>
+            },
+            %% non-utf8 password cannot be encoded in json
+            result => {error, not_authorized}
+        },
+
+        %% post request with non-utf8 password, form urlencoded
+        #{
+            handler => fun(Req0, State) ->
+                {ok, PostVars, Req1} = cowboy_req:read_urlencoded_body(Req0),
+                #{
+                    <<"password">> := <<255, 255, 255>>
+                } = maps:from_list(PostVars),
+                Req = cowboy_req:reply(
+                    200,
+                    #{<<"content-type">> => <<"application/json">>},
+                    emqx_utils_json:encode(#{result => allow, is_superuser => false}),
+                    Req1
+                ),
+                {ok, Req, State}
+            end,
+            config_params => #{
+                <<"method">> => <<"post">>,
+                <<"headers">> => #{
+                    <<"content-type">> =>
+                        <<"application/x-www-form-urlencoded">>
+                },
+                <<"body">> => #{
+                    <<"password">> => ?PH_PASSWORD
+                }
+            },
+            credentials => #{
+                password => <<255, 255, 255>>
+            },
+            result => {ok, #{is_superuser => false, client_attrs => #{}}}
+        },
+
+        %% custom headers
+        #{
+            handler => fun(Req0, State) ->
+                <<"Test Value">> = cowboy_req:header(<<"x-test-header">>, Req0),
+                Req = cowboy_req:reply(200, Req0),
+                {ok, Req, State}
+            end,
+            config_params => #{},
+            %% only one chain, ignore by authn http and deny by default
+            result => {error, not_authorized}
+        },
+
+        %% 204 code
+        #{
+            handler => fun(Req0, State) ->
+                Req = cowboy_req:reply(204, Req0),
+                {ok, Req, State}
+            end,
+            config_params => #{},
+            result => {ok, #{is_superuser => false}}
+        },
+
+        %% 400 code
+        #{
+            handler => fun(Req0, State) ->
+                Req = cowboy_req:reply(400, Req0),
+                {ok, Req, State}
+            end,
+            config_params => #{},
+            %% only one chain, ignore by authn http and deny by default
+            result => {error, not_authorized}
+        },
+
+        %% 500 code
+        #{
+            handler => fun(Req0, State) ->
+                Req = cowboy_req:reply(500, Req0),
+                {ok, Req, State}
+            end,
+            config_params => #{},
+            %% only one chain, ignore by authn http and deny by default
+            result => {error, not_authorized}
+        },
+
+        %% Handling error
+        #{
+            handler => fun(Req0, State) ->
+                error(woops),
+                {ok, Req0, State}
+            end,
+            config_params => #{},
+            %% only one chain, ignore by authn http and deny by default
+            result => {error, not_authorized}
+        }
+    ].
+
+unexpected_status_handler() ->
+    fun(Req0, State) ->
+        Req = cowboy_req:reply(500, Req0),
+        {ok, Req, State}
+    end.
+
+invalid_json_handler() ->
+    fun(Req0, State) ->
+        Req = cowboy_req:reply(
+            200,
+            #{<<"content-type">> => <<"application/json">>},
+            <<"not-json">>,
+            Req0
+        ),
+        {ok, Req, State}
+    end.
+
+invalid_result_handler(Result) ->
+    json_response_handler(#{result => Result}).
+
+json_response_handler(Response) ->
+    fun(Req0, State) ->
+        Req = cowboy_req:reply(
+            200,
+            #{<<"content-type">> => <<"application/json">>},
+            emqx_utils_json:encode(Response),
+            Req0
+        ),
+        {ok, Req, State}
+    end.
+
+authenticate_with_unexpected_status(TCConfig) ->
+    authenticate_with_http_handler(TCConfig, unexpected_status_handler()).
+
+authenticate_with_http_handler(TCConfig, Handler) ->
+    AuthConfig = raw_http_auth_config(TCConfig),
+    {ok, _} = emqx:update_config(?PATH, {create_authenticator, ?GLOBAL, AuthConfig}),
+    ok = emqx_utils_http_test_server:set_handler(Handler),
+    ok = emqx_authn_test_lib:add_permissive_builtin_authenticator(
+        ?PATH,
+        ?GLOBAL,
+        maps:get(username, ?CREDENTIALS),
+        maps:get(password, ?CREDENTIALS)
+    ),
+    Result = emqx_access_control:authenticate(?CREDENTIALS),
+    emqx_authn_test_lib:delete_authenticators(
+        [authentication],
+        ?GLOBAL
+    ),
+    Result.
+
+profile_cases() ->
+    [t_backend_failure, t_malformed_response, t_destroy].
+
+expected_authn_result(TCConfig) ->
+    case ?config(security_profile, TCConfig) of
+        legacy -> {ok, #{is_superuser => false}};
+        hardened -> {error, not_authorized}
+    end.
+
+uri_encode(T) ->
+    emqx_http_lib:uri_encode(to_list(T)).
+
+to_list(A) when is_atom(A) ->
+    atom_to_list(A);
+to_list(N) when is_integer(N) ->
+    integer_to_list(N);
+to_list(B) when is_binary(B) ->
+    binary_to_list(B);
+to_list(L) when is_list(L) ->
+    L.
+
+acl_rules() ->
+    [
+        #{
+            <<"permission">> => <<"allow">>,
+            <<"action">> => <<"pub">>,
+            <<"topics">> => [
+                <<"http-authn-acl/1">>
+            ]
+        },
+        #{
+            <<"permission">> => <<"allow">>,
+            <<"action">> => <<"sub">>,
+            <<"topics">> =>
+                [
+                    <<"eq http-authn-acl/#">>
+                ]
+        },
+        #{
+            <<"permission">> => <<"deny">>,
+            <<"action">> => <<"all">>,
+            <<"topics">> => [<<"#">>]
+        }
+    ].
+
+http_port_bin(TCConfig) ->
+    integer_to_binary(?config(http_port, TCConfig)).

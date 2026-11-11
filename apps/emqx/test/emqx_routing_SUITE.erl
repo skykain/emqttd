@@ -1,0 +1,584 @@
+%%--------------------------------------------------------------------
+%% Copyright (c) 2017-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
+%%--------------------------------------------------------------------
+
+-module(emqx_routing_SUITE).
+
+-compile(export_all).
+-compile(nowarn_export_all).
+
+-include_lib("eunit/include/eunit.hrl").
+-include_lib("common_test/include/ct.hrl").
+-include_lib("snabbkaffe/include/snabbkaffe.hrl").
+-include_lib("emqx/include/asserts.hrl").
+-include_lib("emqx/include/emqx.hrl").
+-include_lib("emqx/include/emqx_router.hrl").
+
+all() ->
+    [
+        {group, batch_sync_on},
+        {group, batch_sync_replicants},
+        {group, batch_sync_off}
+    ].
+
+groups() ->
+    ClusterTCs = [
+        t_cluster_routing,
+        t_sharded_route_unsubscribe,
+        t_sharded_route_subscriber_down,
+        t_slow_rlog_routing_consistency
+    ],
+    SingleTCs = [t_concurrent_routing_updates],
+    BatchSyncTCs = lists:duplicate(5, t_concurrent_routing_updates_with_errors),
+    [
+        {batch_sync_on, [], [{group, cluster}, {group, single_batch_on}]},
+        {batch_sync_replicants, [], [{group, cluster}, {group, single}]},
+        {batch_sync_off, [], [{group, cluster}, {group, single}]},
+        {cluster, [], ClusterTCs},
+        {single_batch_on, [], SingleTCs ++ BatchSyncTCs},
+        {single, [], SingleTCs}
+    ].
+
+init_per_group(batch_sync_on, Config) ->
+    [{emqx_config, "broker.routing.batch_sync.enable_on = all"} | Config];
+init_per_group(batch_sync_replicants, Config) ->
+    [{emqx_config, "broker.routing.batch_sync.enable_on = replicant"} | Config];
+init_per_group(batch_sync_off, Config) ->
+    [{emqx_config, "broker.routing.batch_sync.enable_on = none"} | Config];
+init_per_group(cluster, Config) ->
+    WorkDir = emqx_cth_suite:work_dir(Config),
+    NodeSpecs = [
+        {emqx_routing_SUITE1, #{apps => [mk_emqx_appspec(1, Config)], role => core}},
+        {emqx_routing_SUITE2, #{apps => [mk_emqx_appspec(2, Config)], role => core}},
+        {emqx_routing_SUITE3, #{apps => [mk_emqx_appspec(3, Config)], role => replicant}}
+    ],
+    Nodes = emqx_cth_cluster:start(NodeSpecs, #{work_dir => WorkDir}),
+    [{cluster, Nodes} | Config];
+init_per_group(GroupName, Config) when
+    GroupName =:= single_batch_on;
+    GroupName =:= single
+->
+    WorkDir = emqx_cth_suite:work_dir(?FUNCTION_NAME, Config),
+    Apps = emqx_cth_suite:start(
+        [
+            {emqx, #{
+                config => mk_config_broker(Config),
+                %% NOTE
+                %% Artificially increasing pool workers contention by forcing small pool size.
+                before_start => fun() ->
+                    % NOTE
+                    % This one is actually defined on `emqx_conf_schema` level, but used
+                    % in `emqx_broker`. Thus we have to resort to this ugly hack.
+                    emqx_config:force_put([node, broker_pool_size], 2),
+                    emqx_app:set_config_loader(?MODULE)
+                end
+            }}
+        ],
+        #{work_dir => WorkDir}
+    ),
+    [{group_apps, Apps} | Config].
+
+end_per_group(cluster, Config) ->
+    emqx_cth_cluster:stop(?config(cluster, Config));
+end_per_group(GroupName, Config) when
+    GroupName =:= single_batch_on;
+    GroupName =:= single
+->
+    emqx_cth_suite:stop(?config(group_apps, Config));
+end_per_group(_, _Config) ->
+    ok.
+
+init_per_testcase(TC, Config) ->
+    emqx_common_test_helpers:init_per_testcase(?MODULE, TC, Config).
+
+end_per_testcase(TC, Config) ->
+    emqx_common_test_helpers:end_per_testcase(?MODULE, TC, Config).
+
+mk_emqx_appspec(N, Config) ->
+    {emqx, #{
+        config => mk_config(N, Config),
+        after_start => fun() ->
+            % NOTE
+            % This one is actually defined on `emqx_conf_schema` level, but used
+            % in `emqx_broker`. Thus we have to resort to this ugly hack.
+            emqx_config:force_put([rpc, mode], async)
+        end
+    }}.
+
+mk_genrpc_appspec() ->
+    {gen_rpc, #{
+        override_env => [{port_discovery, stateless}]
+    }}.
+
+mk_config(N, Config) ->
+    emqx_cth_suite:merge_config(
+        mk_config_broker(Config),
+        mk_config_listeners(N)
+    ).
+
+mk_config_broker(CTConfig) ->
+    string:join(proplists:get_all_values(emqx_config, CTConfig), "\n").
+
+mk_config_listeners(N) ->
+    Port = 1883 + N,
+    #{
+        listeners => #{
+            tcp => #{default => #{bind => "127.0.0.1:" ++ integer_to_list(Port)}},
+            ssl => #{default => #{enable => false}},
+            ws => #{default => #{enable => false}},
+            wss => #{default => #{enable => false}}
+        }
+    }.
+
+%%
+
+t_cluster_routing(Config) ->
+    Cluster = ?config(cluster, Config),
+    Clients = [C1, C2, C3] = lists:sort([start_client(N) || N <- Cluster]),
+    Commands = [
+        {fun publish/3, [C1, <<"a/b/c">>, <<"wontsee">>]},
+        {fun publish/3, [C2, <<"a/b/d">>, <<"wontsee">>]},
+        {fun subscribe/3, [Cluster, C3, <<"a/+/c/#">>]},
+        {fun publish/3, [C1, <<"a/b/c">>, <<"01">>]},
+        {fun publish/3, [C2, <<"a/b/d">>, <<"wontsee">>]},
+        {fun subscribe/3, [Cluster, C1, <<"a/b/c">>]},
+        {fun subscribe/3, [Cluster, C2, <<"a/b/+">>]},
+        {fun publish/3, [C3, <<"a/b/c">>, <<"02">>]},
+        {fun publish/3, [C2, <<"a/b/d">>, <<"03">>]},
+        {fun publish/3, [C2, <<"a/b/c/d">>, <<"04">>]},
+        {fun subscribe/3, [Cluster, C3, <<"a/b/d">>]},
+        {fun publish/3, [C1, <<"a/b/d">>, <<"05">>]},
+        {fun unsubscribe/3, [Cluster, C3, <<"a/+/c/#">>]},
+        {fun publish/3, [C1, <<"a/b/c">>, <<"06">>]},
+        {fun publish/3, [C2, <<"a/b/d">>, <<"07">>]},
+        {fun publish/3, [C2, <<"a/b/c/d">>, <<"08">>]},
+        {fun unsubscribe/3, [Cluster, C2, <<"a/b/+">>]},
+        {fun publish/3, [C1, <<"a/b/c">>, <<"09">>]},
+        {fun publish/3, [C2, <<"a/b/d">>, <<"10">>]},
+        {fun publish/3, [C2, <<"a/b/c/d">>, <<"11">>]},
+        {fun unsubscribe/3, [Cluster, C3, <<"a/b/d">>]},
+        {fun unsubscribe/3, [Cluster, C1, <<"a/b/c">>]},
+        {fun publish/3, [C1, <<"a/b/c">>, <<"wontsee">>]},
+        {fun publish/3, [C2, <<"a/b/d">>, <<"wontsee">>]}
+    ],
+    ok = lists:foreach(fun({F, Args}) -> erlang:apply(F, Args) end, Commands),
+    _ = [emqtt:stop(C) || C <- Clients],
+    Deliveries = ?drainMailbox(),
+    Diff = snabbkaffe_diff:diff_lists(
+        #{
+            compare_fun => fun(
+                {pub, Cli1, #{topic := T1, payload := P1}},
+                {pub, Cli2, #{topic := T2, payload := P2}}
+            ) ->
+                Cli1 =:= Cli2 andalso T1 =:= T2 andalso P1 =:= P2
+            end
+        },
+        [
+            {pub, C1, #{topic => <<"a/b/c">>, payload => <<"02">>}},
+            {pub, C1, #{topic => <<"a/b/c">>, payload => <<"06">>}},
+            {pub, C1, #{topic => <<"a/b/c">>, payload => <<"09">>}},
+            {pub, C2, #{topic => <<"a/b/c">>, payload => <<"02">>}},
+            {pub, C2, #{topic => <<"a/b/d">>, payload => <<"03">>}},
+            {pub, C2, #{topic => <<"a/b/d">>, payload => <<"05">>}},
+            {pub, C2, #{topic => <<"a/b/c">>, payload => <<"06">>}},
+            {pub, C2, #{topic => <<"a/b/d">>, payload => <<"07">>}},
+            {pub, C3, #{topic => <<"a/b/c">>, payload => <<"01">>}},
+            {pub, C3, #{topic => <<"a/b/c">>, payload => <<"02">>}},
+            {pub, C3, #{topic => <<"a/b/c/d">>, payload => <<"04">>}},
+            {pub, C3, #{topic => <<"a/b/d">>, payload => <<"05">>}},
+            {pub, C3, #{topic => <<"a/b/d">>, payload => <<"07">>}},
+            {pub, C3, #{topic => <<"a/b/d">>, payload => <<"10">>}}
+        ],
+        lists:sort(
+            fun({pub, CL, #{payload := PL}}, {pub, CR, #{payload := PR}}) ->
+                {CL, PL} < {CR, PR}
+            end,
+            Deliveries
+        )
+    ),
+    case Diff of
+        [] ->
+            ok;
+        _ ->
+            ct:pal("~s", [snabbkaffe_diff:format(Diff)]),
+            error(no_match)
+    end.
+
+start_client(Node) ->
+    Self = self(),
+    {ok, C} = emqtt:start_link(#{
+        port => get_mqtt_tcp_port(Node),
+        msg_handler => #{
+            publish => fun(Msg) -> Self ! {pub, self(), Msg} end
+        }
+    }),
+    {ok, _Props} = emqtt:connect(C),
+    C.
+
+publish(C, Topic, Payload) ->
+    {ok, #{reason_code := 0}} = emqtt:publish(C, Topic, Payload, 1),
+    %% Sleep to avoid racing with other operations, e.g. unsubscribe:
+    ct:sleep(100).
+
+subscribe(Nodes, C, Topic) ->
+    ct:pal("Subscribe ~p ~s", [C, Topic]),
+    {ok, _Props, [0]} = emqtt:subscribe(C, Topic),
+    emqx_cth_cluster:sync_routes(Nodes, 10_000).
+
+unsubscribe(Nodes, C, Topic) ->
+    ct:pal("Un-subscribe ~p ~s", [C, Topic]),
+    {ok, _Props, undefined} = emqtt:unsubscribe(C, Topic),
+    emqx_cth_cluster:sync_routes(Nodes, 10_000).
+
+-doc "Keep routes and deliver messages to remaining shards after explicit unsubscribe".
+t_sharded_route_unsubscribe(Config) ->
+    test_sharded_route(Config, unsubscribe).
+
+-doc "Keep routes and deliver messages to remaining shards after subscriber processes exit".
+t_sharded_route_subscriber_down(Config) ->
+    test_sharded_route(Config, down).
+
+test_sharded_route(Config, Stop) ->
+    [Core, _Core2, Replicant] = Nodes = ?config(cluster, Config),
+    lists:foreach(
+        fun(#{filter := FilterSuffix, topic := TopicSuffix, order := Order}) ->
+            Prefix = atom_to_binary(Stop),
+            Topic = <<Prefix/binary, "/sharded/", TopicSuffix/binary>>,
+            Filter = <<Prefix/binary, "/sharded/", FilterSuffix/binary>>,
+            %% Fill three shards through the public subscription API.
+            Count = 2 * (emqx_broker_helper:shard_capacity() + 1) + 1,
+            Subscribers = [start_sharded_subscriber(Replicant, Filter) || _ <- lists:seq(1, Count)],
+            Shards = maps:from_list([
+                {I, rpc:call(Replicant, emqx_broker, subscribers, [subscriber_shard(Filter, I)])}
+             || I <- Order
+            ]),
+            ?assert(lists:all(fun(Pids) -> Pids =/= [] end, maps:values(Shards))),
+            ok = emqx_cth_cluster:sync_routes(Nodes),
+            assert_sharded_delivery([Replicant, Core], Topic, Subscribers),
+            %% Remove shards in both orders, including the last subscriber.
+            remove_subscriber_shards(Order, Shards, Stop, Nodes, Filter, Topic)
+        end,
+        [
+            #{filter => <<"ascending/#">>, topic => <<"ascending/1">>, order => [0, 1, 2]},
+            #{filter => <<"descending">>, topic => <<"descending">>, order => [2, 1, 0]}
+        ]
+    ).
+
+start_sharded_subscriber(Node, Filter) ->
+    Parent = self(),
+    Pid = spawn_link(Node, fun() ->
+        ok = emqx_broker:subscribe(Filter),
+        Parent ! {subscribed, self()},
+        sharded_subscriber_loop(Parent, Filter)
+    end),
+    ?assertReceive({subscribed, Pid}, 5000),
+    Pid.
+
+sharded_subscriber_loop(Parent, Filter) ->
+    receive
+        {deliver, Filter, Message} ->
+            Parent ! {delivered, self(), Message},
+            sharded_subscriber_loop(Parent, Filter);
+        unsubscribe ->
+            ok = emqx_broker:unsubscribe(Filter)
+    end.
+
+remove_subscriber_shards([], _Shards, _Stop, _Nodes, _Filter, _Topic) ->
+    ok;
+remove_subscriber_shards([I | Rest], Shards0, Stop, Nodes, Filter, Topic) ->
+    [Core, _Core2, Replicant] = Nodes,
+    {Subscribers, Shards1} = maps:take(I, Shards0),
+    lists:foreach(fun(Pid) -> stop_sharded_subscriber(Pid, Stop) end, Subscribers),
+    ok = rpc:call(Replicant, ?MODULE, wait_subscriber_shard_empty, [Filter, I]),
+    ok = emqx_cth_cluster:sync_routes(Nodes),
+    Remaining = lists:append(maps:values(Shards1)),
+    lists:foreach(
+        fun(Node) ->
+            ?assertEqual(
+                Remaining =/= [],
+                rpc:call(Node, emqx_router, has_route, [Filter, Replicant]),
+                #{node => Node, removed_shard => I}
+            )
+        end,
+        Nodes
+    ),
+    assert_sharded_delivery([Replicant, Core], Topic, Remaining),
+    remove_subscriber_shards(Rest, Shards1, Stop, Nodes, Filter, Topic).
+
+stop_sharded_subscriber(Pid, unsubscribe) ->
+    Ref = monitor(process, Pid),
+    Pid ! unsubscribe,
+    ?assertReceive({'DOWN', Ref, process, Pid, normal}, 5000);
+stop_sharded_subscriber(Pid, down) ->
+    ?assertEqual(shutdown, stop_concurrent_client(Pid)).
+
+subscriber_shard(Filter, 0) ->
+    Filter;
+subscriber_shard(Filter, I) ->
+    {shard, Filter, I}.
+
+wait_subscriber_shard_empty(Filter, I) ->
+    ?retry(10, 500, ?assertEqual([], emqx_broker:subscribers(subscriber_shard(Filter, I)))),
+    %% Wait for shard cleanup and its notification to the route-owning worker.
+    _ = sys:get_state(gproc_pool:pick_worker(broker_pool, {Filter, I})),
+    _ = sys:get_state(gproc_pool:pick_worker(broker_pool, {Filter, 0})),
+    ok.
+
+assert_sharded_delivery(Nodes, Topic, Subscribers) ->
+    lists:foreach(
+        fun(Node) ->
+            Payload = emqx_guid:gen(),
+            Message = emqx_message:make(?MODULE, Topic, Payload),
+            Result = rpc:call(Node, emqx_broker, publish, [Message]),
+            ?assertEqual(Subscribers =/= [], Result =/= []),
+            lists:foreach(
+                fun(Pid) ->
+                    ?assertReceive(
+                        {delivered, Pid, #message{topic = Topic, payload = Payload}}, 5000
+                    )
+                end,
+                Subscribers
+            )
+        end,
+        Nodes
+    ).
+
+%%
+
+-define(SUBSCRIBE_TOPICS, [
+    <<"t/#">>,
+    <<"t/fixed">>,
+    <<"t/1/+">>,
+    <<"t/2/+">>,
+    <<"t/42/+/+">>,
+    <<"client/${i}/+">>,
+    <<"client/${i}/fixed">>,
+    <<"client/${i}/#">>,
+    <<"rand/${r}/+">>,
+    <<"rand/${r}/fixed">>
+]).
+
+t_concurrent_routing_updates(init, Config) ->
+    ok = snabbkaffe:start_trace(),
+    Config;
+t_concurrent_routing_updates('end', _Config) ->
+    ok = snabbkaffe:stop().
+
+t_concurrent_routing_updates(_Config) ->
+    NClients = 400,
+    NRTopics = 250,
+    MCommands = 8,
+    Port = get_mqtt_tcp_port(node()),
+    Clients = [
+        spawn_link(?MODULE, run_concurrent_client, [I, Port, MCommands, NRTopics])
+     || I <- lists:seq(1, NClients)
+    ],
+    ok = lists:foreach(fun ping_concurrent_client/1, Clients),
+    ok = timer:sleep(200),
+    Subscribers = ets:tab2list(?SUBSCRIBER),
+    Topics = maps:keys(maps:from_list(Subscribers)),
+    ?assertEqual(lists:sort(Topics), lists:sort(emqx_router:topics())),
+    ok = lists:foreach(fun stop_concurrent_client/1, Clients),
+    ok = timer:sleep(1000),
+    ct:pal("Trace: ~p", [?of_kind(router_syncer_new_batch, snabbkaffe:collect_trace())]),
+    ?assertEqual([], ets:tab2list(?SUBSCRIBER)),
+    ?assertEqual([], emqx_router:topics()).
+
+t_concurrent_routing_updates_with_errors(init, Config) ->
+    ok = snabbkaffe:start_trace(),
+    ok = meck:new(emqx_router, [passthrough, no_history]),
+    Config;
+t_concurrent_routing_updates_with_errors('end', _Config) ->
+    ok = meck:unload(emqx_router),
+    ok = snabbkaffe:stop().
+
+t_concurrent_routing_updates_with_errors(_Config) ->
+    NClients = 100,
+    NRTopics = 80,
+    MCommands = 6,
+    PSyncError = 0.1,
+    Port = get_mqtt_tcp_port(node()),
+    %% Crash the batch sync operation with some small probability.
+    ok = meck:expect(emqx_router, mria_batch_run, fun(Vsn, Batch) ->
+        case rand:uniform() < PSyncError of
+            false -> meck:passthrough([Vsn, Batch]);
+            true -> error(overload)
+        end
+    end),
+    Clients = [
+        spawn_link(?MODULE, run_concurrent_client, [I, Port, MCommands, NRTopics])
+     || I <- lists:seq(1, NClients)
+    ],
+    ok = lists:foreach(fun ping_concurrent_client/1, Clients),
+    0 = ?retry(
+        _Interval = 500,
+        _NTimes = 10,
+        0 = lists:sum([S || #{size := S} <- emqx_router_syncer:stats()])
+    ),
+    Subscribers = ets:tab2list(?SUBSCRIBER),
+    Topics = maps:keys(maps:from_list(Subscribers)),
+    ?assertEqual(lists:sort(Topics), lists:sort(emqx_router:topics())),
+    ok = lists:foreach(fun stop_concurrent_client/1, Clients),
+    ok = timer:sleep(100),
+    0 = ?retry(
+        500,
+        10,
+        0 = lists:sum([S || #{size := S} <- emqx_router_syncer:stats()])
+    ),
+    ct:pal("Trace: ~p", [?of_kind(router_syncer_new_batch, snabbkaffe:collect_trace())]),
+    ?assertEqual([], ets:tab2list(?SUBSCRIBER)),
+    ?assertEqual([], emqx_router:topics()).
+
+run_concurrent_client(I, Port, MCommands, NRTopics) ->
+    % _ = rand:seed(default, I),
+    Ctx = #{
+        i => I,
+        r => rand:uniform(NRTopics)
+    },
+    {ok, C} = emqtt:start_link(#{port => Port, clientid => render("client:${i}", Ctx)}),
+    {ok, _Props} = emqtt:connect(C),
+    NCommands = rand:uniform(MCommands),
+    Commands = gen_concurrent_client_plan(NCommands, Ctx),
+    ok = subscribe_concurrent_client(C, Commands),
+    run_concurrent_client_loop(C).
+
+gen_concurrent_client_plan(N, Ctx) ->
+    lists:foldl(
+        fun(_, Acc) -> mixin(pick_random_command(Ctx), Acc) end,
+        [],
+        lists:seq(1, N)
+    ).
+
+subscribe_concurrent_client(C, Commands) ->
+    lists:foreach(
+        fun
+            ({subscribe, Topic}) ->
+                {ok, _Props, [0]} = emqtt:subscribe(C, Topic);
+            ({unsubscribe, Topic}) ->
+                {ok, _Props, undefined} = emqtt:unsubscribe(C, Topic)
+        end,
+        Commands
+    ).
+
+pick_random_command(Ctx) ->
+    Topic = render(randpick(?SUBSCRIBE_TOPICS), Ctx),
+    randpick([
+        [{subscribe, Topic}],
+        [{subscribe, Topic}, {unsubscribe, Topic}]
+    ]).
+
+render(Template, Ctx) ->
+    iolist_to_binary(emqx_template:render_strict(emqx_template:parse(Template), Ctx)).
+
+run_concurrent_client_loop(C) ->
+    receive
+        {From, Ref, F} ->
+            Reply = F(C),
+            From ! {Ref, Reply},
+            run_concurrent_client_loop(C)
+    end.
+
+ping_concurrent_client(Pid) ->
+    Ref = make_ref(),
+    Pid ! {self(), Ref, fun emqtt:ping/1},
+    receive
+        {Ref, Reply} -> Reply
+    after 5000 ->
+        error(timeout)
+    end.
+
+stop_concurrent_client(Pid) ->
+    MRef = erlang:monitor(process, Pid),
+    true = erlang:unlink(Pid),
+    true = erlang:exit(Pid, shutdown),
+    receive
+        {'DOWN', MRef, process, Pid, Reason} -> Reason
+    end.
+
+randpick(List) ->
+    lists:nth(rand:uniform(length(List)), List).
+
+mixin(L = [H | T], Into = [HInto | TInto]) ->
+    case rand:uniform(length(Into) + 1) of
+        1 -> [H | mixin(T, Into)];
+        _ -> [HInto | mixin(L, TInto)]
+    end;
+mixin(L, Into) ->
+    L ++ Into.
+
+%%
+
+t_slow_rlog_routing_consistency(init, Config) ->
+    [Core1, _Core2, _Replicant] = ?config(cluster, Config),
+    MnesiaHook = rpc:call(Core1, persistent_term, get, [{mnesia_hook, post_commit}]),
+    [{original_mnesia_hook, MnesiaHook} | Config];
+t_slow_rlog_routing_consistency('end', Config) ->
+    [Core1, Core2, _Replicant] = ?config(cluster, Config),
+    MnesiaHook = ?config(original_mnesia_hook, Config),
+    ok = register_mria_hook(MnesiaHook, [Core1, Core2]).
+
+t_slow_rlog_routing_consistency(Config) ->
+    [Core1, Core2, Replicant] = ?config(cluster, Config),
+    ClientId = atom_to_binary(?FUNCTION_NAME),
+    Topic = <<"t/", ClientId/binary>>,
+    Self = self(),
+    ?assertEqual(ok, rpc:call(Replicant, emqx_broker, do_subscribe, [Topic, Self, #{}])),
+    %% Wait for normal route replication (must be fast enough)
+    emqx_common_test_helpers:wait_for(
+        ?FUNCTION_NAME,
+        ?LINE,
+        fun() ->
+            rpc:call(Replicant, emqx_router, has_route, [Topic, Replicant])
+        end,
+        2_000
+    ),
+    DelayMs = 3_000,
+    slowdown_mria_rlog(?config(original_mnesia_hook, Config), [Core1, Core2], DelayMs),
+    {ok, _} = rpc:call(Replicant, mnesia_subscr, subscribe, [Self, {table, ?ROUTE_TAB_V3, simple}]),
+    UnSubSubFun = fun() ->
+        %% Unsubscribe must remove a route, but the effect
+        %% is expected to be delayed on the replicant node
+        ok = emqx_broker:do_unsubscribe(Topic, Self, #{}),
+        %% Wait a little (less than introduced delay),
+        %% just to reduce the risk of delete/add routes ops being re-ordered
+        timer:sleep(100),
+        %% Subscribe must add a route again, even though the previosus
+        %% route may be still present on the replicant at the time of
+        %% this re-subscription
+        ok = emqx_broker:do_subscribe(Topic, Self, #{})
+    end,
+    ?assertEqual(ok, erpc:call(Replicant, UnSubSubFun)),
+    receive
+        %% Can't match route record, since table name =/= record name,
+        {mnesia_table_event, {write, {?ROUTE_TAB_V3, Topic, Replicant}, _}} ->
+            %% Event is reported before Mnesia writes a record, need to wait again...
+            timer:sleep(100),
+            ?assert(rpc:call(Replicant, emqx_router, has_route, [Topic, Replicant]))
+    after DelayMs * 3 ->
+        ct:pal("Received messages: ~p", [process_info(Self, messages)]),
+        ct:fail("quick re-subscribe failed to add a route")
+    end.
+
+%%
+
+get_mqtt_tcp_port(Node) ->
+    emqx_common_test_helpers:listener_port(
+        erpc:call(Node, emqx_config, get, [[listeners, tcp, default, bind]])
+    ).
+
+slowdown_mria_rlog(MnesiaHook, Nodes, DelayMs) ->
+    MnesiaHook1 = fun(Tid, CommitData) ->
+        spawn(fun() ->
+            timer:sleep(DelayMs),
+            MnesiaHook(Tid, CommitData)
+        end),
+        ok
+    end,
+    register_mria_hook(MnesiaHook1, Nodes).
+
+register_mria_hook(MnesiaHook, Nodes) ->
+    [ok, ok] = [
+        rpc:call(N, mnesia_hook, register_hook, [post_commit, MnesiaHook])
+     || N <- Nodes
+    ],
+    ok.

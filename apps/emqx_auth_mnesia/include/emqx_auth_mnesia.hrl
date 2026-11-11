@@ -1,38 +1,25 @@
--define(APP, emqx_auth_mnesia).
+%%--------------------------------------------------------------------
+%% Copyright (c) 2020-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
+%%--------------------------------------------------------------------
 
--type(login():: {clientid, binary()}
-              | {username, binary()}).
+-ifndef(EMQX_AUTH_MNESIA_HRL).
+-define(EMQX_AUTH_MNESIA_HRL, true).
 
--record(emqx_user, {
-          login :: login(),
-          password :: binary(),
-          created_at :: integer()
-        }).
+-define(AUTHN_SHARD, emqx_authn_shard).
 
--record(emqx_acl, {
-          filter:: {login() | all, emqx_topic:topic()},
-          action :: pub | sub | pubsub,
-          access :: allow | deny,
-          created_at :: integer()
-         }).
+-define(AUTHZ_TYPE, built_in_database).
+-define(AUTHZ_TYPE_BIN, <<"built_in_database">>).
 
--record(auth_metrics, {
-        success = 'client.auth.success',
-        failure = 'client.auth.failure',
-        ignore = 'client.auth.ignore'
-    }).
+-define(AUTHN_MECHANISM_SIMPLE, password_based).
+-define(AUTHN_MECHANISM_SIMPLE_BIN, <<"password_based">>).
 
--record(acl_metrics, {
-        allow = 'client.acl.allow',
-        deny = 'client.acl.deny',
-        ignore = 'client.acl.ignore'
-    }).
+-define(AUTHN_MECHANISM_SCRAM, scram).
+-define(AUTHN_MECHANISM_SCRAM_BIN, <<"scram">>).
 
--define(METRICS(Type), tl(tuple_to_list(#Type{}))).
--define(METRICS(Type, K), #Type{}#Type.K).
+-define(AUTHN_BACKEND, built_in_database).
+-define(AUTHN_BACKEND_BIN, <<"built_in_database">>).
 
--define(AUTH_METRICS, ?METRICS(auth_metrics)).
--define(AUTH_METRICS(K), ?METRICS(auth_metrics, K)).
+-define(AUTHN_TYPE_SIMPLE, {?AUTHN_MECHANISM_SIMPLE, ?AUTHN_BACKEND}).
+-define(AUTHN_TYPE_SCRAM, {?AUTHN_MECHANISM_SCRAM, ?AUTHN_BACKEND}).
 
--define(ACL_METRICS, ?METRICS(acl_metrics)).
--define(ACL_METRICS(K), ?METRICS(acl_metrics, K)).
+-endif.

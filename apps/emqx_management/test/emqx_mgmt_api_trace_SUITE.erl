@@ -1,0 +1,1268 @@
+%%--------------------------------------------------------------------
+%% Copyright (c) 2020-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
+%%--------------------------------------------------------------------
+-module(emqx_mgmt_api_trace_SUITE).
+
+%% API
+-compile(export_all).
+-compile(nowarn_export_all).
+
+-include_lib("eunit/include/eunit.hrl").
+-include_lib("kernel/include/file.hrl").
+-include_lib("stdlib/include/zip.hrl").
+-include_lib("snabbkaffe/include/snabbkaffe.hrl").
+-include_lib("emqx/include/logger.hrl").
+-include_lib("common_test/include/ct.hrl").
+-include_lib("emqx/include/emqx_hooks.hrl").
+-include_lib("emqx/include/emqx_config.hrl").
+
+-import(emqx_common_test_helpers, [on_exit/1]).
+
+%%--------------------------------------------------------------------
+%% Setups
+%%--------------------------------------------------------------------
+
+all() ->
+    emqx_common_test_helpers:all(?MODULE).
+
+init_per_suite(Config) ->
+    Apps = emqx_cth_suite:start(
+        [
+            %% Needed by `emqx_modules`:
+            {emqx_conf, #{
+                config => #{log => #{audit => #{enable => true, level => info}}},
+                %% `emqx_cth_suite' picks a schema by app name that does not declare
+                %% `log.audit', so name the one that does.
+                schema_mod => emqx_conf_schema
+            }},
+            %% Manages `emqx_trace` server:
+            emqx_modules,
+            emqx_audit,
+            emqx_management,
+            emqx_mgmt_api_test_util:emqx_dashboard()
+        ],
+        #{work_dir => emqx_cth_suite:work_dir(Config)}
+    ),
+    [{apps, Apps} | Config].
+
+end_per_suite(Config) ->
+    ok = emqx_cth_suite:stop(?config(apps, Config)).
+
+init_per_testcase(t_create_trace_audit_records_namespace, Config) ->
+    ok = snabbkaffe:start_trace(),
+    emqx_trace:clear(),
+    ok = emqx_hooks:add(
+        'namespace.resource_pre_create',
+        {?MODULE, mark_ns1_managed, []},
+        1000
+    ),
+    Config;
+init_per_testcase(t_namespaced_user_cross_ns_isolation, Config) ->
+    ok = snabbkaffe:start_trace(),
+    emqx_trace:clear(),
+    %% Starting with release-61, the trace API rejects namespaced calls
+    %% unless the namespace is registered as a managed one via the
+    %% `namespace.resource_pre_create' hook (normally serviced by
+    %% emqx_mt, which this suite intentionally does not start). Install
+    %% a tiny local callback that marks `ns1' as existing for the
+    %% duration of this test. The hookpoint itself was registered in
+    %% release-61 too, so we cannot install this on release-60 (the
+    %% test passes there without it anyway).
+    ok = emqx_hooks:add(
+        'namespace.resource_pre_create',
+        {?MODULE, mark_ns1_managed, []},
+        1000
+    ),
+    Config;
+init_per_testcase(_, Config) ->
+    ok = snabbkaffe:start_trace(),
+    emqx_trace:clear(),
+    Config.
+
+end_per_testcase(t_create_trace_audit_records_namespace, _Config) ->
+    ok = emqx_hooks:del('namespace.resource_pre_create', {?MODULE, mark_ns1_managed}),
+    snabbkaffe:stop(),
+    emqx_common_test_helpers:call_janitor(),
+    ok;
+end_per_testcase(t_namespaced_user_cross_ns_isolation, _Config) ->
+    ok = emqx_hooks:del('namespace.resource_pre_create', {?MODULE, mark_ns1_managed}),
+    snabbkaffe:stop(),
+    emqx_common_test_helpers:call_janitor(),
+    ok;
+end_per_testcase(_, _Config) ->
+    snabbkaffe:stop(),
+    emqx_common_test_helpers:call_janitor(),
+    ok.
+
+mark_ns1_managed(#{namespace := <<"ns1">>}, Acc) ->
+    {stop, Acc#{exists => true}};
+mark_ns1_managed(_Args, Acc) ->
+    {stop, Acc}.
+
+t_config(_Config) ->
+    %% Config should contain schema defaults:
+    {ok, Conf0} = request_api(get, api_path("tracing")),
+    ?assertMatch(
+        #{
+            <<"max_file_size">> := <<"128MB">>,
+            <<"max_traces">> := 30
+        },
+        json(Conf0)
+    ),
+    %% Empty config udpates do nothing:
+    {ok, Conf1} = request_api(put, api_path("tracing"), #{}),
+    ?assertMatch(
+        #{
+            %% NOTE
+            %% Due to configuration subsystem shenanigans value changes "shape".
+            <<"max_file_size">> := 128 * 1024 * 1024,
+            <<"max_traces">> := 30
+        },
+        json(Conf1)
+    ),
+    %% Invalid updates are rejected:
+    {error, {{"HTTP/1.1", 400, "Bad Request"}, _, ErrorResp1}} =
+        request_api(put, api_path("tracing"), #{<<"encoding">> => <<"pretty">>}, true),
+    {error, {{"HTTP/1.1", 400, "Bad Request"}, _, ErrorResp2}} =
+        request_api(put, api_path("tracing"), #{<<"max_file_size">> => 1}, true),
+    ?assertMatch(#{<<"code">> := <<"BAD_REQUEST">>}, json(ErrorResp1)),
+    ?assertMatch(#{<<"code">> := <<"BAD_REQUEST">>}, json(ErrorResp2)),
+    %% Config udpates are respected:
+    try
+        {ok, Conf2} = request_api(put, api_path("tracing"), #{<<"max_traces">> => 0}),
+        ?assertMatch(
+            #{<<"max_traces">> := 0},
+            json(Conf2)
+        ),
+        Trace = #{
+            <<"name">> => ?FUNCTION_NAME,
+            <<"type">> => <<"topic">>,
+            <<"topic">> => <<"/x/y/z">>
+        },
+        {error, {{"HTTP/1.1", 400, "Bad Request"}, _, ErrorResp3}} =
+            request_api(post, api_path("trace"), Trace, true),
+        ?assertMatch(
+            #{<<"code">> := <<"EXCEED_LIMIT">>},
+            json(ErrorResp3)
+        )
+    after
+        {ok, _} = request_api(put, api_path("tracing"), json(Conf0))
+    end.
+
+t_http_test(_Config) ->
+    %% list
+    {ok, Empty} = request_api(get, api_path("trace")),
+    ?assertEqual([], json(Empty)),
+    %% create
+    ErrorTrace = #{},
+    Opts = #{return_all => true},
+    {error, {{"HTTP/1.1", 400, "Bad Request"}, _, Body}} =
+        emqx_mgmt_api_test_util:request_api(post, api_path("trace"), [], [], ErrorTrace, Opts),
+    ?assertMatch(#{<<"code">> := <<"BAD_REQUEST">>}, json(Body)),
+
+    Name = <<"test-name">>,
+    Trace = #{
+        <<"name">> => Name,
+        <<"type">> => <<"topic">>,
+        <<"topic">> => <<"/x/y/z">>
+    },
+
+    {ok, Create} = request_api(post, api_path("trace"), Trace),
+    ?assertMatch(#{<<"name">> := Name}, json(Create)),
+
+    {ok, List} = request_api(get, api_path("trace")),
+    [Data] = json(List),
+    ?assertEqual(Name, maps:get(<<"name">>, Data)),
+
+    %% update
+    {ok, Update} = request_api(put, api_path("trace/test-name/stop"), #{}),
+    ?assertEqual(
+        #{
+            <<"enable">> => false,
+            <<"name">> => <<"test-name">>
+        },
+        json(Update)
+    ),
+
+    ?assertMatch(
+        {error, {"HTTP/1.1", 404, _}},
+        request_api(put, api_path("trace/test-name-not-found/stop"), #{})
+    ),
+    {ok, List1} = request_api(get, api_path("trace")),
+    [Data1] = json(List1),
+    Node = atom_to_binary(node()),
+    ?assertMatch(
+        #{
+            <<"status">> := <<"stopped">>,
+            <<"name">> := <<"test-name">>,
+            <<"log_size">> := #{Node := _},
+            <<"start_at">> := _,
+            <<"end_at">> := _,
+            <<"type">> := <<"topic">>,
+            <<"topic">> := <<"/x/y/z">>
+        },
+        Data1
+    ),
+
+    %% delete
+    {ok, Delete} = request_api(delete, api_path("trace/test-name")),
+    ?assertEqual(<<>>, Delete),
+
+    {error, {{"HTTP/1.1", 404, "Not Found"}, _, DeleteNotFound}} =
+        emqx_mgmt_api_test_util:request_api(delete, api_path("trace/test-name"), [], [], [], Opts),
+    ?assertEqual(
+        #{
+            <<"code">> => <<"NOT_FOUND">>,
+            <<"message">> => <<"test-name NOT FOUND">>
+        },
+        json(DeleteNotFound)
+    ),
+
+    {ok, List2} = request_api(get, api_path("trace")),
+    ?assertEqual([], json(List2)),
+
+    %% clear
+    {ok, Create1} = request_api(post, api_path("trace"), Trace),
+    ?assertMatch(#{<<"name">> := Name}, json(Create1)),
+
+    {ok, Clear} = request_api(delete, api_path("trace")),
+    ?assertEqual(<<>>, Clear).
+
+t_http_test_rule_trace(_Config) ->
+    %% create
+    Name = atom_to_binary(?FUNCTION_NAME),
+    Trace = #{
+        <<"name">> => Name,
+        <<"type">> => <<"ruleid">>,
+        <<"ruleid">> => Name
+    },
+
+    {ok, Create} = request_api(post, api_path("trace"), Trace),
+    ?assertMatch(#{<<"name">> := Name}, json(Create)),
+
+    {ok, List} = request_api(get, api_path("trace")),
+    [Data] = json(List),
+    ?assertEqual(Name, maps:get(<<"name">>, Data)),
+
+    %% update
+    {ok, Update} = request_api(put, api_path(iolist_to_binary(["trace/", Name, "/stop"])), #{}),
+    ?assertEqual(
+        #{
+            <<"enable">> => false,
+            <<"name">> => Name
+        },
+        json(Update)
+    ),
+    {ok, List1} = request_api(get, api_path("trace")),
+    [Data1] = json(List1),
+    Node = atom_to_binary(node()),
+    ?assertMatch(
+        #{
+            <<"status">> := <<"stopped">>,
+            <<"name">> := Name,
+            <<"log_size">> := #{Node := _},
+            <<"start_at">> := _,
+            <<"end_at">> := _,
+            <<"type">> := <<"ruleid">>,
+            <<"ruleid">> := Name
+        },
+        Data1
+    ),
+
+    %% delete
+    {ok, Delete} = request_api(delete, api_path(["trace/", Name])),
+    ?assertEqual(<<>>, Delete).
+
+t_http_test_json_formatter(_Config) ->
+    Name = <<"testname">>,
+    Topic = <<"/x/y/z">>,
+    Trace = #{
+        <<"name">> => Name,
+        <<"type">> => <<"topic">>,
+        <<"topic">> => Topic,
+        <<"formatter">> => <<"json">>
+    },
+
+    {ok, Create} = request_api(post, api_path("trace"), Trace),
+    ?assertMatch(#{<<"name">> := Name}, json(Create)),
+
+    {ok, List} = request_api(get, api_path("trace")),
+    [Data] = json(List),
+    ?assertEqual(<<"json">>, maps:get(<<"formatter">>, Data)),
+
+    {ok, List1} = request_api(get, api_path("trace")),
+    [Data1] = json(List1),
+    ?assertMatch(
+        #{
+            <<"formatter">> := <<"json">>
+        },
+        Data1
+    ),
+
+    %% Check that the log is empty
+    {ok, _Detail} = request_api(get, api_path("trace/" ++ binary_to_list(Name) ++ "/log_detail")),
+    %% Trace is empty which results in a not found error
+    {error, _} = request_api(get, api_path("trace/" ++ binary_to_list(Name) ++ "/download")),
+
+    %% Start a client and send a message to get info to the log
+    ClientId = <<"my_client_id">>,
+    {ok, Client} = emqtt:start_link([{clean_start, true}, {clientid, ClientId}]),
+    {ok, _} = emqtt:connect(Client),
+    %% Normal message
+    emqtt:publish(Client, Topic, #{}, <<"log_this_message">>, [{qos, 2}]),
+    %% Escape line breaks
+    emqtt:publish(Client, Topic, #{}, <<"\nlog\nthis\nmessage">>, [{qos, 2}]),
+    %% Escape escape character
+    emqtt:publish(Client, Topic, #{}, <<"\\\nlog\n_\\n_this\nmessage\\">>, [{qos, 2}]),
+    %% Escape end of string
+    emqtt:publish(Client, Topic, #{}, <<"\"log_this_message\"">>, [{qos, 2}]),
+
+    %% Manually create some trace messages to test the JSON formatter
+
+    %% String key and value
+    ?TRACE("CUSTOM", "my_log_msg", #{topic => Topic, "str" => "str"}),
+    %% Log Erlang term
+    ?TRACE("CUSTOM", "my_log_msg", #{topic => Topic, term => {notjson}}),
+    %% Log Erlang term key
+    ?TRACE("CUSTOM", "my_log_msg", #{topic => Topic, {'notjson'} => term}),
+    %% Log Integer
+    ?TRACE("CUSTOM", "my_log_msg", #{topic => Topic, integer => 42}),
+    %% Log Float
+    ?TRACE("CUSTOM", "my_log_msg", #{topic => Topic, float => 1.2}),
+    %% Log Integer Key
+    ?TRACE("CUSTOM", "my_log_msg", #{topic => Topic, 42 => integer}),
+    %% Log Float Key
+    ?TRACE("CUSTOM", "my_log_msg", #{topic => Topic, 1.2 => float}),
+    %% Log Map Key
+    ?TRACE("CUSTOM", "my_log_msg", #{topic => Topic, #{} => value}),
+    %% Empty submap
+    ?TRACE("CUSTOM", "my_log_msg", #{topic => Topic, sub => #{}}),
+    %% Non-empty submap
+    ?TRACE("CUSTOM", "my_log_msg", #{topic => Topic, sub => #{key => value}}),
+    %% Bolean values
+    ?TRACE("CUSTOM", "my_log_msg", #{topic => Topic, true => true, false => false}),
+    %% Key value list
+    ?TRACE("CUSTOM", "my_log_msg", #{
+        topic => Topic,
+        list => [
+            {<<"key">>, <<"value">>},
+            {<<"key2">>, <<"value2">>}
+        ]
+    }),
+    %% We do special formatting for client_ids and rule_ids
+    ?TRACE("CUSTOM", "my_log_msg", #{
+        topic => Topic,
+        client_ids => maps:from_keys([<<"a">>, <<"b">>, <<"c">>], true)
+    }),
+    ?TRACE("CUSTOM", "my_log_msg", #{
+        topic => Topic,
+        rule_ids => maps:from_keys([<<"a">>, <<"b">>, <<"c">>], true)
+    }),
+    %% action_id should be rendered as action_info
+    ?TRACE("CUSTOM", "my_log_msg", #{
+        topic => Topic,
+        action_id =>
+            <<"action:http:emqx_bridge_http_test_lib:connector:http:emqx_bridge_http_test_lib">>
+    }),
+    %% We should handle report style logging
+    ?SLOG(error, #{msg => "recursive_republish_detected"}, #{topic => Topic}),
+    ?TRACE("CUSTOM", "my_log_msg", #{
+        topic => Topic,
+        %% This will be converted to map
+        map_key => [{a, a}, {b, b}]
+    }),
+    ?TRACE("CUSTOM", "my_log_msg", #{
+        topic => Topic,
+        %% We should not convert this to a map as we will lose information
+        map_key => [{a, a}, {a, b}]
+    }),
+    {ok, _Detail2} = request_api(get, api_path("trace/" ++ binary_to_list(Name) ++ "/log_detail")),
+    {ok, Bin} = request_api(get, api_path("trace/" ++ binary_to_list(Name) ++ "/download")),
+    {ok, [
+        _Comment,
+        #zip_file{
+            name = _ZipName,
+            info = #file_info{size = Size, type = regular, access = read_write}
+        }
+    ]} = zip:table(Bin),
+    ?assert(Size > 0),
+    {ok, [{_, LogContent}]} = zip:unzip(Bin, [memory]),
+    LogEntriesTrailing = string:split(LogContent, "\n", all),
+    LogEntries = lists:droplast(LogEntriesTrailing),
+    DecodedLogEntries = [
+        begin
+            ct:pal("LOG ENTRY\n~s\n", [JSONEntry]),
+            emqx_utils_json:decode(JSONEntry)
+        end
+     || JSONEntry <- LogEntries
+    ],
+    ListIterFun =
+        fun
+            ListIterFunRec([]) ->
+                ok;
+            ListIterFunRec([Item | Rest]) ->
+                receive
+                    From ->
+                        From ! {list_iter_item, Item}
+                end,
+                ListIterFunRec(Rest)
+        end,
+    ListIter = spawn_link(fun() -> ListIterFun(DecodedLogEntries) end),
+    NextFun =
+        fun() ->
+            ListIter ! self(),
+            receive
+                {list_iter_item, Item} ->
+                    Item
+            end
+        end,
+    ?assertMatch(
+        #{<<"meta">> := #{<<"payload">> := <<"log_this_message">>}},
+        NextFun()
+    ),
+    ?assertMatch(
+        #{<<"meta">> := #{<<"payload">> := <<"\nlog\nthis\nmessage">>}},
+        NextFun()
+    ),
+    ?assertMatch(
+        #{
+            <<"meta">> := #{<<"payload">> := <<"\\\nlog\n_\\n_this\nmessage\\">>}
+        },
+        NextFun()
+    ),
+    ?assertMatch(
+        #{<<"meta">> := #{<<"payload">> := <<"\"log_this_message\"">>}},
+        NextFun()
+    ),
+    ?assertMatch(
+        #{<<"meta">> := #{<<"str">> := <<"str">>}},
+        NextFun()
+    ),
+    ?assertMatch(
+        #{<<"meta">> := #{<<"term">> := <<"{notjson}">>}},
+        NextFun()
+    ),
+    ?assertMatch(
+        #{<<"meta">> := <<_/binary>>},
+        NextFun()
+    ),
+    ?assertMatch(
+        #{<<"meta">> := #{<<"integer">> := 42}},
+        NextFun()
+    ),
+    ?assertMatch(
+        #{<<"meta">> := #{<<"float">> := 1.2}},
+        NextFun()
+    ),
+    ?assertMatch(
+        #{<<"meta">> := <<_/binary>>},
+        NextFun()
+    ),
+    ?assertMatch(
+        #{<<"meta">> := <<_/binary>>},
+        NextFun()
+    ),
+    ?assertMatch(
+        #{<<"meta">> := <<_/binary>>},
+        NextFun()
+    ),
+    ?assertMatch(
+        #{<<"meta">> := #{<<"sub">> := #{}}},
+        NextFun()
+    ),
+    ?assertMatch(
+        #{<<"meta">> := #{<<"sub">> := #{<<"key">> := <<"value">>}}},
+        NextFun()
+    ),
+    ?assertMatch(
+        #{<<"meta">> := #{<<"true">> := true, <<"false">> := false}},
+        NextFun()
+    ),
+    ?assertMatch(
+        #{
+            <<"meta">> := #{
+                <<"list">> := #{
+                    <<"key">> := <<"value">>,
+                    <<"key2">> := <<"value2">>
+                }
+            }
+        },
+        NextFun()
+    ),
+    ?assertMatch(
+        #{
+            <<"meta">> := #{
+                <<"client_ids">> := [<<"a">>, <<"b">>, <<"c">>]
+            }
+        },
+        NextFun()
+    ),
+    ?assertMatch(
+        #{
+            <<"meta">> := #{
+                <<"rule_ids">> := [<<"a">>, <<"b">>, <<"c">>]
+            }
+        },
+        NextFun()
+    ),
+    ?assertMatch(
+        #{
+            <<"meta">> := #{
+                <<"action_info">> := #{
+                    <<"type">> := <<"http">>,
+                    <<"name">> := <<"emqx_bridge_http_test_lib">>
+                }
+            }
+        },
+        NextFun()
+    ),
+    ?assertMatch(
+        #{
+            <<"level">> := <<"error">>,
+            <<"meta">> :=
+                #{
+                    <<"msg">> := <<"recursive_republish_detected">>,
+                    <<"topic">> := <<"/x/y/z">>
+                },
+            <<"msg">> := <<"recursive_republish_detected">>,
+            <<"time">> := _
+        },
+        NextFun()
+    ),
+    ?assertMatch(
+        #{
+            <<"meta">> := #{
+                <<"map_key">> := #{
+                    <<"a">> := <<"a">>,
+                    <<"b">> := <<"b">>
+                }
+            }
+        },
+        NextFun()
+    ),
+    ?assertMatch(
+        #{
+            <<"meta">> := #{
+                <<"map_key">> := [_, _]
+            }
+        },
+        NextFun()
+    ),
+    {ok, Delete} = request_api(delete, api_path("trace/" ++ binary_to_list(Name))),
+    ?assertEqual(<<>>, Delete),
+
+    {ok, List2} = request_api(get, api_path("trace")),
+    ?assertEqual([], json(List2)),
+
+    ok = emqtt:disconnect(Client).
+
+t_create_failed(_Config) ->
+    Now = erlang:system_time(second),
+    Trace = #{
+        <<"type">> => <<"topic">>,
+        <<"topic">> => <<"/x/y/z">>,
+        <<"start_at">> => Now
+    },
+
+    BadName1 = Trace#{<<"name">> => <<"test/bad">>},
+    ?assertMatch(
+        {error, {"HTTP/1.1", 400, _}},
+        request_api(post, api_path("trace"), BadName1)
+    ),
+    BadName2 = Trace#{<<"name">> => list_to_binary(lists:duplicate(257, "t"))},
+    ?assertMatch(
+        {error, {"HTTP/1.1", 400, _}},
+        request_api(post, api_path("trace"), BadName2)
+    ),
+
+    %% already_exist
+    GoodName = Trace#{<<"name">> => <<"test-name-0">>},
+    {ok, Create} = request_api(post, api_path("trace"), GoodName),
+    ?assertMatch(#{<<"name">> := <<"test-name-0">>}, json(Create)),
+    ?assertMatch(
+        {error, {"HTTP/1.1", 409, _}},
+        request_api(post, api_path("trace"), GoodName)
+    ),
+
+    %% MAX Limited
+    lists:map(
+        fun(Seq) ->
+            {ok, _} = emqx_trace:create(#{
+                name => list_to_binary("name" ++ integer_to_list(Seq)),
+                filter => {topic, list_to_binary("/x/y/" ++ integer_to_list(Seq))}
+            })
+        end,
+        lists:seq(1, 30 - ets:info(emqx_trace, size))
+    ),
+    GoodName1 = Trace#{<<"name">> => <<"test-name-1">>},
+    ?assertMatch(
+        {error, {"HTTP/1.1", 400, _}},
+        request_api(post, api_path("trace"), GoodName1)
+    ),
+    %% clear, delete all
+    ?assertMatch({ok, _}, request_api(delete, api_path("trace"), [])),
+    %% allow create using test-name-0 again
+    {ok, Create1} = request_api(post, api_path("trace"), GoodName),
+    ?assertMatch(#{<<"name">> := <<"test-name-0">>}, json(Create1)),
+    %% new name but same trace in the same second
+    GoodName2 = Trace#{<<"name">> => <<"test-name-1">>},
+    ?assertMatch(
+        {error, {"HTTP/1.1", 409, _}},
+        request_api(post, api_path("trace"), GoodName2)
+    ),
+    %% new name but bad payload-encode
+    GoodName3 = Trace#{
+        <<"name">> => <<"test-name-2">>,
+        <<"payload_encode">> => <<"bad">>
+    },
+    ?assertMatch(
+        {error, {"HTTP/1.1", 400, _}},
+        request_api(post, api_path("trace"), GoodName3)
+    ).
+
+t_log_file(_Config) ->
+    ClientId = <<"client-test-download">>,
+    Now = erlang:system_time(second),
+    Name = <<"test_client_id">>,
+    create_trace(Name, ClientId, Now),
+    {ok, Client} = emqtt:start_link([{clean_start, true}, {clientid, ClientId}]),
+    {ok, _} = emqtt:connect(Client),
+    [
+        begin
+            _ = emqtt:ping(Client)
+        end
+     || _ <- lists:seq(1, 5)
+    ],
+    ?assertMatch(
+        {error, {"HTTP/1.1", 404, "Not Found"}},
+        request_api(get, api_path("trace/test_client_not_found/log_detail"))
+    ),
+    {ok, Detail} = request_api(get, api_path("trace/test_client_id/log_detail")),
+    ?assertMatch([#{<<"mtime">> := _, <<"size">> := _, <<"node">> := _}], json(Detail)),
+    {ok, Binary} = request_api(get, api_path("trace/test_client_id/download")),
+    {ok, [
+        Comment,
+        #zip_file{
+            name = ZipName,
+            info = #file_info{size = Size, type = regular, access = read_write}
+        }
+    ]} = zip:table(Binary),
+    ?assert(Size > 0),
+    ZipNamePrefix = lists:flatten(io_lib:format("~s-trace_~s", [node(), Name])),
+    ?assertNotEqual(nomatch, re:run(ZipName, [ZipNamePrefix])),
+    Path = api_path("trace/test_client_id/download?node=" ++ atom_to_list(node())),
+    {ok, Binary2} = request_api(get, Path),
+    ?assertMatch(
+        {ok, [
+            Comment,
+            #zip_file{
+                name = ZipName,
+                info = #file_info{size = Size, type = regular, access = read_write}
+            }
+        ]},
+        zip:table(Binary2)
+    ),
+    {error, {_, 404, _}} =
+        request_api(
+            get,
+            api_path("trace/test_client_id/download?node=unknown_node")
+        ),
+    {error, {_, 404, _}} =
+        request_api(
+            get,
+            % known atom but unknown node
+            api_path("trace/test_client_id/download?node=undefined")
+        ),
+    ?assertMatch(
+        {error, {"HTTP/1.1", 404, "Not Found"}},
+        request_api(
+            get,
+            api_path("trace/test_client_not_found/download?node=" ++ atom_to_list(node()))
+        )
+    ),
+    ok = emqtt:disconnect(Client),
+    ok.
+
+create_trace(Name, ClientId, Start) ->
+    create_trace(Name, clientid, ClientId, Start).
+
+create_trace(Name, Type, TypeValue, Start) ->
+    ?wait_async_action(
+        begin
+            {ok, _Created} = request_api(post, api_path("trace"), #{
+                <<"name">> => Name,
+                <<"type">> => Type,
+                Type => TypeValue,
+                <<"start_at">> => Start
+            })
+        end,
+        #{?snk_kind := update_trace_done}
+    ).
+
+create_rule_trace(RuleId) ->
+    Now = erlang:system_time(second),
+    create_trace(atom_to_binary(?FUNCTION_NAME), ruleid, RuleId, Now - 2).
+
+t_create_rule_trace(_Config) ->
+    create_rule_trace(atom_to_binary(?FUNCTION_NAME)).
+
+t_stream_log(_Config) ->
+    TraceDir = emqx_trace:trace_dir(),
+    ClientId = <<"client-stream">>,
+    Now = erlang:system_time(second),
+    Name = "test_stream_log",
+    create_trace(list_to_binary(Name), ClientId, Now - 10),
+    {ok, Client} = emqtt:start_link([{clean_start, true}, {clientid, ClientId}]),
+    {ok, _} = emqtt:connect(Client),
+    [
+        begin
+            _ = emqtt:ping(Client)
+        end
+     || _ <- lists:seq(1, 5)
+    ],
+    emqtt:publish(Client, <<"/good">>, #{}, <<"ghood1">>, [{qos, 0}]),
+    emqtt:publish(Client, <<"/good">>, #{}, <<"ghood2">>, [{qos, 0}]),
+    ok = emqtt:disconnect(Client),
+    ct:sleep(200),
+    {ok, Files} = file:list_dir(TraceDir),
+    TraceFile = hd([filename:join(TraceDir, F) || F <- Files, string:find(F, Name) /= nomatch]),
+    ct:pal("FileName: ~p", [TraceFile]),
+    {ok, FileBin} = file:read_file(TraceFile),
+    ct:pal("FileBin: ~p ~s", [byte_size(FileBin), FileBin]),
+    {ok, Binary} = request_api(get, api_path("trace/test_stream_log/log?bytes=10")),
+    #{<<"meta">> := Meta, <<"items">> := Bin} = json(Binary),
+    ?assertEqual(10, byte_size(Bin)),
+    ?assertMatch(#{<<"position">> := _, <<"bytes">> := 10}, Meta),
+    #{<<"position">> := Pos} = Meta,
+    {ok, Binary1} =
+        request_api(get, api_path(["trace/test_stream_log/log?bytes=10&position=", Pos])),
+    #{<<"meta">> := Meta1, <<"items">> := Bin1} = json(Binary1),
+    ?assertMatch(#{<<"position">> := _, <<"bytes">> := 10}, Meta1),
+    ?assertEqual(10, byte_size(Bin1)),
+    ct:pal("~p vs ~p", [Bin, Bin1]),
+    %% in theory they could be the same but we know they shouldn't
+    ?assertNotEqual(Bin, Bin1),
+    #{<<"position">> := Pos1} = Meta1,
+    {ok, Binary2} =
+        request_api(get, api_path(["trace/test_stream_log/log?bytes=100000&position=", Pos1])),
+    #{<<"meta">> := Meta2, <<"items">> := _} = json(Binary2),
+    ?assertMatch(#{<<"position">> := _, <<"hint">> := <<"eof">>}, Meta2).
+
+t_stream_log_errors(_Config) ->
+    ClientId = atom_to_binary(?FUNCTION_NAME),
+    Now = erlang:system_time(second),
+    create_trace(<<"err_stream_log">>, ClientId, Now - 10),
+    meck:new(file, [passthrough, unstick]),
+    meck:expect(file, pread, 2, {error, enomem}),
+    meck:expect(file, pread, 3, {error, enomem}),
+    {error, {_, 503, _}} =
+        request_api(get, api_path("trace/err_stream_log/log")),
+    meck:unload(file),
+    {error, {_, 400, _}} =
+        request_api(get, api_path("trace/err_stream_log/log?&bytes=1000000000000")),
+    %% Bad cursor:
+    {error, {_, 400, _}} =
+        request_api(get, api_path("trace/err_stream_log/log?&bytes=10&position=invalid")),
+    {error, {_, 400, _}} =
+        request_api(get, api_path("trace/err_stream_log/log?&bytes=10&position=g3QAAAABdwFzYSK")),
+    {error, {_, 404, _}} =
+        request_api(get, api_path("trace/err_stream_log/log?node=unknown_node")),
+    % known atom but not a node
+    {error, {_, 404, _}} =
+        request_api(get, api_path("trace/err_stream_log/log?node=undefined")),
+    {error, {_, 404, _}} =
+        request_api(get, api_path("trace/err_stream_log_not_found/log")).
+
+-doc """
+RPC failures other than `nodedown' (e.g. `timeout') while streaming a trace log
+return a structured 503, and downloading a trace over a failing RPC returns a
+structured 500 instead of crashing.
+""".
+t_stream_log_badrpc(_Config) ->
+    ClientId = atom_to_binary(?FUNCTION_NAME),
+    Now = erlang:system_time(second),
+    create_trace(<<"badrpc_stream_log">>, ClientId, Now - 10),
+    ok = meck:new(emqx_mgmt_trace_proto_v3, [passthrough]),
+    try
+        meck:expect(emqx_mgmt_trace_proto_v3, stream_trace_log, 4, {badrpc, timeout}),
+        ?assertMatch(
+            {error, {_, 503, _}},
+            request_api(get, api_path("trace/badrpc_stream_log/log"))
+        ),
+        {error, {{_, 500, _}, _Headers, Body}} =
+            request_api(get, api_path("trace/badrpc_stream_log/download"), [], true),
+        ?assertMatch(#{<<"code">> := <<"INTERNAL_ERROR">>}, json(Body)),
+        ?assertNotEqual(nomatch, string:find(Body, <<"badrpc">>))
+    after
+        meck:unload(emqx_mgmt_trace_proto_v3)
+    end.
+
+t_stream_log_stale(_Config) ->
+    %% Configure relatively low size limit:
+    MaxSize = 100 * 1024,
+    MaxSizeDefault = emqx_config:get([trace, max_file_size]),
+    ok = emqx_config:put([trace, max_file_size], MaxSize),
+    ClientId = atom_to_binary(?FUNCTION_NAME),
+    Now = erlang:system_time(second),
+    create_trace(<<"stale_stream_log">>, ClientId, Now - 10),
+    %% Start the client and publish some messages:
+    {ok, Client} = emqtt:start_link([{clean_start, true}, {clientid, ClientId}]),
+    {ok, _} = emqtt:connect(Client),
+    ok = lists:foreach(
+        fun(_) -> emqtt:publish(Client, <<"t/" ?MODULE_STRING>>, <<"HELLO">>, qos1) end,
+        lists:seq(1, 100)
+    ),
+    ok = timer:sleep(500),
+    %% Start streaming the log:
+    {ok, Resp1} = request_api(get, api_path("trace/stale_stream_log/log?bytes=40")),
+    #{<<"meta">> := #{<<"position">> := P1}, <<"items">> := _} = json(Resp1),
+    {ok, Resp2} = request_api(get, api_path(["trace/stale_stream_log/log?bytes=40&position=", P1])),
+    #{<<"meta">> := #{<<"position">> := P2}, <<"items">> := _} = json(Resp2),
+    %% Overwhelm the trace log:
+    ok = lists:foreach(
+        fun(_) -> emqtt:publish(Client, <<"t/" ?MODULE_STRING>>, <<"HELLO">>, qos1) end,
+        lists:seq(1, 400)
+    ),
+    ok = timer:sleep(500),
+    %% Cursor is now stale:
+    {error, {{_, 400, _}, _, RespErr}} =
+        request_api(
+            get,
+            api_path(["trace/stale_stream_log/log?&bytes=40&position=", P2]),
+            [],
+            #{return_all => true}
+        ),
+    ?assertEqual(
+        #{<<"code">> => <<"STALE_CURSOR">>, <<"message">> => <<"Stale cursor">>},
+        json(RespErr)
+    ),
+    %% Cleanup:
+    ok = emqx_config:put([trace, max_file_size], MaxSizeDefault),
+    ok = emqtt:disconnect(Client).
+
+t_trace_files_are_deleted_after_download(_Config) ->
+    ClientId = <<"client-test-delete-after-download">>,
+    Now = erlang:system_time(second),
+    Name = <<"test_client_id">>,
+    create_trace(Name, ClientId, Now),
+    {ok, Client} = emqtt:start_link([{clean_start, true}, {clientid, ClientId}]),
+    {ok, _} = emqtt:connect(Client),
+    [
+        begin
+            _ = emqtt:ping(Client)
+        end
+     || _ <- lists:seq(1, 5)
+    ],
+    ok = emqtt:disconnect(Client),
+
+    %% Check that files have been removed after download and that zip
+    %% directories uses unique session ids
+    ?check_trace(
+        begin
+            %% Download two zip files
+            Path = api_path(["trace/", binary_to_list(Name), "/download"]),
+            {ok, Binary1} = request_api(get, Path),
+            {ok, Binary2} = request_api(get, Path),
+            ?assertMatch({ok, _}, zip:table(Binary1)),
+            ?assertMatch({ok, _}, zip:table(Binary2))
+        end,
+        fun(Trace) ->
+            [
+                #{zip_dir := ZipDir1},
+                #{zip_dir := ZipDir2}
+            ] = ?of_kind(trace_api_download_trace_log, Trace),
+            ?assertEqual({error, enoent}, file:list_dir(ZipDir1)),
+            ?assertEqual({error, enoent}, file:list_dir(ZipDir2)),
+            ?assertNotEqual(ZipDir1, ZipDir2)
+        end
+    ),
+    ok.
+
+t_download_empty_trace(_Config) ->
+    ClientId = <<"client-test-empty-trace-download">>,
+    Now = erlang:system_time(second),
+    Name = <<"test_client_id_empty_trace">>,
+    create_trace(Name, ClientId, Now),
+    ?check_trace(
+        begin
+            ?wait_async_action(
+                ?assertMatch(
+                    {ok, _}, request_api(put, api_path(<<"trace/", Name/binary, "/stop">>), #{})
+                ),
+                #{?snk_kind := update_trace_done}
+            )
+        end,
+        []
+    ),
+    {error, {{_, 404, _}, _Headers, Body}} =
+        request_api(get, api_path(<<"trace/", Name/binary, "/download">>), [], #{return_all => true}),
+    ?assertMatch(#{<<"message">> := <<"Trace is empty">>}, emqx_utils_json:decode(Body)),
+    TraceDir = emqx_trace:trace_dir(),
+    ?assertEqual(ok, file:del_dir_r(TraceDir)),
+    ?assertEqual(ok, file:make_dir(TraceDir)),
+    %% return 404 if trace file is not found
+    {error, {{_, 404, _}, _, _}} =
+        request_api(get, api_path(<<"trace/", Name/binary, "/download">>), [], #{return_all => true}),
+    ?assertMatch(#{<<"message">> := <<"Trace is empty">>}, emqx_utils_json:decode(Body)),
+    ok.
+
+-doc """
+Verifies that we check the namespace query parameter (`ns`) against the actor's namespace.
+
+* Global admins can start traces for arbitrary namespaces.
+* Namespaced admins are restricted to their own namespace.
+""".
+t_namespaced_rule_trace(_TCConfig) ->
+    on_exit(fun() ->
+        emqx_hooks:del(
+            'namespace.resource_pre_create',
+            {?MODULE, on_namespace_resource_pre_create}
+        )
+    end),
+    ok = emqx_hooks:add(
+        'namespace.resource_pre_create',
+        {?MODULE, on_namespace_resource_pre_create, []},
+        ?HP_HIGHEST
+    ),
+
+    Namespace = <<"some_ns">>,
+    CreateTrace = fun(Params, Opts) ->
+        ?wait_async_action(
+            create_trace_api(Params, Opts),
+            #{?snk_kind := "creating_trace"},
+            1_000
+        )
+    end,
+
+    %% Global admin can start traces on any namespace.
+    Name = <<"my_trace">>,
+    Params = #{
+        <<"name">> => Name,
+        <<"type">> => <<"ruleid">>,
+        <<"ruleid">> => Name
+    },
+    %% Create a trace targeting ns (specified ns param, global admin).
+    ?assertMatch(
+        {{200, #{<<"namespace">> := Namespace}}, {ok, #{namespace := Namespace}}},
+        CreateTrace(Params, #{ns => Namespace})
+    ),
+    {204, _} = delete_trace_api(Name),
+
+    %% Create a trace targeting global (no ns param, global admin).
+    ?assertMatch(
+        {{200, #{<<"namespace">> := null}}, {ok, #{namespace := ?global_ns}}},
+        CreateTrace(Params, #{})
+    ),
+    {204, _} = delete_trace_api(Name),
+
+    Role = iolist_to_binary(["ns:", Namespace, "::administrator"]),
+    NsToken = emqx_bridge_v2_testlib:create_namespaced_user_and_token(#{
+        params => #{<<"role">> => Role}
+    }),
+    AuthHeader = {"Authorization", iolist_to_binary(["Bearer ", NsToken])},
+
+    %% Create a trace targeting ns (no ns param, namespaced admin).
+    ?assertMatch(
+        {{200, _}, {ok, #{namespace := Namespace}}},
+        CreateTrace(Params, #{auth_header => AuthHeader})
+    ),
+    {204, _} = delete_trace_api(Name),
+
+    %% Create a trace targeting valid ns (ns param, equal to namespaced admin's).
+    ?assertMatch(
+        {{200, _}, {ok, #{namespace := Namespace}}},
+        CreateTrace(Params, #{ns => Namespace, auth_header => AuthHeader})
+    ),
+    {204, _} = delete_trace_api(Name),
+
+    %% Create a trace targeting inavlid ns (ns param, different from namespaced admin's).
+    OtherNamespace = <<"other_ns">>,
+    ?assertMatch(
+        {403, _},
+        create_trace_api(Params, #{ns => OtherNamespace, auth_header => AuthHeader})
+    ),
+
+    ok.
+
+-doc """
+Regression test for #18653/#18664's class of bug: audit records for
+`POST /trace` must identify the namespace, both for a global admin's
+implicit-global trace and a namespaced admin's implicit-own-namespace
+trace (no `?ns=` in either case).
+""".
+t_create_trace_audit_records_namespace(_TCConfig) ->
+    StartAt = erlang:system_time(microsecond),
+    ?assertMatch(
+        {200, _},
+        create_trace_api(
+            #{
+                <<"name">> => <<"global_trace_for_audit">>,
+                <<"type">> => <<"clientid">>,
+                <<"clientid">> => <<"clientid_audit_global">>
+            },
+            #{}
+        )
+    ),
+    NsAdmin = namespaced_admin_headers(),
+    ?assertMatch(
+        {200, _},
+        create_trace_api(
+            #{
+                <<"name">> => <<"ns_trace_for_audit">>,
+                <<"type">> => <<"clientid">>,
+                <<"clientid">> => <<"clientid_audit_ns">>
+            },
+            #{auth_header => NsAdmin}
+        )
+    ),
+    Entries = wait_for_audit_entries(<<"/trace">>, StartAt, 2, 2000),
+    Namespaces = lists:sort([namespace_of(E) || E <- Entries]),
+    ?assertEqual(lists:sort([<<"global">>, <<"ns1">>]), Namespaces),
+    ok.
+
+%% The audit write happens after the HTTP response is already sent (see
+%% minirest_handler:init/2), so poll for a bit rather than assume the record
+%% is there the instant the request returns.
+wait_for_audit_entries(_OperationId, _StartAt, _ExpectedCount, RemainMs) when RemainMs =< 0 ->
+    ct:fail(audit_entries_not_found_in_time);
+wait_for_audit_entries(OperationId, StartAt, ExpectedCount, RemainMs) ->
+    Entries = audit_entries_since(OperationId, StartAt),
+    case length(Entries) >= ExpectedCount of
+        true ->
+            Entries;
+        false ->
+            SleepMs = 100,
+            ct:sleep(SleepMs),
+            wait_for_audit_entries(OperationId, StartAt, ExpectedCount, RemainMs - SleepMs)
+    end.
+
+audit_entries_since(OperationId, StartAt) ->
+    URL = emqx_mgmt_api_test_util:api_path(["audit"]),
+    QueryParams = #{
+        <<"operation_id">> => OperationId,
+        <<"gte_created_at">> => integer_to_binary(StartAt),
+        <<"limit">> => <<"100">>
+    },
+    {200, #{<<"data">> := Data}} =
+        emqx_mgmt_api_test_util:simple_request(#{
+            method => get, url => URL, query_params => QueryParams
+        }),
+    Data.
+
+namespace_of(#{<<"http_request">> := #{<<"namespace">> := Ns}}) -> Ns.
+
+-doc """
+Checks the cross-namespace access boundary on per-trace operations.
+
+A trace created by a global administrator must not be visible to a
+namespaced administrator from a different namespace via any per-name
+endpoint — list / download / stream / log_detail / delete / stop. We
+return `404` (not `403`) for cross-namespace lookups so the response
+does not leak the existence of traces in other namespaces.
+
+Also asserts that namespaced administrators cannot trigger the bulk
+`DELETE /trace` (clear-all): that one returns `403` because the caller
+asked for a global action.
+
+The namespaced *viewer* role is exercised separately: viewers may only
+issue GETs, so RBAC rejects DELETE/PUT before our handlers see them,
+and we just confirm that listing hides the global trace and that GET
+endpoints return 404.
+""".
+t_namespaced_user_cross_ns_isolation(_TCConfig) ->
+    %% Use a default-global auth header to create a global trace.
+    Name = <<"global_trace_for_isolation">>,
+    {ok, _} = request_api(
+        post,
+        api_path("trace"),
+        #{
+            <<"name">> => Name,
+            <<"type">> => <<"clientid">>,
+            <<"clientid">> => <<"clientid_xyz">>
+        }
+    ),
+    NsAdmin = namespaced_admin_headers(),
+    %% Namespaced administrator: every per-trace lookup is 404, bulk
+    %% clear is 403.
+    ?assertMatch({404, _}, download_trace_simple(Name, NsAdmin)),
+    ?assertMatch({404, _}, stream_trace_log_simple(Name, NsAdmin)),
+    ?assertMatch({404, _}, log_detail_simple(Name, NsAdmin)),
+    ?assertMatch({404, _}, delete_one_trace_simple(Name, NsAdmin)),
+    ?assertMatch({404, _}, stop_trace_simple(Name, NsAdmin)),
+    ?assertMatch({200, []}, list_traces_simple(NsAdmin)),
+    ?assertMatch({403, _}, clear_traces_simple(NsAdmin)),
+    %% Namespaced viewer: GETs only. RBAC blocks DELETE/PUT itself.
+    NsViewer = namespaced_viewer_headers(),
+    ?assertMatch({404, _}, download_trace_simple(Name, NsViewer)),
+    ?assertMatch({404, _}, stream_trace_log_simple(Name, NsViewer)),
+    ?assertMatch({404, _}, log_detail_simple(Name, NsViewer)),
+    ?assertMatch({200, []}, list_traces_simple(NsViewer)),
+    ok.
+
+-doc """
+Checks the namespace boundary on `PUT /tracing` (the global trace
+configuration endpoint).
+
+A namespaced administrator must not mutate the global `[trace]`
+configuration; RBAC gates the operation on `?global_ns` and
+returns `403 UNAUTHORIZED_ROLE`. A namespaced viewer is also
+rejected (RBAC blocks `PUT` for viewers before the handler is reached).
+A global administrator retains full read/write access (regression) and
+the namespaced write leaves the config unchanged.
+""".
+t_namespaced_user_cannot_update_config(_TCConfig) ->
+    %% Snapshot the current global trace config; we'll assert it is
+    %% unchanged after the rejected namespaced write, and restore it
+    %% at the end.
+    GlobalAdmin = emqx_bridge_v2_testlib:create_superuser(),
+    {200, Conf0} = tracing_simple(get, GlobalAdmin),
+    try
+        %% Namespaced administrator: 403 UNAUTHORIZED_ROLE from RBAC.
+        NsAdmin = namespaced_admin_headers(),
+        {StatusAdm, BodyAdm} = tracing_simple(put, #{<<"max_traces">> => 1}, NsAdmin),
+        ?assertEqual(403, StatusAdm),
+        ?assertMatch(#{<<"code">> := <<"UNAUTHORIZED_ROLE">>}, BodyAdm),
+        %% Config is left untouched.
+        {200, Conf1} = tracing_simple(get, GlobalAdmin),
+        ?assertEqual(Conf0, Conf1),
+        %% Namespaced viewer: RBAC rejects `PUT` for viewers before the
+        %% handler is reached; the response is still a 403.
+        NsViewer = namespaced_viewer_headers(),
+        {StatusViewer, _} = tracing_simple(put, #{<<"max_traces">> => 1}, NsViewer),
+        ?assertEqual(403, StatusViewer),
+        %% Positive regression: a global dashboard administrator can
+        %% update both visible fields, and each update persists on GET.
+        {200, Conf2} = tracing_simple(put, #{<<"max_traces">> => 1}, GlobalAdmin),
+        ?assertMatch(#{<<"max_traces">> := 1}, Conf2),
+        {200, Conf3} = tracing_simple(get, GlobalAdmin),
+        ?assertMatch(#{<<"max_traces">> := 1}, Conf3),
+        {200, Conf4} = tracing_simple(put, #{<<"max_file_size">> => <<"64MB">>}, GlobalAdmin),
+        ?assertMatch(#{<<"max_file_size">> := 64 * 1024 * 1024}, Conf4),
+        {200, Conf5} = tracing_simple(get, GlobalAdmin),
+        ?assertMatch(#{<<"max_file_size">> := 64 * 1024 * 1024}, Conf5)
+    after
+        {200, _} = tracing_simple(put, Conf0, GlobalAdmin)
+    end.
+
+namespaced_admin_headers() ->
+    emqx_bridge_v2_testlib:create_namespaced_admin_headers(#{}).
+
+namespaced_viewer_headers() ->
+    emqx_bridge_v2_testlib:create_namespaced_admin_headers(#{
+        params => #{
+            <<"username">> => <<"nsviewer">>,
+            <<"role">> => <<"ns:ns1::viewer">>
+        }
+    }).
+
+download_trace_simple(Name, AuthHeader) ->
+    emqx_mgmt_api_test_util:simple_request(#{
+        method => get,
+        url => emqx_mgmt_api_test_util:api_path(["trace", Name, "download"]),
+        auth_header => AuthHeader
+    }).
+
+stream_trace_log_simple(Name, AuthHeader) ->
+    emqx_mgmt_api_test_util:simple_request(#{
+        method => get,
+        url => emqx_mgmt_api_test_util:api_path(["trace", Name, "log"]),
+        auth_header => AuthHeader
+    }).
+
+log_detail_simple(Name, AuthHeader) ->
+    emqx_mgmt_api_test_util:simple_request(#{
+        method => get,
+        url => emqx_mgmt_api_test_util:api_path(["trace", Name, "log_detail"]),
+        auth_header => AuthHeader
+    }).
+
+delete_one_trace_simple(Name, AuthHeader) ->
+    emqx_mgmt_api_test_util:simple_request(#{
+        method => delete,
+        url => emqx_mgmt_api_test_util:api_path(["trace", Name]),
+        auth_header => AuthHeader
+    }).
+
+stop_trace_simple(Name, AuthHeader) ->
+    emqx_mgmt_api_test_util:simple_request(#{
+        method => put,
+        url => emqx_mgmt_api_test_util:api_path(["trace", Name, "stop"]),
+        auth_header => AuthHeader
+    }).
+
+list_traces_simple(AuthHeader) ->
+    emqx_mgmt_api_test_util:simple_request(#{
+        method => get,
+        url => emqx_mgmt_api_test_util:api_path(["trace"]),
+        auth_header => AuthHeader
+    }).
+
+clear_traces_simple(AuthHeader) ->
+    emqx_mgmt_api_test_util:simple_request(#{
+        method => delete,
+        url => emqx_mgmt_api_test_util:api_path(["trace"]),
+        auth_header => AuthHeader
+    }).
+
+tracing_simple(get, AuthHeader) ->
+    emqx_mgmt_api_test_util:simple_request(#{
+        method => get,
+        url => emqx_mgmt_api_test_util:api_path(["tracing"]),
+        auth_header => AuthHeader
+    }).
+
+tracing_simple(put, Body, AuthHeader) ->
+    emqx_mgmt_api_test_util:simple_request(#{
+        method => put,
+        url => emqx_mgmt_api_test_util:api_path(["tracing"]),
+        body => Body,
+        auth_header => AuthHeader
+    }).
+
+to_rfc3339(Second) ->
+    list_to_binary(calendar:system_time_to_rfc3339(Second)).
+
+create_trace_api(Params, Opts) ->
+    URL = emqx_mgmt_api_test_util:api_path(["trace"]),
+    QueryParams =
+        case maps:find(ns, Opts) of
+            {ok, Ns} when is_binary(Ns) ->
+                #{<<"ns">> => Ns};
+            error ->
+                #{}
+        end,
+    ReqOpts = maps:with([auth_header], Opts),
+    emqx_mgmt_api_test_util:simple_request(ReqOpts#{
+        method => post,
+        url => URL,
+        body => Params,
+        query_params => QueryParams
+    }).
+
+delete_trace_api(Name) ->
+    URL = emqx_mgmt_api_test_util:api_path(["trace", Name]),
+    emqx_mgmt_api_test_util:simple_request(#{
+        method => delete,
+        url => URL
+    }).
+
+request_api(Method, Url) ->
+    request_api(Method, Url, []).
+
+request_api(Method, Url, Body) ->
+    request_api(Method, Url, Body, #{}).
+
+request_api(Method, Url, Body, ReturnAll = true) ->
+    request_api(Method, Url, Body, #{return_all => ReturnAll});
+request_api(Method, Url, Body, Opts) ->
+    Opts1 = Opts#{httpc_req_opts => [{body_format, binary}]},
+    emqx_mgmt_api_test_util:request_api(Method, Url, [], [], Body, Opts1).
+
+api_path(Path) ->
+    emqx_mgmt_api_test_util:api_path([Path]).
+
+json(Data) ->
+    emqx_utils_json:decode(Data).
+
+on_namespace_resource_pre_create(#{namespace := _Namespace}, ResCtx) ->
+    {stop, ResCtx#{exists := true}}.

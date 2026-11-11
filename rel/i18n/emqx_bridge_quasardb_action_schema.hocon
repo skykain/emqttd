@@ -1,0 +1,32 @@
+emqx_bridge_quasardb_action_schema {
+  quasardb {
+    label: """Upload to QuasarDB"""
+    desc:
+    """Action that takes incoming events and appends them to QuasarDB."""
+  }
+
+  action_parameters {
+    label: """QuasarDB action parameters"""
+    desc:
+    """Set of parameters for the action."""
+  }
+
+  sql {
+    label: "SQL"
+    desc: """~
+      SQL for inserting data. Supports placeholder variables such as `${clientid}`.
+      The action validates the `INSERT INTO ... VALUES (...)` structure before it renders placeholders.
+      It quotes and escapes values according to their SQL context.
+      Use unquoted placeholders for numbers, `NULL`, and timestamp values.
+      Text values are quoted automatically. Use single quotes to force a placeholder to remain text.
+      This quoted form also combines a placeholder with static string content.
+      Timestamp values must use a documented QuasarDB timestamp form.
+      Values containing `NUL` are not supported by the QuasarDB query API.~"""
+  }
+
+  health_check_table {
+    label: "Table Name For Health Check"
+    desc: """~
+      Table name to use in Action health checks.  Currently, it's not possible to infer the table name directly from the SQL.  If set, this value will be used in a `SHOW TABLE <table>` statement to probe the table existence during Action health checks.~"""
+  }
+}

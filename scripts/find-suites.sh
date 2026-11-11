@@ -1,15 +1,111 @@
 #!/usr/bin/env bash
 
-## this script prints out all test/*_SUITE.erl files of a given app,
+## If EMQX_CT_SUITES or SUITES is provided, it prints the variable.
+## Otherwise this script tries to find all test/*_SUITE.erl files of then given app,
 ## file names are separated by comma for rebar3 ct's `--suite` option
+
+## If SUITEGROUP is set as M_N, it prints group M of N groups.
+## Suites are dealt to groups round-robin in sorted order:
+## group M gets the suites at positions M, M+N, M+2N, ...
+## SUITEGROUP default value is 1_1
 
 set -euo pipefail
 
 # ensure dir
 cd -P -- "$(dirname -- "$0")/.."
 
-TESTDIR="test"
-if [ "$1" != "emqx" ]; then
-    TESTDIR="$1/test"
+RELATIVE_OUTPUT=0
+if [[ "${1:-}" == "--relative" ]]; then
+    RELATIVE_OUTPUT=1
+    shift
 fi
-find "${TESTDIR}" -name "*_SUITE.erl" 2>/dev/null | xargs | tr ' ' ','
+
+DIR="$1"
+
+complete_path() {
+    local filename="$1"
+    local base_dir="$DIR/test"
+
+    if [[ "$RELATIVE_OUTPUT" == "1" ]]; then
+        base_dir="test"
+    fi
+
+    # Check if path prefix is present
+    if [[ "$filename" != */* ]]; then
+        filename="$base_dir/$filename"
+    fi
+
+    # Check if suffix is present
+    if [[ "$filename" != *.erl ]]; then
+        filename="$filename.erl"
+    fi
+
+    if [[ "$RELATIVE_OUTPUT" == "1" ]]; then
+        filename="${filename#"${DIR}"/}"
+        filename="${filename#./"${DIR}"/}"
+        filename="${filename#./}"
+    fi
+
+    echo "$filename"
+}
+## EMQX_CT_SUITES or SUITES is useful in ad-hoc runs
+EMQX_CT_SUITES="${EMQX_CT_SUITES:-${SUITES:-}}"
+if [ -n "${EMQX_CT_SUITES:-}" ]; then
+    OUTPUT=""
+    IFS=',' read -ra FILE_ARRAY <<< "$EMQX_CT_SUITES"
+    for file in "${FILE_ARRAY[@]}"; do
+        path=$(complete_path "$file")
+        check_path="$path"
+        if [[ "$RELATIVE_OUTPUT" == "1" ]]; then
+            check_path="$DIR/$path"
+        fi
+        if [ ! -f "$check_path" ]; then
+            echo ''
+            echo "ERROR: '$check_path' is not a file. Ignored!" >&2
+            exit 1
+        fi
+        if [ -z "$OUTPUT" ]; then
+            OUTPUT="$path"
+        else
+            OUTPUT="$OUTPUT,$path"
+        fi
+    done
+    echo "${OUTPUT}"
+    exit 0
+fi
+
+TESTDIR="$DIR/test"
+INTEGRATION_TESTDIR="$DIR/integration_test"
+# Get the output of the find command
+IFS=$'\n' read -r -d '' -a FILES < <(find "${TESTDIR}" -name "*_SUITE.erl" 2>/dev/null | LC_ALL=C sort && printf '\0')
+if [[ -d "${INTEGRATION_TESTDIR}" ]]; then
+  IFS=$'\n' read -r -d '' -a FILES_INTEGRATION < <(find "${INTEGRATION_TESTDIR}" -name "*_SUITE.erl" 2>/dev/null | LC_ALL=C sort && printf '\0')
+fi
+# shellcheck disable=SC2206
+FILES+=(${FILES_INTEGRATION:-})
+
+SUITEGROUP_RAW="${SUITEGROUP:-1_1}"
+SUITEGROUP="$(echo "$SUITEGROUP_RAW" | cut -d '_' -f1)"
+SUITEGROUP_COUNT="$(echo "$SUITEGROUP_RAW" | cut -d '_' -f2)"
+
+# Calculate the total number of files
+FILE_COUNT=${#FILES[@]}
+
+if (( SUITEGROUP > SUITEGROUP_COUNT )); then
+    echo "Error: SUITEGROUP in the format of M_N, M must be not greater than M"
+    exit 1
+fi
+
+# Deal the suites round-robin, so that suites sharing a name prefix
+# land in different groups.
+sep=''
+for (( i = SUITEGROUP - 1; i < FILE_COUNT; i += SUITEGROUP_COUNT )); do
+    path="${FILES[$i]}"
+    if [[ "$RELATIVE_OUTPUT" == "1" ]]; then
+        path="${path#"${DIR}"/}"
+        path="${path#./}"
+    fi
+    echo -n "${sep}${path}"
+    sep=','
+done
+echo

@@ -1,0 +1,35 @@
+Fixes: <!-- github issue number if applicable -->
+Release version: <!-- run script ./scripts/rel-versions to get release versions -->
+Introduced in: <!-- N/A: If this is a pre-release fix (e.g. found in QA phase);  pre-5.8: If it's an old one (5.8 is the earliest minor actively maintained); VSN: The exact version wihch introduced the bug.  -->
+
+## Summary
+
+<!--
+Please compose a nontrivial summary in case of significant changes.
+* Point out the crucial changes in logic
+* Point out the most relevant files and modules for the change
+* Provide some reasoning for the decisions taken
+-->
+
+## PR Checklist
+<!--
+Please convert the PR to a draft if any of the following conditions are not met.
+-->
+- [ ] The changes are covered with new or existing tests
+- [ ] Change log for changes visible by users has been added to `changes/ee/(feat|perf|fix|breaking)-<PR-id>.en.md` files
+- [ ] Schema changes are backward compatible or intentionally breaking (describe the changes and the reasoning in the summary)
+
+<!--
+Please, take in account the following guidelines while working on PR:
+* Try to achieve reasonable coverage of the new code
+* Add property-based tests for code that performs complex user input validation or implements a complex algorithm
+* Create a PR to [emqx-docs](https://github.com/emqx/emqx-docs) if documentation update is required, or make a follow-up jira ticket
+* Do not squash large PRs into a single commit, try to keep comprehensive history of incremental changes
+* Do not squash any significant amount of review fixes into the previous commits
+-->
+
+<!--
+## Checklist for CI (.github/workflows) changes
+- [ ] If changed package build workflow, pass [this action](https://github.com/emqx/emqx/actions/workflows/build_packages.yaml) (manual trigger)
+- [ ] Change log has been added to `changes/` dir for user-facing artifacts update
+-->

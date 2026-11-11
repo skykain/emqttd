@@ -1,0 +1,1052 @@
+%%--------------------------------------------------------------------
+%% Copyright (c) 2018-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
+%%--------------------------------------------------------------------
+
+-module(emqx_broker_SUITE).
+
+-compile(export_all).
+-compile(nowarn_export_all).
+
+-include_lib("eunit/include/eunit.hrl").
+-include_lib("emqx/include/asserts.hrl").
+-include_lib("common_test/include/ct.hrl").
+-include_lib("snabbkaffe/include/snabbkaffe.hrl").
+
+-include_lib("emqx/include/emqx.hrl").
+-include_lib("emqx/include/emqx_hooks.hrl").
+-include_lib("emqx/include/emqx_mqtt.hrl").
+
+all() ->
+    [
+        {group, legacy},
+        {group, hardened}
+    ].
+
+groups() ->
+    TCs = emqx_common_test_helpers:all(?MODULE),
+    ConnClientTCs = [
+        t_connected_client_count_persistent,
+        t_connected_client_count_anonymous,
+        t_connected_client_count_transient_takeover,
+        t_connected_client_stats
+    ],
+    OtherTCs = TCs -- ConnClientTCs,
+    ProfileGroups = [{group, all_cases}, {group, connected_client_count_group}],
+    [
+        {legacy, [], ProfileGroups},
+        {hardened, [], ProfileGroups},
+        {all_cases, [], OtherTCs},
+        {connected_client_count_group, [
+            {group, tcp},
+            {group, ws},
+            {group, quic}
+        ]},
+        {tcp, [], ConnClientTCs},
+        {ws, [], ConnClientTCs},
+        {quic, [], ConnClientTCs}
+    ].
+
+init_per_group(Profile, Config) when Profile =:= legacy; Profile =:= hardened ->
+    ok = emqx_common_test_helpers:set_security_profile(Profile),
+    [{security_profile, Profile} | Config];
+init_per_group(connected_client_count_group, Config) ->
+    Config;
+init_per_group(tcp, Config) ->
+    Apps = emqx_cth_suite:start(
+        [emqx],
+        #{work_dir => emqx_cth_suite:work_dir(Config)}
+    ),
+    [{conn_fun, connect}, {group_apps, Apps} | Config];
+init_per_group(ws, Config) ->
+    Apps = emqx_cth_suite:start(
+        [emqx],
+        #{work_dir => emqx_cth_suite:work_dir(Config)}
+    ),
+    [
+        {ssl, false},
+        {enable_websocket, true},
+        {conn_fun, ws_connect},
+        {port, 8083},
+        {host, "localhost"},
+        {group_apps, Apps}
+        | Config
+    ];
+init_per_group(quic, Config) ->
+    Apps = emqx_cth_suite:start(
+        [
+            {emqx,
+                "listeners.quic.test {"
+                "\n enable = true"
+                "\n max_connections = 1024000"
+                "\n idle_timeout = 15s"
+                "\n ssl_options.verify = verify_peer"
+                "\n }" ++
+                    emqx_common_test_helpers:listener_test_certs("listeners.quic.test")}
+        ],
+        #{work_dir => emqx_cth_suite:work_dir(Config)}
+    ),
+    Port = listener_port(quic, test),
+    [
+        {conn_fun, quic_connect},
+        {port, Port},
+        {ssl_opts, emqx_common_test_helpers:client_mtls()},
+        {ssl, true},
+        {group_apps, Apps}
+        | Config
+    ];
+init_per_group(_Group, Config) ->
+    Apps = emqx_cth_suite:start(
+        [emqx],
+        #{work_dir => emqx_cth_suite:work_dir(Config)}
+    ),
+    [{group_apps, Apps} | Config].
+
+end_per_group(connected_client_count_group, _Config) ->
+    ok;
+end_per_group(Profile, _Config) when Profile =:= legacy; Profile =:= hardened ->
+    emqx_common_test_helpers:clear_security_profile();
+end_per_group(_Group, Config) ->
+    emqx_cth_suite:stop(?config(group_apps, Config)).
+
+listener_port(Type, Name) ->
+    case emqx_config:get([listeners, Type, Name, bind]) of
+        {_, Port} -> Port;
+        Port -> Port
+    end.
+
+init_per_suite(Config) ->
+    emqx_common_test_helpers:clear_security_profile(),
+    Config.
+
+end_per_suite(_Config) ->
+    emqx_common_test_helpers:clear_security_profile().
+
+init_per_testcase(Case, Config) ->
+    ?MODULE:Case({init, Config}).
+
+end_per_testcase(Case, Config) ->
+    ?MODULE:Case({'end', Config}).
+
+%%--------------------------------------------------------------------
+%% PubSub Test
+%%--------------------------------------------------------------------
+
+%% Verify that a publish hook can report persistence through `message_persisted` message header
+t_message_persisted({init, Config}) ->
+    Config;
+t_message_persisted({'end', _Config}) ->
+    emqx_hooks:del('message.publish', {?MODULE, mark_message_persisted});
+t_message_persisted(_Config) ->
+    Topic = <<"t_message_persisted">>,
+    Msg = emqx_message:make(?MODULE, 1, Topic, <<"payload">>),
+
+    %% An absent or false header does not count as persistence.
+    ?assertEqual({ok, [], Msg}, emqx_broker:publish2(Msg)),
+    NotPersisted = emqx_message:set_header(message_persisted, false, Msg),
+    ?assertEqual({ok, [], NotPersisted}, emqx_broker:publish2(NotPersisted)),
+
+    %% Hook-reported persistence prevents a no-subscriber drop.
+    ok = emqx_hooks:add('message.publish', {?MODULE, mark_message_persisted, []}, ?HP_LOWEST),
+    Dropped = emqx_metrics:val_global('messages.dropped.no_subscribers'),
+    Persisted = emqx_message:set_header(message_persisted, true, Msg),
+    ?assertEqual({ok, [persisted], Persisted}, emqx_broker:publish2(Msg)),
+    ?assertEqual(Dropped, emqx_metrics:val_global('messages.dropped.no_subscribers')),
+
+    %% Persisted messages still reach matching subscribers.
+    ok = emqx_broker:subscribe(Topic),
+    ?assertMatch({ok, [{_, Topic, _}, persisted], Persisted}, emqx_broker:publish2(Msg)),
+    receive
+        {deliver, Topic, #message{payload = <<"payload">>}} -> ok
+    after 1000 ->
+        ct:fail(message_not_delivered)
+    end,
+    ok = emqx_broker:unsubscribe(Topic),
+
+    %% A blocked message that a hook persisted is reported as persisted and is not routed.
+    ok = emqx_broker:subscribe(Topic),
+    Blocked = emqx_message:set_header(allow_publish, false, Msg),
+    PersistedBlocked = emqx_message:set_header(message_persisted, true, Blocked),
+    ?assertEqual({ok, [persisted], PersistedBlocked}, emqx_broker:publish2(Blocked)),
+    ?assertEqual(
+        {ok, [persisted], PersistedBlocked},
+        emqx_broker:publish2(Blocked, #{hook_prohibition_as_error => true})
+    ),
+    ?assertNotReceive({deliver, Topic, _}),
+    ok = emqx_broker:unsubscribe(Topic),
+    ok = emqx_hooks:del('message.publish', {?MODULE, mark_message_persisted}),
+
+    %% A blocked message without the persistence header is still reported as blocked.
+    ?assertEqual({ok, [], Blocked}, emqx_broker:publish2(Blocked)),
+    ?assertEqual(
+        {error, blocked, Blocked},
+        emqx_broker:publish2(Blocked, #{hook_prohibition_as_error => true})
+    ),
+    ok = emqx_hooks:add('message.publish', {?MODULE, mark_message_persisted, []}, ?HP_LOWEST),
+
+    %% A disconnect request also takes precedence over the persistence header.
+    Disconnect = emqx_message:set_header(should_disconnect, true, Msg),
+    PersistedDisconnect = emqx_message:set_header(message_persisted, true, Disconnect),
+    ?assertEqual({error, disconnect, PersistedDisconnect}, emqx_broker:publish2(Disconnect)).
+
+mark_message_persisted(Message) ->
+    {ok, emqx_message:set_header(message_persisted, true, Message)}.
+
+%% Verify that `dispatch_info/2' sends the term unchanged to exact and wildcard subscribers only.
+t_dispatch_info({init, Config}) ->
+    Config;
+t_dispatch_info({'end', _Config}) ->
+    emqx_hooks:del('message.publish', {?MODULE, mark_message_persisted});
+t_dispatch_info(_Config) ->
+    Topic = <<"t_dispatch_info/a">>,
+    Info = {dispatch_info_test, make_ref()},
+    Publish = emqx_metrics:val_global('messages.publish'),
+    Dropped = emqx_metrics:val_global('messages.dropped'),
+
+    %% A term without subscribers goes nowhere and changes no counters.
+    ?assertEqual(ok, emqx_broker:dispatch_info(Topic, Info)),
+    ?assertNotReceive(Info),
+
+    %% Exact and wildcard subscribers each receive the term once; shared subscribers do not.
+    ok = emqx_broker:subscribe(Topic),
+    ok = emqx_broker:subscribe(<<"t_dispatch_info/+">>),
+    ok = emqx_broker:subscribe(emqx_topic:make_shared_record(<<"g">>, Topic)),
+    ok = emqx_hooks:add('message.publish', {?MODULE, mark_message_persisted, []}, ?HP_LOWEST),
+    ?assertEqual(ok, emqx_broker:dispatch_info(Topic, Info)),
+    ?assertReceive(Info),
+    ?assertReceive(Info),
+    ?assertNotReceive(Info),
+
+    %% The term is not a delivery, so delivery draining leaves it in the mailbox.
+    ?assertEqual(ok, emqx_broker:dispatch_info(Topic, Info)),
+    ?assertEqual([], emqx_utils:drain_deliver()),
+    ?assertReceive(Info),
+    ?assertReceive(Info),
+
+    ?assertEqual(Publish, emqx_metrics:val_global('messages.publish')),
+    ?assertEqual(Dropped, emqx_metrics:val_global('messages.dropped')),
+    ok = emqx_broker:unsubscribe(Topic),
+    ok = emqx_broker:unsubscribe(<<"t_dispatch_info/+">>),
+    ok = emqx_broker:unsubscribe(emqx_topic:make_shared_record(<<"g">>, Topic)).
+
+%% Check that the legacy and v2 publish APIs report the same outcomes in their own formats.
+t_publish_compatibility({init, Config}) ->
+    Config;
+t_publish_compatibility({'end', _Config}) ->
+    ok;
+t_publish_compatibility(_Config) ->
+    Msg = emqx_message:make(?MODULE, 1, <<"t_publish_compatibility">>, <<"payload">>),
+    ?assertEqual([], emqx_broker:publish(Msg)),
+    ?assertEqual([], emqx:publish(Msg)),
+    ?assertEqual([], emqx_broker:safe_publish(Msg)),
+    ?assertEqual({ok, [], Msg}, emqx_broker:publish2(Msg)),
+    ?assertEqual({ok, [], Msg}, emqx:publish2(Msg)),
+    ?assertEqual({ok, [], Msg}, emqx_broker:safe_publish2(Msg)),
+
+    Persisted = emqx_message:set_header(message_persisted, true, Msg),
+    ?assertEqual([persisted], emqx_broker:publish(Persisted)),
+    ?assertEqual({ok, [persisted], Persisted}, emqx_broker:publish2(Persisted)),
+
+    Blocked = emqx_message:set_header(allow_publish, false, Msg),
+    ?assertEqual([], emqx_broker:publish(Blocked)),
+    ?assertEqual({ok, [], Blocked}, emqx_broker:publish2(Blocked)),
+    Opts = #{hook_prohibition_as_error => true},
+    ?assertEqual({blocked, Blocked}, emqx_broker:publish(Blocked, Opts)),
+    ?assertEqual({blocked, Blocked}, emqx_broker:safe_publish(Blocked, Opts)),
+    ?assertEqual({error, blocked, Blocked}, emqx_broker:publish2(Blocked, Opts)),
+    ?assertEqual({error, blocked, Blocked}, emqx_broker:safe_publish2(Blocked, Opts)),
+
+    Disconnect = emqx_message:set_header(should_disconnect, true, Msg),
+    ?assertEqual(disconnect, emqx_broker:publish(Disconnect)),
+    ?assertEqual(disconnect, emqx_broker:safe_publish(Disconnect)),
+    ?assertEqual({error, disconnect, Disconnect}, emqx_broker:publish2(Disconnect)),
+    ?assertEqual({error, disconnect, Disconnect}, emqx_broker:safe_publish2(Disconnect)),
+
+    %% Invalid messages fail at the legacy API boundary.
+    ?assertMatch(
+        {'EXIT', {function_clause, [{emqx_broker, publish, _, _} | _]}},
+        catch emqx_broker:publish(invalid)
+    ),
+    ?assertMatch(
+        {'EXIT', {function_clause, [{emqx_broker, publish, _, _} | _]}},
+        catch emqx_broker:publish(invalid, #{})
+    ),
+    ?assertMatch(
+        {'EXIT', {function_clause, [{emqx_broker, safe_publish, _, _} | _]}},
+        catch emqx_broker:safe_publish(invalid)
+    ),
+    ?assertMatch(
+        {'EXIT', {function_clause, [{emqx_broker, safe_publish, _, _} | _]}},
+        catch emqx_broker:safe_publish(invalid, #{})
+    ),
+
+    %% Invalid messages fail at the v2 API boundary.
+    ?assertMatch(
+        {'EXIT', {function_clause, [{emqx_broker, publish2, [invalid], _} | _]}},
+        catch emqx_broker:publish2(invalid)
+    ),
+    ?assertMatch(
+        {'EXIT', {function_clause, [{emqx_broker, publish2, [invalid, #{}], _} | _]}},
+        catch emqx_broker:publish2(invalid, #{})
+    ),
+    ?assertMatch(
+        {'EXIT', {function_clause, [{emqx_broker, safe_publish2, [invalid], _} | _]}},
+        catch emqx_broker:safe_publish2(invalid)
+    ),
+    ?assertMatch(
+        {'EXIT', {function_clause, [{emqx_broker, safe_publish2, [invalid, #{}], _} | _]}},
+        catch emqx_broker:safe_publish2(invalid, #{})
+    ).
+
+%% Check that safe publish keeps the legacy empty result when publishing fails.
+t_safe_publish_compatibility({init, Config}) ->
+    Config;
+t_safe_publish_compatibility({'end', _Config}) ->
+    ok;
+t_safe_publish_compatibility(_Config) ->
+    Msg0 = emqx_message:make(?MODULE, 1, <<"t_safe_publish_compatibility">>, <<"payload">>),
+    Msg = Msg0#message{topic = invalid_topic},
+    ?assertEqual([], emqx_broker:safe_publish(Msg)),
+    ?assertEqual({ok, [], Msg}, emqx_broker:safe_publish2(Msg)).
+
+t_stats_fun({init, Config}) ->
+    ok = emqx_stats:reset(),
+    Config;
+t_stats_fun(Config) when is_list(Config) ->
+    ok = emqx_broker:subscribe(<<"topic">>, <<"clientid">>),
+    ok = emqx_broker:subscribe(<<"topic2">>, <<"clientid">>),
+    %% ensure stats refreshed
+    emqx_broker_helper:stats_fun(),
+    %% emqx_stats:set_stat is a gen_server cast
+    %% make a synced call sync
+    ignored = gen_server:call(emqx_stats, call, infinity),
+    ?assertEqual(2, emqx_stats:getstat('subscribers.count')),
+    ?assertEqual(2, emqx_stats:getstat('subscribers.max')),
+    ?assertEqual(2, emqx_stats:getstat('subscriptions.count')),
+    ?assertEqual(2, emqx_stats:getstat('subscriptions.max')),
+    ?assertEqual(2, emqx_stats:getstat('suboptions.count')),
+    ?assertEqual(2, emqx_stats:getstat('suboptions.max'));
+t_stats_fun({'end', _Config}) ->
+    ok = emqx_broker:unsubscribe(<<"topic">>),
+    ok = emqx_broker:unsubscribe(<<"topic2">>).
+
+t_subscribed({init, Config}) ->
+    emqx_broker:subscribe(<<"topic">>),
+    Config;
+t_subscribed(Config) when is_list(Config) ->
+    ?assertEqual(true, emqx:subscribed(self(), <<"topic">>));
+t_subscribed({'end', _Config}) ->
+    emqx_broker:unsubscribe(<<"topic">>).
+
+t_subscribed_2({init, Config}) ->
+    emqx_broker:subscribe(<<"topic">>, <<"clientid">>),
+    Config;
+t_subscribed_2(Config) when is_list(Config) ->
+    ?assertEqual(true, emqx_broker:subscribed(self(), <<"topic">>));
+t_subscribed_2({'end', _Config}) ->
+    emqx_broker:unsubscribe(<<"topic">>).
+
+t_topics({init, Config}) ->
+    Topics = [<<"topic">>, <<"topic/1">>, <<"topic/2">>],
+    [{topics, Topics} | Config];
+t_topics(Config) when is_list(Config) ->
+    Topics = [T1, T2, T3] = proplists:get_value(topics, Config),
+    ok = emqx_broker:subscribe(T1, <<"clientId">>),
+    ok = emqx_broker:subscribe(T2, <<"clientId">>),
+    ok = emqx_broker:subscribe(T3, <<"clientId">>),
+    Topics1 = emqx_broker:topics(),
+    ?assertEqual(
+        true,
+        lists:foldl(
+            fun(Topic, Acc) ->
+                case lists:member(Topic, Topics1) of
+                    true -> Acc;
+                    false -> false
+                end
+            end,
+            true,
+            Topics
+        )
+    );
+t_topics({'end', Config}) ->
+    Topics = proplists:get_value(topics, Config),
+    lists:foreach(fun(T) -> emqx_broker:unsubscribe(T) end, Topics).
+
+t_subscribers({init, Config}) ->
+    emqx_broker:subscribe(<<"topic">>, <<"clientid">>),
+    Config;
+t_subscribers(Config) when is_list(Config) ->
+    ?assertEqual([self()], emqx_broker:subscribers(<<"topic">>));
+t_subscribers({'end', _Config}) ->
+    emqx_broker:unsubscribe(<<"topic">>).
+
+t_subscriptions({init, Config}) ->
+    emqx_broker:subscribe(<<"topic">>, <<"clientid">>, #{qos => 1}),
+    Config;
+t_subscriptions(Config) when is_list(Config) ->
+    ct:sleep(100),
+    ?assertEqual(
+        #{nl => 0, qos => 1, rap => 0, rh => 0, subid => <<"clientid">>},
+        proplists:get_value(<<"topic">>, emqx_broker:subscriptions(self()))
+    ),
+    ?assertEqual(
+        #{nl => 0, qos => 1, rap => 0, rh => 0, subid => <<"clientid">>},
+        proplists:get_value(<<"topic">>, emqx_broker:subscriptions(<<"clientid">>))
+    );
+t_subscriptions({'end', _Config}) ->
+    emqx_broker:unsubscribe(<<"topic">>).
+
+-doc """
+An MQTT client writes no `emqx_subid` row, and `subscriptions/1` returns the same
+list for its clientid as for its channel pid.
+""".
+t_subscriptions_by_clientid({init, Config}) ->
+    Config;
+t_subscriptions_by_clientid({'end', _Config}) ->
+    ok;
+t_subscriptions_by_clientid(Config) when is_list(Config) ->
+    ClientId = <<"t_subscriptions_by_clientid">>,
+    {ok, C} = emqtt:start_link([{clean_start, true}, {clientid, ClientId}]),
+    {ok, _} = emqtt:connect(C),
+    try
+        {ok, _, [1, 0]} = emqtt:subscribe(C, [{<<"t/1">>, 1}, {<<"t/2">>, 0}]),
+        [ChanPid] = emqx_cm:lookup_channels(local, ClientId),
+        %% The channel registers with `no_monitor`, so it writes no emqx_subid row
+        %% and is found through the emqx_cm channel table.
+        ?assertEqual(ClientId, emqx_broker_helper:lookup_subid(ChanPid)),
+        ?assertEqual([], ets:lookup(emqx_subid, ClientId)),
+        Subs = emqx_broker:subscriptions(ChanPid),
+        ?assertEqual([<<"t/1">>, <<"t/2">>], lists:sort(proplists:get_keys(Subs))),
+        ?assertEqual(Subs, emqx_broker:subscriptions(ClientId)),
+        ?assertEqual(Subs, emqx_broker:subopts_by_clientid(ClientId))
+    after
+        ok = emqtt:disconnect(C)
+    end.
+
+-doc """
+When two channels are registered for one clientid, as during a session takeover,
+`subscriptions/1` returns the subscriptions of the channel registered last,
+even when that channel has the smaller pid.
+""".
+t_subscriptions_by_clientid_takeover({init, Config}) ->
+    Config;
+t_subscriptions_by_clientid_takeover({'end', _Config}) ->
+    ok;
+t_subscriptions_by_clientid_takeover(Config) when is_list(Config) ->
+    ClientId = <<"t_subscriptions_by_clientid_takeover">>,
+    StartChan = fun() ->
+        spawn_link(fun() ->
+            receive
+                {subscribe, Topic, From} ->
+                    ok = emqx_broker:subscribe(Topic, ClientId, #{qos => 0}, no_monitor),
+                    From ! {subscribed, self()}
+            end,
+            receive
+                stop -> ok
+            end
+        end)
+    end,
+    %% The channel registered last gets the smaller pid.
+    [NewPid, OldPid] = lists:sort([StartChan(), StartChan()]),
+    ok = emqx_cm:register_channel(ClientId, OldPid, #{conn_mod => emqx_connection}),
+    ok = emqx_cm:register_channel(ClientId, NewPid, #{conn_mod => emqx_connection}),
+    lists:foreach(
+        fun({Pid, Topic}) ->
+            Pid ! {subscribe, Topic, self()},
+            receive
+                {subscribed, Pid} -> ok
+            after 5000 -> ct:fail({subscribe_timeout, Pid})
+            end
+        end,
+        [{OldPid, <<"t/old">>}, {NewPid, <<"t/new">>}]
+    ),
+    try
+        ?assertEqual([<<"t/new">>], proplists:get_keys(emqx_broker:subscriptions(ClientId)))
+    after
+        OldPid ! stop,
+        NewPid ! stop
+    end.
+
+t_sub_pub({init, Config}) ->
+    ok = emqx_broker:subscribe(<<"topic">>),
+    Config;
+t_sub_pub(Config) when is_list(Config) ->
+    ct:sleep(100),
+    emqx_broker:safe_publish2(emqx_message:make(ct, <<"topic">>, <<"hello">>)),
+    ?assert(
+        receive
+            {deliver, <<"topic">>, #message{payload = <<"hello">>}} ->
+                true;
+            _ ->
+                false
+        after 100 ->
+            false
+        end
+    );
+t_sub_pub({'end', _Config}) ->
+    ok = emqx_broker:unsubscribe(<<"topic">>).
+
+t_nosub_pub({init, Config}) ->
+    Config;
+t_nosub_pub({'end', _Config}) ->
+    ok;
+t_nosub_pub(Config) when is_list(Config) ->
+    Dropped = emqx_metrics:val_global('messages.dropped'),
+    emqx_broker:publish2(emqx_message:make(ct, <<"topic">>, <<"hello">>)),
+    ?assertEqual(Dropped + 1, emqx_metrics:val_global('messages.dropped')).
+
+t_shared_subscribe({init, Config}) ->
+    emqx_broker:subscribe(
+        emqx_topic:make_shared_record(<<"group">>, <<"topic">>), <<"clientid">>, #{}
+    ),
+    ct:sleep(100),
+    Config;
+t_shared_subscribe(Config) when is_list(Config) ->
+    emqx_broker:safe_publish2(emqx_message:make(ct, <<"topic">>, <<"hello">>)),
+    ?assert(
+        receive
+            {deliver, <<"topic">>, #message{
+                headers = #{redispatch_to := ?REDISPATCH_TO(<<"group">>, <<"topic">>)},
+                payload = <<"hello">>
+            }} ->
+                true;
+            Msg ->
+                ct:pal("Msg: ~p", [Msg]),
+                false
+        after 100 ->
+            false
+        end
+    );
+t_shared_subscribe({'end', _Config}) ->
+    emqx_broker:unsubscribe(emqx_topic:make_shared_record(<<"group">>, <<"topic">>)).
+
+t_shared_subscribe_2({init, Config}) ->
+    Config;
+t_shared_subscribe_2({'end', _Config}) ->
+    ok;
+t_shared_subscribe_2(_) ->
+    {ok, ConnPid} = emqtt:start_link([{clean_start, true}, {clientid, <<"clientid">>}]),
+    {ok, _} = emqtt:connect(ConnPid),
+    {ok, _, [0]} = emqtt:subscribe(ConnPid, <<"$share/group/topic">>, 0),
+
+    {ok, ConnPid2} = emqtt:start_link([{clean_start, true}, {clientid, <<"clientid2">>}]),
+    {ok, _} = emqtt:connect(ConnPid2),
+    {ok, _, [0]} = emqtt:subscribe(ConnPid2, <<"$share/group2/topic">>, 0),
+
+    ct:sleep(10),
+    ok = emqtt:publish(ConnPid, <<"topic">>, <<"hello">>, 0),
+    Msgs = recv_msgs(2),
+    ?assertEqual(2, length(Msgs)),
+    ?assertEqual(
+        true,
+        lists:foldl(
+            fun
+                (#{payload := <<"hello">>, topic := <<"topic">>}, Acc) ->
+                    Acc;
+                (_, _) ->
+                    false
+            end,
+            true,
+            Msgs
+        )
+    ),
+    emqtt:disconnect(ConnPid),
+    emqtt:disconnect(ConnPid2).
+
+t_shared_subscribe_3({init, Config}) ->
+    Config;
+t_shared_subscribe_3({'end', _Config}) ->
+    ok;
+t_shared_subscribe_3(_) ->
+    {ok, ConnPid} = emqtt:start_link([{clean_start, true}, {clientid, <<"clientid">>}]),
+    {ok, _} = emqtt:connect(ConnPid),
+    {ok, _, [0]} = emqtt:subscribe(ConnPid, <<"$share/group/topic">>, 0),
+
+    {ok, ConnPid2} = emqtt:start_link([{clean_start, true}, {clientid, <<"clientid2">>}]),
+    {ok, _} = emqtt:connect(ConnPid2),
+    {ok, _, [0]} = emqtt:subscribe(ConnPid2, <<"$share/group/topic">>, 0),
+
+    ct:sleep(10),
+    ok = emqtt:publish(ConnPid, <<"topic">>, <<"hello">>, 0),
+    Msgs = recv_msgs(2),
+    ?assertEqual(1, length(Msgs)),
+    emqtt:disconnect(ConnPid),
+    emqtt:disconnect(ConnPid2).
+
+t_fanout({init, Config}) ->
+    Config;
+t_fanout({'end', _Config}) ->
+    emqx_stats:reset();
+t_fanout(_Config) ->
+    NSubscribers = 2500,
+    Subscribers = [
+        spawn_link(fun() ->
+            ClientID = integer_to_binary(I),
+            ok = emqx_broker:subscribe(<<"topic">>, ClientID),
+            ?assertReceive({deliver, <<"topic">>, #message{payload = <<"hello">>}}, 5000)
+        end)
+     || I <- lists:seq(1, NSubscribers)
+    ],
+    ?retry(
+        200,
+        10,
+        NSubscribers = emqx_stats:getstat('suboptions.count')
+    ),
+    emqx_broker:safe_publish2(emqx_message:make(ct, <<"topic">>, <<"hello">>)),
+    ?retry(
+        200,
+        10,
+        false = lists:any(fun erlang:is_process_alive/1, Subscribers)
+    ).
+
+t_fanout_async_dispatch({init, Config}) ->
+    emqx_config:put([broker, perf, async_fanout_shard_dispatch], true),
+    emqx_broker:init_config(),
+    Config;
+t_fanout_async_dispatch({'end', _Config}) ->
+    emqx_config:put([broker, perf, async_fanout_shard_dispatch], false),
+    emqx_broker:init_config();
+t_fanout_async_dispatch(Config) ->
+    t_fanout(Config).
+
+%% persistent sessions, when gone, do not contribute to connected
+%% client count
+t_connected_client_count_persistent({init, Config}) ->
+    ok = snabbkaffe:start_trace(),
+    Config;
+t_connected_client_count_persistent(Config) when is_list(Config) ->
+    ConnFun = ?config(conn_fun, Config),
+    ClientID = <<"clientid">>,
+    ClientOpts = [
+        {clean_start, false},
+        {clientid, ClientID}
+        | Config
+    ],
+    ?assertEqual(0, emqx_cm:get_connected_client_count()),
+    ?check_trace(
+        #{timetrap => 10_000},
+        %% NOTE
+        %% Change in the number of clients is sometimes not reflected immediately.
+        %% That's why we have to retry test assertions.
+        begin
+            %% Connect a client.
+            T0 = timestep(),
+            {ok, ConnPid0} = emqtt:start_link(ClientOpts),
+            {ok, _} = emqtt:ConnFun(ConnPid0),
+            {ok, _} = block_until(emqx_cm_connected_client_count_inc, since(T0)),
+            ?retry(10, 3, ?assertEqual(1, emqx_cm:get_connected_client_count())),
+            %% Disconnect, should be zero again.
+            true = erlang:unlink(ConnPid0),
+            ok = emqtt:disconnect(ConnPid0),
+            {ok, _} = block_until(emqx_cm_connected_client_count_dec, since(T0)),
+            ?retry(10, 3, ?assertEqual(0, emqx_cm:get_connected_client_count())),
+            %% Reconnecting.
+            T1 = timestep(),
+            {ok, ConnPid1} = emqtt:start_link(ClientOpts),
+            {ok, _} = emqtt:ConnFun(ConnPid1),
+            {ok, _} = block_until(emqx_cm_connected_client_count_inc, since(T1)),
+            ?retry(10, 3, ?assertEqual(1, emqx_cm:get_connected_client_count())),
+            %% Take over, should be exacly 1 once the takeover is complete.
+            T2 = timestep(),
+            true = erlang:unlink(ConnPid1),
+            {ok, ConnPid2} = emqtt:start_link(ClientOpts),
+            {ok, _} = emqtt:ConnFun(ConnPid2),
+            {ok, _} = block_until(emqx_cm_connected_client_count_inc, since(T2)),
+            {ok, _} = block_until(emqx_cm_connected_client_count_dec, since(T2)),
+            ?retry(10, 3, ?assertEqual(1, emqx_cm:get_connected_client_count())),
+            %% Abnormal exit of channel process
+            T3 = timestep(),
+            true = erlang:unlink(ConnPid2),
+            ChanPids = emqx_cm:all_channels(),
+            ok = lists:foreach(fun(ChanPid) -> exit(ChanPid, kill) end, ChanPids),
+            {ok, _} = block_until(
+                {
+                    ?match_event(#{?snk_kind := emqx_cm_connected_client_count_dec}),
+                    length(ChanPids)
+                },
+                since(T3)
+            ),
+            ?retry(10, 5, ?assertEqual(0, emqx_cm:get_connected_client_count()))
+        end,
+        fun(_) ->
+            ok
+        end
+    );
+t_connected_client_count_persistent({'end', _Config}) ->
+    snabbkaffe:stop(),
+    ok.
+
+%% connections without client_id also contribute to connected client
+%% count
+t_connected_client_count_anonymous({init, Config}) ->
+    ok = snabbkaffe:start_trace(),
+    process_flag(trap_exit, true),
+    Config;
+t_connected_client_count_anonymous(Config) when is_list(Config) ->
+    ConnFun = ?config(conn_fun, Config),
+    ?assertEqual(0, emqx_cm:get_connected_client_count()),
+    %% first client
+    {ok, ConnPid0} = emqtt:start_link([
+        {clean_start, true}
+        | Config
+    ]),
+    {{ok, _}, {ok, [_]}} = wait_for_events(
+        fun() -> emqtt:ConnFun(ConnPid0) end,
+        [emqx_cm_connected_client_count_inc]
+    ),
+    ?assertEqual(1, emqx_cm:get_connected_client_count()),
+    %% second client
+    {ok, ConnPid1} = emqtt:start_link([
+        {clean_start, true}
+        | Config
+    ]),
+    {{ok, _}, {ok, [_]}} = wait_for_events(
+        fun() -> emqtt:ConnFun(ConnPid1) end,
+        [emqx_cm_connected_client_count_inc]
+    ),
+    ?assertEqual(2, emqx_cm:get_connected_client_count()),
+    %% when first client disconnects, shouldn't affect the second
+    {ok, {ok, [_]}} = wait_for_events(
+        fun() -> emqtt:disconnect(ConnPid0) end,
+        [
+            emqx_cm_connected_client_count_dec
+        ]
+    ),
+    ?assertEqual(1, emqx_cm:get_connected_client_count()),
+    %% reconnecting
+    {ok, ConnPid2} = emqtt:start_link([
+        {clean_start, true}
+        | Config
+    ]),
+    {{ok, _}, {ok, [_]}} = wait_for_events(
+        fun() -> emqtt:ConnFun(ConnPid2) end,
+        [emqx_cm_connected_client_count_inc]
+    ),
+    ?assertEqual(2, emqx_cm:get_connected_client_count()),
+    {ok, {ok, [_]}} = wait_for_events(
+        fun() -> emqtt:disconnect(ConnPid1) end,
+        [
+            emqx_cm_connected_client_count_dec
+        ]
+    ),
+    ?assertEqual(1, emqx_cm:get_connected_client_count()),
+    %% abnormal exit of channel process
+    Chans = emqx_cm:all_channels(),
+    {ok, {ok, [_]}} = wait_for_events(
+        fun() ->
+            lists:foreach(
+                fun(ChanPid) -> exit(ChanPid, kill) end,
+                Chans
+            )
+        end,
+        [
+            emqx_cm_connected_client_count_dec
+        ]
+    ),
+    ?assertEqual(0, emqx_cm:get_connected_client_count()),
+    ok;
+t_connected_client_count_anonymous({'end', _Config}) ->
+    snabbkaffe:stop(),
+    ok.
+
+t_connected_client_count_transient_takeover({init, Config}) ->
+    ok = snabbkaffe:start_trace(),
+    process_flag(trap_exit, true),
+    Config;
+t_connected_client_count_transient_takeover(Config) when is_list(Config) ->
+    ConnFun = ?config(conn_fun, Config),
+    ClientID = <<"clientid">>,
+    ?assertEqual(0, emqx_cm:get_connected_client_count()),
+    %% we spawn several clients simultaneously to cause the race
+    %% condition for the client id lock
+    NumClients = 20,
+    ConnectSuccessCntr = counters:new(1, []),
+    ConnectFailCntr = counters:new(1, []),
+    Opts = [
+        {clean_start, true},
+        {clientid, ClientID}
+        | Config
+    ],
+    ConnectFun =
+        fun() ->
+            process_flag(trap_exit, true),
+            try
+                {ok, ConnPid} = emqtt:start_link(Opts),
+                {ok, _} = emqtt:ConnFun(ConnPid),
+                counters:add(ConnectSuccessCntr, 1, 1)
+            catch
+                _:_ ->
+                    counters:add(ConnectFailCntr, 1, 1)
+            end
+        end,
+    {ok, {ok, [_, _]}} =
+        wait_for_events(
+            fun() ->
+                lists:foreach(
+                    fun(_) ->
+                        spawn(ConnectFun)
+                    end,
+                    lists:seq(1, NumClients)
+                )
+            end,
+            %% At least one channel acquires the lock for this client id.  We
+            %% also expect a decrement event because the client dies along with
+            %% the ephemeral process.
+            [
+                emqx_cm_connected_client_count_inc,
+                emqx_cm_connected_client_count_dec
+            ],
+            5000
+        ),
+    %% Since more than one pair of inc/dec may be emitted, we need to
+    %% wait for full stabilization
+    ?retry(
+        _Sleep = 100,
+        _Retries = 100,
+        begin
+            ConnectSuccessCnt = counters:get(ConnectSuccessCntr, 1),
+            ConnectFailCnt = counters:get(ConnectFailCntr, 1),
+            NumClients = ConnectSuccessCnt + ConnectFailCnt
+        end
+    ),
+    ConnectSuccessCnt = counters:get(ConnectSuccessCntr, 1),
+    ?assert(ConnectSuccessCnt > 0),
+    EventsThatShouldHaveHappened = lists:flatten(
+        lists:duplicate(
+            ConnectSuccessCnt,
+            [
+                emqx_cm_connected_client_count_inc,
+                emqx_cm_connected_client_count_dec
+            ]
+        )
+    ),
+    wait_for_events(fun() -> ok end, EventsThatShouldHaveHappened, 10000, infinity),
+    %% It must be 0 again because we got enough
+    %% emqx_cm_connected_client_count_dec events
+    ?assertEqual(0, emqx_cm:get_connected_client_count()),
+    %% connecting again, this time, retry until server is not busy
+    %% BackInTime must stay 0 here: this clientid was just reused by the
+    %% takeover storm, so a look-back window can match a stale inc event from
+    %% one of those discarded channels instead of this reconnect's own event.
+    %% Only the forward timeout needs widening.
+    {{ok, _}, {ok, [_]}} =
+        wait_for_events(
+            fun() -> start_connect_client(Opts, ConnFun) end,
+            [emqx_cm_connected_client_count_inc],
+            5000
+        ),
+    ?assertEqual(1, emqx_cm:get_connected_client_count()),
+    %% abnormal exit of channel process
+    [ChanPid] = emqx_cm:all_channels(),
+    {ok, {ok, [_]}} =
+        wait_for_events(
+            fun() ->
+                exit(ChanPid, kill),
+                ok
+            end,
+            [emqx_cm_connected_client_count_dec]
+        ),
+    ?assertEqual(0, emqx_cm:get_connected_client_count()),
+    ok;
+t_connected_client_count_transient_takeover({'end', _Config}) ->
+    snabbkaffe:stop(),
+    ok.
+
+t_connected_client_stats({init, Config}) ->
+    ok = supervisor:terminate_child(emqx_kernel_sup, emqx_stats),
+    {ok, _} = supervisor:restart_child(emqx_kernel_sup, emqx_stats),
+    ok = snabbkaffe:start_trace(),
+    Config;
+t_connected_client_stats(Config) when is_list(Config) ->
+    ConnFun = ?config(conn_fun, Config),
+    ?assertEqual(0, emqx_cm:get_connected_client_count()),
+    ?assertEqual(0, emqx_stats:getstat('live_connections.count')),
+    ?assertEqual(0, emqx_stats:getstat('live_connections.max')),
+    {ok, ConnPid} = emqtt:start_link([
+        {clean_start, true},
+        {clientid, <<"clientid">>}
+        | Config
+    ]),
+    {{ok, _}, {ok, [_]}} = wait_for_events(
+        fun() -> emqtt:ConnFun(ConnPid) end,
+        [emqx_cm_connected_client_count_inc]
+    ),
+    timer:sleep(20),
+    %% ensure stats are synchronized
+    {_, {ok, [_]}} = wait_for_stats(
+        fun emqx_cm:stats_fun/0,
+        [
+            #{
+                count_stat => 'live_connections.count',
+                max_stat => 'live_connections.max'
+            }
+        ]
+    ),
+    ?assertEqual(1, emqx_stats:getstat('live_connections.count')),
+    ?assertEqual(1, emqx_stats:getstat('live_connections.max')),
+    {ok, {ok, [_]}} = wait_for_events(
+        fun() -> emqtt:disconnect(ConnPid) end,
+        [emqx_cm_connected_client_count_dec]
+    ),
+    timer:sleep(20),
+    %% ensure stats are synchronized
+    {_, {ok, [_]}} = wait_for_stats(
+        fun emqx_cm:stats_fun/0,
+        [
+            #{
+                count_stat => 'live_connections.count',
+                max_stat => 'live_connections.max'
+            }
+        ]
+    ),
+    ?assertEqual(0, emqx_stats:getstat('live_connections.count')),
+    ?assertEqual(1, emqx_stats:getstat('live_connections.max')),
+    ok;
+t_connected_client_stats({'end', _Config}) ->
+    ok = snabbkaffe:stop(),
+    ok = supervisor:terminate_child(emqx_kernel_sup, emqx_stats),
+    {ok, _} = supervisor:restart_child(emqx_kernel_sup, emqx_stats),
+    ok.
+
+%% the count must be always non negative
+t_connect_client_never_negative({init, Config}) ->
+    Config;
+t_connect_client_never_negative(Config) when is_list(Config) ->
+    ?assertEqual(0, emqx_cm:get_connected_client_count()),
+    %% would go to -1
+    ChanPid = list_to_pid("<0.0.1>"),
+    emqx_cm:mark_channel_disconnected(ChanPid),
+    ?assertEqual(0, emqx_cm:get_connected_client_count()),
+    %% would be 0, if really went to -1
+    emqx_cm:mark_channel_connected(ChanPid),
+    ?assertEqual(1, emqx_cm:get_connected_client_count()),
+    ok;
+t_connect_client_never_negative({'end', _Config}) ->
+    ok.
+
+t_connack_auth_error({init, Config}) ->
+    process_flag(trap_exit, true),
+    emqx_common_test_helpers:listeners_enable_authn_scoped(),
+    emqx_hooks:put(
+        'client.authenticate',
+        {?MODULE, authenticate_deny, []},
+        ?HP_AUTHN
+    ),
+    Config;
+t_connack_auth_error({'end', _Config}) ->
+    emqx_hooks:del(
+        'client.authenticate',
+        {?MODULE, authenticate_deny, []}
+    ),
+    ok;
+t_connack_auth_error(Config) when is_list(Config) ->
+    %% MQTT 3.1
+    ?assertEqual(0, emqx_metrics:val_global('packets.connack.auth_error')),
+    {ok, C0} = emqtt:start_link([{proto_ver, v4}]),
+    ?assertEqual({error, {malformed_username_or_password, undefined}}, emqtt:connect(C0)),
+    ?assertEqual(1, emqx_metrics:val_global('packets.connack.auth_error')),
+    %% MQTT 5.0
+    {ok, C1} = emqtt:start_link([{proto_ver, v5}]),
+    ?assertEqual({error, {bad_username_or_password, #{}}}, emqtt:connect(C1)),
+    ?assertEqual(2, emqx_metrics:val_global('packets.connack.auth_error')),
+    ok.
+
+authenticate_deny(_Credentials, _Default) ->
+    {stop, {error, bad_username_or_password}}.
+
+wait_for_events(Action, Kinds) ->
+    wait_for_events(Action, Kinds, 1000).
+
+wait_for_events(Action, Kinds, Timeout) ->
+    wait_for_events(Action, Kinds, Timeout, 0).
+
+wait_for_events(Action, Kinds, Timeout, BackInTime) ->
+    Predicate = fun(#{?snk_kind := K}) ->
+        lists:member(K, Kinds)
+    end,
+    N = length(Kinds),
+    {ok, Sub} = snabbkaffe_collector:subscribe(Predicate, N, Timeout, BackInTime),
+    Res = Action(),
+    case snabbkaffe_collector:receive_events(Sub) of
+        {timeout, _} ->
+            {Res, timeout};
+        {ok, Events} ->
+            {Res, {ok, Events}}
+    end.
+
+block_until(Kind, BackInTime) when is_atom(Kind) ->
+    block_until(?match_event(#{?snk_kind := Kind}), BackInTime);
+block_until(Predicate, BackInTime) ->
+    snabbkaffe:block_until(Predicate, infinity, BackInTime).
+
+wait_for_stats(Action, Stats) ->
+    Predicate = fun
+        (Event = #{?snk_kind := emqx_stats_setstat}) ->
+            Stat = maps:with(
+                [
+                    count_stat,
+                    max_stat
+                ],
+                Event
+            ),
+            lists:member(Stat, Stats);
+        (_) ->
+            false
+    end,
+    N = length(Stats),
+    Timeout = 500,
+    {ok, Sub} = snabbkaffe_collector:subscribe(Predicate, N, Timeout, 0),
+    Res = Action(),
+    case snabbkaffe_collector:receive_events(Sub) of
+        {timeout, _} ->
+            {Res, timeout};
+        {ok, Events} ->
+            {Res, {ok, Events}}
+    end.
+
+recv_msgs(Count) ->
+    recv_msgs(Count, []).
+
+recv_msgs(0, Msgs) ->
+    Msgs;
+recv_msgs(Count, Msgs) ->
+    receive
+        {publish, Msg} ->
+            recv_msgs(Count - 1, [Msg | Msgs]);
+        _Other ->
+            recv_msgs(Count, Msgs)
+    after 100 ->
+        Msgs
+    end.
+
+timestep() ->
+    T0 = erlang:monotonic_time(millisecond),
+    ok = timer:sleep(1),
+    T0.
+
+since(T0) ->
+    erlang:monotonic_time(millisecond) - T0.
+
+start_connect_client(Opts, ConnFun) ->
+    {ok, Pid} = emqtt:start_link(Opts),
+    case emqtt_connect(Pid, ConnFun) of
+        {ok, _ConnAck} ->
+            {ok, Pid};
+        {error, {server_busy, _ConnAckProps}} ->
+            timer:sleep(10),
+            ClientId = proplists:get_value(clientid, Opts),
+            ct:pal("~s reconnect after delay", [ClientId]),
+            start_connect_client(Opts, ConnFun);
+        {error, Reason} ->
+            error(Reason)
+    end.
+
+emqtt_connect(ClientPid, ConnFun) ->
+    unlink(ClientPid),
+    case emqtt:ConnFun(ClientPid) of
+        {ok, ConnAck} ->
+            {ok, ConnAck};
+        {error, Reason} ->
+            %% ensure failed client is killed
+            exit(ClientPid, kill),
+            {error, Reason}
+    end.

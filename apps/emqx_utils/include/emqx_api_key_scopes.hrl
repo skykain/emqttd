@@ -1,0 +1,195 @@
+%%--------------------------------------------------------------------
+%% Copyright (c) 2020-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
+%%--------------------------------------------------------------------
+
+%% API Key scope name constants.
+%%
+%% Every minirest_api module MUST export a `scopes/0` callback that
+%% returns one of these macros (or a map of path => macro for modules
+%% whose endpoints span multiple scopes; the keys are the exact terms
+%% the module's `paths/0` returns).
+%%
+%% A path may also declare a non-empty LIST of these macros, meaning
+%% "a holder of any one of these scopes may call this path". Use a list
+%% only where an endpoint has two legitimate audiences that cannot be
+%% collapsed into one scope name.
+%%
+%% Using macros ensures compile-time safety: a typo in a scope name
+%% will cause a compilation error rather than a silent runtime bug.
+
+%% ── User-visible scopes ────────────────────────────────────────────
+
+-define(SCOPE_CONNECTIONS, <<"connections">>).
+-define(SCOPE_PUBLISH, <<"publish">>).
+-define(SCOPE_DATA_INTEGRATION, <<"data_integration">>).
+-define(SCOPE_ACCESS_CONTROL, <<"access_control">>).
+-define(SCOPE_GATEWAYS, <<"gateways">>).
+-define(SCOPE_MONITORING, <<"monitoring">>).
+-define(SCOPE_CLUSTER_OPERATIONS, <<"cluster_operations">>).
+-define(SCOPE_SYSTEM, <<"system">>).
+-define(SCOPE_AUDIT, <<"audit">>).
+-define(SCOPE_LICENSE, <<"license">>).
+
+%% Grants the plugin-extended API gateway (`/plugin_api/:plugin/...`)
+%% and nothing else. This is the surface a plugin publishes for its own
+%% callers, NOT plugin administration: installing, starting, stopping
+%% and configuring plugins stays on `?SCOPE_SYSTEM`.
+%%
+%% The gateway path also accepts `?SCOPE_SYSTEM`, so keys and users
+%% that predate this scope keep working. See
+%% `emqx_plugins_api_endpoint:scopes/0`.
+%%
+%% The scope says nothing about what a plugin does behind the gateway.
+%% A plugin is free to publish a dangerous endpoint, and holding this
+%% scope reaches it.
+-define(SCOPE_PLUGIN_API, <<"plugin_api">>).
+
+%% ── Internal scopes ────────────────────────────────────────────────
+
+%% Endpoints that API Keys must never access (dashboard login/SSO/
+%% API Key self-management).  Not exposed to users.
+-define(SCOPE_DENIED, <<"$denied">>).
+
+%% Sentinel for paths that are intentionally unscoped: pre-login entry
+%% points (/login, /sso/login/:backend, ...) and meta endpoints that
+%% only return static catalog data (/user_scopes, /api_key_scopes).
+%% Modules using the map form of scopes/0 must declare such paths with
+%% this value rather than omitting them, so that genuinely forgotten
+%% paths still produce a startup warning. The collector inserts the
+%% sentinel into the runtime cache so that an exact-match lookup can
+%% tell "explicitly public" from "genuinely unmapped", and skips those
+%% entries during wildcard template matching so a sibling template
+%% cannot claim a public path. Lookups still report a public path as
+%% unscoped, preserving fail-open semantics.
+-define(SCOPE_PUBLIC, <<"$public">>).
+
+%% ── Login-user-only scopes (since 5.10.4) ─────────────────────────────
+%%
+%% These scopes apply to dashboard login users only. API keys MUST NOT
+%% hold any of them — schema validation rejects creation/update of API
+%% keys whose scope list includes any login-only scope; bootstrap-file
+%% loader filters them with a warning.
+%%
+%% All four are ADMIN-ONLY: only login users with role=administrator may
+%% hold them. Schema validation enforces this in POST /users / PUT
+%% /users/:name handlers.
+%%
+%% `mfa_management` means "manage OTHER users' MFA" and nothing else.
+%% It was previously holdable by any role, where for a non-administrator
+%% it acted as a self-exemption key over that user's own MFA. Self-MFA is
+%% now an identity-authorized operation on `/current_user/mfa', so the
+%% scope has no self meaning left to carry.
+
+-define(SCOPE_USER_MGMT, <<"user_management">>).
+-define(SCOPE_MFA_MGMT, <<"mfa_management">>).
+-define(SCOPE_SSO_MGMT, <<"sso_management">>).
+-define(SCOPE_API_KEY_MGMT, <<"api_key_management">>).
+
+%% All four login-only scopes. Used by:
+%%   * API key schema validation (reject any in this list)
+%%   * bootstrap-file loader (drop any in this list with warning)
+%%   * login user scope catalog (/user_scopes endpoint)
+-define(LOGIN_ONLY_SCOPES, [
+    ?SCOPE_USER_MGMT,
+    ?SCOPE_MFA_MGMT,
+    ?SCOPE_SSO_MGMT,
+    ?SCOPE_API_KEY_MGMT
+]).
+
+%% Subset of login-only scopes that require role=administrator.
+%% Currently all of them, but kept as its own list: this is the
+%% role-compatibility rule, which is a different question from
+%% "is this scope administrator-EQUIVALENT" (?PRIVILEGE_SCOPES).
+%% `mfa_management' is admin-only and NOT a privilege scope.
+-define(ADMIN_ONLY_SCOPES, [
+    ?SCOPE_USER_MGMT,
+    ?SCOPE_MFA_MGMT,
+    ?SCOPE_SSO_MGMT,
+    ?SCOPE_API_KEY_MGMT
+]).
+
+%% Generic (API-key-compatible) scopes — these scopes are usable
+%% both by API keys and by dashboard login users. Used to compute the
+%% role-default fallback for users whose extra.scopes is absent:
+%%   * global administrator default = GENERIC_SCOPES ++ LOGIN_ONLY_SCOPES
+%%   * global viewer default        = GENERIC_SCOPES
+%% Namespaced roles use NS_ADMIN_ALLOWED_SCOPES / NS_VIEWER_ALLOWED_SCOPES.
+-define(GENERIC_SCOPES, [
+    ?SCOPE_CONNECTIONS,
+    ?SCOPE_PUBLISH,
+    ?SCOPE_DATA_INTEGRATION,
+    ?SCOPE_ACCESS_CONTROL,
+    ?SCOPE_GATEWAYS,
+    ?SCOPE_MONITORING,
+    ?SCOPE_CLUSTER_OPERATIONS,
+    ?SCOPE_SYSTEM,
+    ?SCOPE_AUDIT,
+    ?SCOPE_LICENSE,
+    ?SCOPE_PLUGIN_API
+]).
+
+%% Namespaced-administrator scope defaults — a restricted subset of
+%% scopes that are actually useful for a namespaced admin. RBAC blocks
+%% namespaced admins from mutating most system endpoints, but
+%% explicitly allows data_backup (export/import/list). RBAC is the
+%% primary authorization gate for mutating endpoints, where the scope
+%% layer is defense-in-depth; for GET endpoints RBAC's catch-all grants
+%% namespaced admins blanket read access, so there the scope layer is
+%% the sole gate, not a second layer.
+-define(NS_ADMIN_COMMON_SCOPES, [
+    ?SCOPE_CONNECTIONS,
+    ?SCOPE_MONITORING,
+    ?SCOPE_DATA_INTEGRATION,
+    ?SCOPE_ACCESS_CONTROL,
+    ?SCOPE_SYSTEM,
+    %% Allow read-only cluster info such as `GET /nodes`.  RBAC blocks
+    %% the mutating endpoints in this scope (cluster join/leave,
+    %% eviction, node rebalance) for namespaced callers.
+    ?SCOPE_CLUSTER_OPERATIONS,
+    %% Allow read-only license info (`GET /license`,
+    %% `GET /license/setting`, `GET /license/session_hwm_history`).
+    %% RBAC blocks `POST /license` and `PUT /license/setting` for
+    %% namespaced callers, so writes still return 403.
+    ?SCOPE_LICENSE,
+    %% The gateway forwards the caller's namespace to the plugin, and
+    %% namespaced callers reach it today through `?SCOPE_SYSTEM`.
+    %% Listing it keeps that reach and lets a namespaced caller be
+    %% narrowed down to the plugin API alone.
+    ?SCOPE_PLUGIN_API
+]).
+-define(NS_ADMIN_LOGIN_SCOPES, [
+    ?SCOPE_USER_MGMT,
+    ?SCOPE_API_KEY_MGMT
+]).
+-define(NS_ADMIN_ALLOWED_SCOPES, ?NS_ADMIN_COMMON_SCOPES ++ ?NS_ADMIN_LOGIN_SCOPES).
+
+%% Namespaced non-administrator scopes (dashboard viewer, API-key viewer).
+%% A namespaced viewer may not hold a scope that a namespaced administrator
+%% lacks, and it holds no login-only scopes.
+-define(NS_VIEWER_ALLOWED_SCOPES, ?NS_ADMIN_COMMON_SCOPES).
+
+%% ── Privilege scope group ──────────────────────────────────────────
+%%
+%% Any one of these scopes is administrator-equivalent in effect:
+%%   * `system' covers `/configs/*' and `/data/*', which
+%%     can rewrite the whole node configuration.
+%%   * `user_management' can provision another login user holding any
+%%     scopes.
+%%   * `api_key_management' can mint an API key holding any scopes.
+%%   * `sso_management' can rotate the SSO backend.
+%%
+%% Combining a privilege scope with a non-privilege ("restricted")
+%% scope cannot meaningfully restrict the account, so schema validation
+%% refuses that combination at write time: an explicit, non-empty scope
+%% list must be either entirely privilege or entirely non-privilege.
+%% `mfa_management' is intentionally excluded: it is administrator-only
+%% like the other three, but it is not administrator-equivalent — it
+%% resets another user's MFA and cannot provision users, mint keys or
+%% rewrite configuration. So it may share an explicit list with
+%% restricted scopes while the other three may not.
+-define(PRIVILEGE_SCOPES, [
+    ?SCOPE_SYSTEM,
+    ?SCOPE_USER_MGMT,
+    ?SCOPE_API_KEY_MGMT,
+    ?SCOPE_SSO_MGMT
+]).

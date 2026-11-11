@@ -1,180 +1,109 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -define(APP, emqx_rule_engine).
 
 -define(KV_TAB, '@rule_engine_db').
 
--type(maybe(T) :: T | undefined).
+%% Process dictionary key holding the namespace of the rule currently being
+%% applied in this process.  Rule engine SQL helper functions which keep
+%% per-namespace state (e.g. kv_store_*) read it to scope their keys.
+-define(RULE_NAMESPACE_PD_KEY, '$rule_engine_namespace').
 
--type(rule_id() :: binary()).
--type(rule_name() :: binary()).
+-define(RES_SEP, <<":">>).
+-define(NS_SEG, <<"ns">>).
 
--type(resource_id() :: binary()).
--type(action_instance_id() :: binary()).
+-type option(T) :: T | undefined.
 
--type(action_name() :: atom()).
--type(resource_type_name() :: atom()).
+-type rule_id() :: binary().
+-type rule_name() :: binary().
 
--type(category() :: data_persist| data_forward | offline_msgs | debug | other).
+-type mf() :: {Module :: atom(), Fun :: atom()}.
 
--type(descr() :: #{en := binary(), zh => binary()}).
+-type hook() :: atom() | 'any'.
+-type topic() :: binary().
 
--type(mf() :: {Module::atom(), Fun::atom()}).
+-type selected_data() :: map().
+-type envs() :: map().
 
--type(hook() :: atom() | 'any').
+-type builtin_action_func() :: republish | console.
+-type builtin_action_module() :: emqx_rule_actions.
+-type bridge_channel_id() :: binary().
+-type action_fun_args() :: map().
 
--type(topic() :: binary()).
-
--type(resource_status() :: #{ alive := boolean()
-                            , atom() => binary() | atom() | list(binary()|atom())
-                            }).
-
--define(descr, #{en => <<>>, zh => <<>>}).
-
--record(action,
-        { name :: action_name()
-        , category :: category()
-        , for :: hook()
-        , app :: atom()
-        , types = [] :: list(resource_type_name())
-        , module :: module()
-        , on_create :: mf()
-        , on_destroy :: maybe(mf())
-        , hidden = false :: boolean()
-        , params_spec :: #{atom() => term()} %% params specs
-        , title = ?descr :: descr()
-        , description = ?descr :: descr()
-        }).
-
--record(action_instance,
-        { id :: action_instance_id()
-        , name :: action_name()
-        , fallbacks :: list(#action_instance{})
-        , args :: #{binary() => term()} %% the args got from API for initializing action_instance
-        }).
-
--record(rule,
-        { id :: rule_id()
-        , for :: list(topic())
-        , rawsql :: binary()
-        , is_foreach :: boolean()
-        , fields :: list()
-        , doeach :: term()
-        , incase :: list()
-        , conditions :: tuple()
-        , on_action_failed :: continue | stop
-        , actions :: list(#action_instance{})
-        , enabled :: boolean()
-        , created_at :: integer() %% epoch in millisecond precision
-        , description :: binary()
-        }).
-
--record(resource,
-        { id :: resource_id()
-        , type :: resource_type_name()
-        , config :: #{} %% the configs got from API for initializing resource
-        , created_at :: integer() | undefined %% epoch in millisecond precision
-        , description :: binary()
-        }).
-
--record(resource_type,
-        { name :: resource_type_name()
-        , provider :: atom()
-        , params_spec :: #{atom() => term()} %% params specs
-        , on_create :: mf()
-        , on_status :: mf()
-        , on_destroy :: mf()
-        , title = ?descr :: descr()
-        , description = ?descr :: descr()
-        }).
-
--record(rule_hooks,
-        { hook :: atom()
-        , rule_id :: rule_id()
-        }).
-
--record(resource_params,
-        { id :: resource_id()
-        , params :: #{} %% the params got after initializing the resource
-        , status = #{is_alive => false} :: #{is_alive := boolean(), atom() => term()}
-        }).
-
--record(action_instance_params,
-        { id :: action_instance_id()
-        %% the params got after initializing the action
-        , params :: #{}
-        %% the Func/Bindings got after initializing the action
-        , apply :: fun((Data::map(), Envs::map()) -> any())
-                 | #{mod := module(), bindings := #{atom() => term()}}
-        }).
+-type action() ::
+    #{
+        mod := builtin_action_module() | module(),
+        func := builtin_action_func() | atom(),
+        args => action_fun_args()
+    }
+    | bridge_channel_id()
+    | {bridge_v2, emqx_bridge_v2:bridge_v2_type(), emqx_bridge_v2:bridge_v2_name()}
+    | {bridge, emqx_utils_maps:config_key(), emqx_utils_maps:config_key(), bridge_channel_id()}.
 
 %% Arithmetic operators
--define(is_arith(Op), (Op =:= '+' orelse
-                       Op =:= '-' orelse
-                       Op =:= '*' orelse
-                       Op =:= '/' orelse
-                       Op =:= 'div')).
+-define(is_arith(Op),
+    (Op =:= '+' orelse
+        Op =:= '-' orelse
+        Op =:= '*' orelse
+        Op =:= '/' orelse
+        Op =:= 'div' orelse
+        Op =:= 'mod')
+).
 
 %% Compare operators
--define(is_comp(Op), (Op =:= '=' orelse
-                      Op =:= '=~' orelse
-                      Op =:= '>' orelse
-                      Op =:= '<' orelse
-                      Op =:= '<=' orelse
-                      Op =:= '>=' orelse
-                      Op =:= '<>' orelse
-                      Op =:= '!=')).
+-define(is_comp(Op),
+    (Op =:= '=' orelse
+        Op =:= '=~' orelse
+        Op =:= '>' orelse
+        Op =:= '<' orelse
+        Op =:= '<=' orelse
+        Op =:= '>=' orelse
+        Op =:= '<>' orelse
+        Op =:= '!=')
+).
 
 %% Logical operators
 -define(is_logical(Op), (Op =:= 'and' orelse Op =:= 'or')).
 
--define(RAISE(_EXP_, _ERROR_),
-        ?RAISE(_EXP_, _ = do_nothing, _ERROR_)).
+-define(RAISE(EXP, ERROR),
+    ?RAISE(EXP, _ = do_nothing, ERROR)
+).
 
--define(RAISE(_EXP_, _EXP_ON_FAIL_, _ERROR_),
-        fun() ->
-            try (_EXP_)
-            catch _EXCLASS_:_EXCPTION_:_ST_ ->
-                _EXP_ON_FAIL_,
-                throw(_ERROR_)
-            end
-        end()).
+-define(RAISE_BAD_SQL(Detail), throw(Detail)).
 
--define(CLUSTER_CALL(Func, Args), ?CLUSTER_CALL(Func, Args, ok)).
-
--define(CLUSTER_CALL(Func, Args, ResParttern),
-    fun() -> case rpc:multicall(ekka_mnesia:running_nodes(), ?MODULE, Func, Args, 5000) of
-        {ResL, []} ->
-            case lists:filter(fun(ResParttern) -> false; (_) -> true end, ResL) of
-                [] -> ResL;
-                ErrL ->
-                    ?LOG(error, "cluster_call error found, ResL: ~p", [ResL]),
-                    throw({Func, ErrL})
-            end;
-        {ResL, BadNodes} ->
-            ?LOG(error, "cluster_call bad nodes found: ~p, ResL: ~p", [BadNodes, ResL]),
-            throw({Func, {failed_on_nodes, BadNodes}})
-   end end()).
+-define(RAISE(EXP, EXP_ON_FAIL, ERROR),
+    fun() ->
+        try
+            (EXP)
+        catch
+            EXCLASS:EXCPTION:ST ->
+                EXP_ON_FAIL,
+                throw(ERROR)
+        end
+    end()
+).
 
 %% Tables
--define(RULE_TAB, emqx_rule).
--define(ACTION_TAB, emqx_rule_action).
--define(ACTION_INST_PARAMS_TAB, emqx_action_instance_params).
--define(RES_TAB, emqx_resource).
--define(RES_PARAMS_TAB, emqx_resource_params).
--define(RULE_HOOKS, emqx_rule_hooks).
--define(RES_TYPE_TAB, emqx_resource_type).
+-define(RULE_TAB, emqx_rule_engine).
+-define(RULE_TOPIC_INDEX, emqx_rule_engine_topic_index).
+
+%% Allowed sql function provider modules
+-define(DEFAULT_SQL_FUNC_PROVIDER, emqx_rule_funcs).
+-define(IS_VALID_SQL_FUNC_PROVIDER_MODULE_NAME(Name),
+    (case Name of
+        <<"emqx_rule_funcs", _/binary>> ->
+            true;
+        <<"EmqxRuleFuncs", _/binary>> ->
+            true;
+        _ ->
+            false
+    end)
+).
+
+-define(ROOT_KEY, rule_engine).
+-define(ROOT_KEY_BIN, <<"rule_engine">>).
+-define(KEY_PATH, [?ROOT_KEY, rules]).
+-define(RULE_PATH(RULE), [?ROOT_KEY, rules, RULE]).
+-define(TAG, "RULE").

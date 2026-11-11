@@ -1,0 +1,207 @@
+%%--------------------------------------------------------------------
+%% Copyright (c) 2020-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
+%%--------------------------------------------------------------------
+
+%% a coap to mqtt adapter with a retained topic message database
+-module(emqx_coap_pubsub_handler).
+
+-include_lib("emqx/include/emqx.hrl").
+-include_lib("emqx/include/emqx_mqtt.hrl").
+-include_lib("emqx/include/emqx_access_control.hrl").
+-include("emqx_coap.hrl").
+
+-export([handle_request/4, handle_request/6]).
+
+-import(emqx_coap_medium, [reply/2, reply/3]).
+-import(emqx_coap_channel, [run_hooks/3]).
+
+-define(UNSUB(Topic, Msg), #{subscribe => {Topic, Msg}}).
+-define(SUB(Topic, Token, Opts, Msg), #{
+    subscribe => {
+        #{
+            topic => Topic,
+            token => Token,
+            clientid => ClientId,
+            subopts => Opts
+        },
+        Msg
+    }
+}).
+
+%% TODO maybe can merge this code into emqx_coap_session, simplify the call chain
+
+handle_request(Path, #coap_message{} = Msg, Ctx, CInfo) ->
+    handle_request(Path, Msg, Ctx, CInfo, false, undefined).
+
+handle_request(
+    Path, #coap_message{method = Method} = Msg, Ctx, CInfo, IsConnectionless, Session
+) ->
+    case check_topic(Method, Path) of
+        {ok, Topic} ->
+            handle_method(Method, Topic, Msg, Ctx, CInfo, IsConnectionless, Session);
+        _ ->
+            reply({error, bad_request}, <<"invalid topic">>, Msg)
+    end.
+
+handle_method(get, Topic, Msg, Ctx, CInfo, IsConnectionless, Session) ->
+    case emqx_coap_message:get_option(observe, Msg) of
+        0 ->
+            subscribe(Msg, Topic, Ctx, CInfo, IsConnectionless);
+        1 ->
+            unsubscribe(Msg, Topic, Ctx, CInfo, Session);
+        _ ->
+            reply({error, bad_request}, <<"invalid observe value">>, Msg)
+    end;
+handle_method(
+    post, Topic, #coap_message{payload = Payload} = Msg, Ctx, CInfo, _IsConnectionless, _Session
+) ->
+    PublishOpts = get_publish_opts(Msg),
+    QoS = get_publish_qos(Msg, PublishOpts),
+    #{clientid := ClientId} = CInfo,
+    MQTTMsg = apply_publish_opts(PublishOpts, emqx_message:make(ClientId, QoS, Topic, Payload)),
+    case emqx_gateway_ctx:authorize_publish(Ctx, CInfo, MQTTMsg) of
+        {allow, NMsg} ->
+            _ = emqx_message_ingress:finalize_and_publish(CInfo, NMsg),
+            reply({ok, changed}, Msg);
+        deny ->
+            reply({error, unauthorized}, Msg);
+        {error, _Reason} ->
+            reply({error, unauthorized}, Msg)
+    end;
+handle_method(_, _, Msg, _, _, _, _) ->
+    reply({error, method_not_allowed}, Msg).
+
+check_topic(_Method, []) ->
+    error;
+check_topic(Method, Path) ->
+    Topic = emqx_http_lib:uri_decode(iolist_to_binary(lists:join(<<"/">>, Path))),
+    try emqx_topic:validate(topic_type(Method), Topic) of
+        true -> {ok, Topic}
+    catch
+        error:_ -> error
+    end.
+
+%% A publish takes a topic name. A subscribe and an unsubscribe take a topic filter.
+topic_type(post) -> name;
+topic_type(_) -> filter.
+
+get_sub_opts(Msg) ->
+    SubOpts = maps:fold(
+        fun parse_sub_opts/3, #{}, emqx_coap_message:extract_uri_query(Msg)
+    ),
+    case SubOpts of
+        #{qos := _} ->
+            maps:merge(mk_subopts(), SubOpts);
+        _ ->
+            CfgType = emqx_conf:get([gateway, coap, subscribe_qos], ?QOS_0),
+            maps:merge(mk_subopts(type_to_qos(CfgType, Msg)), SubOpts)
+    end.
+
+mk_subopts() ->
+    mk_subopts(?QOS_0).
+
+mk_subopts(QoS) ->
+    #{qos => QoS, rh => 1, rap => 0, nl => 0, is_new => false}.
+
+parse_sub_opts(<<"qos">>, V, Opts) ->
+    Opts#{qos => erlang:binary_to_integer(V)};
+parse_sub_opts(<<"nl">>, V, Opts) ->
+    Opts#{nl => erlang:binary_to_integer(V)};
+parse_sub_opts(<<"rh">>, V, Opts) ->
+    Opts#{rh => erlang:binary_to_integer(V)};
+parse_sub_opts(_, _, Opts) ->
+    Opts.
+
+type_to_qos(qos0, _) ->
+    ?QOS_0;
+type_to_qos(qos1, _) ->
+    ?QOS_1;
+type_to_qos(qos2, _) ->
+    ?QOS_2;
+type_to_qos(coap, #coap_message{type = Type}) ->
+    case Type of
+        non ->
+            ?QOS_0;
+        _ ->
+            ?QOS_1
+    end.
+
+get_publish_opts(Msg) ->
+    Qs = emqx_coap_message:extract_uri_query(Msg),
+    maps:fold(
+        fun
+            (<<"retain">>, V, Acc) ->
+                Val = V =:= <<"true">>,
+                Acc#{retain => Val};
+            (<<"expiry">>, V, Acc) ->
+                Val = erlang:binary_to_integer(V),
+                Acc#{expiry_interval => Val};
+            (<<"qos">>, V, Acc) ->
+                Val = erlang:binary_to_integer(V),
+                Acc#{qos => Val};
+            (_, _, Acc) ->
+                Acc
+        end,
+        #{},
+        Qs
+    ).
+
+get_publish_qos(Msg, PublishOpts) ->
+    case PublishOpts of
+        #{qos := QoS} ->
+            QoS;
+        _ ->
+            CfgType = emqx_conf:get([gateway, coap, publish_qos], ?QOS_0),
+            type_to_qos(CfgType, Msg)
+    end.
+
+apply_publish_opts(Opts, MQTTMsg) ->
+    maps:fold(
+        fun
+            (retain, Val, Acc) ->
+                emqx_message:set_flag(retain, Val, Acc);
+            (expiry_interval, Val, Acc) ->
+                Props = emqx_message:get_header(properties, Acc, #{}),
+                emqx_message:set_header(
+                    properties,
+                    Props#{'Message-Expiry-Interval' => Val},
+                    Acc
+                );
+            (_, _, Acc) ->
+                Acc
+        end,
+        MQTTMsg,
+        Opts
+    ).
+
+subscribe(#coap_message{token = <<>>} = Msg, _, _, _, _) ->
+    reply({error, bad_request}, <<"observe without token">>, Msg);
+subscribe(#coap_message{token = Token} = Msg, Topic, Ctx, CInfo, IsConnectionless) ->
+    #{qos := QoS} = SubOpts = get_sub_opts(Msg),
+    Action = ?AUTHZ_SUBSCRIBE(QoS),
+    case emqx_coap_channel:validator(Action, Topic, Ctx, CInfo) of
+        allow ->
+            #{clientid := ClientId} = CInfo,
+
+            MountTopic = mount(CInfo, Topic),
+            emqx_broker:subscribe(MountTopic, ClientId, SubOpts),
+            maybe_run_session_subscribed(IsConnectionless, Ctx, CInfo, MountTopic, SubOpts),
+            ?SUB(MountTopic, Token, SubOpts, Msg);
+        _ ->
+            reply({error, unauthorized}, Msg)
+    end.
+
+maybe_run_session_subscribed(true, _Ctx, _CInfo, _MountTopic, _SubOpts) ->
+    ok;
+maybe_run_session_subscribed(false, Ctx, CInfo, MountTopic, SubOpts) ->
+    run_hooks(Ctx, 'session.subscribed', [CInfo, MountTopic, SubOpts]).
+
+unsubscribe(#coap_message{token = Token} = Msg, Topic, _Ctx, CInfo, Session) ->
+    MountTopic = mount(CInfo, Topic),
+    case emqx_coap_session:observe_matches(MountTopic, Msg, Session) of
+        true -> ?UNSUB({MountTopic, Token}, Msg);
+        false -> reply({error, bad_request}, Msg)
+    end.
+
+mount(#{mountpoint := Mountpoint}, Topic) ->
+    <<Mountpoint/binary, Topic/binary>>.

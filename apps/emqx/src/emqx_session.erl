@@ -1,0 +1,1056 @@
+%%--------------------------------------------------------------------
+%% Copyright (c) 2017-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
+%%--------------------------------------------------------------------
+
+%%--------------------------------------------------------------------
+%% @doc
+%% A stateful interaction between a Client and a Server. Some Sessions
+%% last only as long as the Network Connection, others can span multiple
+%% consecutive Network Connections between a Client and a Server.
+%%
+%% The Session State in the Server consists of:
+%%
+%% The existence of a Session, even if the rest of the Session State is empty.
+%%
+%% The Clients subscriptions, including any Subscription Identifiers.
+%%
+%% QoS 1 and QoS 2 messages which have been sent to the Client, but have not
+%% been completely acknowledged.
+%%
+%% QoS 1 and QoS 2 messages pending transmission to the Client and OPTIONALLY
+%% QoS 0 messages pending transmission to the Client.
+%%
+%% QoS 2 messages which have been received from the Client, but have not been
+%% completely acknowledged.The Will Message and the Will Delay Interval
+%%
+%% If the Session is currently not connected, the time at which the Session
+%% will end and Session State will be discarded.
+%% @end
+%%--------------------------------------------------------------------
+
+%% MQTT Session
+-module(emqx_session).
+
+-include("logger.hrl").
+-include("types.hrl").
+-include("emqx.hrl").
+-include("emqx_session.hrl").
+-include("emqx_channel.hrl").
+-include("emqx_mqtt.hrl").
+-include_lib("snabbkaffe/include/snabbkaffe.hrl").
+
+-ifdef(TEST).
+-compile(export_all).
+-compile(nowarn_export_all).
+-include_lib("eunit/include/eunit.hrl").
+-endif.
+
+-export([
+    create/3,
+    open/3,
+    destroy/1,
+    destroy/2
+]).
+
+-export([
+    info/1,
+    info/2,
+    stats/1,
+    chan_info/1
+]).
+
+-export([
+    subscribe/4,
+    unsubscribe/4
+]).
+
+-export([
+    publish/4,
+    puback/5,
+    pubrec/3,
+    pubrel/3,
+    pubcomp/5,
+    replay/3
+]).
+
+-export([
+    deliver/4,
+    handle_info/3,
+    refresh_quota/1,
+    handle_signal/3,
+    handle_timeout/4,
+    disconnect/3,
+    terminate/3
+]).
+
+%% Will message handling
+-export([
+    clear_will_message/1,
+    publish_will_message_now/2
+]).
+
+% Session implementations
+-export([
+    enrich_delivers/3,
+    enrich_message/4
+]).
+
+% Utilities
+-export([should_keep/1]).
+-export([get_session_conf/1]).
+
+%% Context stashing
+-export([
+    get_context/0,
+    pop_context/0,
+    put_context/1
+]).
+
+-export_type([
+    t/0,
+    conf/0,
+    conninfo/0,
+    connflag/0,
+    effect/0,
+    effects/0,
+    clientinfo/0,
+    reply/0,
+    replies/0,
+    common_timer_name/0,
+    custom_timer_name/0,
+    session_id/0,
+    session/0
+]).
+
+-type session_id() :: term().
+
+-type clientinfo() :: emqx_types:clientinfo().
+-type conninfo() ::
+    emqx_types:conninfo()
+    | #{
+        %% Subset of `emqx_types:conninfo()` properties
+        receive_maximum => non_neg_integer(),
+        expiry_interval => non_neg_integer()
+    }.
+
+-type connflag() :: congested.
+
+-type common_timer_name() :: retry_delivery | expire_awaiting_rel.
+-type custom_timer_name() :: atom().
+-type effect() :: {set_timer | reset_timer, custom_timer_name(), timeout()}.
+-type effects() :: effect() | [effect()].
+
+-type message() :: emqx_types:message().
+-type publish() :: {option(emqx_types:packet_id()), emqx_types:message()}.
+-type pubrel() :: {pubrel, emqx_types:packet_id()}.
+-type reply() :: publish() | pubrel().
+-type replies() :: [reply()] | reply().
+
+%% Configuration map used for durable session properties and legacy session encoding.
+%% In-memory sessions use the shared #session_conf{} from emqx_connection_conf.
+-type conf() :: #{
+    %% Max subscriptions allowed
+    max_subscriptions := non_neg_integer() | infinity,
+    %% Maximum number of awaiting QoS2 messages allowed
+    max_awaiting_rel := non_neg_integer() | infinity,
+    %% Upgrade QoS?
+    upgrade_qos := boolean(),
+    %% Retry interval for redelivering QoS1/2 messages (Unit: millisecond)
+    retry_interval := timeout(),
+    %% Awaiting PUBREL Timeout (Unit: millisecond)
+    await_rel_timeout := timeout()
+}.
+
+-type session() :: t().
+
+-type t() ::
+    emqx_session_mem:session()
+    | emqx_persistent_session_ds:session().
+
+-define(INFO_KEYS, [
+    id,
+    created_at,
+    is_persistent,
+    subscriptions,
+    upgrade_qos,
+    retry_interval,
+    await_rel_timeout,
+    impl
+]).
+
+-define(IMPL(S), (get_impl_mod(S))).
+
+%%--------------------------------------------------------------------
+%% Behaviour
+%% -------------------------------------------------------------------
+
+-callback create(clientinfo(), conninfo(), emqx_maybe:t(message())) ->
+    t().
+
+-callback open(clientinfo(), conninfo(), emqx_maybe:t(message())) ->
+    {_IsPresent :: true, t(), _ReplayContext} | false.
+
+-callback destroy(t() | clientinfo()) -> ok.
+
+-callback clear_will_message(t()) -> t().
+
+-callback publish_will_message_now(t(), message()) -> t().
+
+-callback handle_timeout
+    (clientinfo(), common_timer_name(), [connflag()], t()) ->
+        {ok | effects(), replies(), t()}
+        | {ok | effects(), replies(), timeout(), t()};
+    (clientinfo(), custom_timer_name(), [connflag()], t()) ->
+        {ok | effects(), replies(), t()}.
+
+-callback handle_info(clientinfo(), term(), t()) ->
+    {ok, t()} | {shutdown, _Reason, t()}.
+
+-callback handle_signal(clientinfo(), term(), t()) ->
+    {ok | effects(), t()}
+    | {ok | effects(), replies(), t()}.
+
+-callback get_subscription(emqx_types:topic(), t()) ->
+    emqx_types:subopts() | undefined.
+
+-callback subscribe(
+    emqx_types:clientinfo(),
+    emqx_types:topic() | emqx_types:share(),
+    emqx_types:subopts(),
+    t()
+) ->
+    {ok, t()} | {error, emqx_types:reason_code()}.
+
+-callback unsubscribe(emqx_types:clientinfo(), emqx_types:topic(), t()) ->
+    {ok, t(), emqx_types:subopts()}
+    | {error, emqx_types:reason_code()}.
+
+-callback publish(emqx_types:packet_id(), emqx_types:message(), t()) ->
+    {ok, emqx_types:publish_result2(), t()}
+    | {error, emqx_types:reason_code()}.
+
+-callback puback(clientinfo(), emqx_types:packet_id(), [connflag()], t()) ->
+    {ok | effects(), emqx_types:message(), replies(), t()}
+    | {error, emqx_types:reason_code()}.
+
+-callback pubrec(emqx_types:packet_id(), t()) ->
+    {ok, emqx_types:message(), t()}
+    | {error, emqx_types:reason_code()}.
+
+-callback pubrel(emqx_types:packet_id(), t()) ->
+    {ok, t()}
+    | {error, emqx_types:reason_code()}.
+
+-callback pubcomp(clientinfo(), emqx_types:packet_id(), [connflag()], t()) ->
+    {ok | effects(), emqx_types:message(), replies(), t()}
+    | {error, emqx_types:reason_code()}.
+
+-callback replay(clientinfo(), _ReplayContext, t()) ->
+    {ok | effects(), replies(), t()}.
+
+-callback deliver(clientinfo(), [emqx_types:deliver()], [connflag()], t()) ->
+    {ok | effects(), replies(), t()}.
+
+-callback info(atom(), t()) -> term().
+
+-callback stats(t()) -> emqx_types:stats().
+-callback chan_info(t()) -> #{atom() => term()}.
+
+-callback disconnect(t(), conninfo()) ->
+    {idle | shutdown, effects(), t()}.
+
+-callback terminate(clientinfo(), _Reason, t()) -> ok.
+
+%%--------------------------------------------------------------------
+%% Create a Session
+%%--------------------------------------------------------------------
+
+-spec create(clientinfo(), conninfo(), emqx_maybe:t(message())) -> t().
+create(ClientInfo, ConnInfo, MaybeWillMsg) ->
+    % FIXME error conditions
+    create(
+        hd(choose_impl_candidates(ClientInfo, ConnInfo)), ClientInfo, ConnInfo, MaybeWillMsg
+    ).
+
+create(Mod, ClientInfo, ConnInfo, MaybeWillMsg) ->
+    % FIXME error conditions
+    Session = Mod:create(ClientInfo, ConnInfo, MaybeWillMsg),
+    ok = run_hook_with_conninfo('session.created', ConnInfo, [ClientInfo, info(Session)]),
+    Session.
+
+-spec open(clientinfo(), conninfo(), emqx_maybe:t(message())) ->
+    {_IsPresent :: true, t(), _ReplayContext} | {_IsPresent :: false, t()}.
+open(ClientInfo, ConnInfo, MaybeWillMsg) ->
+    Mods = [Default | _] = choose_impl_candidates(ClientInfo, ConnInfo),
+    %% NOTE
+    %% Try to look the existing session up in session stores corresponding to the given
+    %% `Mods` in order, starting from the last one.
+    case try_open(Mods, ClientInfo, ConnInfo, MaybeWillMsg) of
+        {_IsPresent = true, Session, _} = Present ->
+            ok = run_hook_with_conninfo('session.resumed', ConnInfo, [ClientInfo, info(Session)]),
+            Present;
+        false ->
+            %% NOTE
+            %% Nothing was found, create a new session with the `Default` implementation.
+            {false, create(Default, ClientInfo, ConnInfo, MaybeWillMsg)}
+    end.
+
+try_open([Mod | Rest], ClientInfo, ConnInfo, MaybeWillMsg) ->
+    case try_open(Rest, ClientInfo, ConnInfo, MaybeWillMsg) of
+        {_IsPresent = true, _, _} = Present ->
+            Present;
+        false ->
+            Mod:open(ClientInfo, ConnInfo, MaybeWillMsg)
+    end;
+try_open([], _ClientInfo, _ConnInfo, _MaybeWillMsg) ->
+    false.
+
+-spec get_session_conf(clientinfo()) -> conf().
+get_session_conf(_ClientInfo = #{zone := Zone}) ->
+    #{
+        max_subscriptions => get_mqtt_conf(Zone, max_subscriptions),
+        max_awaiting_rel => max_awaiting_rel(Zone),
+        upgrade_qos => get_mqtt_conf(Zone, upgrade_qos),
+        retry_interval => get_mqtt_conf(Zone, retry_interval),
+        await_rel_timeout => get_mqtt_conf(Zone, await_rel_timeout)
+    }.
+
+max_awaiting_rel(Zone) ->
+    case get_mqtt_conf(Zone, max_awaiting_rel) of
+        infinity -> infinity;
+        Limit -> max(1, Limit)
+    end.
+
+get_mqtt_conf(Zone, Key) ->
+    emqx_config:get_zone_conf(Zone, [mqtt, Key]).
+
+%%--------------------------------------------------------------------
+%% Existing sessions
+%% -------------------------------------------------------------------
+
+-spec destroy(clientinfo(), conninfo()) -> ok.
+destroy(ClientInfo, ConnInfo) ->
+    %% When destroying/discarding a session, the current `ClientInfo' might suggest an
+    %% implementation which does not correspond to the one previously used by this client.
+    %% An example of this is a client that first connects with `Session-Expiry-Interval' >
+    %% 0, and later reconnects with `Session-Expiry-Interval' = 0 and `clean_start' =
+    %% true.  So we may simply destroy sessions from all implementations, since the key
+    %% (ClientID) is the same.
+    Mods = choose_impl_candidates(ClientInfo, ConnInfo),
+    lists:foreach(fun(Mod) -> Mod:destroy(ClientInfo) end, Mods).
+
+-spec destroy(t()) -> ok.
+destroy(Session) ->
+    ?IMPL(Session):destroy(Session).
+
+%%--------------------------------------------------------------------
+%% Subscriptions
+%% -------------------------------------------------------------------
+
+-spec subscribe(
+    clientinfo(),
+    emqx_types:topic() | emqx_types:share(),
+    emqx_types:subopts(),
+    t()
+) ->
+    {ok, t()} | {error, emqx_types:reason_code()}.
+subscribe(ClientInfo, TopicFilter, SubOpts, Session) ->
+    SubOpts0 = ?IMPL(Session):get_subscription(TopicFilter, Session),
+    case ?IMPL(Session):subscribe(ClientInfo, TopicFilter, SubOpts, Session) of
+        {ok, Session1} ->
+            ok = emqx_hooks:'session.subscribed'(
+                ClientInfo,
+                TopicFilter,
+                SubOpts#{is_new => (SubOpts0 == undefined)}
+            ),
+            {ok, Session1};
+        {error, RC} ->
+            {error, RC}
+    end.
+
+-spec unsubscribe(
+    clientinfo(),
+    emqx_types:topic() | emqx_types:share(),
+    emqx_types:subopts(),
+    t()
+) ->
+    {ok, t()} | {error, emqx_types:reason_code()}.
+unsubscribe(
+    ClientInfo,
+    TopicFilter,
+    UnSubOpts,
+    Session
+) ->
+    case ?IMPL(Session):unsubscribe(ClientInfo, TopicFilter, Session) of
+        {ok, Session1, SubOpts} ->
+            ok = emqx_hooks:'session.unsubscribed'(
+                ClientInfo,
+                TopicFilter,
+                maps:merge(SubOpts, UnSubOpts)
+            ),
+            {ok, Session1};
+        {error, RC} ->
+            {error, RC}
+    end.
+
+%%--------------------------------------------------------------------
+%% Client -> Broker: PUBLISH
+%%--------------------------------------------------------------------
+
+-spec publish(clientinfo(), emqx_types:packet_id(), emqx_types:message(), t()) ->
+    {ok, emqx_types:publish_result2(), t()}
+    | {error, emqx_types:reason_code()}.
+publish(_ClientInfo, PacketId, Msg, Session) ->
+    case ?IMPL(Session):publish(PacketId, Msg, Session) of
+        {ok, _Result, _Session} = Ok ->
+            % TODO: only timers are allowed for now
+            Ok;
+        {error, RC} = Error when Msg#message.qos =:= ?QOS_2 ->
+            on_dropped_qos2_msg(PacketId, Msg, RC),
+            Error;
+        {error, _} = Error ->
+            Error
+    end.
+
+%%--------------------------------------------------------------------
+%% Client -> Broker: PUBACK
+%%--------------------------------------------------------------------
+
+-spec puback(clientinfo(), emqx_types:packet_id(), emqx_types:reason_code(), [connflag()], t()) ->
+    {ok | effects(), message(), replies(), t()}
+    | {error, emqx_types:reason_code()}.
+puback(ClientInfo, PacketId, ReasonCode, Flags, Session) ->
+    case ?IMPL(Session):puback(ClientInfo, PacketId, Flags, Session) of
+        {_OkEffects, Msg, Replies, Session1} = Ok ->
+            _ = on_delivery_completed(Msg, ReasonCode, ClientInfo, Session1),
+            _ = on_maybe_delivery_completed_qos0(Replies, ClientInfo, Session1),
+            Ok;
+        {error, _} = Error ->
+            Error
+    end.
+
+%%--------------------------------------------------------------------
+%% Client -> Broker: PUBREC / PUBREL / PUBCOMP
+%%--------------------------------------------------------------------
+
+-spec pubrec(clientinfo(), emqx_types:packet_id(), t()) ->
+    {ok, message(), t()}
+    | {error, emqx_types:reason_code()}.
+pubrec(_ClientInfo, PacketId, Session) ->
+    ?IMPL(Session):pubrec(PacketId, Session).
+
+-spec pubrel(clientinfo(), emqx_types:packet_id(), t()) ->
+    {ok, t()}
+    | {error, emqx_types:reason_code()}.
+pubrel(_ClientInfo, PacketId, Session) ->
+    ?IMPL(Session):pubrel(PacketId, Session).
+
+-spec pubcomp(clientinfo(), emqx_types:packet_id(), emqx_types:reason_code(), [connflag()], t()) ->
+    {ok | effects(), replies(), t()}
+    | {error, emqx_types:reason_code()}.
+pubcomp(ClientInfo, PacketId, ReasonCode, Flags, Session) ->
+    case ?IMPL(Session):pubcomp(ClientInfo, PacketId, Flags, Session) of
+        {OkEffects, Msg, Replies, Session1} ->
+            _ = on_delivery_completed(Msg, ReasonCode, ClientInfo, Session1),
+            _ = on_maybe_delivery_completed_qos0(Replies, ClientInfo, Session1),
+            {OkEffects, Replies, Session1};
+        {error, _} = Error ->
+            Error
+    end.
+
+%%--------------------------------------------------------------------
+
+-spec replay(clientinfo(), [emqx_types:message()], t()) ->
+    {ok | effects(), replies(), t()}.
+replay(ClientInfo, ReplayContext, Session) ->
+    ?IMPL(Session):replay(ClientInfo, ReplayContext, Session).
+
+%%--------------------------------------------------------------------
+%% Broker -> Client: Deliver
+%%--------------------------------------------------------------------
+
+-spec deliver(clientinfo(), [emqx_types:deliver()], [connflag()], t()) ->
+    {ok | effects(), replies(), t()}.
+deliver(ClientInfo, Delivers, Flags, Session) ->
+    Messages = enrich_delivers(ClientInfo, Delivers, Session),
+    Ok = ?IMPL(Session):deliver(ClientInfo, Messages, Flags, Session),
+    {_OkEffects, Replies, Session1} = Ok,
+    _ = on_maybe_delivery_completed_qos0(Replies, ClientInfo, Session1),
+    Ok.
+
+%%--------------------------------------------------------------------
+
+enrich_delivers(ClientInfo, Delivers, Session) ->
+    UpgradeQoS = ?IMPL(Session):info(upgrade_qos, Session),
+    do_enrich_delivers(ClientInfo, UpgradeQoS, Session, Delivers, []).
+
+do_enrich_delivers(_ClientInfo, _UpgradeQoS, _Session, [], Acc) ->
+    lists:reverse(Acc);
+do_enrich_delivers(ClientInfo, UpgradeQoS, Session, [D | Rest], Acc0) ->
+    %% Note: `enrich_deliver' always returns a list containing 0 or 1
+    %% elements.
+    Acc = enrich_deliver(ClientInfo, D, UpgradeQoS, Session) ++ Acc0,
+    do_enrich_delivers(ClientInfo, UpgradeQoS, Session, Rest, Acc).
+
+enrich_deliver(ClientInfo, {deliver, Topic, Msg}, UpgradeQoS, Session) ->
+    SubOpts =
+        case Msg of
+            #message{headers = #{redispatch_to := ?REDISPATCH_TO(Group, T)}} ->
+                ?IMPL(Session):get_subscription(emqx_topic:make_shared_record(Group, T), Session);
+            %% If present, sub_topic contains the actual topic to which the client subscribed
+            %% to trigger the delivery.
+            %% The message itself may have a different topic, e.g. when using message queues
+            #message{headers = #{sub_topic := SubTopic}} when is_binary(SubTopic) ->
+                ?IMPL(Session):get_subscription(SubTopic, Session);
+            _ ->
+                ?IMPL(Session):get_subscription(Topic, Session)
+        end,
+    enrich_message(ClientInfo, Msg, SubOpts, UpgradeQoS).
+
+%% Caution: updating this function _may_ break consistency of replay
+%% for persistent sessions. Persistent sessions expect it to return
+%% the same result during replay. If it changes the behavior between
+%% releases, sessions restored from the cold storage may end up
+%% replaying messages with different QoS, etc.
+enrich_message(
+    ClientInfo = #{clientid := ClientId},
+    Msg = #message{from = ClientId},
+    #{nl := 1},
+    _UpgradeQoS
+) ->
+    _ = emqx_session_events:handle_event(ClientInfo, {dropped, Msg, no_local}),
+    [];
+%% NOTE:
+%% This branch is used on the durable-session replay path. Keep the persisted
+%% subscription-filter representation and `emqx_subscription_filter:match_message/2`
+%% behavior deterministic and version-stable, otherwise replayed delivery can
+%% change across upgrades.
+enrich_message(ClientInfo, MsgIn, SubOpts = #{sub_filter_ast := AST}, UpgradeQoS) ->
+    case emqx_subscription_filter:match_message(AST, MsgIn) of
+        true ->
+            enrich_message(ClientInfo, MsgIn, clean_sub_filter_subopts(SubOpts), UpgradeQoS);
+        false ->
+            _ = emqx_session_events:handle_event(ClientInfo, {dropped, MsgIn, subscription_filter}),
+            []
+    end;
+enrich_message(_ClientInfo, MsgIn, SubOpts = #{}, UpgradeQoS) ->
+    %% https://www.erlang.org/doc/system/maps.html#using-maps-as-an-alternative-to-records
+    Default = #{nl => 0, qos => undefined, rap => 0, subid => undefined},
+    #{nl := NL, qos := SubQoS, rap := RAP, subid := SubId} = maps:merge(Default, SubOpts),
+    #message{flags = Flags0, headers = Headers0, qos = PubQoS} = MsgIn,
+    %% Update flags of the packet according to the subscription
+    %% options:
+    %%
+    %% - When No Local(NL) = 1, set `nl' to `true'
+    %%
+    %% - Retain as Published (RAP): clear `retain' flag, unless RAP =
+    %% 1 or `retained' header = `true'.
+    KeepRetain =
+        case Headers0 of
+            #{retained := true} -> true;
+            _ -> RAP =:= 1
+        end,
+    Flags =
+        case NL of
+            1 when KeepRetain ->
+                Flags0#{nl => true};
+            1 ->
+                Flags0#{nl => true, retain => false};
+            _ when KeepRetain ->
+                Flags0;
+            _ ->
+                Flags0#{retain => false}
+        end,
+    %% Add `Subscription-Identifier' if it's specified for the
+    %% subscription:
+    Headers =
+        case SubId of
+            undefined ->
+                Headers0;
+            _ ->
+                case Headers0 of
+                    #{properties := Properties} ->
+                        Headers0#{properties := Properties#{'Subscription-Identifier' => SubId}};
+                    #{} ->
+                        Headers0#{properties => #{'Subscription-Identifier' => SubId}}
+                end
+        end,
+    %% Update QoS:
+    QoS =
+        case is_integer(SubQoS) of
+            true when UpgradeQoS ->
+                SubQoS;
+            true ->
+                min(SubQoS, PubQoS);
+            false ->
+                PubQoS
+        end,
+    [
+        MsgIn#message{
+            flags = Flags,
+            headers = Headers,
+            qos = QoS
+        }
+    ];
+enrich_message(_ClientInfo, Msg, undefined, _UpgradeQoS) ->
+    [Msg].
+
+clean_sub_filter_subopts(SubOpts) ->
+    maps:without(
+        [sub_filter_ast, sub_filter_enabled, sub_filter_raw, sub_filter_source],
+        SubOpts
+    ).
+
+%%--------------------------------------------------------------------
+%% Timeouts
+%%--------------------------------------------------------------------
+
+-spec handle_timeout(clientinfo(), common_timer_name() | custom_timer_name(), [connflag()], t()) ->
+    {ok | effects(), replies(), t()}
+    %% NOTE: only relevant for `common_timer_name()`
+    | {ok | effects(), replies(), timeout(), t()}.
+handle_timeout(ClientInfo, Timer, Flags, Session) ->
+    case ?IMPL(Session):handle_timeout(ClientInfo, Timer, Flags, Session) of
+        {_OkEffects, Replies, Session1} = Ok ->
+            _ = on_maybe_delivery_completed_qos0(Replies, ClientInfo, Session1),
+            Ok;
+        {_OkEffects, Replies, _Timeout, Session1} = Ok ->
+            _ = on_maybe_delivery_completed_qos0(Replies, ClientInfo, Session1),
+            Ok
+    end.
+
+%%--------------------------------------------------------------------
+%% Generic Messages
+%%--------------------------------------------------------------------
+
+-spec handle_info(clientinfo(), term(), t()) ->
+    {ok, t()} | {shutdown, _Reason, t()}.
+handle_info(ClientInfo, Info, Session) ->
+    ?IMPL(Session):handle_info(ClientInfo, Info, Session).
+
+-doc "Build the delivery limiter when a finite limit is now configured.".
+-spec refresh_quota(t()) -> t().
+refresh_quota(Session) when ?IS_SESSION_IMPL_MEM(Session) ->
+    emqx_session_mem:refresh_quota(Session);
+refresh_quota(Session) ->
+    Session.
+
+-spec handle_signal(clientinfo(), term(), t()) ->
+    {ok | effects(), t()}
+    | {ok | effects(), replies(), t()}.
+handle_signal(ClientInfo, Signal, Session) ->
+    ?IMPL(Session):handle_signal(ClientInfo, Signal, Session).
+
+%%--------------------------------------------------------------------
+
+-spec disconnect(clientinfo(), conninfo(), t()) ->
+    {idle | shutdown, effects(), t()}.
+disconnect(ClientInfo, ConnInfo, Session) ->
+    emqx_metrics:inc_global('session.disconnected'),
+    emqx_hooks:'session.disconnected'(ClientInfo, info(Session)),
+    ?IMPL(Session):disconnect(Session, ConnInfo).
+
+-spec terminate(clientinfo(), Reason :: term(), t()) ->
+    ok.
+terminate(ClientInfo, Reason, Session) ->
+    _ = run_terminate_hooks(ClientInfo, Reason, Session),
+    _ = ?IMPL(Session):terminate(ClientInfo, Reason, Session),
+    ok.
+
+run_terminate_hooks(ClientInfo, discarded, Session) ->
+    emqx_metrics:inc_global('session.discarded'),
+    emqx_hooks:'session.discarded'(ClientInfo, info(Session));
+run_terminate_hooks(ClientInfo, takenover, Session) ->
+    emqx_metrics:inc_global('session.takenover'),
+    emqx_hooks:'session.takenover'(ClientInfo, info(Session));
+run_terminate_hooks(ClientInfo, Reason, Session) ->
+    emqx_metrics:inc_global('session.terminated'),
+    emqx_hooks:'session.terminated'(ClientInfo, Reason, info(Session)).
+
+%%--------------------------------------------------------------------
+%% Session Info
+%% -------------------------------------------------------------------
+
+-spec info(t()) -> emqx_types:infos().
+info(Session) ->
+    maps:from_list(info(?INFO_KEYS, Session)).
+
+-spec info
+    ([atom()], t()) -> [{atom(), _Value}];
+    (atom() | {atom(), _Meta}, t()) -> _Value.
+info(Keys, Session) when is_list(Keys) ->
+    [{Key, info(Key, Session)} || Key <- Keys];
+info(impl, Session) ->
+    get_impl_mod(Session);
+info(Key, Session) ->
+    ?IMPL(Session):info(Key, Session).
+
+-spec stats(t()) -> emqx_types:stats().
+stats(Session) ->
+    ?IMPL(Session):stats(Session).
+
+-doc """
+The session attributes that the channel caches in the channel info table:
+`impl`, `?CHAN_INFO_SESSION_KEYS` and the ones of the session implementation,
+such as `mqueue_max` of a memory session or `n_streams` of a durable session.
+""".
+-spec chan_info(t()) -> #{atom() => term()}.
+chan_info(Session) ->
+    ?IMPL(Session):chan_info(Session).
+
+%%--------------------------------------------------------------------
+%% Common message events
+%%--------------------------------------------------------------------
+
+on_delivery_completed(Msg, ReasonCode, #{clientid := ClientId}, Session) ->
+    emqx_hooks:'delivery.completed'(
+        Msg,
+        #{
+            session_birth_time => ?IMPL(Session):info(created_at, Session),
+            clientid => ClientId,
+            reason_code => ReasonCode
+        }
+    ).
+
+%% NOTE
+%% The function is called when the session returns new messages
+%% to send to the client.
+%% The client will not send PUBACK for QoS 0 messages.
+%% So we call the 'delivery.completed' callback for them here.
+on_maybe_delivery_completed_qos0(Replies, #{clientid := ClientId}, Session) ->
+    lists:foreach(
+        fun({_PacketId, Msg}) ->
+            case Msg of
+                #message{qos = ?QOS_0} ->
+                    emqx_hooks:'delivery.completed'(
+                        Msg,
+                        #{
+                            session_birth_time => ?IMPL(Session):info(created_at, Session),
+                            clientid => ClientId
+                        }
+                    );
+                _ ->
+                    ok
+            end
+        end,
+        Replies
+    ).
+
+on_dropped_qos2_msg(PacketId, Msg, RC) ->
+    ?SLOG(
+        warning,
+        #{
+            msg => "dropped_qos2_packet",
+            reason => emqx_reason_codes:name(RC),
+            packet_id => PacketId
+        },
+        #{topic => Msg#message.topic}
+    ),
+    ok = emqx_metrics:inc_global('messages.dropped'),
+    ok = emqx_hooks:'message.dropped'(Msg, #{node => node()}, emqx_reason_codes:name(RC)),
+    ok.
+
+%%--------------------------------------------------------------------
+
+-spec should_keep(message()) -> boolean().
+should_keep(MsgDeliver) ->
+    not is_banned_msg(MsgDeliver).
+
+is_banned_msg(#message{from = ClientId}) ->
+    emqx_banned:check_clientid(ClientId).
+
+%%--------------------------------------------------------------------
+
+-spec get_impl_mod(t()) -> module().
+get_impl_mod(Session) when ?IS_SESSION_IMPL_MEM(Session) ->
+    emqx_session_mem;
+get_impl_mod(Session) when ?IS_SESSION_IMPL_DS(Session) ->
+    emqx_persistent_session_ds;
+get_impl_mod(Session) ->
+    maybe_mock_impl_mod(Session).
+
+-ifdef(TEST).
+maybe_mock_impl_mod({Mock, _State}) when is_atom(Mock) ->
+    Mock.
+-else.
+-spec maybe_mock_impl_mod(_Session) -> no_return().
+maybe_mock_impl_mod(Session) ->
+    error(noimpl, [Session]).
+-endif.
+
+choose_impl_candidates(#{zone := Zone}, #{expiry_interval := EI}) ->
+    case emqx_persistent_message:is_persistence_enabled(Zone) of
+        false ->
+            [emqx_session_mem];
+        true ->
+            Force = emqx_persistent_message:force_ds(Zone),
+            case EI of
+                0 when not Force ->
+                    %% NOTE
+                    %% If ExpiryInterval is 0, the natural choice is
+                    %% `emqx_session_mem'. Yet we still need to look
+                    %% the existing session up in the
+                    %% `emqx_persistent_session_ds' store first,
+                    %% because previous connection may have set
+                    %% ExpiryInterval to a non-zero value.
+                    [emqx_session_mem, emqx_persistent_session_ds];
+                _ ->
+                    [emqx_persistent_session_ds]
+            end
+    end.
+
+-compile({inline, [run_hook_with_conninfo/3]}).
+run_hook_with_conninfo(Name, ConnInfo, Args) ->
+    ok = emqx_metrics:inc_global(Name),
+    Ctx = #{
+        conninfo => ConnInfo
+    },
+    emqx_hooks:run(Name, Ctx, Args).
+
+%%--------------------------------------------------------------------
+%% Will message handling
+%%--------------------------------------------------------------------
+
+-spec clear_will_message(t()) -> t().
+clear_will_message(Session) ->
+    ?IMPL(Session):clear_will_message(Session).
+
+-spec publish_will_message_now(t(), message()) -> t().
+publish_will_message_now(Session, WillMsg) ->
+    ?IMPL(Session):publish_will_message_now(Session, WillMsg).
+
+%%--------------------------------------------------------------------
+%% Context stashing
+%%--------------------------------------------------------------------
+
+-define(CTX_PD_KEY, {?MODULE, ctx}).
+
+-spec get_context() -> undefined | map().
+get_context() ->
+    get(?CTX_PD_KEY).
+
+-spec pop_context() -> undefined | map().
+pop_context() ->
+    erase(?CTX_PD_KEY).
+
+-spec put_context(map()) -> ok.
+put_context(#{} = Ctx) ->
+    _ = put(?CTX_PD_KEY, Ctx),
+    ok.
+
+-undef(CTX_PD_KEY).
+
+%%--------------------------------------------------------------------
+%% Unit tests
+%%--------------------------------------------------------------------
+
+-ifdef(TEST).
+
+enrich_no_local_test_() ->
+    SubOpts = #{nl => 1},
+    Msg = emqx_message:make(<<"client1">>, 1, <<"topic">>, <<"payload">>),
+    {setup,
+        fun() ->
+            meck:new(emqx_session_events, [no_history]),
+            ok = meck:expect(
+                emqx_session_events,
+                handle_event,
+                fun(_, _) ->
+                    ok
+                end
+            )
+        end,
+        fun(_) ->
+            meck:unload(emqx_session_events)
+        end,
+        [
+            ?_assertMatch(
+                [],
+                enrich_message(#{clientid => <<"client1">>}, Msg, SubOpts, false)
+            ),
+            ?_assertMatch(
+                [#message{from = <<"client1">>, topic = <<"topic">>, payload = <<"payload">>}],
+                enrich_message(#{clientid => <<"client2">>}, Msg, SubOpts, false)
+            )
+        ]}.
+
+%% This testcase verifies that enrich function clear `retain' flag:
+enrich_clear_retain_flag_test() ->
+    ClientInfo = #{clientid => <<"client">>},
+    MsgIn = emqx_message:set_flag(
+        my_awesome_flag,
+        emqx_message:set_flag(
+            retain,
+            emqx_message:make(<<"client2">>, 1, <<"topic">>, <<"payload">>)
+        )
+    ),
+    [Msg1] = enrich_message(ClientInfo, MsgIn, #{}, false),
+    ?assertMatch(
+        false,
+        emqx_message:get_flag(retain, Msg1),
+        "Retain flag should not be cleared"
+    ),
+    ?assertMatch(
+        true,
+        emqx_message:get_flag(my_awesome_flag, Msg1),
+        "Other flags are preserved"
+    ),
+    ?assertMatch(
+        false,
+        emqx_message:get_flag(nl, Msg1),
+        "Other flags are preserved"
+    ),
+    %% Now with nl
+    [Msg2] = enrich_message(ClientInfo, MsgIn, #{nl => 1}, false),
+    ?assertMatch(
+        false,
+        emqx_message:get_flag(retain, Msg2),
+        "Retain flag should be cleared"
+    ),
+    ?assertMatch(
+        true,
+        emqx_message:get_flag(nl, Msg2),
+        "nl flag should be inherited from the subscription"
+    ).
+
+%% This testcase verifies that enrich function doesn't clear `retain'
+%% flag when retained header is set:
+enrich_retain_as_published1_test() ->
+    ClientInfo = #{clientid => <<"client">>},
+    MsgIn = emqx_message:set_flag(
+        my_awesome_flag,
+        emqx_message:set_flag(
+            retain,
+            emqx_message:set_header(
+                retained,
+                true,
+                emqx_message:make(<<"client2">>, 1, <<"topic">>, <<"payload">>)
+            )
+        )
+    ),
+    [Msg1] = enrich_message(ClientInfo, MsgIn, #{}, false),
+    ?assertMatch(
+        true,
+        emqx_message:get_flag(retain, Msg1),
+        "Retain flag should not be cleared when retained header is true"
+    ),
+    ?assertMatch(
+        true,
+        emqx_message:get_flag(my_awesome_flag, Msg1),
+        "Other flags are preserved"
+    ),
+    ?assertMatch(
+        false,
+        emqx_message:get_flag(nl, Msg1),
+        "Other flags are preserved"
+    ),
+    ?assertMatch(
+        #{retained := true},
+        emqx_message:get_headers(Msg1)
+    ),
+    %% Now with nl
+    [Msg2] = enrich_message(ClientInfo, MsgIn, #{nl => 1}, false),
+    ?assertMatch(
+        true,
+        emqx_message:get_flag(retain, Msg2),
+        "Retain flag should not be cleared when retained header is true"
+    ),
+    ?assertMatch(
+        true,
+        emqx_message:get_flag(nl, Msg2),
+        "nl flag should be inherited from the subscription"
+    ).
+
+%% This testcase verifies that enrich function doesn't clear `retain'
+%% flag when `rap' is set:
+enrich_retain_as_published2_test() ->
+    ClientInfo = #{clientid => <<"client">>},
+    MsgIn = emqx_message:set_flag(
+        my_awesome_flag,
+        emqx_message:set_flag(
+            retain,
+            emqx_message:set_header(
+                retained,
+                true,
+                emqx_message:make(<<"client2">>, 1, <<"topic">>, <<"payload">>)
+            )
+        )
+    ),
+    ?assertMatch(
+        [MsgIn],
+        enrich_message(ClientInfo, MsgIn, #{rap => 1}, false)
+    ),
+    %% Now with nl
+    [Msg1] = enrich_message(ClientInfo, MsgIn, #{rap => 1, nl => 1}, false),
+    ?assertMatch(
+        true,
+        emqx_message:get_flag(retain, Msg1),
+        "Retain flag should not be cleared when rap is set for the subscription"
+    ),
+    ?assertMatch(
+        true,
+        emqx_message:get_flag(nl, Msg1),
+        "nl flag should be inherited from the subscription"
+    ).
+
+enrich_subid1_test() ->
+    ClientInfo = #{clientid => <<"client">>},
+    MsgIn = emqx_message:set_header(
+        retained, true, emqx_message:make(<<"client2">>, 1, <<"topic">>, <<"payload">>)
+    ),
+    SubInfo = #{subid => 42},
+    [MsgOut] = enrich_message(ClientInfo, MsgIn, SubInfo, false),
+    ?assertMatch(
+        #{'Subscription-Identifier' := 42},
+        emqx_message:get_header(properties, MsgOut)
+    ),
+    ?assertMatch(
+        true,
+        emqx_message:get_header(retained, MsgOut)
+    ).
+
+enrich_subid2_test() ->
+    ClientInfo = #{clientid => <<"client">>},
+    MsgIn = emqx_message:set_header(
+        properties,
+        #{myprop => hello},
+        emqx_message:make(<<"client2">>, 1, <<"topic">>, <<"payload">>)
+    ),
+    SubInfo = #{subid => 42},
+    [MsgOut] = enrich_message(ClientInfo, MsgIn, SubInfo, false),
+    ?assertMatch(
+        #{'Subscription-Identifier' := 42, myprop := hello},
+        emqx_message:get_header(properties, MsgOut)
+    ).
+
+enrich_qos_no_upgrade_test() ->
+    ClientInfo = #{clientid => <<"client">>},
+    Enrich = fun(QoS, MsgIn) ->
+        [#message{qos = Ret}] = enrich_message(ClientInfo, MsgIn, #{qos => QoS}, false),
+        Ret
+    end,
+    [
+        ?assertEqual(
+            min(PubQoS, SubQoS),
+            Enrich(SubQoS, emqx_message:make(<<"client2">>, PubQoS, <<"topic">>, <<"payload">>))
+        )
+     || PubQoS <- [0, 1, 2],
+        SubQoS <- [0, 1, 2, undefined]
+    ].
+
+enrich_qos_upgrade_test() ->
+    ClientInfo = #{clientid => <<"client">>},
+    Enrich = fun(QoS, MsgIn) ->
+        [#message{qos = Ret}] = enrich_message(ClientInfo, MsgIn, #{qos => QoS}, true),
+        Ret
+    end,
+    [
+        ?assertEqual(
+            SubQoS,
+            Enrich(SubQoS, emqx_message:make(<<"client2">>, PubQoS, <<"topic">>, <<"payload">>))
+        )
+     || PubQoS <- [0, 1, 2],
+        SubQoS <- [0, 1, 2]
+    ].
+
+-endif.

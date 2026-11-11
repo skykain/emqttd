@@ -1,0 +1,2560 @@
+%%--------------------------------------------------------------------
+%% Copyright (c) 2025-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
+%%--------------------------------------------------------------------
+-module(emqx_bridge_mqtt_action_SUITE).
+
+-moduledoc """
+This suite holds test cases for the `mqtt` action.
+
+For cases where a single connector has both actions and sources, see
+`emqx_bridge_mqtt_hybrid_SUITE`.
+""".
+
+-compile(nowarn_export_all).
+-compile(export_all).
+
+-include_lib("eunit/include/eunit.hrl").
+-include_lib("common_test/include/ct.hrl").
+-include_lib("snabbkaffe/include/snabbkaffe.hrl").
+-include_lib("emqx/include/asserts.hrl").
+-include_lib("emqx/include/emqx_hooks.hrl").
+-include_lib("emqx_resource/include/emqx_resource.hrl").
+-include_lib("emqx/include/emqx_mqtt.hrl").
+-include_lib("emqx_utils/include/emqx_message.hrl").
+
+%%------------------------------------------------------------------------------
+%% Defs
+%%------------------------------------------------------------------------------
+
+-import(emqx_common_test_helpers, [on_exit/1]).
+
+-define(CONNECTOR_TYPE, mqtt).
+-define(CONNECTOR_TYPE_BIN, <<"mqtt">>).
+-define(ACTION_TYPE, mqtt).
+-define(ACTION_TYPE_BIN, <<"mqtt">>).
+
+-define(local, local).
+-define(cluster, cluster).
+-define(global_namespace, global_namespace).
+-define(namespaced, namespaced).
+
+-define(ON(NODE, BODY), erpc:call(NODE, fun() -> BODY end)).
+-define(ON_ALL(NODES, BODY), erpc:multicall(NODES, fun() -> BODY end)).
+
+-define(NS, <<"some_namespace">>).
+
+%%------------------------------------------------------------------------------
+%% CT boilerplate
+%%------------------------------------------------------------------------------
+
+all() ->
+    [
+        {group, ?cluster},
+        {group, legacy},
+        {group, hardened}
+    ].
+
+groups() ->
+    AllTCs0 = emqx_common_test_helpers:all_with_matrix(?MODULE),
+    AllTCs = lists:filter(
+        fun
+            ({group, _}) -> false;
+            (_) -> true
+        end,
+        AllTCs0
+    ),
+    CustomMatrix = emqx_common_test_helpers:groups_with_matrix(?MODULE),
+    LocalTCs = merge_custom_groups(?local, AllTCs, CustomMatrix),
+    ClusterTCs = merge_custom_groups(?cluster, cluster_testcases(), CustomMatrix),
+    [
+        {?cluster, ClusterTCs},
+        {?local, LocalTCs},
+        {legacy, [], [{group, ?local}]},
+        {hardened, [], [{group, ?local}]}
+    ].
+
+merge_custom_groups(RootGroup, GroupTCs, CustomMatrix0) ->
+    CustomMatrix =
+        lists:flatmap(
+            fun
+                ({G, _, SubGroup}) when G == RootGroup ->
+                    SubGroup;
+                (_) ->
+                    []
+            end,
+            CustomMatrix0
+        ),
+    CustomMatrix ++ GroupTCs.
+
+cluster_testcases() ->
+    Key = ?cluster,
+    lists:filter(
+        fun
+            ({testcase, TestCase, _Opts}) ->
+                emqx_common_test_helpers:get_tc_prop(?MODULE, TestCase, Key, false);
+            (TestCase) ->
+                emqx_common_test_helpers:get_tc_prop(?MODULE, TestCase, Key, false)
+        end,
+        emqx_common_test_helpers:all(?MODULE)
+    ).
+
+init_per_suite(TCConfig) ->
+    TCConfig.
+
+end_per_suite(_TCConfig) ->
+    ok.
+
+init_per_group(?cluster = Group, TCConfig) ->
+    AppSpecs = [
+        emqx,
+        emqx_conf,
+        emqx_connector,
+        emqx_bridge_mqtt,
+        emqx_bridge,
+        emqx_rule_engine,
+        emqx_management
+    ],
+    Nodes = emqx_cth_cluster:start(
+        [
+            {bridge_mqtt_pub1, #{
+                role => core,
+                apps => AppSpecs ++ [emqx_mgmt_api_test_util:emqx_dashboard()]
+            }},
+            {bridge_mqtt_pub2, #{
+                role => core,
+                apps => AppSpecs
+            }},
+            {bridge_mqtt_pub3, #{
+                role => core,
+                apps => AppSpecs
+            }}
+        ],
+        #{work_dir => emqx_cth_suite:work_dir(Group, TCConfig)}
+    ),
+    [{nodes, Nodes} | TCConfig];
+init_per_group(Profile, TCConfig) when Profile =:= legacy; Profile =:= hardened ->
+    ok = emqx_common_test_helpers:set_security_profile(Profile),
+    [{security_profile, Profile} | TCConfig];
+init_per_group(?local, TCConfig) ->
+    Apps = emqx_cth_suite:start(
+        [
+            {emqx_conf, #{config => emqx_cth_suite:emqx_config_authn(true)}},
+            emqx_connector,
+            emqx_bridge_mqtt,
+            {emqx_bridge, #{
+                after_start => fun() ->
+                    ok = emqx_hooks:add(
+                        'namespace.resource_pre_create',
+                        {?MODULE, on_namespace_resource_pre_create, []},
+                        ?HP_HIGHEST
+                    )
+                end
+            }},
+            emqx_rule_engine,
+            emqx_management,
+            emqx_mgmt_api_test_util:emqx_dashboard()
+        ],
+        #{work_dir => emqx_cth_suite:work_dir(TCConfig)}
+    ),
+    [{apps, Apps} | TCConfig];
+init_per_group(?namespaced, TCConfig) ->
+    Opts = #{namespace => ?NS},
+    AuthHeader = emqx_bridge_v2_testlib:ensure_namespaced_api_key(Opts),
+    emqx_bridge_v2_testlib:set_auth_header_getter(fun() -> AuthHeader end),
+    [
+        {auth_header, AuthHeader},
+        {resource_namespace, ?NS}
+        | TCConfig
+    ];
+init_per_group(_Group, TCConfig) ->
+    TCConfig.
+
+end_per_group(?cluster, TCConfig) ->
+    Nodes = get_config(nodes, TCConfig),
+    ok = emqx_cth_cluster:stop(Nodes),
+    ok;
+end_per_group(Profile, _TCConfig) when Profile =:= legacy; Profile =:= hardened ->
+    emqx_common_test_helpers:clear_security_profile();
+end_per_group(?local, TCConfig) ->
+    Apps = get_config(apps, TCConfig),
+    emqx_cth_suite:stop(Apps),
+    ok;
+end_per_group(_Group, _TCConfig) ->
+    ok.
+
+init_per_testcase(TestCase, TCConfig) ->
+    Path = group_path(TCConfig, no_groups),
+    ct:pal(asciiart:visible($%, "~p - ~s", [Path, TestCase])),
+    ConnectorName = atom_to_binary(TestCase),
+    ConnectorConfig = connector_config(#{}),
+    ActionName = ConnectorName,
+    ActionConfig = action_config(#{
+        <<"connector">> => ConnectorName
+    }),
+    setup_auth_header(TCConfig),
+    snabbkaffe:start_trace(),
+    [
+        {bridge_kind, action},
+        {connector_type, ?CONNECTOR_TYPE},
+        {connector_name, ConnectorName},
+        {connector_config, ConnectorConfig},
+        {action_type, ?ACTION_TYPE},
+        {action_name, ActionName},
+        {action_config, ActionConfig}
+        | TCConfig
+    ].
+
+end_per_testcase(_TestCase, TCConfig) ->
+    snabbkaffe:stop(),
+    emqx_bridge_v2_testlib:delete_all_rules(),
+    emqx_bridge_v2_testlib:delete_all_bridges_and_connectors(),
+    maybe
+        {nodes, Nodes} ?= lists:keyfind(nodes, 1, TCConfig),
+        ?ON_ALL(Nodes, begin
+            emqx_bridge_v2_testlib:delete_all_rules(),
+            emqx_bridge_v2_testlib:delete_all_bridges_and_connectors()
+        end)
+    end,
+    emqx_common_test_helpers:call_janitor(),
+    wait_until_all_clients_disconnected(),
+    ok.
+
+%%------------------------------------------------------------------------------
+%% Helper fns
+%%------------------------------------------------------------------------------
+
+on_namespace_resource_pre_create(#{namespace := _Namespace}, ResCtx) ->
+    {stop, ResCtx#{exists := true}}.
+
+connector_config(Overrides) ->
+    emqx_bridge_schema_testlib:mqtt_connector_config(Overrides).
+
+action_config(Overrides) ->
+    emqx_bridge_schema_testlib:mqtt_action_config(Overrides).
+
+get_config(K, TCConfig) -> emqx_bridge_v2_testlib:get_value(K, TCConfig).
+get_config(K, TCConfig, Default) -> proplists:get_value(K, TCConfig, Default).
+
+group_path(Config, Default) ->
+    case emqx_common_test_helpers:group_path(Config) of
+        [] -> Default;
+        Path -> Path
+    end.
+
+get_tc_prop(TestCase, Key, Default) ->
+    maybe
+        true ?= erlang:function_exported(?MODULE, TestCase, 0),
+        {Key, Val} ?= proplists:lookup(Key, ?MODULE:TestCase()),
+        Val
+    else
+        _ -> Default
+    end.
+
+get_tcp_mqtt_port(Node) ->
+    emqx_common_test_helpers:listener_port(
+        ?ON(Node, emqx_config:get([listeners, tcp, default, bind]))
+    ).
+
+get_ssl_mqtt_port() ->
+    emqx_common_test_helpers:listener_port(
+        emqx_config:get([listeners, ssl, default, bind])
+    ).
+
+setup_auth_header(TCConfig) ->
+    case get_config(nodes, TCConfig, undefined) of
+        [N1 | _] ->
+            Fun = fun() -> ?ON(N1, emqx_mgmt_api_test_util:auth_header_()) end,
+            emqx_bridge_v2_testlib:set_auth_header_getter(Fun);
+        _ ->
+            ok
+    end.
+
+connector_resource_id(TCConfig) ->
+    emqx_bridge_v2_testlib:connector_resource_id(TCConfig).
+
+create_connector_api(TCConfig, Overrides) ->
+    emqx_bridge_v2_testlib:simplify_result(
+        emqx_bridge_v2_testlib:create_connector_api(TCConfig, Overrides)
+    ).
+
+update_connector_api(TCConfig, Overrides) ->
+    #{
+        connector_type := Type,
+        connector_name := Name,
+        connector_config := Cfg0
+    } =
+        emqx_bridge_v2_testlib:get_common_values_with_configs(TCConfig),
+    Cfg = emqx_utils_maps:deep_merge(Cfg0, Overrides),
+    emqx_bridge_v2_testlib:simplify_result(
+        emqx_bridge_v2_testlib:update_connector_api(Name, Type, Cfg)
+    ).
+
+probe_connector_api(TCConfig, Overrides) ->
+    emqx_bridge_v2_testlib:probe_connector_api2(TCConfig, Overrides).
+
+get_connector_api(TCConfig) ->
+    #{connector_type := Type, connector_name := Name} =
+        emqx_bridge_v2_testlib:get_common_values(TCConfig),
+    emqx_bridge_v2_testlib:simplify_result(
+        emqx_bridge_v2_testlib:get_connector_api(Type, Name)
+    ).
+
+create_action_api(Config, Overrides) ->
+    emqx_bridge_v2_testlib:simplify_result(
+        emqx_bridge_v2_testlib:create_action_api(Config, Overrides)
+    ).
+
+get_action_api(TCConfig) ->
+    emqx_bridge_v2_testlib:simplify_result(
+        emqx_bridge_v2_testlib:get_action_api(
+            TCConfig
+        )
+    ).
+
+get_source_api(TCConfig) ->
+    emqx_bridge_v2_testlib:simplify_result(
+        emqx_bridge_v2_testlib:get_source_api(
+            TCConfig
+        )
+    ).
+
+get_action_metrics_api(TCConfig) ->
+    emqx_bridge_v2_testlib:get_action_metrics_api(
+        TCConfig
+    ).
+
+simple_create_rule_api(SQL, TCConfig) ->
+    emqx_bridge_v2_testlib:simple_create_rule_api(SQL, TCConfig).
+
+simple_create_rule_api(TCConfig) ->
+    emqx_bridge_v2_testlib:simple_create_rule_api(TCConfig).
+
+get_stats_api() ->
+    {200, Res} = emqx_bridge_v2_testlib:get_stats_http(),
+    lists:foldl(
+        fun(#{<<"node">> := N} = R, Acc) -> Acc#{N => R} end,
+        #{},
+        Res
+    ).
+
+start_client(TCConfigOrNode) ->
+    start_client(TCConfigOrNode, _Opts = #{}).
+
+start_client(TCConfig, Opts) when is_list(TCConfig) ->
+    case get_config(nodes, TCConfig, undefined) of
+        [N | _] ->
+            start_client(N, Opts);
+        _ ->
+            start_client(node(), Opts)
+    end;
+start_client(Node, Opts) when is_atom(Node) ->
+    Port = get_tcp_mqtt_port(Node),
+    {ok, C} = emqtt:start_link(Opts#{port => Port, proto_ver => v5}),
+    on_exit(fun() -> catch emqtt:stop(C) end),
+    {ok, _} = emqtt:connect(C),
+    C.
+
+recv_downs(N, Timeout) ->
+    recv_downs(N, Timeout, []).
+
+recv_downs(0, _Timeout, Acc) ->
+    lists:reverse(Acc);
+recv_downs(N, Timeout, Acc) ->
+    receive
+        {'DOWN', _MRef, process, Pid, _Reason} ->
+            recv_downs(N - 1, Timeout, [Pid | Acc])
+    after Timeout ->
+        ct:fail("timeout waiting for ~b more DOWN messages, got: ~p", [N, lists:reverse(Acc)])
+    end.
+
+get_emqtt_clients(TCConfig) when is_list(TCConfig) ->
+    ConnResId = connector_resource_id(TCConfig),
+    get_emqtt_clients(ConnResId);
+get_emqtt_clients(PoolName) ->
+    lists:filtermap(
+        fun({_Id, Worker}) ->
+            case ecpool_worker:client(Worker) of
+                {ok, Client} -> {true, Client};
+                _ -> false
+            end
+        end,
+        ecpool:workers(PoolName)
+    ).
+
+get_connected_clients(ConnResId) ->
+    Clients = get_emqtt_clients(ConnResId),
+    Clients0 =
+        lists:map(
+            fun(Client) ->
+                Info = emqtt:info(Client),
+                #{
+                    clientid => proplists:get_value(clientid, Info),
+                    username => proplists:get_value(username, Info)
+                }
+            end,
+            Clients
+        ),
+    lists:sort(fun(#{clientid := A}, #{clientid := B}) -> A =< B end, Clients0).
+
+wait_until_all_clients_disconnected() ->
+    case ets:whereis(emqx_channel) of
+        undefined ->
+            %% ETS table doesn't exist on this node (e.g. cluster group)
+            ok;
+        _ ->
+            kick_all_clients(),
+            wait_until_all_clients_disconnected(50)
+    end.
+
+kick_all_clients() ->
+    lists:foreach(
+        fun(ClientId) -> catch emqx_cm:kick_session(ClientId) end,
+        emqx_cm:all_client_ids()
+    ).
+
+wait_until_all_clients_disconnected(0) ->
+    ct:pal("warning: not all clients disconnected, remaining: ~p", [emqx_cm:all_channels()]),
+    ok;
+wait_until_all_clients_disconnected(Retries) ->
+    case emqx_cm:all_channels() of
+        [] ->
+            ok;
+        _ ->
+            timer:sleep(100),
+            wait_until_all_clients_disconnected(Retries - 1)
+    end.
+
+%% Collect N `'DOWN'' messages from monitors already set up by the caller,
+%% waiting up to `Timeout' total for them all to arrive. Fails the test if
+%% fewer than N arrive within the timeout. Unlike `emqx_utils:drain_down/1'
+%% (which uses `after 0' and races mailbox arrival), this actually waits.
+wait_for_downs(N, Timeout) ->
+    Deadline = erlang:monotonic_time(millisecond) + Timeout,
+    wait_for_downs(N, Deadline, []).
+
+wait_for_downs(0, _Deadline, Acc) ->
+    lists:reverse(Acc);
+wait_for_downs(N, Deadline, Acc) ->
+    Remaining = max(0, Deadline - erlang:monotonic_time(millisecond)),
+    receive
+        {'DOWN', _MRef, process, Pid, _Reason} ->
+            wait_for_downs(N - 1, Deadline, [Pid | Acc])
+    after Remaining ->
+        ct:fail({timeout_waiting_for_downs, #{missing => N, got => lists:reverse(Acc)}})
+    end.
+
+start_publisher(Topic, Interval, CtrlPid) ->
+    spawn_link(fun() -> publisher(Topic, 1, Interval, CtrlPid) end).
+
+stop_publisher(Pid) ->
+    _ = Pid ! {self(), stop},
+    receive
+        {Pid, N} -> N
+    after 1_000 -> ct:fail("publisher ~p did not stop", [Pid])
+    end.
+
+publisher(Topic, N, Delay, CtrlPid) ->
+    _ = emqx:publish2(emqx_message:make(Topic, integer_to_binary(N))),
+    receive
+        {CtrlPid, stop} ->
+            CtrlPid ! {self(), N}
+    after Delay ->
+        publisher(Topic, N + 1, Delay, CtrlPid)
+    end.
+
+hook_authenticate() ->
+    on_exit(fun unhook_authenticate/0),
+    emqx_hooks:add('client.authenticate', {?MODULE, authenticate, [self()]}, ?HP_HIGHEST).
+
+unhook_authenticate() ->
+    emqx_hooks:del('client.authenticate', {?MODULE, authenticate}).
+
+authenticate(Credential, _, TestRunnerPid) ->
+    _ = TestRunnerPid ! {authenticate, Credential},
+    ignore.
+
+action_metrics(TCConfig) ->
+    case get_action_metrics_api(TCConfig) of
+        {200, #{<<"metrics">> := Metrics}} ->
+            Metrics;
+        Other ->
+            error({unexpected_action_metrics, Other})
+    end.
+
+broker_address(Port) ->
+    iolist_to_binary(["127.0.0.1:", integer_to_list(Port)]).
+
+%% A stand-in for a remote TCP endpoint that accepts a connection and drops it right
+%% away, so the client fails with a bare connection error.
+start_closing_broker() ->
+    {ok, ListenSocket} = gen_tcp:listen(0, [
+        binary, {active, false}, {reuseaddr, true}, {ip, {127, 0, 0, 1}}
+    ]),
+    {ok, Port} = inet:port(ListenSocket),
+    Pid = spawn(fun() -> closing_broker_accept_loop(ListenSocket) end),
+    {Port, {ListenSocket, Pid}}.
+
+stop_closing_broker({ListenSocket, Pid}) ->
+    _ = catch gen_tcp:close(ListenSocket),
+    exit(Pid, kill),
+    ok.
+
+closing_broker_accept_loop(ListenSocket) ->
+    case gen_tcp:accept(ListenSocket) of
+        {ok, Socket} ->
+            _ = spawn(fun() -> gen_tcp:close(Socket) end),
+            closing_broker_accept_loop(ListenSocket);
+        {error, _Reason} ->
+            ok
+    end.
+
+%% A TCP relay towards the broker that the test can freeze.  While frozen, bytes are
+%% dropped in both directions but the sockets stay open, which is what a black-holed
+%% network looks like to the client.
+start_relay(UpstreamPort) ->
+    {ok, ListenSocket} = gen_tcp:listen(0, [
+        binary, {active, false}, {reuseaddr, true}, {ip, {127, 0, 0, 1}}
+    ]),
+    {ok, Port} = inet:port(ListenSocket),
+    Pid = spawn(fun() -> relay_coordinator(ListenSocket, UpstreamPort) end),
+    {Port, {ListenSocket, Pid}}.
+
+stop_relay({ListenSocket, Pid}) ->
+    _ = catch gen_tcp:close(ListenSocket),
+    exit(Pid, kill),
+    ok.
+
+freeze_relay(Relay) ->
+    relay_set_frozen(Relay, true).
+
+thaw_relay(Relay) ->
+    relay_set_frozen(Relay, false).
+
+relay_set_frozen({_ListenSocket, Pid}, Frozen) ->
+    Pid ! {frozen, Frozen},
+    ok.
+
+relay_coordinator(ListenSocket, UpstreamPort) ->
+    process_flag(trap_exit, true),
+    Coordinator = self(),
+    _ = spawn_link(fun() -> relay_acceptor(ListenSocket, UpstreamPort, Coordinator) end),
+    relay_coordinator_loop(UpstreamPort, false, []).
+
+relay_coordinator_loop(UpstreamPort, Frozen, Connections) ->
+    receive
+        {connection, Pid} ->
+            %% Keep the state consistent for connections accepted while frozen.
+            Pid ! {frozen, Frozen},
+            relay_coordinator_loop(UpstreamPort, Frozen, [Pid | Connections]);
+        {frozen, NewFrozen} ->
+            [
+                Pid ! {frozen, NewFrozen}
+             || Pid <- Connections
+            ],
+            relay_coordinator_loop(UpstreamPort, NewFrozen, Connections);
+        {'EXIT', _Pid, _Reason} ->
+            relay_coordinator_loop(UpstreamPort, Frozen, Connections)
+    end.
+
+relay_acceptor(ListenSocket, UpstreamPort, Coordinator) ->
+    case gen_tcp:accept(ListenSocket) of
+        {ok, Downstream} ->
+            %% The accepted socket receives data in the process that controls it, so
+            %% hand it over before that process listens on it.  The connection process
+            %% is not linked to this one: a client that goes away while it is being
+            %% set up must not stop the relay from accepting later connections.
+            Pid = spawn(fun() -> relay_connection_start(UpstreamPort) end),
+            case gen_tcp:controlling_process(Downstream, Pid) of
+                ok ->
+                    Pid ! {downstream, Downstream},
+                    Coordinator ! {connection, Pid};
+                {error, _Reason} ->
+                    _ = gen_tcp:close(Downstream)
+            end,
+            relay_acceptor(ListenSocket, UpstreamPort, Coordinator);
+        {error, _Reason} ->
+            ok
+    end.
+
+relay_connection_start(UpstreamPort) ->
+    case relay_wait_for(downstream) of
+        undefined ->
+            ok;
+        Downstream ->
+            %% The coordinator reports the state of the relay as soon as it knows
+            %% about this connection, so a connection accepted while frozen never
+            %% forwards anything.
+            Frozen =
+                case relay_wait_for(frozen) of
+                    undefined -> false;
+                    Value -> Value
+                end,
+            relay_connection(Downstream, UpstreamPort, Frozen)
+    end.
+
+relay_wait_for(Tag) ->
+    receive
+        {Tag, Value} -> Value
+    after 5_000 -> undefined
+    end.
+
+relay_connection(Downstream, UpstreamPort, Frozen) ->
+    case gen_tcp:connect({127, 0, 0, 1}, UpstreamPort, [binary, {active, true}], 5_000) of
+        {ok, Upstream} ->
+            ok = inet:setopts(Downstream, [{active, true}]),
+            relay_loop(Downstream, Upstream, Frozen);
+        {error, _Reason} ->
+            ok = gen_tcp:close(Downstream)
+    end.
+
+relay_loop(Downstream, Upstream, Frozen) ->
+    receive
+        {tcp, Downstream, Data} ->
+            _ = relay_forward(Upstream, Data, Frozen),
+            relay_loop(Downstream, Upstream, Frozen);
+        {tcp, Upstream, Data} ->
+            _ = relay_forward(Downstream, Data, Frozen),
+            relay_loop(Downstream, Upstream, Frozen);
+        {frozen, NewFrozen} ->
+            relay_loop(Downstream, Upstream, NewFrozen);
+        {tcp_closed, _Socket} ->
+            ok;
+        {tcp_error, _Socket, _Reason} ->
+            ok
+    end.
+
+relay_forward(_To, _Data, true) ->
+    ok;
+relay_forward(To, Data, false) ->
+    gen_tcp:send(To, Data).
+
+is_resource_down_alarm(ResId) ->
+    lists:any(
+        fun
+            (#{name := Name, details := Details}) when is_map(Details) ->
+                Name =:= ResId andalso maps:get(reason, Details, undefined) =:= resource_down;
+            (_) ->
+                false
+        end,
+        emqx_alarm:get_alarms(activated)
+    ).
+
+%%------------------------------------------------------------------------------
+%% Test cases
+%%------------------------------------------------------------------------------
+
+t_start_stop(TCConfig) when is_list(TCConfig) ->
+    emqx_bridge_v2_testlib:t_start_stop(TCConfig, mqtt_connector_stopped).
+
+t_on_get_status(TCConfig) when is_list(TCConfig) ->
+    emqx_bridge_v2_testlib:t_on_get_status(TCConfig).
+
+t_rule_action(TCConfig) when is_list(TCConfig) ->
+    #{<<"parameters">> := #{<<"topic">> := Topic}} =
+        get_config(action_config, TCConfig),
+    C = start_client(TCConfig),
+    PrePublishFn = fun(Context) ->
+        {ok, _, [_]} = emqtt:subscribe(C, Topic, [{qos, 2}]),
+        Context
+    end,
+    PostPublishFn = fun(Context) ->
+        #{payload := Payload} = Context,
+        ?assertReceive({publish, #{payload := Payload}})
+    end,
+    ActionOverrides = #{<<"parameters">> => #{<<"payload">> => <<"${.payload}">>}},
+    Opts = #{
+        action_overrides => ActionOverrides,
+        pre_publish_fn => PrePublishFn,
+        post_publish_fn => PostPublishFn,
+        rule_topic => <<"rule/topic">>,
+        sql => <<"select payload from \"rule/topic\" ">>
+    },
+    emqx_bridge_v2_testlib:t_rule_action(TCConfig, Opts).
+
+-doc """
+Checks that we auto-fill Server Name Indication when using SSL and said field is not set.
+""".
+t_sni_autofill(TCConfig) when is_list(TCConfig) ->
+    ?check_trace(
+        begin
+            {201, _} = create_connector_api(TCConfig, #{
+                <<"server">> => <<"127.0.0.1:8883">>,
+                <<"ssl">> => #{<<"enable">> => true}
+            }),
+            ok
+        end,
+        fun(Trace) ->
+            ?assertMatch(
+                [#{config := #{ssl := #{server_name_indication := _}}} | _],
+                ?of_kind("starting_mqtt_connector", Trace)
+            ),
+            ok
+        end
+    ),
+    ok.
+
+t_static_clientids() ->
+    [{matrix, true}].
+t_static_clientids(matrix) ->
+    [[?cluster]];
+t_static_clientids(TCConfig) ->
+    [N1, N2, N3] = Nodes = get_config(nodes, TCConfig),
+    [N1Bin, N2Bin, N3Bin] = lists:map(fun atom_to_binary/1, Nodes),
+    Port = get_tcp_mqtt_port(N1),
+    ct:pal("creating connector"),
+    {201, _} = create_connector_api(TCConfig, #{
+        <<"server">> => <<"127.0.0.1:", (integer_to_binary(Port))/binary>>,
+        <<"static_clientids">> =>
+            [
+                #{<<"node">> => N1Bin, <<"ids">> => []},
+                #{<<"node">> => N2Bin, <<"ids">> => [<<"1">>, <<"3">>]},
+                #{<<"node">> => N3Bin, <<"ids">> => [<<"2">>]}
+            ]
+    }),
+
+    %% Nodes without any workers should report as disconnected.
+    ct:pal("checking connector health"),
+    ?retry(
+        500,
+        10,
+        ?assertMatch(
+            {200, #{
+                <<"status">> := <<"inconsistent">>,
+                <<"node_status">> := [
+                    #{
+                        <<"status">> := <<"disconnected">>,
+                        <<"status_reason">> := <<"{unhealthy_target,", _/binary>>
+                    },
+                    #{<<"status">> := <<"connected">>},
+                    #{<<"status">> := <<"connected">>}
+                ]
+            }},
+            get_connector_api(TCConfig)
+        )
+    ),
+    ConnResId = connector_resource_id(TCConfig),
+    GetWorkerClientids = fun() ->
+        Clientids = lists:map(
+            fun({_WorkerId, WorkerPid}) ->
+                {ok, Client} = ecpool_worker:client(WorkerPid),
+                Info = emqtt:info(Client),
+                proplists:get_value(clientid, Info)
+            end,
+            ecpool:workers(ConnResId)
+        ),
+        lists:sort(Clientids)
+    end,
+    ?assertEqual([], ?ON(N1, GetWorkerClientids())),
+    ?assertEqual([<<"1">>, <<"3">>], ?ON(N2, GetWorkerClientids())),
+    ?assertEqual([<<"2">>], ?ON(N3, GetWorkerClientids())),
+
+    %% Actions using this connector should be created just fine as well
+    ct:pal("creating action"),
+    {201, #{<<"parameters">> := #{<<"topic">> := RemoteTopic}}} =
+        create_action_api(TCConfig, #{
+            <<"parameters">> => #{
+                <<"payload">> => <<"${.payload}">>
+            }
+        }),
+    ct:pal("checking action health"),
+    ?retry(
+        500,
+        10,
+        ?assertMatch(
+            {200, #{
+                <<"status">> := <<"inconsistent">>,
+                <<"node_status">> := [
+                    #{<<"status">> := <<"disconnected">>},
+                    #{<<"status">> := <<"connected">>},
+                    #{<<"status">> := <<"connected">>}
+                ]
+            }},
+            get_action_api(TCConfig)
+        )
+    ),
+
+    ct:pal("creating rule"),
+    #{id := RuleId, topic := RuleTopic} = simple_create_rule_api(
+        <<"select payload from \"${t}\" ">>,
+        TCConfig
+    ),
+
+    C0 = start_client(N1),
+    {ok, _, [?RC_GRANTED_QOS_1]} = emqtt:subscribe(C0, RemoteTopic, ?QOS_1),
+    Clients = lists:map(fun start_client/1, Nodes),
+
+    %% Messages from the client connected to the node without clientids will be lost.
+    ct:pal("publishing messages"),
+    lists:foreach(
+        fun({N, C}) ->
+            {ok, _} = emqtt:publish(C, RuleTopic, integer_to_binary(N), ?QOS_1)
+        end,
+        lists:enumerate(Clients)
+    ),
+    ?assertNotReceive({publish, #{payload := <<"1">>}}),
+    ?assertReceive({publish, #{payload := <<"2">>}}),
+    ?assertReceive({publish, #{payload := <<"3">>}}),
+    ?retry(
+        500,
+        10,
+        ?assertMatch(
+            {200, #{
+                <<"metrics">> := #{
+                    <<"matched">> := 3,
+                    <<"success">> := 2,
+                    <<"failed">> := 0,
+                    <<"dropped">> := 1
+                },
+                <<"node_metrics">> := [
+                    #{
+                        <<"metrics">> := #{
+                            <<"matched">> := 1,
+                            <<"success">> := 0,
+                            <<"failed">> := 0,
+                            <<"dropped">> := 1
+                        }
+                    },
+                    #{
+                        <<"metrics">> := #{
+                            <<"matched">> := 1,
+                            <<"success">> := 1,
+                            <<"failed">> := 0,
+                            <<"dropped">> := 0
+                        }
+                    },
+                    #{
+                        <<"metrics">> := #{
+                            <<"matched">> := 1,
+                            <<"success">> := 1,
+                            <<"failed">> := 0,
+                            <<"dropped">> := 0
+                        }
+                    }
+                ]
+            }},
+            get_action_metrics_api(TCConfig)
+        )
+    ),
+    ?assertMatch(
+        #{
+            N1 := #{
+                counters := #{
+                    'matched' := 1,
+                    'passed' := 1,
+                    'actions.failed' := 1,
+                    'actions.success' := 0
+                }
+            },
+            N2 := #{
+                counters := #{
+                    'matched' := 1,
+                    'passed' := 1,
+                    'actions.failed' := 0,
+                    'actions.success' := 1
+                }
+            },
+            N3 := #{
+                counters := #{
+                    'matched' := 1,
+                    'passed' := 1,
+                    'actions.failed' := 0,
+                    'actions.success' := 1
+                }
+            }
+        },
+        maps:from_list([{N, ?ON(N, emqx_bridge_v2_testlib:get_rule_metrics(RuleId))} || N <- Nodes])
+    ),
+
+    ok.
+
+%% The guard is unreachable through the delivery path (the status gates return first), so
+%% assert the callback contract directly against the connector's real resource state.
+-doc """
+A node without an assigned static clientid fails egress queries as unrecoverable.
+""".
+t_no_assigned_clientid_is_unrecoverable(TCConfig) ->
+    NodeBin = atom_to_binary(node()),
+    {201, _} = create_connector_api(TCConfig, #{
+        <<"static_clientids">> => [
+            %% This node is listed without any clientid, while another listed node owns
+            %% the one clientid the schema requires to accept the configuration.
+            #{<<"node">> => NodeBin, <<"ids">> => []},
+            #{<<"node">> => <<"remote@127.0.0.1">>, <<"ids">> => [<<"1">>]}
+        ]
+    }),
+    ?retry(
+        200,
+        50,
+        ?assertMatch(
+            {200, #{<<"status">> := <<"disconnected">>}}, get_connector_api(TCConfig)
+        )
+    ),
+    {201, _} = create_action_api(TCConfig, #{}),
+    {ConnResId, ChanResId, State} = wait_for_installed_channel(TCConfig),
+    Msg = emqx_message:make(<<"t/static-clientid-guard">>, <<"payload">>),
+    ExpectedError =
+        {error, {unrecoverable_error, <<"This node has no assigned static clientid.">>}},
+    ?assertEqual(
+        ExpectedError,
+        emqx_bridge_mqtt_connector:on_query(ConnResId, {ChanResId, Msg}, State)
+    ),
+    ?assertEqual(
+        ExpectedError,
+        emqx_bridge_mqtt_connector:on_query_async(
+            ConnResId, {ChanResId, Msg}, {fun(_) -> ok end, []}, State
+        )
+    ),
+    %% The resource manager restarts this disconnected resource every second, so
+    %% `on_get_status/2' can race with the pool being re-registered.
+    ?retry(
+        200,
+        50,
+        ?assertEqual(
+            {?status_disconnected,
+                {unhealthy_target, <<"Connector has no assigned static clientids">>}},
+            emqx_bridge_mqtt_connector:on_get_status(ConnResId, State)
+        )
+    ),
+    ?assertEqual(
+        {?status_disconnected, {unhealthy_target, <<"No clientids assigned to this node">>}},
+        emqx_bridge_mqtt_connector:on_get_channel_status(ConnResId, ChanResId, State)
+    ),
+    ok.
+
+%% A disconnected connector installs its configured channels when it is retried, which
+%% the resource manager does every `health_check_interval'; wait for that incarnation.
+wait_for_installed_channel(TCConfig) ->
+    ActionName = get_config(action_name, TCConfig),
+    ?retry(200, 50, begin
+        {ok, {ConnResId, ChanResId}} =
+            emqx_bridge_v2:get_resource_ids(global, actions, ?ACTION_TYPE, ActionName),
+        {ok, _, #{state := State}} = emqx_resource:get_instance(ConnResId),
+        {?status_disconnected, _} =
+            emqx_bridge_mqtt_connector:on_get_channel_status(ConnResId, ChanResId, State),
+        {ConnResId, ChanResId, State}
+    end).
+
+t_static_clientids_inherit_credentials() ->
+    [{matrix, true}].
+t_static_clientids_inherit_credentials(matrix) ->
+    [[?cluster]];
+t_static_clientids_inherit_credentials(TCConfig) ->
+    [N1 | _] = Nodes = get_config(nodes, TCConfig),
+    [N1Bin, N2Bin, N3Bin] = lists:map(fun atom_to_binary/1, Nodes),
+    Port = get_tcp_mqtt_port(N1),
+    ct:pal("creating connector"),
+    ?check_trace(
+        begin
+            {201, _} = create_connector_api(TCConfig, #{
+                <<"server">> => <<"127.0.0.1:", (integer_to_binary(Port))/binary>>,
+                <<"username">> => <<"root_user">>,
+                <<"password">> => <<"root_pass">>,
+                <<"static_clientids">> =>
+                    [
+                        #{<<"node">> => N1Bin, <<"ids">> => [<<"1">>]},
+                        #{
+                            <<"node">> => N2Bin,
+                            <<"ids">> => [
+                                #{
+                                    <<"clientid">> => <<"2">>,
+                                    <<"username">> => <<"specific_user2">>,
+                                    <<"password">> => <<"specific_pass2">>
+                                }
+                            ]
+                        },
+                        #{
+                            <<"node">> => N3Bin,
+                            <<"ids">> => [
+                                #{
+                                    <<"clientid">> => <<"3">>,
+                                    <<"username">> => <<"specific_user3">>
+                                }
+                            ]
+                        }
+                    ]
+            })
+        end,
+        fun(Trace) ->
+            SubTrace = ?of_kind("mqtt_emqtt_client_about_to_start", Trace),
+            Opts0 = lists:map(fun(#{opts := Opts}) -> Opts end, SubTrace),
+            Opts = lists:sort(fun(#{clientid := C1}, #{clientid := C2}) -> C1 =< C2 end, Opts0),
+            ?assertMatch(
+                [
+                    #{
+                        clientid := <<"1">>,
+                        username := <<"root_user">>,
+                        password := _
+                    },
+                    #{
+                        clientid := <<"2">>,
+                        username := <<"specific_user2">>,
+                        password := _
+                    },
+                    #{
+                        clientid := <<"3">>,
+                        username := <<"specific_user3">>,
+                        password := _
+                    }
+                ],
+                lists:map(fun(O) -> maps:with([clientid, username, password], O) end, Opts)
+            ),
+            [C1, C2, C3] = Opts,
+            ?assertEqual(<<"root_pass">>, emqx_secret:unwrap(maps:get(password, C1)), #{opts => C1}),
+            ?assertEqual(<<"specific_pass2">>, emqx_secret:unwrap(maps:get(password, C2)), #{
+                opts => C2
+            }),
+            ?assertEqual(<<"root_pass">>, emqx_secret:unwrap(maps:get(password, C3)), #{opts => C3}),
+            ok
+        end
+    ),
+    ok.
+
+t_rule_test_trace() ->
+    [{matrix, true}].
+t_rule_test_trace(matrix) ->
+    [
+        [?local, ?global_namespace],
+        [?local, ?namespaced]
+    ];
+t_rule_test_trace(TCConfig) ->
+    Opts = #{},
+    emqx_bridge_v2_testlib:t_rule_test_trace(TCConfig, Opts).
+
+%% Checks that we can forward original MQTT user properties via this action.  Also
+%% verifies that extra properties may be added via templates.
+t_forward_user_properties(TCConfig) ->
+    {201, _} = create_connector_api(TCConfig, _Overrides = #{}),
+    {201, #{<<"parameters">> := #{<<"topic">> := RemoteTopic}}} =
+        create_action_api(
+            TCConfig,
+            #{}
+        ),
+    #{topic := RuleTopic} = simple_create_rule_api(
+        <<
+            "select *,"
+            " map_put(concat('User-Property.', payload.extra_key), "
+            "payload.extra_value, pub_props) as pub_props from \"${t}\""
+        >>,
+        TCConfig
+    ),
+    C = start_client(TCConfig),
+    {ok, _, [?RC_GRANTED_QOS_1]} = emqtt:subscribe(C, RemoteTopic, 1),
+    Payload1 = emqx_utils_json:encode(#{
+        <<"extra_key">> => <<"k2">>,
+        <<"extra_value">> => <<"v2">>
+    }),
+    {ok, _} = emqtt:publish(
+        C,
+        RuleTopic,
+        #{'User-Property' => [{<<"k1">>, <<"v1">>}]},
+        Payload1,
+        [{qos, ?QOS_1}]
+    ),
+    {publish, #{properties := #{'User-Property' := UserProps1}}} =
+        ?assertReceive({publish, #{properties := #{'User-Property' := _}}}),
+    ?assertMatch(
+        [{<<"k1">>, <<"v1">>}, {<<"k2">>, <<"v2">>}],
+        UserProps1
+    ),
+    ok.
+
+%% Verifies that `emqtt' clients automatically try to reconnect once disconnected.
+t_reconnect(TCConfig) ->
+    PoolSize = 3,
+    ?check_trace(
+        begin
+            {201, _} = create_connector_api(TCConfig, #{
+                <<"pool_size">> => PoolSize
+            }),
+            ConnResId = emqx_bridge_v2_testlib:connector_resource_id(TCConfig),
+            ?retry(
+                500,
+                20,
+                ?assertEqual(PoolSize, length(get_emqtt_clients(ConnResId)))
+            ),
+            ClientIds0 =
+                lists:sort(
+                    [
+                        proplists:get_value(clientid, emqtt:info(Client))
+                     || Client <- get_emqtt_clients(ConnResId)
+                    ]
+                ),
+            ClientIds = lists:droplast(ClientIds0),
+            ChanPids0 =
+                lists:sort(lists:flatmap(fun emqx_cm:lookup_channels/1, ClientIds0)),
+            ChanPids = lists:droplast(ChanPids0),
+            lists:foreach(fun(Pid) -> monitor(process, Pid) end, ChanPids),
+            ct:pal("kicking ~p (leaving 1 client alive)", [ClientIds]),
+            {204, _} = emqx_bridge_v2_testlib:kick_clients_http(ClientIds),
+            %% `emqx_utils:drain_down/1' returns whatever is already in the
+            %% mailbox (`after 0'), so it races the kick propagation. Wait
+            %% with a generous timeout for the expected count to arrive.
+            DownPids = wait_for_downs(PoolSize - 1, 5_000),
+            ?assertEqual(lists:sort(ChanPids), lists:sort(DownPids)),
+            %% Recovery
+            ct:pal("clients kicked; waiting for recovery..."),
+            ?retry(
+                500,
+                20,
+                ?assertEqual(PoolSize, length(get_emqtt_clients(ConnResId)))
+            ),
+            ?assertEqual(PoolSize, length(ecpool:workers(ConnResId))),
+            ?retry(500, 40, ?assertEqual(PoolSize, length(get_emqtt_clients(ConnResId)))),
+            ok
+        end,
+        []
+    ),
+    ok.
+
+%% Verifies we validate duplicate clientids amongst different connectors as well, to avoid
+%% dumb mistakes like reusing the same clientid multiple times.
+t_duplicate_static_clientids_different_connectors(TCConfig) ->
+    NodeBin = atom_to_binary(node()),
+    {201, _} = create_connector_api(TCConfig, #{
+        <<"static_clientids">> => [#{<<"node">> => NodeBin, <<"ids">> => [<<"1">>]}]
+    }),
+    ?assertMatch(
+        {400, #{
+            <<"message">> := #{
+                <<"kind">> := <<"validation_error">>,
+                <<"reason">> :=
+                    <<
+                        "distinct mqtt connectors must not use the same static clientids;"
+                        " connectors with duplicate static clientids: ",
+                        _/binary
+                    >>
+            }
+        }},
+        create_connector_api([{connector_name, <<"another">>} | TCConfig], #{
+            <<"static_clientids">> => [#{<<"node">> => NodeBin, <<"ids">> => [<<"1">>]}]
+        })
+    ),
+    %% Using a different host is fine (different IPs and hostnames may still lead to the
+    %% same cluster, it's a best effort check)
+    ?assertMatch(
+        {201, _},
+        create_connector_api([{connector_name, <<"another">>} | TCConfig], #{
+            <<"server">> => <<"a-different-host:1883">>,
+            <<"static_clientids">> => [#{<<"node">> => NodeBin, <<"ids">> => [<<"1">>]}]
+        })
+    ),
+    ok.
+
+%% Checks the race condition where the action is deemed healthy, but the MQTT client has
+%% concurrently been disconnected (and, due to a race, `emqtt' gets either a `{error,
+%% closed}' or `{error, tcp_closed}' error message).  We should retry.
+t_publish_while_tcp_closed_concurrently(TCConfig) ->
+    PoolSize = 3,
+    ?check_trace(
+        begin
+            ?force_ordering(
+                #{?snk_kind := call_query_enter},
+                #{?snk_kind := "kill_clients", ?snk_span := start}
+            ),
+            ?force_ordering(
+                #{?snk_kind := "kill_clients", ?snk_span := {complete, _}},
+                #{?snk_kind := "mqtt_action_about_to_publish"}
+            ),
+
+            TestClientid = <<"testclientid">>,
+
+            spawn_link(fun() ->
+                ?tp_span(
+                    "kill_clients",
+                    #{},
+                    begin
+                        ClientIds0 = [_, _ | _] = emqx_cm:all_client_ids(),
+                        ChanPids0 = [_, _ | _] = emqx_cm:all_channels(),
+                        ClientidsChanPids0 = lists:zip(ClientIds0, ChanPids0),
+                        ClientidsChanPids = lists:filter(
+                            fun({CId, _Pid}) ->
+                                CId /= TestClientid
+                            end,
+                            ClientidsChanPids0
+                        ),
+                        {ClientidsToKick, ChanPids} = lists:unzip(ClientidsChanPids),
+                        lists:foreach(fun(Pid) -> monitor(process, Pid) end, ChanPids),
+                        ct:pal("kicking ~p", [ClientidsToKick]),
+                        %% Forcefully kill connection processes, so we get the ellusive `tcp_closed'
+                        %% error more easily from `emqtt'.
+                        lists:foreach(fun(ChanPid) -> ChanPid ! die_if_test end, ChanPids),
+                        _DownPids = emqx_utils:drain_down(PoolSize),
+
+                        ok
+                    end
+                )
+            end),
+
+            {201, _} = create_connector_api(TCConfig, #{
+                %% Should usually be `true', but we allow `false', despite the potential
+                %% issues with duplication of messages and loss of client state.
+                <<"clean_start">> => false,
+                <<"pool_size">> => PoolSize,
+                <<"resource_opts">> => #{<<"health_check_interval">> => <<"15s">>}
+            }),
+            {201, #{<<"parameters">> := #{<<"topic">> := RemoteTopic}}} =
+                create_action_api(
+                    TCConfig,
+                    #{
+                        <<"parameters">> => #{<<"qos">> => ?QOS_2},
+                        <<"resource_opts">> => #{<<"health_check_interval">> => <<"15s">>}
+                    }
+                ),
+
+            #{topic := RuleTopic} = simple_create_rule_api(TCConfig),
+            C = start_client(TCConfig, #{clientid => TestClientid}),
+            {ok, _, [?RC_GRANTED_QOS_2]} = emqtt:subscribe(C, RemoteTopic, [{qos, ?QOS_2}]),
+
+            {ok, _} = emqtt:publish(C, RuleTopic, <<"hey">>, [{qos, ?QOS_2}]),
+
+            ?assertReceive({publish, #{topic := RemoteTopic}}, 5_000),
+
+            ok
+        end,
+        fun(Trace) ->
+            %% Connection being closed forcefully should induce a retry
+            ?assertMatch([_ | _], ?of_kind(buffer_worker_retry_inflight, Trace)),
+            ok
+        end
+    ),
+    ok.
+
+t_fallback_actions(TCConfig) ->
+    emqx_bridge_v2_testlib:t_fallback_actions(TCConfig).
+
+%% Checks that we can start a node with a config with a republish action (essentially,
+%% `emqx_config:init_load' accepts it).g
+t_fallback_actions_load_config(TCConfig) ->
+    #{
+        type := ActionType,
+        name := ActionName,
+        config := ActionConfig0,
+        connector_type := ConnectorType,
+        connector_name := ConnectorName,
+        connector_config := ConnectorConfig
+    } =
+        emqx_bridge_v2_testlib:get_common_values_with_configs(TCConfig),
+    RepublishTopic = <<"republish/fallback">>,
+    RepublishArgs = #{
+        <<"topic">> => RepublishTopic,
+        <<"qos">> => 1,
+        <<"retain">> => false,
+        <<"payload">> => <<"${payload}">>,
+        <<"mqtt_properties">> => #{},
+        <<"user_properties">> => <<"${pub_props.'User-Property'}">>,
+        <<"direct_dispatch">> => false
+    },
+    ActionConfig = emqx_utils_maps:deep_merge(
+        ActionConfig0,
+        #{
+            <<"fallback_actions">> => [
+                #{
+                    <<"kind">> => <<"republish">>,
+                    <<"args">> => RepublishArgs
+                }
+            ],
+            %% Simple way to make the requests fail: make the buffer overflow
+            <<"resource_opts">> => #{
+                <<"max_buffer_bytes">> => <<"0B">>,
+                <<"buffer_seg_bytes">> => <<"0B">>
+            }
+        }
+    ),
+    Hocon = #{
+        <<"connectors">> => #{ConnectorType => #{ConnectorName => ConnectorConfig}},
+        <<"actions">> => #{ActionType => #{ActionName => ActionConfig}}
+    },
+    AppSpecs = [
+        emqx,
+        emqx_conf,
+        emqx_connector,
+        emqx_bridge_mqtt,
+        {emqx_bridge, #{config => Hocon}},
+        emqx_rule_engine,
+        emqx_management
+    ],
+    %% Simply successfully starting the nodes is enough.
+    Nodes = emqx_cth_cluster:start(
+        [{bridge_fallback_actions, #{role => core, apps => AppSpecs}}],
+        #{work_dir => emqx_cth_suite:work_dir(?FUNCTION_NAME, TCConfig)}
+    ),
+    ok = emqx_cth_cluster:stop(Nodes),
+    ok.
+
+t_conf_no_resource_leak(TCConfig) ->
+    FindTopicIndexTab = fun() ->
+        lists:filter(
+            fun(T) -> ets:info(T, name) =:= emqx_topic_index end,
+            ets:all()
+        )
+    end,
+    Tabs1 = FindTopicIndexTab(),
+    {201, _} = create_connector_api(TCConfig, #{
+        %% invalid server
+        <<"server">> => <<"127.0.0.1:6060">>,
+        <<"pool_size">> => 1
+    }),
+    {201, _} = create_action_api(TCConfig, #{}),
+    ?assertEqual(Tabs1, FindTopicIndexTab()).
+
+t_conf_bridge_authn_anonymous(TCConfig) ->
+    ok = hook_authenticate(),
+    {201, _} = create_connector_api(TCConfig, #{<<"pool_size">> => 1}),
+    {201, _} = create_action_api(TCConfig, #{}),
+    ?assertReceive(
+        {authenticate, #{username := undefined, password := undefined}}
+    ).
+
+t_conf_bridge_authn_password(TCConfig) ->
+    Username = <<"user1">>,
+    Password = <<"from-here">>,
+    ok = hook_authenticate(),
+    {201, _} = create_connector_api(TCConfig, #{
+        <<"username">> => Username,
+        <<"password">> => Password,
+        <<"pool_size">> => 1
+    }),
+    {201, _} = create_action_api(TCConfig, #{}),
+    ?assertReceive(
+        {authenticate, #{username := Username, password := Password}}
+    ).
+
+t_conf_bridge_authn_passfile(TCConfig) ->
+    DataDir = get_config(data_dir, TCConfig),
+    Username = <<"user2">>,
+    PasswordFilename = filename:join(DataDir, "password"),
+    ok = filelib:ensure_dir(PasswordFilename),
+    Password = <<"from-there">>,
+    ok = file:write_file(PasswordFilename, Password),
+    PasswordURI = iolist_to_binary(["file://", PasswordFilename]),
+    ok = hook_authenticate(),
+    {201, _} = create_connector_api(TCConfig, #{
+        <<"username">> => Username,
+        <<"password">> => PasswordURI,
+        <<"pool_size">> => 1
+    }),
+    {201, _} = create_action_api(TCConfig, #{}),
+    ?assertReceive(
+        {authenticate, #{username := Username, password := Password}}
+    ),
+    {200, #{
+        <<"status">> := <<"disconnected">>,
+        <<"status_reason">> := Reason
+    }} = update_connector_api(TCConfig, #{
+        <<"username">> => <<"">>,
+        <<"password">> => <<"file://im/pretty/sure/theres/no/such/file">>
+    }),
+    ?assertMatch({match, _}, re:run(Reason, <<"failed_to_read_secret_file">>)).
+
+t_egress_short_clientid(TCConfig) ->
+    %% Name is short, expect the actual client ID in use is hashed from
+    %% <name><nodename-hash>:<pool_worker_id>
+    Name = <<"abc01234">>,
+    BaseId = emqx_bridge_mqtt_lib:clientid_base([Name]),
+    ExpectedClientId = iolist_to_binary([BaseId, $:, "1"]),
+    ?assertMatch(<<"abc01234", _/binary>>, ExpectedClientId),
+    test_egress_clientid(Name, _Prefix = <<>>, ExpectedClientId, TCConfig).
+
+t_egress_long_clientid(TCConfig) ->
+    %% Expect the actual client ID in use is hashed from
+    %% <name><nodename-hash>:<pool_worker_id>
+    Name = <<"abc012345678901234567890">>,
+    BaseId = emqx_bridge_mqtt_lib:clientid_base([Name]),
+    ExpectedClientId = emqx_bridge_mqtt_lib:bytes23(BaseId, 1),
+    test_egress_clientid(Name, _Prefix = <<>>, ExpectedClientId, TCConfig).
+
+t_egress_with_short_prefix(TCConfig) ->
+    %% Expect the actual client ID in use is hashed from
+    %% <prefix>head(sha1(<name><nodename-hash>:<pool_worker_id>), 16)
+    Prefix = <<"012-">>,
+    Name = <<"345">>,
+    BaseId = emqx_bridge_mqtt_lib:clientid_base([Name]),
+    ExpectedClientId = emqx_bridge_mqtt_lib:bytes23_with_prefix(Prefix, BaseId, 1),
+    ?assertMatch(<<"012-", _/binary>>, ExpectedClientId),
+    test_egress_clientid(Name, Prefix, ExpectedClientId, TCConfig).
+
+t_egress_with_long_prefix(TCConfig) ->
+    %% Expect the actual client ID in use is hashed from
+    %% <prefix><name><nodename-hash>:<pool_worker_id>
+    Prefix = <<"0123456789abcdef01234-">>,
+    Name = <<"345">>,
+    BaseId = emqx_bridge_mqtt_lib:clientid_base([Name]),
+    ExpectedClientId = iolist_to_binary([Prefix, BaseId, <<":1">>]),
+    test_egress_clientid(Name, Prefix, ExpectedClientId, TCConfig).
+
+test_egress_clientid(Name, ClientIdPrefix, ExpectedClientId, TCConfig0) ->
+    TCConfig = [{connector_name, Name} | TCConfig0],
+    {201, _} = create_connector_api(TCConfig, #{
+        <<"pool_size">> => 1,
+        <<"clientid_prefix">> => ClientIdPrefix
+    }),
+    {201, #{<<"parameters">> := #{<<"topic">> := RemoteTopic}}} =
+        create_action_api(TCConfig, #{<<"connector">> => Name}),
+    #{topic := LocalTopic} = simple_create_rule_api(TCConfig),
+    Payload = <<"hello">>,
+    emqx:subscribe(RemoteTopic),
+    timer:sleep(100),
+    emqx:publish2(emqx_message:make(LocalTopic, Payload)),
+    {deliver, _, #message{from = From}} = ?assertReceive({deliver, _, _}),
+    ?assertEqual(ExpectedClientId, From),
+    ok.
+
+t_mqtt_conn_bridge_egress_reconnect(TCConfig) ->
+    {201, _} = create_connector_api(TCConfig, #{
+        <<"resource_opts">> => #{
+            %% to make it check the healthy and reconnect quickly
+            <<"health_check_interval">> => <<"500ms">>
+        }
+    }),
+    RemotePrefix = <<"remote">>,
+    {201, _} = create_action_api(TCConfig, #{
+        <<"parameters">> => #{
+            <<"topic">> => <<RemotePrefix/binary, "/${topic}">>,
+            <<"payload">> => <<"${payload}">>,
+            <<"qos">> => <<"${qos}">>,
+            <<"retain">> => <<"${retain}">>
+        },
+        <<"resource_opts">> => #{
+            %% to make it check the healthy and reconnect quickly
+            <<"health_check_interval">> => <<"500ms">>,
+            %% using a long time so we can test recovery
+            <<"request_ttl">> => <<"15s">>,
+            <<"query_mode">> => <<"sync">>,
+            <<"resume_interval">> => <<"500ms">>
+        }
+    }),
+    #{topic := LocalTopic} = simple_create_rule_api(TCConfig),
+    %% we now test if the bridge works as expected
+    RemoteTopic = emqx_topic:join([RemotePrefix, LocalTopic]),
+    Payload0 = <<"hello">>,
+    emqx:subscribe(RemoteTopic),
+
+    ?wait_async_action(
+        %% PUBLISH a message to the 'local' broker, as we have only one broker,
+        %% the remote broker is also the local one.
+        emqx:publish2(emqx_message:make(LocalTopic, Payload0)),
+        #{?snk_kind := buffer_worker_flush_ack}
+    ),
+
+    %% we should receive a message on the "remote" broker, with specified topic
+    ?assertReceive({deliver, RemoteTopic, #message{payload = Payload0}}),
+
+    %% verify the metrics of the bridge
+    ?retry(
+        300,
+        20,
+        ?assertMatch(
+            {200, #{
+                <<"metrics">> := #{
+                    <<"matched">> := 1,
+                    <<"success">> := 1,
+                    <<"failed">> := 0
+                }
+            }},
+            get_action_metrics_api(TCConfig)
+        )
+    ),
+
+    %% stop the listener 1883 to make the bridge disconnected
+    ok = emqx_listeners:stop_listener('tcp:default'),
+    ct:sleep(1500),
+
+    %% PUBLISH 2 messages to the 'local' broker, the messages should
+    %% be enqueued and the resource will block
+    {ok, SRef} =
+        snabbkaffe:subscribe(
+            fun
+                (#{?snk_kind := buffer_worker_retry_inflight_failed}) ->
+                    true;
+                (#{?snk_kind := buffer_worker_flush_nack}) ->
+                    true;
+                (_) ->
+                    false
+            end,
+            _NEvents = 2,
+            _Timeout = 1_000
+        ),
+    Payload1 = <<"hello2">>,
+    Payload2 = <<"hello3">>,
+    %% We need to do it in other processes because it'll block due to
+    %% the long timeout
+    spawn(fun() -> emqx:publish2(emqx_message:make(LocalTopic, Payload1)) end),
+    spawn(fun() -> emqx:publish2(emqx_message:make(LocalTopic, Payload2)) end),
+    {ok, _} = snabbkaffe:receive_events(SRef),
+
+    %% verify the metrics of the bridge, the message should be queued
+    ?assertMatch(
+        {200, #{<<"status">> := Status}} when
+            Status == <<"connecting">> orelse Status == <<"disconnected">>,
+        get_connector_api(TCConfig)
+    ),
+    %% matched >= 3 because of possible retries.
+    ?retry(
+        300,
+        20,
+        ?assertMatch(
+            {200, #{
+                <<"metrics">> := #{
+                    <<"matched">> := Matched,
+                    <<"success">> := 1,
+                    <<"failed">> := 0,
+                    <<"queuing">> := Queuing,
+                    <<"inflight">> := Inflight
+                }
+            }} when Matched >= 3 andalso Inflight + Queuing == 2,
+            get_action_metrics_api(TCConfig)
+        )
+    ),
+
+    %% start the listener 1883 to make the bridge reconnected
+    ok = emqx_listeners:start_listener('tcp:default'),
+    %% verify the metrics of the bridge, the 2 queued messages should have been sent
+    ?retry(
+        500,
+        20,
+        ?assertMatch(
+            {200, #{<<"status">> := <<"connected">>}},
+            get_connector_api(TCConfig)
+        )
+    ),
+    %% matched >= 3 because of possible retries.
+    ?retry(
+        300,
+        20,
+        ?assertMatch(
+            {200, #{
+                <<"metrics">> := #{
+                    <<"matched">> := Matched,
+                    <<"success">> := 3,
+                    <<"failed">> := 0,
+                    <<"queuing">> := 0,
+                    <<"retried">> := _
+                }
+            }} when Matched >= 3,
+            get_action_metrics_api(TCConfig)
+        )
+    ),
+    %% also verify the 2 messages have been sent to the remote broker
+    ?assertReceive({deliver, RemoteTopic, #message{payload = Payload1}}),
+    ?assertReceive({deliver, RemoteTopic, #message{payload = Payload2}}),
+    ok.
+
+t_mqtt_conn_bridge_egress_async_reconnect(TCConfig) ->
+    Self = self(),
+
+    ?check_trace(
+        begin
+            %% stop the listener 1883 to make the bridge disconnected
+            ok = emqx_listeners:stop_listener('tcp:default'),
+
+            {201, _} = create_connector_api(TCConfig, #{
+                <<"resource_opts">> => #{
+                    %% to make it check the healthy and reconnect quickly
+                    <<"health_check_interval">> => <<"500ms">>
+                }
+            }),
+            RemotePrefix = <<"remote">>,
+            {201, _} = create_action_api(TCConfig, #{
+                <<"parameters">> => #{
+                    <<"topic">> => <<RemotePrefix/binary, "/${topic}">>,
+                    <<"payload">> => <<"${payload}">>,
+                    <<"qos">> => <<"${qos}">>,
+                    <<"retain">> => <<"${retain}">>
+                },
+                <<"resource_opts">> => #{
+                    %% to make it check the healthy and reconnect quickly
+                    <<"health_check_interval">> => <<"500ms">>,
+                    %% using a long time so we can test recovery
+                    <<"request_ttl">> => <<"15s">>,
+                    <<"query_mode">> => <<"async">>,
+                    <<"resume_interval">> => <<"500ms">>
+                }
+            }),
+            #{topic := LocalTopic} = simple_create_rule_api(TCConfig),
+            %% we now test if the bridge works as expected
+            RemoteTopic = emqx_topic:join([RemotePrefix, LocalTopic]),
+
+            emqx:subscribe(RemoteTopic),
+
+            Publisher = start_publisher(LocalTopic, 200, Self),
+            ct:sleep(1000),
+
+            ?retry(
+                500,
+                20,
+                ?assertMatch(
+                    {200, #{<<"status">> := Status}} when
+                        Status == <<"connecting">> orelse Status == <<"disconnected">>,
+                    get_connector_api(TCConfig)
+                )
+            ),
+
+            %% start the listener 1883 to make the bridge reconnected
+            ok = emqx_listeners:start_listener('tcp:default'),
+            ?retry(
+                500,
+                20,
+                ?assertMatch(
+                    {200, #{<<"status">> := <<"connected">>}},
+                    get_connector_api(TCConfig)
+                )
+            ),
+
+            N = stop_publisher(Publisher),
+
+            %% all those messages should eventually be delivered
+            lists:foreach(
+                fun(I) ->
+                    Payload = integer_to_binary(I),
+                    ?assertReceive({deliver, RemoteTopic, #message{payload = Payload}})
+                end,
+                lists:seq(1, N)
+            ),
+            ok
+        end,
+        fun(Trace) ->
+            ?assertMatch([_ | _], ?of_kind(emqx_bridge_mqtt_connector_econnrefused_error, Trace)),
+            ok
+        end
+    ),
+    ok.
+
+%% Messages the `emqtt' client has accepted but not yet acknowledged are reported to
+%% the action with the reason why its socket was closed.  For a TLS connection that
+%% reason is a connection-level error (`ssl_closed' for a closed socket), which used to
+%% be classified as unrecoverable: the buffer worker then acknowledged those queries
+%% and dropped them, so they never reached the remote broker even though the connection
+%% came back moments later.  The classification of those reasons themselves is pinned
+%% in `emqx_bridge_mqtt_connector_tests'.
+%%
+%% The broker-side connection of the connector's client is suspended before the
+%% burst is published: while it is suspended no acknowledgement can drain the
+%% client's queue, so the client is guaranteed to still hold the publishes when that
+%% connection is killed.  This removes the race between sampling the queue and
+%% injecting the fault.
+t_publish_while_tls_connection_closed(TCConfig) ->
+    ClientId = <<"t_publish_while_tls_connection_closed">>,
+    ?check_trace(
+        begin
+            SslPort = integer_to_binary(get_ssl_mqtt_port()),
+            ConnResId = connector_resource_id(TCConfig),
+            {201, _} = create_connector_api(TCConfig, #{
+                <<"server">> => <<"mqtts://127.0.0.1:", SslPort/binary>>,
+                <<"ssl">> => #{<<"enable">> => true, <<"verify">> => <<"verify_none">>},
+                <<"static_clientids">> => [
+                    #{<<"node">> => atom_to_binary(node()), <<"ids">> => [ClientId]}
+                ],
+                %% At most one unacknowledged publish at a time: the client keeps the
+                %% rest of the burst queued, so losing the connection below is
+                %% guaranteed to catch messages that were accepted but not
+                %% acknowledged yet.
+                <<"max_inflight">> => 1,
+                %% No health check tick during the outage: the connection must come
+                %% back through the client's own reconnection, not through a resource
+                %% restart.
+                <<"resource_opts">> => #{<<"health_check_interval">> => <<"60s">>}
+            }),
+            RemotePrefix = <<"remote">>,
+            {201, _} = create_action_api(TCConfig, #{
+                <<"parameters">> => #{
+                    <<"topic">> => <<RemotePrefix/binary, "/${topic}">>,
+                    <<"payload">> => <<"${payload}">>,
+                    <<"qos">> => ?QOS_2
+                },
+                <<"resource_opts">> => #{
+                    <<"health_check_interval">> => <<"60s">>,
+                    <<"query_mode">> => <<"async">>,
+                    <<"request_ttl">> => <<"60s">>,
+                    <<"resume_interval">> => <<"500ms">>
+                }
+            }),
+            #{topic := LocalTopic} = simple_create_rule_api(TCConfig),
+            RemoteTopic = emqx_topic:join([RemotePrefix, LocalTopic]),
+            emqx:subscribe(RemoteTopic),
+            ?retry(
+                500,
+                20,
+                ?assertMatch(
+                    {200, #{<<"status">> := <<"connected">>}}, get_connector_api(TCConfig)
+                )
+            ),
+
+            %% Suspend the broker-side connection: acknowledgements stop, so the burst
+            %% published below stays with the client until the connection is lost.
+            BrokerConns = emqx_cm:lookup_channels(ClientId),
+            ?assertMatch([_ | _], BrokerConns),
+            %% Kill the connections on exit as well, in case an assertion below fails
+            %% before they are killed on purpose.
+            on_exit(fun() ->
+                lists:foreach(fun(Pid) -> exit(Pid, kill) end, BrokerConns)
+            end),
+            lists:foreach(fun(Pid) -> true = erlang:suspend_process(Pid) end, BrokerConns),
+
+            Payloads = [integer_to_binary(I) || I <- lists:seq(1, 200)],
+            lists:foreach(
+                fun(Payload) ->
+                    emqx:publish(emqx_message:make(LocalTopic, Payload))
+                end,
+                Payloads
+            ),
+            ok = wait_until_clients_hold(ConnResId, length(Payloads) div 4),
+
+            %% Lose the connection under the client: every publish it holds is reported
+            %% to the action with the socket error and must be retried.
+            lists:foreach(fun(Pid) -> monitor(process, Pid) end, BrokerConns),
+            lists:foreach(fun(Pid) -> exit(Pid, kill) end, BrokerConns),
+            _ = wait_for_downs(length(BrokerConns), 5_000),
+
+            %% Every message must still be delivered once the connection is back.
+            ok = assert_all_delivered(RemoteTopic, Payloads, 60_000),
+            ?retry(
+                500,
+                20,
+                ?assertMatch(
+                    {200, #{
+                        <<"metrics">> := #{
+                            <<"matched">> := Matched, <<"failed">> := 0, <<"dropped">> := 0
+                        }
+                    }} when
+                        Matched >= 200,
+                    get_action_metrics_api(TCConfig)
+                )
+            ),
+            ok
+        end,
+        fun(Trace) ->
+            %% The publishes held by the client when the socket was closed must have
+            %% been retried; a run in which nothing was retried proves nothing.
+            ?assertMatch([_ | _], ?of_kind(buffer_worker_retry_inflight, Trace)),
+            ok
+        end
+    ),
+    ok.
+
+wait_until_clients_hold(ConnResId, MinCount) ->
+    wait_until_clients_hold(ConnResId, MinCount, 400).
+
+wait_until_clients_hold(_ConnResId, _MinCount, 0) ->
+    ct:fail("the mqtt clients never held the unacknowledged messages");
+wait_until_clients_hold(ConnResId, MinCount, Attempts) ->
+    case held_message_count(ConnResId) >= MinCount of
+        true ->
+            ok;
+        false ->
+            timer:sleep(5),
+            wait_until_clients_hold(ConnResId, MinCount, Attempts - 1)
+    end.
+
+held_message_count(ConnResId) ->
+    lists:sum([
+        emqtt:info(Client, n_inflight) + emqtt:info(Client, n_queued)
+     || Client <- get_emqtt_clients(ConnResId)
+    ]).
+
+%% Waits until every expected payload has been delivered at least once.  A retry
+%% may deliver a payload more than once, so duplicates are not a failure here.
+assert_all_delivered(Topic, Payloads, Timeout) ->
+    Expected = maps:from_list([{Payload, true} || Payload <- Payloads]),
+    Deadline = erlang:monotonic_time(millisecond) + Timeout,
+    Seen = collect_delivered(Topic, Expected, #{}, Deadline),
+    Missing = maps:keys(maps:without(maps:keys(Seen), Expected)),
+    ?assertEqual([], Missing, #{delivered => maps:size(Seen)}),
+    ok.
+
+collect_delivered(Topic, Expected, Seen, Deadline) ->
+    case maps:size(Seen) =:= maps:size(Expected) of
+        true ->
+            Seen;
+        false ->
+            Timeout = max(1, Deadline - erlang:monotonic_time(millisecond)),
+            receive
+                {deliver, Topic, #message{payload = Payload}} ->
+                    collect_delivered(Topic, Expected, Seen#{Payload => true}, Deadline)
+            after Timeout ->
+                Seen
+            end
+    end.
+
+%% A remote broker that stops responding without closing the TCP connection makes
+%% the client's keepalive expire.  `emqtt' then stops and reports `pingresp_timeout'
+%% for every publish it still holds.  That reason only says that the remote broker
+%% did not answer in time, so those publishes must be retried like any other
+%% connection-level failure until `request_ttl' expires.
+%%
+%% The broker-side connection is suspended, so it neither acknowledges the publishes
+%% nor answers the keepalive pings: the client is guaranteed to still hold publishes
+%% when its keepalive expires.
+t_publish_while_keepalive_expires(TCConfig) ->
+    ClientId = <<"t_publish_while_keepalive_expires">>,
+    ?check_trace(
+        begin
+            Port = integer_to_binary(get_tcp_mqtt_port(node())),
+            ConnResId = connector_resource_id(TCConfig),
+            {201, _} = create_connector_api(TCConfig, #{
+                <<"server">> => <<"mqtt://127.0.0.1:", Port/binary>>,
+                <<"static_clientids">> => [
+                    #{<<"node">> => atom_to_binary(node()), <<"ids">> => [ClientId]}
+                ],
+                %% At most one unacknowledged publish at a time: the client keeps the
+                %% rest of the burst queued, so the keepalive expiry below is
+                %% guaranteed to catch messages that were accepted but not
+                %% acknowledged yet.
+                <<"max_inflight">> => 1,
+                <<"keepalive">> => <<"1s">>,
+                %% No health check tick during the outage: the connection must come
+                %% back through the client's own reconnection, not through a resource
+                %% restart.
+                <<"resource_opts">> => #{<<"health_check_interval">> => <<"60s">>}
+            }),
+            RemotePrefix = <<"remote">>,
+            {201, _} = create_action_api(TCConfig, #{
+                <<"parameters">> => #{
+                    <<"topic">> => <<RemotePrefix/binary, "/${topic}">>,
+                    <<"payload">> => <<"${payload}">>,
+                    <<"qos">> => ?QOS_2
+                },
+                <<"resource_opts">> => #{
+                    <<"health_check_interval">> => <<"60s">>,
+                    <<"query_mode">> => <<"async">>,
+                    <<"request_ttl">> => <<"60s">>,
+                    <<"resume_interval">> => <<"500ms">>
+                }
+            }),
+            #{topic := LocalTopic} = simple_create_rule_api(TCConfig),
+            RemoteTopic = emqx_topic:join([RemotePrefix, LocalTopic]),
+            emqx:subscribe(RemoteTopic),
+            ?retry(
+                500,
+                20,
+                ?assertMatch(
+                    {200, #{<<"status">> := <<"connected">>}}, get_connector_api(TCConfig)
+                )
+            ),
+
+            BrokerConns = emqx_cm:lookup_channels(ClientId),
+            ?assertMatch([_ | _], BrokerConns),
+            %% Kill the connections on exit as well, in case an assertion below fails
+            %% before they are killed on purpose.
+            on_exit(fun() ->
+                lists:foreach(fun(Pid) -> exit(Pid, kill) end, BrokerConns)
+            end),
+            lists:foreach(fun(Pid) -> true = erlang:suspend_process(Pid) end, BrokerConns),
+
+            Payloads = [integer_to_binary(I) || I <- lists:seq(1, 200)],
+            lists:foreach(
+                fun(Payload) ->
+                    emqx:publish(emqx_message:make(LocalTopic, Payload))
+                end,
+                Payloads
+            ),
+            ok = wait_until_clients_hold(ConnResId, 50),
+
+            %% The keepalive expires on its own and the client stops.  The suspended
+            %% broker-side connection is killed as soon as the client is gone: it can
+            %% no longer answer, and the reconnection below must not wait for it.
+            Clients = get_emqtt_clients(ConnResId),
+            ?assertMatch([_ | _], Clients),
+            lists:foreach(fun(Pid) -> monitor(process, Pid) end, Clients),
+            _ = wait_for_downs(length(Clients), 15_000),
+            lists:foreach(fun(Pid) -> exit(Pid, kill) end, BrokerConns),
+
+            %% Every message must still be delivered once the connection is back.
+            ok = assert_all_delivered(RemoteTopic, Payloads, 60_000),
+            ?retry(
+                500,
+                20,
+                ?assertMatch(
+                    {200, #{
+                        <<"metrics">> := #{
+                            <<"matched">> := Matched, <<"failed">> := 0, <<"dropped">> := 0
+                        }
+                    }} when
+                        Matched >= 200,
+                    get_action_metrics_api(TCConfig)
+                )
+            ),
+            ok
+        end,
+        fun(Trace) ->
+            %% Sanity guard on the fault injection: an in-flight publish must have
+            %% been retried.  The recovery itself is pinned by the delivery and
+            %% metrics assertions above.
+            ?assertMatch([_ | _], ?of_kind(buffer_worker_retry_inflight, Trace)),
+            ok
+        end
+    ),
+    ok.
+
+%% Errors that the pool answers a query with (instead of an asynchronous publish
+%% result) are classified on the connector's public query path: answers that mean the
+%% connection is gone must be retried until `request_ttl', while a peer that does not
+%% speak MQTT must fail fast.
+t_pool_query_errors_are_classified(TCConfig) ->
+    ?check_trace(
+        begin
+            {201, _} = create_connector_api(TCConfig, #{}),
+            {201, _} = create_action_api(TCConfig, #{
+                <<"parameters">> => #{
+                    <<"topic">> => <<"remote/${topic}">>,
+                    <<"payload">> => <<"${payload}">>,
+                    <<"qos">> => ?QOS_1
+                },
+                <<"resource_opts">> => #{
+                    <<"query_mode">> => <<"async">>,
+                    <<"request_ttl">> => <<"5s">>,
+                    <<"resume_interval">> => <<"200ms">>
+                }
+            }),
+            #{topic := LocalTopic} = simple_create_rule_api(TCConfig),
+            RemoteTopic = emqx_topic:join([<<"remote">>, LocalTopic]),
+            emqx:subscribe(RemoteTopic),
+            ?retry(
+                500,
+                20,
+                ?assertMatch(
+                    {200, #{<<"status">> := <<"connected">>}}, get_connector_api(TCConfig)
+                )
+            ),
+
+            %% The pool is unavailable while the resource manager restarts it: the query
+            %% must be kept and retried rather than acknowledged and dropped.
+            lists:foreach(
+                fun(Reason) ->
+                    Payload = pool_error_payload(Reason),
+                    ok = meck:new(ecpool, [passthrough]),
+                    on_exit(fun() -> catch meck:unload(ecpool) end),
+                    ok = meck:expect(ecpool, pick_and_do, 3, {error, Reason}),
+                    CallsBefore = meck:num_calls(ecpool, pick_and_do, 3),
+                    emqx:publish(emqx_message:make(LocalTopic, Payload)),
+                    %% The query really went through the unavailable pool before the pool
+                    %% is healed below.
+                    ?retry(
+                        100,
+                        50,
+                        ?assert(meck:num_calls(ecpool, pick_and_do, 3) > CallsBefore)
+                    ),
+                    %% The pool is back: the query was kept and is delivered.
+                    ok = meck:unload(ecpool),
+                    ?assertReceive({deliver, RemoteTopic, #message{payload = Payload}}, 5_000)
+                end,
+                [disconnected, ecpool_empty, no_such_pool]
+            ),
+            ?retry(
+                200,
+                20,
+                ?assertMatch(
+                    {200, #{<<"metrics">> := #{<<"failed">> := 0, <<"dropped">> := 0}}},
+                    get_action_metrics_api(TCConfig)
+                )
+            ),
+
+            %% The remote peer does not speak MQTT: failing fast is intentional, so the
+            %% message is acknowledged and counted `failed' instead of being retried.
+            ok = meck:new(ecpool, [passthrough]),
+            ok = meck:expect(ecpool, pick_and_do, 3, {error, {frame_parse_error, <<"not mqtt">>}}),
+            CallsBeforeNotMqtt = meck:num_calls(ecpool, pick_and_do, 3),
+            emqx:publish(emqx_message:make(LocalTopic, <<"not-mqtt">>)),
+            ?retry(
+                100,
+                50,
+                ?assert(meck:num_calls(ecpool, pick_and_do, 3) > CallsBeforeNotMqtt)
+            ),
+            ?retry(
+                200,
+                20,
+                ?assertMatch(
+                    {200, #{<<"metrics">> := #{<<"failed">> := 1}}},
+                    get_action_metrics_api(TCConfig)
+                )
+            ),
+            ?assertNotReceive({deliver, RemoteTopic, #message{payload = <<"not-mqtt">>}}, 1_000),
+            ok = meck:unload(ecpool),
+            ok
+        end,
+        fun(Trace) ->
+            ?assertMatch([_ | _], ?of_kind(buffer_worker_retry_inflight, Trace)),
+            ok
+        end
+    ),
+    ok.
+
+pool_error_payload(Reason) ->
+    iolist_to_binary(["pool-error-", atom_to_list(Reason)]).
+
+t_egress_mqtt_bridge_with_dummy_rule(TCConfig) ->
+    {201, _} = create_connector_api(TCConfig, #{}),
+    {201, #{<<"parameters">> := #{<<"topic">> := RemoteTopic}}} = create_action_api(TCConfig, #{}),
+    #{topic := LocalTopic} = simple_create_rule_api(<<"select x from \"${t}\"">>, TCConfig),
+    %% PUBLISH a message to the rule.
+    Payload = <<"hi">>,
+    emqx:subscribe(RemoteTopic),
+    timer:sleep(100),
+    emqx:publish2(emqx_message:make(LocalTopic, Payload)),
+    %% we should receive a message on the "remote" broker, with specified topic
+    ?assertReceive({deliver, RemoteTopic, _}),
+    ok.
+
+t_mqtt_egress_bridge_warns_clean_start(TCConfig) ->
+    Action = fun() ->
+        {201, _} = create_connector_api(TCConfig, #{<<"clean_start">> => false}),
+        {201, _} = create_action_api(TCConfig, #{})
+    end,
+    {_, {ok, _}} =
+        ?wait_async_action(
+            Action(),
+            #{?snk_kind := mqtt_clean_start_egress_action_warning},
+            10_000
+        ),
+    ok.
+
+t_mqtt_conn_bridge_egress_no_payload_template(TCConfig) ->
+    {201, _} = create_connector_api(TCConfig, #{}),
+    %% `payload` template must not be specified here (empty string is not the same thing).
+    {201, #{<<"parameters">> := #{<<"topic">> := RemoteTopic}}} = create_action_api(TCConfig, #{}),
+    #{topic := LocalTopic} = simple_create_rule_api(TCConfig),
+    %% we now test if the bridge works as expected
+    Payload = <<"hello">>,
+    emqx:subscribe(RemoteTopic),
+    ?wait_async_action(
+        %% PUBLISH a message to the 'local' broker, as we have only one broker,
+        %% the remote broker is also the local one.
+        emqx:publish2(emqx_message:make(LocalTopic, Payload)),
+        #{?snk_kind := buffer_worker_flush_ack}
+    ),
+    %% we should receive a message on the "remote" broker, with specified topic
+    {deliver, RemoteTopic, #message{payload = PayloadBin}} = ?assertReceive({deliver, _, _}),
+    ?assertMatch(#{<<"payload">> := Payload}, emqx_utils_json:decode(PayloadBin)),
+    %% verify the metrics of the bridge
+    ?retry(
+        300,
+        20,
+        ?assertMatch(
+            {200, #{
+                <<"metrics">> := #{
+                    <<"matched">> := 1,
+                    <<"success">> := 1,
+                    <<"failed">> := 0
+                }
+            }},
+            get_action_metrics_api(TCConfig)
+        )
+    ),
+    ok.
+
+%% Checks that we utilize the new tuple format of specifying static clientids along with
+%% usernames and passwords.
+t_static_clientids_username_password_tuples(TCConfig) ->
+    NodeBin = atom_to_binary(node()),
+    ?check_trace(
+        begin
+            {201, #{<<"status">> := <<"connected">>}} = create_connector_api(TCConfig, #{
+                <<"static_clientids">> => [
+                    #{
+                        <<"node">> => NodeBin,
+                        <<"ids">> => [
+                            #{
+                                <<"clientid">> => <<"1">>,
+                                <<"username">> => <<"u1">>,
+                                <<"password">> => <<"p1">>
+                            },
+                            #{
+                                <<"clientid">> => <<"2">>,
+                                <<"username">> => <<"u2">>
+                            },
+                            #{<<"clientid">> => <<"3">>}
+                        ]
+                    }
+                ]
+            }),
+            ConnResId = emqx_bridge_v2_testlib:connector_resource_id(TCConfig),
+            ConnectedClients = get_connected_clients(ConnResId),
+            ?assertMatch(
+                [
+                    #{
+                        clientid := <<"1">>,
+                        username := <<"u1">>
+                    },
+                    #{
+                        clientid := <<"2">>,
+                        username := <<"u2">>
+                    },
+                    #{
+                        clientid := <<"3">>,
+                        username := undefined
+                    }
+                ],
+                ConnectedClients
+            ),
+            ok
+        end,
+        fun(Trace) ->
+            SubTrace = ?of_kind("mqtt_emqtt_client_about_to_start", Trace),
+            Opts0 = lists:map(fun(#{opts := Opts}) -> Opts end, SubTrace),
+            Opts = lists:sort(fun(#{clientid := C1}, #{clientid := C2}) -> C1 =< C2 end, Opts0),
+            %% Checking used passwords
+            ?assertMatch(
+                [
+                    #{
+                        clientid := <<"1">>,
+                        username := <<"u1">>,
+                        password := _
+                    },
+                    #{
+                        clientid := <<"2">>,
+                        username := <<"u2">>
+                    },
+                    #{clientid := <<"3">>}
+                ],
+                Opts
+            ),
+            [C1, C2, C3] = Opts,
+            ?assertEqual(<<"p1">>, emqx_secret:unwrap(maps:get(password, C1)), #{opts => C1}),
+            ?assertNot(is_map_key(password, C2), #{opts => C2}),
+            ?assertNot(is_map_key(username, C3), #{opts => C3}),
+            ?assertNot(is_map_key(password, C3), #{opts => C3}),
+            ok
+        end
+    ),
+    ok.
+
+-doc """
+Checks that we correctly deobfuscate passwords inside the static clientid tuple array.
+""".
+t_static_clientids_username_password_tuples_deobfuscate(TCConfig) ->
+    NodeBin = atom_to_binary(node()),
+    {201, #{<<"status">> := <<"connected">>}} = create_connector_api(TCConfig, #{
+        <<"static_clientids">> => [
+            #{
+                <<"node">> => NodeBin,
+                <<"ids">> => [
+                    #{
+                        <<"clientid">> => <<"1">>,
+                        <<"username">> => <<"u1">>,
+                        <<"password">> => <<"p1">>
+                    },
+                    #{
+                        <<"clientid">> => <<"2">>,
+                        <<"username">> => <<"u2">>
+                    },
+                    #{<<"clientid">> => <<"3">>},
+                    #{
+                        <<"clientid">> => <<"4">>,
+                        <<"username">> => <<"u4">>,
+                        <<"password">> => <<"p4">>
+                    }
+                ]
+            }
+        ]
+    }),
+    ?check_trace(
+        begin
+            Overrides = #{
+                <<"static_clientids">> => [
+                    #{
+                        <<"node">> => NodeBin,
+                        <<"ids">> => [
+                            %% Clientid 1 is removed
+                            #{
+                                <<"clientid">> => <<"2">>,
+                                <<"username">> => <<"u2">>
+                            },
+                            #{<<"clientid">> => <<"3">>},
+                            %% Clientid 4 is retained
+                            #{
+                                <<"clientid">> => <<"4">>,
+                                <<"username">> => <<"u4">>,
+                                %% Obfuscated
+                                <<"password">> => <<"******">>
+                            },
+                            %% New clientid
+                            #{
+                                <<"clientid">> => <<"5">>,
+                                <<"username">> => <<"u5">>,
+                                <<"password">> => <<"p5">>
+                            }
+                        ]
+                    }
+                ]
+            },
+            %% Probe should also deobfuscate correctly
+            {204, _} = probe_connector_api(TCConfig, Overrides),
+            %% Update to check deobfuscation of passwords inside the array
+            {200, #{<<"status">> := <<"connected">>}} = update_connector_api(TCConfig, Overrides),
+            ConnResId = emqx_bridge_v2_testlib:connector_resource_id(TCConfig),
+            ConnectedClients = get_connected_clients(ConnResId),
+            ?assertMatch(
+                [
+                    #{
+                        clientid := <<"2">>,
+                        username := <<"u2">>
+                    },
+                    #{
+                        clientid := <<"3">>,
+                        username := undefined
+                    },
+                    #{
+                        clientid := <<"4">>,
+                        username := <<"u4">>
+                    },
+                    #{
+                        clientid := <<"5">>,
+                        username := <<"u5">>
+                    }
+                ],
+                ConnectedClients
+            ),
+            ok
+        end,
+        fun(Trace) ->
+            SubTrace0 = ?of_kind("mqtt_emqtt_client_about_to_start", Trace),
+            {ProbeSubTrace, UpdateSubTrace} = lists:split(4, SubTrace0),
+            GetOpts = fun(SubTrace) ->
+                Opts0 = lists:map(fun(#{opts := Opts}) -> Opts end, SubTrace),
+                lists:sort(fun(#{clientid := C1}, #{clientid := C2}) -> C1 =< C2 end, Opts0)
+            end,
+            ProbeOpts = GetOpts(ProbeSubTrace),
+            UpdateOpts = GetOpts(UpdateSubTrace),
+            %% Checking used passwords
+            Check = fun(CollectedOpts) ->
+                ?assertMatch(
+                    [
+                        #{
+                            clientid := <<"2">>,
+                            username := <<"u2">>
+                        },
+                        #{clientid := <<"3">>},
+                        #{
+                            clientid := <<"4">>,
+                            username := <<"u4">>,
+                            password := _
+                        },
+                        #{
+                            clientid := <<"5">>,
+                            username := <<"u5">>,
+                            password := _
+                        }
+                    ],
+                    CollectedOpts
+                ),
+                [C2, C3, C4, C5] = CollectedOpts,
+                ?assertNot(is_map_key(password, C2), #{opts => C2}),
+                ?assertNot(is_map_key(username, C3), #{opts => C3}),
+                ?assertNot(is_map_key(password, C3), #{opts => C3}),
+                ?assertEqual(<<"p4">>, emqx_secret:unwrap(maps:get(password, C4)), #{opts => C4}),
+                ?assertEqual(<<"p5">>, emqx_secret:unwrap(maps:get(password, C5)), #{opts => C5}),
+                ok
+            end,
+
+            ct:pal("update"),
+            Check(UpdateOpts),
+            ct:pal("probe"),
+            Check(ProbeOpts),
+
+            ok
+        end
+    ),
+    ok.
+
+%% Checks that updating an MQTT connectors without the `static_clientids` field work.
+t_update_without_static_clientids(TCConfig) ->
+    {201, _} = create_connector_api(TCConfig, #{}),
+    {200, _} = update_connector_api(TCConfig, #{}),
+    ok.
+
+%% https://emqx.atlassian.net/browse/EMQX-15061
+%% Even though it's currently not possible to reproduce the path that lead to this, we
+%% attempt to emulate the reported issue by storing an "impossible" value for static
+%% clientids in the raw config.  It's "impossible" because a hocon converter should have
+%% transformed a list of binary clientids into a list of more structured maps.
+t_corrupt_connector_raw_config(TCConfig) ->
+    Name = get_config(connector_name, TCConfig),
+    {201, _} = create_connector_api(TCConfig, #{}),
+    NodeBin = atom_to_binary(node()),
+    StaticClientIds = [#{<<"node">> => NodeBin, <<"ids">> => [<<"1">>]}],
+    ok = emqx_config:put_raw([connectors, mqtt, Name, static_clientids], StaticClientIds),
+    {200, _} = update_connector_api(TCConfig, #{
+        %% Here, it's fine to use list of binaries.  It'll pass through the hocon
+        %% converter.
+        <<"static_clientids">> => StaticClientIds
+    }),
+    ok.
+
+-doc """
+Checks the accepted `server' URI schemes when creating an MQTT connector via the API.
+
+`mqtt' (plain TCP) and `mqtts' (TLS) are the official MQTT URI schemes, and a
+scheme-less `host:port' is accepted as well.  Anything else must be rejected with a
+readable 400, never a 500.
+""".
+t_connector_server_scheme(TCConfig) ->
+    lists:foreach(
+        fun(Server) ->
+            ?assertMatch(
+                {201, _},
+                create_connector_api(TCConfig, #{<<"server">> => Server}),
+                #{server => Server}
+            ),
+            {204, _} = emqx_bridge_v2_testlib:delete_connector_api(TCConfig)
+        end,
+        [
+            <<"mqtt://[::1]:1883">>,
+            <<"mqtts://[::1]:8883">>,
+            <<"mqtt://127.0.0.1:1883">>,
+            <<"[::1]:1883">>,
+            <<"127.0.0.1:1883">>
+        ]
+    ),
+    ?assertMatch(
+        {400, #{
+            <<"message">> := #{
+                <<"kind">> := <<"validation_error">>,
+                <<"reason">> := <<"unsupported_scheme">>
+            }
+        }},
+        create_connector_api(TCConfig, #{<<"server">> => <<"mqtt-tcp://[::1]:1883">>})
+    ),
+    ok.
+
+-doc """
+Checks that a server address with an explicit `mqtts://' (TLS) scheme while SSL is
+disabled fails the connector probe (dashboard Test) with a clear message, and that a
+created connector reports the same clear message as its status reason — instead of a
+raw `function_clause' frame-parse crash (the plain TCP client would otherwise try to
+parse the server's TLS handshake reply as an MQTT frame).
+""".
+t_scheme_ssl_mismatch(TCConfig) ->
+    SslPort = integer_to_binary(get_ssl_mqtt_port()),
+    Overrides = #{
+        <<"server">> => <<"mqtts://127.0.0.1:", SslPort/binary>>,
+        <<"ssl">> => #{<<"enable">> => false}
+    },
+    {400, #{<<"message">> := ProbeMsg0}} = probe_connector_api(TCConfig, Overrides),
+    ProbeMsg = emqx_utils_json:encode(ProbeMsg0),
+    ?assertEqual(
+        match,
+        re:run(ProbeMsg, <<"SSL is disabled">>, [{capture, none}]),
+        #{probe_message => ProbeMsg}
+    ),
+    ?assertEqual(
+        nomatch,
+        re:run(ProbeMsg, <<"function_clause">>, [{capture, none}]),
+        #{probe_message => ProbeMsg}
+    ),
+    {201, _} = create_connector_api(TCConfig, Overrides),
+    ?retry(500, 20, begin
+        {200, #{<<"status">> := Status, <<"status_reason">> := Reason}} =
+            get_connector_api(TCConfig),
+        ?assertEqual(<<"disconnected">>, Status),
+        ?assertEqual(
+            match,
+            re:run(Reason, <<"SSL is disabled">>, [{capture, none}]),
+            #{status_reason => Reason}
+        )
+    end),
+    ok.
+
+-doc """
+Checks that connecting plain TCP to a TLS-speaking port fails with a clear
+explanation about receiving non-MQTT data, instead of a raw emqtt frame-parse crash.
+A scheme-less server address is used, so the upfront scheme/SSL consistency check
+does not apply and the failure happens at connect time.
+""".
+t_connect_to_tls_port(TCConfig) ->
+    SslPort = integer_to_binary(get_ssl_mqtt_port()),
+    {201, _} = create_connector_api(TCConfig, #{
+        <<"server">> => <<"127.0.0.1:", SslPort/binary>>
+    }),
+    ?retry(500, 20, begin
+        {200, #{<<"status">> := Status, <<"status_reason">> := Reason}} =
+            get_connector_api(TCConfig),
+        ?assertEqual(<<"disconnected">>, Status),
+        ?assertEqual(
+            match,
+            re:run(Reason, <<"does not look like MQTT">>, [{capture, none}]),
+            #{status_reason => Reason}
+        ),
+        ?assertEqual(
+            nomatch,
+            re:run(Reason, <<"function_clause">>, [{capture, none}]),
+            #{status_reason => Reason}
+        )
+    end),
+    ok.
+
+-doc """
+Checks that consistently configured connectors still connect: an explicit `mqtt://'
+address with SSL disabled, and an explicit `mqtts://' address with SSL enabled — the
+scheme/SSL consistency check must not reject valid configurations.
+""".
+t_scheme_ssl_consistent_connects(TCConfig) ->
+    TcpPort = integer_to_binary(get_tcp_mqtt_port(node())),
+    SslPort = integer_to_binary(get_ssl_mqtt_port()),
+    {201, _} = create_connector_api(TCConfig, #{
+        <<"server">> => <<"mqtt://127.0.0.1:", TcpPort/binary>>
+    }),
+    ?retry(
+        500,
+        20,
+        ?assertMatch({200, #{<<"status">> := <<"connected">>}}, get_connector_api(TCConfig))
+    ),
+    {204, _} = emqx_bridge_v2_testlib:delete_connector_api(TCConfig),
+    {201, _} = create_connector_api(TCConfig, #{
+        <<"server">> => <<"mqtts://127.0.0.1:", SslPort/binary>>,
+        <<"ssl">> => #{<<"enable">> => true, <<"verify">> => <<"verify_none">>}
+    }),
+    ?retry(
+        500,
+        20,
+        ?assertMatch({200, #{<<"status">> := <<"connected">>}}, get_connector_api(TCConfig))
+    ),
+    ok.
+
+-doc """
+A connection the peer closed without an MQTT-level reason must not be explained as
+a listener capacity problem: the connector cannot know why the remote closed it.
+""".
+t_closed_connection_reason_is_not_a_guess(TCConfig) ->
+    {Port, Broker} = start_closing_broker(),
+    on_exit(fun() -> stop_closing_broker(Broker) end),
+    {201, _} = create_connector_api(TCConfig, #{
+        <<"server">> => broker_address(Port),
+        <<"proto_ver">> => <<"v4">>
+    }),
+    ?retry(500, 20, begin
+        {200, #{<<"status">> := Status, <<"status_reason">> := Reason}} =
+            get_connector_api(TCConfig),
+        ?assertEqual(<<"disconnected">>, Status),
+        ?assertEqual(
+            nomatch,
+            re:run(Reason, <<"maximum capacity">>, [{capture, none}]),
+            #{status_reason => Reason}
+        ),
+        ?assertEqual(
+            nomatch,
+            re:run(Reason, <<"connection attempt was unsuccessful">>, [{capture, none}]),
+            #{status_reason => Reason}
+        )
+    end),
+    ok.
+
+-doc """
+The remote end stops forwarding traffic in both directions while keeping the
+connection open, so the broker never answers the PINGREQ.  The connector must go
+`disconnected' within a couple of health check intervals, keep the messages
+published meanwhile queued instead of handing them to the dead connection, and
+deliver them once the connection works again.
+
+The black hole is a test-owned TCP relay: a full connection close would not create
+a silent hang, and the relay keeps the case independent of external services.
+""".
+t_health_check_hung_remote(TCConfig) ->
+    BrokerPort = get_tcp_mqtt_port(node()),
+    {RelayPort, Relay} = start_relay(BrokerPort),
+    on_exit(fun() -> stop_relay(Relay) end),
+    {201, _} = create_connector_api(TCConfig, #{
+        <<"server">> => broker_address(RelayPort),
+        <<"proto_ver">> => <<"v4">>,
+        %% The connector is recreated while the relay is frozen; a short connect
+        %% timeout keeps those attempts from delaying the recovery after the thaw.
+        <<"connect_timeout">> => <<"1s">>,
+        <<"resource_opts">> => #{
+            %% The silence is noticed on the next check plus the probe budget, and the
+            %% interval also sets how long the probe's verdict stays on the resource
+            %% before the manager retries it.
+            <<"health_check_interval">> => <<"2s">>,
+            <<"health_check_timeout">> => <<"2s">>
+        }
+    }),
+    {201, _} = create_action_api(TCConfig, #{
+        <<"parameters">> => #{
+            <<"topic">> => <<"remote/${topic}">>,
+            <<"payload">> => <<"${payload}">>,
+            <<"qos">> => <<"${qos}">>
+        },
+        <<"resource_opts">> => #{
+            <<"query_mode">> => <<"async">>,
+            <<"request_ttl">> => <<"5m">>
+        }
+    }),
+    #{topic := LocalTopic} = simple_create_rule_api(TCConfig),
+    RemoteTopic = <<"remote/", LocalTopic/binary>>,
+    emqx:subscribe(RemoteTopic),
+    ?retry(
+        500,
+        20,
+        ?assertMatch({200, #{<<"status">> := <<"connected">>}}, get_connector_api(TCConfig))
+    ),
+    emqx:publish(emqx_message:make(LocalTopic, <<"before">>)),
+    ?assertReceive({deliver, RemoteTopic, #message{payload = <<"before">>}}, 5_000),
+
+    %% The remote end goes silent: everything is dropped, the connection stays up.
+    ok = freeze_relay(Relay),
+    try
+        %% The connector must report the verdict of its own probe.  Were the probe
+        %% left unbounded, the framework would abort `on_get_status/2' at
+        %% `health_check_timeout' first and the reason would be its generic
+        %% `resource_health_check_timed_out' instead.
+        ?retry(
+            100,
+            100,
+            begin
+                {200, #{<<"status">> := <<"disconnected">>, <<"status_reason">> := Reason}} =
+                    get_connector_api(TCConfig),
+                ?assertEqual(<<"pingresp_timeout">>, Reason, #{status_reason => Reason})
+            end
+        ),
+        %% The action must follow the connector, otherwise its buffer workers keep
+        %% feeding a connection that cannot deliver anything.
+        ?retry(
+            200,
+            25,
+            ?assertMatch({200, #{<<"status">> := <<"disconnected">>}}, get_action_api(TCConfig))
+        ),
+        ?retry(200, 25, ?assert(is_resource_down_alarm(connector_resource_id(TCConfig)))),
+        %% The message may not be reported as sent, failed or dropped while the
+        %% connection is unusable: it is held by the worker for a retry (either in
+        %% its queue or in its inflight window) until the remote comes back.
+        emqx:publish(emqx_message:make(LocalTopic, <<"during_hang">>)),
+        ?retry(200, 10, begin
+            Metrics = action_metrics(TCConfig),
+            ?assertEqual(1, maps:get(<<"success">>, Metrics, -1), #{metrics => Metrics}),
+            ?assertEqual(0, maps:get(<<"failed">>, Metrics, -1), #{metrics => Metrics}),
+            ?assertEqual(0, maps:get(<<"dropped">>, Metrics, -1), #{metrics => Metrics})
+        end),
+        ct:sleep(3_000),
+        ?assertNotReceive({deliver, RemoteTopic, #message{payload = <<"during_hang">>}})
+    after
+        ok = thaw_relay(Relay)
+    end,
+    %% Once the connection is usable again the queued message must be delivered: it
+    %% may not have been dropped as expired, nor counted as a failure, while the
+    %% remote was silent.
+    ?assertReceive({deliver, RemoteTopic, #message{payload = <<"during_hang">>}}, 15_000),
+    ?retry(
+        1000,
+        20,
+        begin
+            {200, #{<<"status">> := <<"connected">>}} = get_connector_api(TCConfig),
+            Metrics = action_metrics(TCConfig),
+            ?assert(maps:get(<<"matched">>, Metrics, 0) >= 2, #{metrics => Metrics}),
+            ?assert(maps:get(<<"success">>, Metrics, 0) >= 2, #{metrics => Metrics}),
+            ?assertEqual(0, maps:get(<<"failed">>, Metrics, -1), #{metrics => Metrics}),
+            ?assertEqual(0, maps:get(<<"dropped.expired">>, Metrics, -1), #{metrics => Metrics})
+        end
+    ),
+    ok.
+
+-doc """
+Verifies that `retry_interval` option is correctly applied.  `emqtt` interprets it as
+seconds.
+""".
+t_retry_interval_seconds(TCConfig) ->
+    {201, _} = create_connector_api(TCConfig, #{
+        ~"pool_size" => 1,
+        ~"retry_interval" => ~"1500ms"
+    }),
+    [ClientPid] = get_emqtt_clients(TCConfig),
+    %% duration_s uses ceiling to round up
+    Props = maps:from_list(emqtt:info(ClientPid)),
+    ?assertMatch(#{retry_interval := 2_000}, maps:with([retry_interval], Props), #{props => Props}),
+    ok.

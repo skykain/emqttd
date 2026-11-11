@@ -1,0 +1,2128 @@
+%%--------------------------------------------------------------------
+%% Copyright (c) 2020-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
+%%--------------------------------------------------------------------
+
+-module(emqx_stomp_SUITE).
+
+-include_lib("eunit/include/eunit.hrl").
+-include_lib("common_test/include/ct.hrl").
+-include_lib("emqx/include/asserts.hrl").
+-include_lib("emqx/include/emqx.hrl").
+-include_lib("emqx/include/emqx_hooks.hrl").
+-include_lib("snabbkaffe/include/snabbkaffe.hrl").
+-include("emqx_stomp.hrl").
+
+-compile(export_all).
+-compile(nowarn_export_all).
+
+-import(
+    emqx_gateway_test_utils,
+    [
+        assert_fields_exist/2,
+        request/2,
+        request/3
+    ]
+).
+
+-define(HEARTBEAT, <<$\n>>).
+
+-define(CONF_DEFAULT, <<
+    "\n"
+    "gateway.stomp {\n"
+    "  clientinfo_override {\n"
+    "    username = \"${Packet.headers.login}\"\n"
+    "    password = \"${Packet.headers.passcode}\"\n"
+    "  }\n"
+    " frame {\n"
+    "    max_headers = 10\n"
+    "    max_headers_length = 100\n"
+    "    max_body_length = 1024\n"
+    "  }\n"
+    " listeners.tcp.default {\n"
+    "    bind = 61613\n"
+    "    enable_authn = false\n"
+    "  }\n"
+    "}\n"
+>>).
+
+all() ->
+    ProfileTests = hardened_profile_tests(),
+    (emqx_common_test_helpers:all(?MODULE) -- ProfileTests) ++ [{group, hardened}].
+
+groups() ->
+    [{hardened, [], hardened_profile_tests()}].
+
+hardened_profile_tests() ->
+    [
+        t_hardened_rejects_pre_connect_send,
+        t_hardened_rejects_pre_connect_subscribe,
+        t_hardened_rejects_pre_connect_transactional_send,
+        t_hardened_listener_authn_disabled_allows_pub_sub
+    ].
+
+%%--------------------------------------------------------------------
+%% Setups
+%%--------------------------------------------------------------------
+
+init_per_suite(Config) ->
+    application:load(emqx_gateway_stomp),
+    Apps = emqx_cth_suite:start(
+        [
+            {emqx_conf, ?CONF_DEFAULT},
+            emqx_gateway,
+            emqx_auth,
+            emqx_management,
+            {emqx_dashboard, "dashboard.listeners.http { enable = true, bind = 18083 }"}
+        ],
+        #{work_dir => emqx_cth_suite:work_dir(Config)}
+    ),
+    emqx_common_test_http:create_default_app(),
+    [{suite_apps, Apps} | Config].
+
+end_per_suite(Config) ->
+    emqx_common_test_http:delete_default_app(),
+    emqx_cth_suite:stop(?config(suite_apps, Config)),
+    ok.
+
+init_per_group(hardened, Config) ->
+    ok = emqx_common_test_helpers:set_security_profile("hardened"),
+    [{security_profile, hardened} | Config].
+
+end_per_group(hardened, _Config) ->
+    emqx_common_test_helpers:clear_security_profile().
+
+init_per_testcase(TestCase, Config) when
+    TestCase =:= t_auth_expire;
+    TestCase =:= t_auth_failed;
+    TestCase =:= t_authn_superuser;
+    TestCase =:= t_mountpoint_from_authn_client_attrs
+->
+    ok = emqx_gateway_test_utils:set_gateway_listeners_authn(stomp, true),
+    snabbkaffe:start_trace(),
+    Config;
+init_per_testcase(t_license_quota_rejection, Config0) ->
+    Config = init_per_testcase(common, Config0),
+    %% The `license' root is present on this branch with its schema defaults, so
+    %% assert that no real license is configured rather than that the root is
+    %% absent, which is what the case actually depends on.
+    ?assertMatch(#{key := default}, emqx_config:get([license], #{key => default})),
+    ok = emqx_cth_suite:load_apps([emqx_license]),
+    try
+        Apps = emqx_cth_suite:start_app(emqx_license, #{
+            config => #{license => #{key => emqx_license_parser:evaluation()}}
+        }),
+        [{license_apps, Apps} | Config]
+    catch
+        Class:Reason:Stacktrace ->
+            emqx_config:erase(license),
+            erlang:raise(Class, Reason, Stacktrace)
+    end;
+init_per_testcase(_TestCase, Config) ->
+    snabbkaffe:start_trace(),
+    [{stomp_raw_config, emqx_config:get_raw([gateway, stomp])} | Config].
+
+end_per_testcase(TestCase, _Config) when
+    TestCase =:= t_auth_expire;
+    TestCase =:= t_auth_failed;
+    TestCase =:= t_authn_superuser;
+    TestCase =:= t_mountpoint_from_authn_client_attrs
+->
+    ok = emqx_gateway_test_utils:set_gateway_listeners_authn(stomp, false),
+    snabbkaffe:stop(),
+    ok;
+end_per_testcase(t_license_quota_rejection, Config) ->
+    try
+        end_per_testcase(common, Config)
+    after
+        emqx_cth_suite:stop_apps(?config(license_apps, Config)),
+        emqx_config:erase(license)
+    end;
+end_per_testcase(_TestCase, Config) ->
+    emqx_common_test_helpers:call_janitor(),
+    snabbkaffe:stop(),
+    Original = ?config(stomp_raw_config, Config),
+    case emqx_config:get_raw([gateway, stomp]) of
+        Original ->
+            ok;
+        _ ->
+            {ok, _} = emqx_gateway_conf:update_gateway(stomp, Original),
+            ok
+    end.
+
+%%--------------------------------------------------------------------
+%% Test Cases
+%%--------------------------------------------------------------------
+
+t_connect(_) ->
+    %% Successful connect
+    ConnectSucced = fun(Sock) ->
+        emqx_gateway_test_utils:meck_emqx_hook_calls(),
+
+        ok = send_connection_frame(Sock, <<"guest">>, <<"guest">>, <<"1000,2000">>),
+        {ok, Frame} = recv_a_frame(Sock),
+        ?assertMatch(<<"CONNECTED">>, Frame#stomp_frame.command),
+        ?assertEqual(
+            <<"2000,1000">>, proplists:get_value(<<"heart-beat">>, Frame#stomp_frame.headers)
+        ),
+
+        ?assertMatch(
+            ['client.connect' | _],
+            emqx_gateway_test_utils:collect_emqx_hooks_calls()
+        ),
+
+        ok = send_disconnect_frame(Sock, <<"12345">>),
+        ?assertMatch(
+            {ok, #stomp_frame{
+                command = <<"RECEIPT">>,
+                headers = [{<<"receipt-id">>, <<"12345">>}]
+            }},
+            recv_a_frame(Sock)
+        )
+    end,
+    with_connection(ConnectSucced),
+
+    %% Connect will be failed, because of bad version
+    ProtocolError = fun(Sock) ->
+        gen_tcp:send(
+            Sock,
+            serialize(
+                <<"CONNECT">>,
+                [
+                    {<<"accept-version">>, <<"2.0,2.1">>},
+                    {<<"host">>, <<"127.0.0.1:61613">>},
+                    {<<"login">>, <<"guest">>},
+                    {<<"passcode">>, <<"guest">>},
+                    {<<"heart-beat">>, <<"1000,2000">>}
+                ]
+            )
+        ),
+        {ok, Data} = gen_tcp:recv(Sock, 0),
+        {ok, Frame, _, _} = parse(Data),
+        #stomp_frame{
+            command = <<"ERROR">>,
+            headers = _,
+            body = <<"Login Failed: Supported protocol versions < 1.2">>
+        } = Frame
+    end,
+    with_connection(ProtocolError).
+
+t_auth_expire(_) ->
+    ok = meck:new(emqx_access_control, [passthrough, no_history]),
+    ok = meck:expect(
+        emqx_access_control,
+        authenticate,
+        fun(_) ->
+            {ok, #{is_superuser => false, expire_at => erlang:system_time(millisecond) + 500}}
+        end
+    ),
+
+    ConnectWithExpire = fun(Sock) ->
+        ?assertWaitEvent(
+            begin
+                ok = send_connection_frame(Sock, <<"guest">>, <<"guest">>, <<"1000,2000">>),
+                {ok, Frame} = recv_a_frame(Sock),
+                ?assertMatch(<<"CONNECTED">>, Frame#stomp_frame.command)
+            end,
+            #{
+                ?snk_kind := conn_process_terminated,
+                clientid := _,
+                reason := {shutdown, expired}
+            },
+            5000
+        )
+    end,
+    with_connection(ConnectWithExpire),
+    meck:unload(emqx_access_control).
+
+t_auth_failed(_) ->
+    ok = meck:new(emqx_access_control, [passthrough, no_history]),
+    try
+        ok = meck:expect(
+            emqx_access_control,
+            authenticate,
+            fun(_) ->
+                {error, not_authenticated}
+            end
+        ),
+
+        %% restart gateway to clear the shutdown count history
+        emqx_gateway:stop(stomp),
+        emqx_gateway:start(stomp),
+
+        with_connection(fun(Sock) ->
+            ok = send_connection_frame(Sock, <<"guest">>, <<"guest">>, <<"1000,2000">>),
+            {ok, Frame} = recv_a_frame(Sock),
+            ?assertMatch(#stomp_frame{command = <<"ERROR">>}, Frame),
+
+            ListenerId = {'stomp:tcp:default', 61613},
+            ?retry(
+                100,
+                20,
+                ?assertEqual([{not_authenticated, 1}], esockd:get_shutdown_count(ListenerId))
+            )
+        end)
+    after
+        meck:unload(emqx_access_control)
+    end.
+
+t_hardened_rejects_pre_connect_send(_) ->
+    Topic = <<"security/stomp/pre-connect-send">>,
+    Payload = <<"blocked">>,
+    emqx:subscribe(Topic),
+    try
+        with_connection(fun(Sock) ->
+            ok = send_message_frame(Sock, Topic, Payload),
+            assert_error_and_closed(Sock)
+        end),
+        receive
+            {deliver, Topic, _Msg} ->
+                ct:fail(pre_connect_send_was_published)
+        after 500 ->
+            ok
+        end
+    after
+        emqx:unsubscribe(Topic)
+    end.
+
+t_hardened_rejects_pre_connect_subscribe(_) ->
+    Topic = <<"security/stomp/pre-connect-subscribe">>,
+    with_connection(fun(Sock) ->
+        ok = send_subscribe_frame(Sock, 0, Topic),
+        assert_error_and_closed(Sock)
+    end),
+    timer:sleep(100),
+    ?assertEqual([], emqx:subscribers(Topic)).
+
+t_hardened_rejects_pre_connect_transactional_send(_) ->
+    Topic = <<"security/stomp/pre-connect-transaction">>,
+    Payload = <<"blocked">>,
+    emqx:subscribe(Topic),
+    try
+        with_connection(fun(Sock) ->
+            ok = send_begin_frame(Sock, <<"tx-pre-connect">>),
+            ?assertMatch({ok, #stomp_frame{command = <<"RECEIPT">>}}, recv_a_frame(Sock)),
+            ok = send_message_frame(Sock, Topic, Payload, [
+                {<<"transaction">>, <<"tx-pre-connect">>}
+            ]),
+            assert_error_and_closed(Sock)
+        end),
+        receive
+            {deliver, Topic, _Msg} ->
+                ct:fail(pre_connect_transactional_send_was_published)
+        after 500 ->
+            ok
+        end
+    after
+        emqx:unsubscribe(Topic)
+    end.
+
+t_hardened_listener_authn_disabled_allows_pub_sub(_) ->
+    with_stomp_tcp_listener_authn(false, fun() ->
+        with_connection(fun(Sock) ->
+            Topic = <<"security/stomp/authn-disabled">>,
+            Payload = <<"allowed">>,
+            ok = send_connection_frame(Sock, undefined, undefined),
+            ?assertMatch({ok, #stomp_frame{command = <<"CONNECTED">>}}, recv_a_frame(Sock)),
+
+            ok = send_subscribe_frame(Sock, 0, Topic),
+            ?assertMatch({ok, #stomp_frame{command = <<"RECEIPT">>}}, recv_a_frame(Sock)),
+
+            ok = send_message_frame(Sock, Topic, Payload),
+            ?assertMatch({ok, #stomp_frame{command = <<"RECEIPT">>}}, recv_a_frame(Sock)),
+            ?assertMatch(
+                {ok, #stomp_frame{command = <<"MESSAGE">>, body = Payload}},
+                recv_a_frame(Sock)
+            )
+        end)
+    end).
+
+t_authn_disabled_rejects_pre_connect_pub_sub(_) ->
+    with_stomp_tcp_listener_authn(false, fun() ->
+        SendTopic = <<"security/stomp/authn-disabled/pre-connect-send">>,
+        SubTopic = <<"security/stomp/authn-disabled/pre-connect-subscribe">>,
+        Payload = <<"blocked">>,
+        emqx:subscribe(SendTopic),
+        try
+            with_connection(fun(Sock) ->
+                ok = send_message_frame(Sock, SendTopic, Payload),
+                assert_error_and_closed(Sock)
+            end),
+            receive
+                {deliver, SendTopic, _Msg} ->
+                    ct:fail(pre_connect_send_was_published)
+            after 500 ->
+                ok
+            end,
+
+            with_connection(fun(Sock) ->
+                ok = send_subscribe_frame(Sock, 0, SubTopic),
+                assert_error_and_closed(Sock)
+            end),
+            timer:sleep(100),
+            ?assertEqual([], emqx:subscribers(SubTopic))
+        after
+            emqx:unsubscribe(SendTopic)
+        end
+    end).
+
+-doc """
+A CONNECT whose passcode contains a colon authenticates with the original
+password (#12917).  CONNECT headers carry the colon raw: STOMP 1.2 exempts
+CONNECT and CONNECTED frames from header escaping.
+""".
+t_auth_passcode_with_colon(_) ->
+    ok = meck:new(emqx_access_control, [passthrough, no_history]),
+    ok = meck:expect(
+        emqx_access_control,
+        authenticate,
+        fun
+            (#{password := <<"pa:ss">>}) -> {ok, #{is_superuser => false}};
+            (_) -> {error, bad_username_or_password}
+        end
+    ),
+    try
+        with_connection(fun(Sock) ->
+            Wire = <<
+                "CONNECT\n"
+                "accept-version:1.2\n"
+                "host:127.0.0.1:61613\n"
+                "login:admin\n"
+                "passcode:pa:ss\n"
+                "\n",
+                0
+            >>,
+            ok = gen_tcp:send(Sock, Wire),
+            ?assertMatch(
+                {ok, #stomp_frame{command = <<"CONNECTED">>}}, recv_a_frame(Sock)
+            )
+        end)
+    after
+        meck:unload(emqx_access_control)
+    end.
+
+-doc """
+A destination containing a colon works end to end: SUBSCRIBE and SEND carry it
+escaped as `\c` per STOMP 1.2, the broker decodes it, and the MESSAGE frame
+returns it escaped on the wire and decoded after parsing.
+""".
+t_escaped_destination_roundtrip(_) ->
+    Topic = <<"t/a:b">>,
+    with_connection(fun(Sock) ->
+        ok = send_connection_frame(Sock, <<"guest">>, <<"guest">>),
+        ?assertMatch({ok, #stomp_frame{command = <<"CONNECTED">>}}, recv_a_frame(Sock)),
+        %% the serializer escapes the colon in these frames
+        ok = send_subscribe_frame(Sock, 0, Topic),
+        ?assertMatch({ok, #stomp_frame{command = <<"RECEIPT">>}}, recv_a_frame(Sock)),
+        ok = send_message_frame(Sock, Topic, <<"hello">>),
+        ?assertMatch({ok, #stomp_frame{command = <<"RECEIPT">>}}, recv_a_frame(Sock)),
+        {ok, Frame} = recv_a_frame(Sock),
+        ?assertMatch(#stomp_frame{command = <<"MESSAGE">>, body = <<"hello">>}, Frame),
+        ?assertEqual(
+            Topic, proplists:get_value(<<"destination">>, Frame#stomp_frame.headers)
+        )
+    end).
+
+t_heartbeat(_) ->
+    %% Test heartbeat
+    with_connection(fun(Sock) ->
+        gen_tcp:send(
+            Sock,
+            serialize(
+                <<"CONNECT">>,
+                [
+                    {<<"accept-version">>, ?STOMP_VER},
+                    {<<"host">>, <<"127.0.0.1:61613">>},
+                    {<<"login">>, <<"guest">>},
+                    {<<"passcode">>, <<"guest">>},
+                    {<<"heart-beat">>, <<"500,800">>}
+                ]
+            )
+        ),
+        {ok, Data} = gen_tcp:recv(Sock, 0),
+        {ok,
+            #stomp_frame{
+                command = <<"CONNECTED">>,
+                headers = _,
+                body = _
+            },
+            _, _} = parse(Data),
+
+        {ok, ?HEARTBEAT} = gen_tcp:recv(Sock, 0),
+        %% Server will close the connection because never receive the heart beat from client
+        {error, closed} = gen_tcp:recv(Sock, 0)
+    end).
+
+t_subscribe(_) ->
+    with_connection(fun(Sock) ->
+        ok = send_connection_frame(Sock, <<"guest">>, <<"guest">>),
+        ?assertMatch({ok, #stomp_frame{command = <<"CONNECTED">>}}, recv_a_frame(Sock)),
+
+        ok = send_subscribe_frame(Sock, 0, <<"/queue/foo">>),
+        ?assertMatch({ok, #stomp_frame{command = <<"RECEIPT">>}}, recv_a_frame(Sock)),
+
+        %% 'user-defined' header will be retain
+        ok = send_message_frame(Sock, <<"/queue/foo">>, <<"hello">>, [
+            {<<"user-defined">>, <<"emq">>},
+            {<<"content-type">>, <<"text/html">>}
+        ]),
+        ?assertMatch({ok, #stomp_frame{command = <<"RECEIPT">>}}, recv_a_frame(Sock)),
+
+        {ok, Frame} = recv_a_frame(Sock),
+        ?assertEqual(
+            <<"text/html">>, proplists:get_value(<<"content-type">>, Frame#stomp_frame.headers)
+        ),
+
+        ?assertMatch(
+            #stomp_frame{
+                command = <<"MESSAGE">>,
+                headers = _,
+                body = <<"hello">>
+            },
+            Frame
+        ),
+        lists:foreach(
+            fun({Key, Val}) ->
+                Val = proplists:get_value(Key, Frame#stomp_frame.headers)
+            end,
+            [
+                {<<"destination">>, <<"/queue/foo">>},
+                {<<"subscription">>, <<"0">>},
+                {<<"user-defined">>, <<"emq">>}
+            ]
+        ),
+
+        %% assert subscription stats
+        %% The stats update is asynchronous to the RECEIPT, so retry.
+        ?retry(100, 20, ?assertMatch([#{subscriptions_cnt := 1}], clients())),
+
+        %% Unsubscribe
+        ok = send_unsubscribe_frame(Sock, 0),
+        ?assertMatch({ok, #stomp_frame{command = <<"RECEIPT">>}}, recv_a_frame(Sock)),
+
+        %% assert subscription stats
+        ?retry(100, 20, ?assertMatch([#{subscriptions_cnt := 0}], clients())),
+
+        ok = send_message_frame(Sock, <<"/queue/foo">>, <<"You will not receive this msg">>),
+        ?assertMatch({ok, #stomp_frame{command = <<"RECEIPT">>}}, recv_a_frame(Sock)),
+
+        {error, timeout} = gen_tcp:recv(Sock, 0, 500)
+    end).
+
+t_subscribe_inuse(_) ->
+    UsedTopic = <<"/queue/foo">>,
+    UsedSubId = <<"0">>,
+    Setup =
+        fun(Sock) ->
+            ok = send_connection_frame(Sock, <<"guest">>, <<"guest">>),
+            ?assertMatch({ok, #stomp_frame{command = <<"CONNECTED">>}}, recv_a_frame(Sock)),
+            ok = send_subscribe_frame(Sock, UsedSubId, UsedTopic),
+            ?assertMatch({ok, #stomp_frame{command = <<"RECEIPT">>}}, recv_a_frame(Sock))
+        end,
+    TopicIdInuse =
+        fun(Sock) ->
+            Setup(Sock),
+            %% topic-id is in use
+            ok = send_subscribe_frame(Sock, UsedSubId, <<"/queue/bar">>),
+
+            {ok, ErrorFrame} = recv_a_frame(Sock),
+            ?assertMatch(#stomp_frame{command = <<"ERROR">>}, ErrorFrame),
+            ?assertEqual(<<"Subscription id 0 is in used">>, ErrorFrame#stomp_frame.body),
+            ?assertMatch({error, closed}, gen_tcp:recv(Sock, 0))
+        end,
+
+    SubscriptionInuse =
+        fun(Sock) ->
+            Setup(Sock),
+            %% topic is in use
+            ok = send_subscribe_frame(Sock, 1, UsedTopic),
+
+            {ok, ErrorFrame} = recv_a_frame(Sock),
+            ?assertMatch(#stomp_frame{command = <<"ERROR">>}, ErrorFrame),
+            ?assertEqual(<<"Topic /queue/foo already in subscribed">>, ErrorFrame#stomp_frame.body),
+            ?assertMatch({error, closed}, gen_tcp:recv(Sock, 0))
+        end,
+
+    TopicIdInuseViaHttp =
+        fun(Sock) ->
+            Setup(Sock),
+            %% assert subscription stats
+            %% the previous connection's session may still be draining
+            %% asynchronously after its socket was closed, so retry until
+            %% exactly one client is listed
+            [#{clientid := ClientId}] = ?retry(100, 30, [_] = clients()),
+            {error, ErrMsg} = create_subscription(ClientId, <<"/queue/bar">>, UsedSubId),
+            ?assertEqual(<<"Subscription id 0 is in used">>, ErrMsg),
+
+            ok = send_disconnect_frame(Sock)
+        end,
+
+    SubscriptionInuseViaHttp =
+        fun(Sock) ->
+            Setup(Sock),
+            %% assert subscription stats
+            %% the previous connection's session may still be draining
+            %% asynchronously after its socket was closed, so retry until
+            %% exactly one client is listed
+            [#{clientid := ClientId}] = ?retry(100, 30, [_] = clients()),
+            {error, ErrMsg} = create_subscription(ClientId, UsedTopic, <<"1">>),
+            ?assertEqual(<<"Topic /queue/foo already in subscribed">>, ErrMsg),
+
+            ok = send_disconnect_frame(Sock)
+        end,
+
+    with_connection(TopicIdInuse),
+    with_connection(SubscriptionInuse),
+    with_connection(TopicIdInuseViaHttp),
+    with_connection(SubscriptionInuseViaHttp).
+
+t_receive_from_mqtt_publish(_) ->
+    with_connection(fun(Sock) ->
+        ok = send_connection_frame(Sock, <<"guest">>, <<"guest">>),
+        ?assertMatch({ok, #stomp_frame{command = <<"CONNECTED">>}}, recv_a_frame(Sock)),
+
+        ok = send_subscribe_frame(Sock, 0, <<"/queue/foo">>),
+        ?assertMatch({ok, #stomp_frame{command = <<"RECEIPT">>}}, recv_a_frame(Sock)),
+
+        %% send mqtt publish with content-type
+        Msg = emqx_message:make(
+            _From = from_testsuite,
+            _QoS = 1,
+            _Topic = <<"/queue/foo">>,
+            _Payload = <<"hello">>,
+            _Flags = #{},
+            _Headers = #{properties => #{'Content-Type' => <<"application/json">>}}
+        ),
+        emqx:publish2(Msg),
+
+        {ok, Frame} = recv_a_frame(Sock),
+        ?assertEqual(
+            <<"application/json">>,
+            proplists:get_value(<<"content-type">>, Frame#stomp_frame.headers)
+        ),
+
+        ?assertMatch(
+            #stomp_frame{
+                command = <<"MESSAGE">>,
+                headers = _,
+                body = <<"hello">>
+            },
+            Frame
+        ),
+        lists:foreach(
+            fun({Key, Val}) ->
+                Val = proplists:get_value(Key, Frame#stomp_frame.headers)
+            end,
+            [
+                {<<"destination">>, <<"/queue/foo">>},
+                {<<"subscription">>, <<"0">>}
+            ]
+        ),
+
+        %% assert subscription stats
+        %% The stats update is asynchronous to the RECEIPT, so retry.
+        ?retry(100, 20, ?assertMatch([#{subscriptions_cnt := 1}], clients())),
+
+        %% Unsubscribe
+        ok = send_unsubscribe_frame(Sock, 0),
+        ?assertMatch({ok, #stomp_frame{command = <<"RECEIPT">>}}, recv_a_frame(Sock)),
+
+        %% assert subscription stats
+        ?retry(100, 20, ?assertMatch([#{subscriptions_cnt := 0}], clients())),
+
+        ok = send_message_frame(Sock, <<"/queue/foo">>, <<"You will not receive this msg">>),
+        ?assertMatch({ok, #stomp_frame{command = <<"RECEIPT">>}}, recv_a_frame(Sock)),
+
+        {error, timeout} = gen_tcp:recv(Sock, 0, 500)
+    end).
+
+t_transaction(_) ->
+    with_connection(fun(Sock) ->
+        gen_tcp:send(
+            Sock,
+            serialize(
+                <<"CONNECT">>,
+                [
+                    {<<"accept-version">>, ?STOMP_VER},
+                    {<<"host">>, <<"127.0.0.1:61613">>},
+                    {<<"login">>, <<"guest">>},
+                    {<<"passcode">>, <<"guest">>},
+                    {<<"heart-beat">>, <<"0,0">>}
+                ]
+            )
+        ),
+        {ok, Data} = gen_tcp:recv(Sock, 0),
+        {ok,
+            #stomp_frame{
+                command = <<"CONNECTED">>,
+                headers = _,
+                body = _
+            },
+            _, _} = parse(Data),
+
+        %% Subscribe
+        gen_tcp:send(
+            Sock,
+            serialize(
+                <<"SUBSCRIBE">>,
+                [
+                    {<<"id">>, 0},
+                    {<<"destination">>, <<"/queue/foo">>},
+                    {<<"ack">>, <<"auto">>}
+                ]
+            )
+        ),
+
+        %% Transaction: tx1
+        gen_tcp:send(
+            Sock,
+            serialize(
+                <<"BEGIN">>,
+                [{<<"transaction">>, <<"tx1">>}]
+            )
+        ),
+
+        gen_tcp:send(
+            Sock,
+            serialize(
+                <<"SEND">>,
+                [
+                    {<<"destination">>, <<"/queue/foo">>},
+                    {<<"transaction">>, <<"tx1">>}
+                ],
+                <<"hello">>
+            )
+        ),
+
+        %% You will not receive any messages
+        {error, timeout} = gen_tcp:recv(Sock, 0, 1000),
+
+        gen_tcp:send(
+            Sock,
+            serialize(
+                <<"SEND">>,
+                [
+                    {<<"destination">>, <<"/queue/foo">>},
+                    {<<"transaction">>, <<"tx1">>}
+                ],
+                <<"hello again">>
+            )
+        ),
+
+        gen_tcp:send(
+            Sock,
+            serialize(
+                <<"COMMIT">>,
+                [{<<"transaction">>, <<"tx1">>}]
+            )
+        ),
+
+        ct:sleep(1000),
+        {ok, Data1} = gen_tcp:recv(Sock, 0, 500),
+
+        {ok,
+            #stomp_frame{
+                command = <<"MESSAGE">>,
+                headers = _,
+                body = <<"hello">>
+            },
+            Rest1, _} = parse(Data1),
+
+        %{ok, Data2} = gen_tcp:recv(Sock, 0, 500),
+        {ok,
+            #stomp_frame{
+                command = <<"MESSAGE">>,
+                headers = _,
+                body = <<"hello again">>
+            },
+            _Rest2, _} = parse(Rest1),
+
+        %% Transaction: tx2
+        gen_tcp:send(
+            Sock,
+            serialize(
+                <<"BEGIN">>,
+                [{<<"transaction">>, <<"tx2">>}]
+            )
+        ),
+
+        gen_tcp:send(
+            Sock,
+            serialize(
+                <<"SEND">>,
+                [
+                    {<<"destination">>, <<"/queue/foo">>},
+                    {<<"transaction">>, <<"tx2">>}
+                ],
+                <<"hello">>
+            )
+        ),
+
+        gen_tcp:send(
+            Sock,
+            serialize(
+                <<"ABORT">>,
+                [{<<"transaction">>, <<"tx2">>}]
+            )
+        ),
+
+        %% You will not receive any messages
+        {error, timeout} = gen_tcp:recv(Sock, 0, 1000),
+
+        gen_tcp:send(
+            Sock,
+            serialize(
+                <<"DISCONNECT">>,
+                [{<<"receipt">>, <<"12345">>}]
+            )
+        ),
+
+        {ok, Data3} = gen_tcp:recv(Sock, 0),
+        {ok,
+            #stomp_frame{
+                command = <<"RECEIPT">>,
+                headers = [{<<"receipt-id">>, <<"12345">>}],
+                body = _
+            },
+            _, _} = parse(Data3)
+    end).
+
+t_transaction_message_ingress(_) ->
+    Mountpoint = <<"stomp/">>,
+    Topic = <<"source">>,
+    RewrittenTopic = <<"target">>,
+    MountedTopic = <<Mountpoint/binary, RewrittenTopic/binary>>,
+    TxId = <<"tx-pre-authz">>,
+    Payload = <<"transactional">>,
+    TestPid = self(),
+    update_stomp_with_mountpoint(Mountpoint),
+    emqx_common_test_helpers:on_exit(fun() -> update_stomp_with_mountpoint(<<>>) end),
+    ok = emqx:subscribe(Topic),
+    ok = emqx:subscribe(RewrittenTopic),
+    ok = emqx:subscribe(MountedTopic),
+    ok = emqx:subscribe(<<Mountpoint/binary, MountedTopic/binary>>),
+    emqx_common_test_helpers:on_exit(fun() ->
+        emqx:unsubscribe(Topic),
+        emqx:unsubscribe(RewrittenTopic),
+        emqx:unsubscribe(MountedTopic),
+        emqx:unsubscribe(<<Mountpoint/binary, MountedTopic/binary>>)
+    end),
+    ok = emqx_hooks:put(
+        'message.ingress',
+        {?MODULE, stomp_message_ingress, [TestPid, RewrittenTopic]},
+        ?HP_HIGHEST
+    ),
+    emqx_common_test_helpers:on_exit(fun() ->
+        emqx_hooks:del('message.ingress', {?MODULE, stomp_message_ingress}),
+        ok
+    end),
+    with_connection(fun(Sock) ->
+        ok = send_connection_frame(Sock, <<"guest">>, <<"guest">>),
+        ?assertMatch({ok, #stomp_frame{command = <<"CONNECTED">>}}, recv_a_frame(Sock)),
+        ok = send_begin_frame(Sock, TxId),
+        ?assertMatch({ok, #stomp_frame{command = <<"RECEIPT">>}}, recv_a_frame(Sock)),
+
+        %% Ingress runs on SEND and sees the logical message, authz context, and STOMP metadata.
+        ok = send_message_frame(Sock, Topic, Payload, [
+            {<<"transaction">>, TxId},
+            {<<"x-custom">>, <<"value">>}
+        ]),
+        SendMsg =
+            receive
+                {message_ingress, Ctx, Msg} ->
+                    ?assertMatch(#{authz_ctx := #{clientid := _}}, Ctx),
+                    ?assertEqual(Topic, emqx_message:topic(Msg)),
+                    ?assertEqual(Payload, emqx_message:payload(Msg)),
+                    ?assertEqual(false, emqx_message:get_flag(retain, Msg)),
+                    ?assertMatch(
+                        #{
+                            proto_ver := ?STOMP_VER,
+                            protocol := stomp,
+                            username := <<"guest">>,
+                            peerhost := _,
+                            stomp_headers := [{<<"x-custom">>, <<"value">>}]
+                        },
+                        emqx_message:get_headers(Msg)
+                    ),
+                    Msg
+            after 1000 ->
+                ct:fail(message_ingress_hook_not_called)
+            end,
+        %% The hook may rewrite the message, but the transaction buffers it until COMMIT.
+        ?assertNotReceive({deliver, _, _}, 100),
+
+        BeforeCommit = erlang:system_time(millisecond),
+        ok = gen_tcp:send(
+            Sock,
+            serialize(<<"COMMIT">>, [{<<"transaction">>, TxId}])
+        ),
+        ?assertMatch(
+            {ok, #stomp_frame{
+                command = <<"RECEIPT">>,
+                headers = [{<<"receipt-id">>, <<"rp-source">>}]
+            }},
+            recv_a_frame(Sock)
+        ),
+        %% COMMIT publishes the same message with the rewritten topic mounted exactly once.
+        receive
+            {deliver, MountedTopic, PublishedMsg} ->
+                %% Transaction buffering preserves identity, timestamp, and hook-added headers.
+                ?assertEqual(emqx_message:id(SendMsg), emqx_message:id(PublishedMsg)),
+                ?assertEqual(
+                    emqx_message:timestamp(SendMsg), emqx_message:timestamp(PublishedMsg)
+                ),
+                ?assert(emqx_message:timestamp(PublishedMsg) =< BeforeCommit),
+                ?assertEqual(true, emqx_message:get_header(ingress, PublishedMsg))
+        after 1000 ->
+            ct:fail(transactional_message_not_published)
+        end,
+        %% Catch original, unmounted rewritten, or double-mounted publications.
+        ?assertNotReceive({deliver, _, _}, 100),
+        ok = send_disconnect_frame(Sock)
+    end).
+
+t_receipt_in_error(_) ->
+    with_connection(fun(Sock) ->
+        gen_tcp:send(
+            Sock,
+            serialize(
+                <<"CONNECT">>,
+                [
+                    {<<"accept-version">>, ?STOMP_VER},
+                    {<<"host">>, <<"127.0.0.1:61613">>},
+                    {<<"login">>, <<"guest">>},
+                    {<<"passcode">>, <<"guest">>},
+                    {<<"heart-beat">>, <<"0,0">>}
+                ]
+            )
+        ),
+        {ok, Data} = gen_tcp:recv(Sock, 0),
+        {ok,
+            #stomp_frame{
+                command = <<"CONNECTED">>,
+                headers = _,
+                body = _
+            },
+            _, _} = parse(Data),
+
+        gen_tcp:send(
+            Sock,
+            serialize(
+                <<"ABORT">>,
+                [
+                    {<<"transaction">>, <<"tx1">>},
+                    {<<"receipt">>, <<"12345">>}
+                ]
+            )
+        ),
+
+        {ok, Data1} = gen_tcp:recv(Sock, 0),
+        {ok,
+            Frame = #stomp_frame{
+                command = <<"ERROR">>,
+                headers = _,
+                body = <<"Transaction tx1 not found">>
+            },
+            _, _} = parse(Data1),
+
+        <<"12345">> = proplists:get_value(<<"receipt-id">>, Frame#stomp_frame.headers)
+    end).
+
+t_ack(_) ->
+    with_connection(fun(Sock) ->
+        gen_tcp:send(
+            Sock,
+            serialize(
+                <<"CONNECT">>,
+                [
+                    {<<"accept-version">>, ?STOMP_VER},
+                    {<<"host">>, <<"127.0.0.1:61613">>},
+                    {<<"login">>, <<"guest">>},
+                    {<<"passcode">>, <<"guest">>},
+                    {<<"heart-beat">>, <<"0,0">>}
+                ]
+            )
+        ),
+        {ok, Data} = gen_tcp:recv(Sock, 0),
+        {ok,
+            #stomp_frame{
+                command = <<"CONNECTED">>,
+                headers = _,
+                body = _
+            },
+            _, _} = parse(Data),
+
+        %% Subscribe
+        gen_tcp:send(
+            Sock,
+            serialize(
+                <<"SUBSCRIBE">>,
+                [
+                    {<<"id">>, 0},
+                    {<<"destination">>, <<"/queue/foo">>},
+                    {<<"ack">>, <<"client">>}
+                ]
+            )
+        ),
+
+        gen_tcp:send(
+            Sock,
+            serialize(
+                <<"SEND">>,
+                [{<<"destination">>, <<"/queue/foo">>}],
+                <<"ack test">>
+            )
+        ),
+
+        {ok, Data1} = gen_tcp:recv(Sock, 0),
+        {ok,
+            Frame = #stomp_frame{
+                command = <<"MESSAGE">>,
+                headers = _,
+                body = <<"ack test">>
+            },
+            _, _} = parse(Data1),
+
+        AckId = proplists:get_value(<<"ack">>, Frame#stomp_frame.headers),
+
+        gen_tcp:send(
+            Sock,
+            serialize(
+                <<"ACK">>,
+                [
+                    {<<"id">>, AckId},
+                    {<<"receipt">>, <<"12345">>}
+                ]
+            )
+        ),
+
+        {ok, Data2} = gen_tcp:recv(Sock, 0),
+        {ok,
+            #stomp_frame{
+                command = <<"RECEIPT">>,
+                headers = [{<<"receipt-id">>, <<"12345">>}],
+                body = _
+            },
+            _, _} = parse(Data2),
+
+        gen_tcp:send(
+            Sock,
+            serialize(
+                <<"SEND">>,
+                [{<<"destination">>, <<"/queue/foo">>}],
+                <<"nack test">>
+            )
+        ),
+
+        {ok, Data3} = gen_tcp:recv(Sock, 0),
+        {ok,
+            Frame1 = #stomp_frame{
+                command = <<"MESSAGE">>,
+                headers = _,
+                body = <<"nack test">>
+            },
+            _, _} = parse(Data3),
+
+        AckId1 = proplists:get_value(<<"ack">>, Frame1#stomp_frame.headers),
+
+        gen_tcp:send(
+            Sock,
+            serialize(
+                <<"NACK">>,
+                [
+                    {<<"id">>, AckId1},
+                    {<<"receipt">>, <<"12345">>}
+                ]
+            )
+        ),
+
+        {ok, Data4} = gen_tcp:recv(Sock, 0),
+        {ok,
+            #stomp_frame{
+                command = <<"RECEIPT">>,
+                headers = [{<<"receipt-id">>, <<"12345">>}],
+                body = _
+            },
+            _, _} = parse(Data4)
+    end).
+
+t_1000_msg_send(_) ->
+    with_connection(fun(Sock) ->
+        gen_tcp:send(
+            Sock,
+            serialize(
+                <<"CONNECT">>,
+                [
+                    {<<"accept-version">>, ?STOMP_VER},
+                    {<<"host">>, <<"127.0.0.1:61613">>},
+                    {<<"login">>, <<"guest">>},
+                    {<<"passcode">>, <<"guest">>},
+                    {<<"heart-beat">>, <<"0,0">>}
+                ]
+            )
+        ),
+        {ok, Data} = gen_tcp:recv(Sock, 0),
+        {ok,
+            #stomp_frame{
+                command = <<"CONNECTED">>,
+                headers = _,
+                body = _
+            },
+            _, _} = parse(Data),
+
+        Topic = <<"/queue/foo">>,
+        SendFun = fun() ->
+            gen_tcp:send(
+                Sock,
+                serialize(
+                    <<"SEND">>,
+                    [{<<"destination">>, Topic}],
+                    <<"msgtest">>
+                )
+            )
+        end,
+
+        RecvFun = fun() ->
+            receive
+                {deliver, Topic, _Msg} ->
+                    ok
+            after 100 ->
+                ?assert(false, "waiting message timeout")
+            end
+        end,
+
+        emqx:subscribe(Topic),
+        lists:foreach(fun(_) -> SendFun() end, lists:seq(1, 1000)),
+        lists:foreach(fun(_) -> RecvFun() end, lists:seq(1, 1000))
+    end).
+
+t_sticky_packets_truncate_after_headers(_) ->
+    with_connection(fun(Sock) ->
+        gen_tcp:send(
+            Sock,
+            serialize(
+                <<"CONNECT">>,
+                [
+                    {<<"accept-version">>, ?STOMP_VER},
+                    {<<"host">>, <<"127.0.0.1:61613">>},
+                    {<<"login">>, <<"guest">>},
+                    {<<"passcode">>, <<"guest">>},
+                    {<<"heart-beat">>, <<"0,0">>}
+                ]
+            )
+        ),
+        {ok, Data} = gen_tcp:recv(Sock, 0),
+        {ok,
+            #stomp_frame{
+                command = <<"CONNECTED">>,
+                headers = _,
+                body = _
+            },
+            _, _} = parse(Data),
+
+        Topic = <<"/queue/foo">>,
+
+        emqx:subscribe(Topic),
+        gen_tcp:send(Sock, [
+            "SEND\n",
+            "content-length:3\n",
+            "destination:/queue/foo\n"
+        ]),
+        timer:sleep(300),
+        gen_tcp:send(Sock, ["\nfoo", 0]),
+        receive
+            {deliver, Topic, _Msg} ->
+                ok
+        after 100 ->
+            ?assert(false, "waiting message timeout")
+        end
+    end).
+
+t_frame_error_in_connect(_) ->
+    with_connection(fun(Sock) ->
+        gen_tcp:send(
+            Sock,
+            serialize(
+                <<"CONNECT">>,
+                [
+                    {<<"accept-version">>, ?STOMP_VER},
+                    {<<"host">>, <<"127.0.0.1:61613">>},
+                    {<<"login">>, <<"guest">>},
+                    {<<"passcode">>, <<"guest">>},
+                    {<<"heart-beat">>, <<"0,0">>},
+                    {<<"custome_header1">>, <<"val">>},
+                    {<<"custome_header2">>, <<"val">>},
+                    {<<"custome_header3">>, <<"val">>},
+                    {<<"custome_header4">>, <<"val">>},
+                    {<<"custome_header5">>, <<"val">>},
+                    {<<"custome_header6">>, <<"val">>}
+                ]
+            )
+        ),
+        ?assertMatch({error, closed}, gen_tcp:recv(Sock, 0))
+    end).
+
+t_frame_error_too_many_headers(_) ->
+    Frame = serialize(
+        <<"SEND">>,
+        [
+            {<<"destination">>, <<"/queue/foo">>},
+            {<<"custome_header1">>, <<"val">>},
+            {<<"custome_header2">>, <<"val">>},
+            {<<"custome_header3">>, <<"val">>},
+            {<<"custome_header4">>, <<"val">>},
+            {<<"custome_header5">>, <<"val">>},
+            {<<"custome_header6">>, <<"val">>},
+            {<<"custome_header7">>, <<"val">>},
+            {<<"custome_header8">>, <<"val">>},
+            {<<"custome_header9">>, <<"val">>},
+            {<<"custome_header10">>, <<"val">>}
+        ],
+        <<"test">>
+    ),
+    Assert =
+        fun(Sock) ->
+            {ok, ErrorFrame} = recv_a_frame(Sock),
+            ?assertMatch(#stomp_frame{command = <<"ERROR">>}, ErrorFrame),
+            ?assertMatch(
+                match, re:run(ErrorFrame#stomp_frame.body, "too_many_headers", [{capture, none}])
+            ),
+            ?assertMatch({error, closed}, gen_tcp:recv(Sock, 0))
+        end,
+    test_frame_error(Frame, Assert).
+
+t_frame_error_too_long_header(_) ->
+    LongHeaderVal = emqx_utils:bin_to_hexstr(crypto:strong_rand_bytes(50), upper),
+    Frame = serialize(
+        <<"SEND">>,
+        [
+            {<<"destination">>, <<"/queue/foo">>},
+            {<<"custome_header10">>, LongHeaderVal}
+        ],
+        <<"test">>
+    ),
+    Assert =
+        fun(Sock) ->
+            {ok, ErrorFrame} = recv_a_frame(Sock),
+            ?assertMatch(#stomp_frame{command = <<"ERROR">>}, ErrorFrame),
+            ?assertMatch(
+                match, re:run(ErrorFrame#stomp_frame.body, "too_long_header", [{capture, none}])
+            ),
+            ?assertMatch({error, closed}, gen_tcp:recv(Sock, 0))
+        end,
+    test_frame_error(Frame, Assert).
+
+t_frame_error_too_long_body(_) ->
+    LongBody = emqx_utils:bin_to_hexstr(crypto:strong_rand_bytes(513), upper),
+    Frame = serialize(
+        <<"SEND">>,
+        [{<<"destination">>, <<"/queue/foo">>}],
+        LongBody
+    ),
+    Assert =
+        fun(Sock) ->
+            {ok, ErrorFrame} = recv_a_frame(Sock),
+            ?assertMatch(#stomp_frame{command = <<"ERROR">>}, ErrorFrame),
+            ?assertMatch(
+                match, re:run(ErrorFrame#stomp_frame.body, "too_long_body", [{capture, none}])
+            ),
+            ?assertMatch({error, closed}, gen_tcp:recv(Sock, 0))
+        end,
+    test_frame_error(Frame, Assert).
+
+%% The declared `content-length` exceeds max_body_length, so the frame must be
+%% rejected without the client ever sending the body.
+t_frame_error_declared_body_too_long(_) ->
+    Frame = [
+        <<"SEND\ndestination:/queue/foo\ncontent-length:1000000\n\n">>
+    ],
+    Assert =
+        fun(Sock) ->
+            {ok, ErrorFrame} = recv_a_frame(Sock),
+            ?assertMatch(#stomp_frame{command = <<"ERROR">>}, ErrorFrame),
+            ?assertMatch(
+                match, re:run(ErrorFrame#stomp_frame.body, "too_long_body", [{capture, none}])
+            ),
+            ?assertMatch({error, closed}, gen_tcp:recv(Sock, 0))
+        end,
+    test_frame_error(Frame, Assert).
+
+%% A transaction that is never committed must be dropped once it expires, and
+%% the cleanup must keep running for transactions opened later.
+t_transaction_expires(_) ->
+    ok = update_stomp_transaction(#{<<"timeout">> => <<"1s">>}),
+    with_connection(fun(Sock) ->
+        ok = send_connection_frame(Sock, <<"guest">>, <<"guest">>),
+        ?assertMatch({ok, #stomp_frame{command = <<"CONNECTED">>}}, recv_a_frame(Sock)),
+
+        ok = begin_frame(Sock, <<"tx1">>),
+        ?assertMatch({ok, #stomp_frame{command = <<"RECEIPT">>}}, recv_a_frame(Sock)),
+        ok = send_transactional_frame(
+            Sock,
+            <<"SEND">>,
+            [transaction_header(<<"tx1">>), {<<"destination">>, <<"/queue/foo">>}],
+            <<"hello">>
+        ),
+
+        %% The buffered SEND is silently discarded when the transaction expires.
+        ct:sleep(1500),
+        ok = send_transactional_frame(Sock, <<"COMMIT">>, [transaction_header(<<"tx1">>)]),
+        {ok, ErrorFrame} = recv_a_frame(Sock),
+        ?assertMatch(#stomp_frame{command = <<"ERROR">>}, ErrorFrame),
+        ?assertMatch(
+            match, re:run(ErrorFrame#stomp_frame.body, "not found", [{capture, none}])
+        ),
+
+        %% The same must hold for a transaction opened after the first sweep.
+        ok = begin_frame(Sock, <<"tx2">>),
+        ?assertMatch({ok, #stomp_frame{command = <<"RECEIPT">>}}, recv_a_frame(Sock)),
+        ct:sleep(1500),
+        ok = send_transactional_frame(Sock, <<"COMMIT">>, [transaction_header(<<"tx2">>)]),
+        {ok, ErrorFrame2} = recv_a_frame(Sock),
+        ?assertMatch(#stomp_frame{command = <<"ERROR">>}, ErrorFrame2)
+    end).
+
+t_transaction_max_transactions(_) ->
+    ok = update_stomp_transaction(#{<<"max_transactions">> => 2}),
+    with_connection(fun(Sock) ->
+        ok = send_connection_frame(Sock, <<"guest">>, <<"guest">>),
+        ?assertMatch({ok, #stomp_frame{command = <<"CONNECTED">>}}, recv_a_frame(Sock)),
+
+        ok = begin_frame(Sock, <<"tx1">>),
+        ?assertMatch({ok, #stomp_frame{command = <<"RECEIPT">>}}, recv_a_frame(Sock)),
+        ok = begin_frame(Sock, <<"tx2">>),
+        ?assertMatch({ok, #stomp_frame{command = <<"RECEIPT">>}}, recv_a_frame(Sock)),
+
+        ok = begin_frame(Sock, <<"tx3">>),
+        {ok, ErrorFrame} = recv_a_frame(Sock),
+        ?assertMatch(#stomp_frame{command = <<"ERROR">>}, ErrorFrame),
+        ?assertMatch(
+            match,
+            re:run(ErrorFrame#stomp_frame.body, "Too many transactions", [{capture, none}])
+        ),
+        ?assertEqual({error, closed}, gen_tcp:recv(Sock, 0))
+    end).
+
+t_transaction_max_actions(_) ->
+    ok = update_stomp_transaction(#{<<"max_actions_per_transaction">> => 2}),
+    with_connection(fun(Sock) ->
+        ok = send_connection_frame(Sock, <<"guest">>, <<"guest">>),
+        ?assertMatch({ok, #stomp_frame{command = <<"CONNECTED">>}}, recv_a_frame(Sock)),
+
+        ok = begin_frame(Sock, <<"tx1">>),
+        ?assertMatch({ok, #stomp_frame{command = <<"RECEIPT">>}}, recv_a_frame(Sock)),
+
+        lists:foreach(
+            fun(N) ->
+                Body = integer_to_binary(N),
+                ok = send_transactional_frame(
+                    Sock,
+                    <<"SEND">>,
+                    [transaction_header(<<"tx1">>), {<<"destination">>, <<"/queue/foo">>}],
+                    Body
+                )
+            end,
+            lists:seq(1, 3)
+        ),
+
+        {ok, ErrorFrame} = recv_a_frame(Sock),
+        ?assertMatch(#stomp_frame{command = <<"ERROR">>}, ErrorFrame),
+        ?assertMatch(
+            match,
+            re:run(ErrorFrame#stomp_frame.body, "Transaction limit exceeded", [{capture, none}])
+        ),
+        ?assertEqual({error, closed}, gen_tcp:recv(Sock, 0))
+    end).
+
+t_transaction_max_retained_bytes(_) ->
+    ok = update_stomp_transaction(#{<<"max_retained_bytes">> => 100}),
+    with_connection(fun(Sock) ->
+        ok = send_connection_frame(Sock, <<"guest">>, <<"guest">>),
+        ?assertMatch({ok, #stomp_frame{command = <<"CONNECTED">>}}, recv_a_frame(Sock)),
+
+        ok = begin_frame(Sock, <<"tx1">>),
+        ?assertMatch({ok, #stomp_frame{command = <<"RECEIPT">>}}, recv_a_frame(Sock)),
+
+        ok = send_transactional_frame(
+            Sock,
+            <<"SEND">>,
+            [transaction_header(<<"tx1">>), {<<"destination">>, <<"/queue/foo">>}],
+            binary:copy(<<"x">>, 512)
+        ),
+
+        {ok, ErrorFrame} = recv_a_frame(Sock),
+        ?assertMatch(#stomp_frame{command = <<"ERROR">>}, ErrorFrame),
+        ?assertMatch(
+            match,
+            re:run(ErrorFrame#stomp_frame.body, "Transaction limit exceeded", [{capture, none}])
+        ),
+        ?assertEqual({error, closed}, gen_tcp:recv(Sock, 0))
+    end).
+
+%% `transaction` is required for BEGIN; without it the frame is rejected
+%% instead of opening a transaction keyed on `undefined`.
+t_transaction_begin_requires_id(_) ->
+    with_connection(fun(Sock) ->
+        ok = send_connection_frame(Sock, <<"guest">>, <<"guest">>),
+        ?assertMatch({ok, #stomp_frame{command = <<"CONNECTED">>}}, recv_a_frame(Sock)),
+
+        ok = send_transactional_frame(Sock, <<"BEGIN">>, [{<<"receipt">>, <<"begin">>}]),
+        {ok, ErrorFrame} = recv_a_frame(Sock),
+        ?assertMatch(#stomp_frame{command = <<"ERROR">>}, ErrorFrame),
+        ?assertMatch(
+            match,
+            re:run(ErrorFrame#stomp_frame.body, "Transaction id is required", [{capture, none}])
+        ),
+        %% The connection is still usable: the rejection is not fatal.
+        ok = begin_frame(Sock, <<"tx1">>),
+        ?assertMatch({ok, #stomp_frame{command = <<"RECEIPT">>}}, recv_a_frame(Sock))
+    end).
+
+t_transaction_duplicate_begin_rejected(_) ->
+    with_connection(fun(Sock) ->
+        ok = send_connection_frame(Sock, <<"guest">>, <<"guest">>),
+        ?assertMatch({ok, #stomp_frame{command = <<"CONNECTED">>}}, recv_a_frame(Sock)),
+
+        ok = begin_frame(Sock, <<"tx1">>),
+        ?assertMatch({ok, #stomp_frame{command = <<"RECEIPT">>}}, recv_a_frame(Sock)),
+
+        ok = send_transactional_frame(
+            Sock,
+            <<"BEGIN">>,
+            [transaction_header(<<"tx1">>), {<<"receipt">>, <<"begin-again">>}]
+        ),
+        {ok, ErrorFrame} = recv_a_frame(Sock),
+        ?assertMatch(#stomp_frame{command = <<"ERROR">>}, ErrorFrame),
+        ?assertMatch(
+            match,
+            re:run(ErrorFrame#stomp_frame.body, "already started", [{capture, none}])
+        )
+    end).
+
+-doc "An empty transaction returns its COMMIT receipt and releases the transaction ID.".
+t_transaction_commit_receipt_empty(_) ->
+    with_connection(fun(Sock) ->
+        ok = send_connection_frame(Sock, <<"guest">>, <<"guest">>, <<"0,0">>),
+        ?assertMatch({ok, #stomp_frame{command = <<"CONNECTED">>}}, recv_a_frame(Sock)),
+        ok = begin_frame(Sock, <<"tx1">>),
+        assert_receipt(Sock, <<"begin-tx1">>),
+        ok = send_transactional_frame(
+            Sock,
+            <<"COMMIT">>,
+            [transaction_header(<<"tx1">>), {<<"receipt">>, <<"commit">>}]
+        ),
+        assert_receipt(Sock, <<"commit">>),
+        ok = begin_frame(Sock, <<"tx1">>),
+        assert_receipt(Sock, <<"begin-tx1">>)
+    end).
+
+-doc "Transaction receipts and published messages keep their order with or without a COMMIT receipt.".
+t_transaction_commit_receipt_order(_) ->
+    lists:foreach(
+        fun(CommitReceipt) -> transaction_commit_receipt_order(CommitReceipt) end,
+        [[], [{<<"receipt">>, <<"commit">>}]]
+    ).
+
+t_rest_clientid_info(_) ->
+    with_connection(fun(Sock) ->
+        send_connection_frame(Sock, <<"guest">>, <<"guest">>),
+        ?assertMatch({ok, #stomp_frame{command = <<"CONNECTED">>}}, recv_a_frame(Sock)),
+
+        %% client lists
+        %% The client shows up in the clients API asynchronously to the
+        %% CONNECTED frame, so retry.
+        ?retry(
+            100,
+            20,
+            ?assertMatch({200, #{data := [_]}}, request(get, "/gateways/stomp/clients"))
+        ),
+        {200, Clients} = request(get, "/gateways/stomp/clients"),
+        ?assertEqual(1, length(maps:get(data, Clients))),
+        StompClient = lists:nth(1, maps:get(data, Clients)),
+        ClientId = maps:get(clientid, StompClient),
+        ClientPath =
+            "/gateways/stomp/clients/" ++
+                binary_to_list(ClientId),
+        {200, StompClient1} = request(get, ClientPath),
+        ?assertEqual(StompClient, StompClient1),
+        assert_fields_exist(
+            [
+                proto_name,
+                awaiting_rel_max,
+                inflight_cnt,
+                disconnected_at,
+                send_msg,
+                heap_size,
+                connected,
+                recv_cnt,
+                send_pkt,
+                mailbox_len,
+                username,
+                recv_pkt,
+                expiry_interval,
+                clientid,
+                mqueue_max,
+                send_oct,
+                ip_address,
+                is_bridge,
+                awaiting_rel_cnt,
+                mqueue_dropped,
+                mqueue_len,
+                node,
+                inflight_max,
+                reductions,
+                subscriptions_max,
+                connected_at,
+                keepalive,
+                created_at,
+                clean_start,
+                subscriptions_cnt,
+                recv_msg,
+                send_cnt,
+                proto_ver,
+                recv_oct
+            ],
+            StompClient
+        ),
+
+        %% assert keepalive
+        ?assertEqual(10, maps:get(keepalive, StompClient)),
+
+        %% sub & unsub
+        {200, []} = request(get, ClientPath ++ "/subscriptions"),
+        ok = send_subscribe_frame(Sock, 0, <<"/queue/foo">>),
+        ?assertMatch({ok, #stomp_frame{command = <<"RECEIPT">>}}, recv_a_frame(Sock)),
+
+        {200, Subs} = request(get, ClientPath ++ "/subscriptions"),
+        ?assertEqual(1, length(Subs)),
+        assert_fields_exist([topic, qos], lists:nth(1, Subs)),
+
+        {201, _} = request(
+            post,
+            ClientPath ++ "/subscriptions",
+            #{
+                topic => <<"t/a">>,
+                qos => 1,
+                sub_props => #{subid => <<"1001">>}
+            }
+        ),
+
+        {200, Subs1} = request(get, ClientPath ++ "/subscriptions"),
+        ?assertEqual(2, length(Subs1)),
+        {200, StompClient2} = request(get, ClientPath),
+        ?assertMatch(#{subscriptions_cnt := 2}, StompClient2),
+
+        {204, _} = request(delete, ClientPath ++ "/subscriptions/t%2Fa"),
+        {200, Subs2} = request(get, ClientPath ++ "/subscriptions"),
+        ?assertEqual(1, length(Subs2)),
+        {200, StompClient3} = request(get, ClientPath),
+        ?assertMatch(#{subscriptions_cnt := 1}, StompClient3),
+
+        %% kickout
+        {204, _} = request(delete, ClientPath),
+        % sync
+        ignored = gen_server:call(emqx_cm, ignore, infinity),
+        ok = emqx_pool:flush_async_tasks(),
+        {200, Clients2} = request(get, "/gateways/stomp/clients"),
+        ?assertEqual(0, length(maps:get(data, Clients2)))
+    end).
+
+t_authn_superuser(_) ->
+    %% mock authn
+    meck:new(emqx_access_control, [passthrough]),
+    meck:expect(
+        emqx_access_control,
+        authenticate,
+        fun
+            (#{username := <<"admin">>}) ->
+                {ok, #{is_superuser => true}};
+            (#{username := <<"bad_user">>}) ->
+                {error, not_authorized};
+            (_) ->
+                {ok, #{is_superuser => false}}
+        end
+    ),
+    %% mock authz
+    meck:expect(
+        emqx_access_control,
+        authorize,
+        fun
+            (_ClientInfo = #{is_superuser := true}, _PubSub, _Topic) ->
+                allow;
+            (_ClientInfo, _PubSub, _Topic) ->
+                deny
+        end
+    ),
+
+    LoginFailure = fun(Sock) ->
+        ok = send_connection_frame(Sock, <<"bad_user">>, <<"public">>),
+        ?assertMatch({ok, #stomp_frame{command = <<"ERROR">>}}, recv_a_frame(Sock)),
+        ?assertMatch({error, closed}, recv_a_frame(Sock))
+    end,
+
+    PublishFailure = fun(Sock) ->
+        ok = send_connection_frame(Sock, <<"user1">>, <<"public">>),
+        ?assertMatch({ok, #stomp_frame{command = <<"CONNECTED">>}}, recv_a_frame(Sock)),
+        ok = send_message_frame(Sock, <<"t/a">>, <<"hello">>),
+        ?assertMatch({ok, #stomp_frame{command = <<"ERROR">>}}, recv_a_frame(Sock)),
+        ?assertMatch({error, closed}, recv_a_frame(Sock))
+    end,
+
+    SubscribeFailed = fun(Sock) ->
+        ok = send_connection_frame(Sock, <<"user1">>, <<"public">>),
+        ?assertMatch({ok, #stomp_frame{command = <<"CONNECTED">>}}, recv_a_frame(Sock)),
+        ok = send_subscribe_frame(Sock, 0, <<"t/a">>),
+        ?assertMatch({ok, #stomp_frame{command = <<"ERROR">>}}, recv_a_frame(Sock)),
+        ?assertMatch({error, closed}, recv_a_frame(Sock))
+    end,
+
+    LoginAsSuperUser = fun(Sock) ->
+        ok = send_connection_frame(Sock, <<"admin">>, <<"public">>),
+        ?assertMatch({ok, #stomp_frame{command = <<"CONNECTED">>}}, recv_a_frame(Sock)),
+        ok = send_subscribe_frame(Sock, 0, <<"t/a">>),
+        ?assertMatch({ok, #stomp_frame{command = <<"RECEIPT">>}}, recv_a_frame(Sock)),
+        ok = send_message_frame(Sock, <<"t/a">>, <<"hello">>),
+        ?assertMatch({ok, #stomp_frame{command = <<"RECEIPT">>}}, recv_a_frame(Sock)),
+        ?assertMatch(
+            {ok, #stomp_frame{
+                command = <<"MESSAGE">>,
+                body = <<"hello">>
+            }},
+            recv_a_frame(Sock)
+        ),
+        ok = send_disconnect_frame(Sock)
+    end,
+
+    with_connection(LoginFailure),
+    with_connection(PublishFailure),
+    with_connection(SubscribeFailed),
+    with_connection(LoginAsSuperUser),
+    meck:unload(emqx_access_control).
+
+t_mountpoint(_) ->
+    update_stomp_with_mountpoint(<<"stomp/">>),
+
+    PubSub = fun(Sock) ->
+        ok = send_connection_frame(Sock, <<"user1">>, <<"public">>),
+        ?assertMatch({ok, #stomp_frame{command = <<"CONNECTED">>}}, recv_a_frame(Sock)),
+        ok = send_subscribe_frame(Sock, 0, <<"t/a">>),
+        ?assertMatch({ok, #stomp_frame{command = <<"RECEIPT">>}}, recv_a_frame(Sock)),
+        ok = send_message_frame(Sock, <<"t/a">>, <<"hello">>),
+        ?assertMatch({ok, #stomp_frame{command = <<"RECEIPT">>}}, recv_a_frame(Sock)),
+
+        {ok, #stomp_frame{
+            command = <<"MESSAGE">>,
+            headers = Headers,
+            body = <<"hello">>
+        }} = recv_a_frame(Sock),
+        ?assertEqual(<<"t/a">>, proplists:get_value(<<"destination">>, Headers)),
+
+        ?assertEqual(
+            <<"text/plain">>, proplists:get_value(<<"content-type">>, Headers)
+        ),
+
+        ok = send_disconnect_frame(Sock)
+    end,
+
+    PubToMqtt = fun(Sock) ->
+        ok = send_connection_frame(Sock, <<"user1">>, <<"public">>),
+        ?assertMatch({ok, #stomp_frame{command = <<"CONNECTED">>}}, recv_a_frame(Sock)),
+
+        ok = emqx:subscribe(<<"stomp/t/a">>),
+        ok = send_message_frame(Sock, <<"t/a">>, <<"hello">>),
+        ?assertMatch({ok, #stomp_frame{command = <<"RECEIPT">>}}, recv_a_frame(Sock)),
+
+        receive
+            {deliver, Topic, Msg} ->
+                ?assertEqual(<<"stomp/t/a">>, Topic),
+                ?assertEqual(<<"hello">>, emqx_message:payload(Msg))
+        after 100 ->
+            ?assert(false, "waiting message timeout")
+        end,
+        ok = send_disconnect_frame(Sock)
+    end,
+
+    ReceiveMsgFromMqtt = fun(Sock) ->
+        ok = send_connection_frame(Sock, <<"user1">>, <<"public">>),
+        ?assertMatch({ok, #stomp_frame{command = <<"CONNECTED">>}}, recv_a_frame(Sock)),
+        ok = send_subscribe_frame(Sock, 0, <<"t/a">>),
+        ?assertMatch({ok, #stomp_frame{command = <<"RECEIPT">>}}, recv_a_frame(Sock)),
+
+        Msg = emqx_message:make(<<"stomp/t/a">>, <<"hello">>),
+        emqx:publish2(Msg),
+
+        {ok, #stomp_frame{
+            command = <<"MESSAGE">>,
+            headers = Headers,
+            body = <<"hello">>
+        }} = recv_a_frame(Sock),
+        ?assertEqual(<<"t/a">>, proplists:get_value(<<"destination">>, Headers)),
+
+        ok = send_disconnect_frame(Sock)
+    end,
+
+    with_connection(PubSub),
+    with_connection(PubToMqtt),
+    with_connection(ReceiveMsgFromMqtt),
+    update_stomp_with_mountpoint(<<>>).
+
+-doc "SEND receipts work after coalesced heartbeats.".
+t_coalesced_heartbeat_and_send(_) ->
+    with_connection(fun(Sock) ->
+        ok = send_connection_frame(Sock, <<"guest">>, <<"guest">>),
+        ?assertMatch({ok, #stomp_frame{command = <<"CONNECTED">>}}, recv_a_frame(Sock)),
+        Frame = iolist_to_binary(
+            serialize(
+                <<"SEND">>,
+                [{<<"destination">>, <<"audit">>}, {<<"receipt">>, <<"audit-receipt">>}],
+                <<"hello">>
+            )
+        ),
+        lists:foreach(
+            fun(Heartbeats) ->
+                ok = gen_tcp:send(Sock, <<Heartbeats/binary, Frame/binary>>),
+                {ok, #stomp_frame{command = <<"RECEIPT">>, headers = Headers}} = recv_a_frame(Sock),
+                ?assertEqual(<<"audit-receipt">>, proplists:get_value(<<"receipt-id">>, Headers))
+            end,
+            [<<"\n">>, <<"\r\n">>, <<"\n\r\n">>]
+        )
+    end).
+
+t_mountpoint_from_authn_client_attrs(_) ->
+    update_stomp_with_mountpoint(<<"stomp/${client_attrs.group}/">>),
+    meck:new(emqx_access_control, [passthrough, no_history]),
+    meck:expect(
+        emqx_access_control,
+        authenticate,
+        fun
+            (#{username := <<"user1">>}) ->
+                {ok, #{client_attrs => #{<<"group">> => <<"g1">>}}};
+            (ClientInfo) ->
+                meck:passthrough([ClientInfo])
+        end
+    ),
+    MountedTopic = <<"stomp/g1/t/a">>,
+    ok = emqx:subscribe(MountedTopic),
+    try
+        with_connection(fun(Sock) ->
+            ok = send_connection_frame(Sock, <<"user1">>, <<"public">>),
+            ?assertMatch({ok, #stomp_frame{command = <<"CONNECTED">>}}, recv_a_frame(Sock)),
+            ok = send_message_frame(Sock, <<"t/a">>, <<"hello">>),
+            ?assertMatch({ok, #stomp_frame{command = <<"RECEIPT">>}}, recv_a_frame(Sock)),
+            receive
+                {deliver, MountedTopic, Msg} ->
+                    ?assertEqual(<<"hello">>, emqx_message:payload(Msg))
+            after 1000 ->
+                ?assert(false, "waiting message timeout")
+            end,
+            ok = send_disconnect_frame(Sock)
+        end)
+    after
+        update_stomp_with_mountpoint(<<>>),
+        emqx:unsubscribe(MountedTopic),
+        meck:unload(emqx_access_control)
+    end.
+
+t_update_not_restart_listener(_) ->
+    update_stomp_with_mountpoint(<<"stomp/">>),
+    with_connection(fun(Sock) ->
+        ok = send_connection_frame(Sock, <<"user1">>, <<"public">>),
+        ?assertMatch({ok, #stomp_frame{command = <<"CONNECTED">>}}, recv_a_frame(Sock)),
+
+        update_stomp_with_mountpoint(<<>>),
+
+        %% send successfully means the listener is not restarted
+        ok = send_message_frame(Sock, <<"t/a">>, <<"hello">>),
+        ?assertMatch({ok, #stomp_frame{command = <<"RECEIPT">>}}, recv_a_frame(Sock)),
+
+        ok = send_disconnect_frame(Sock)
+    end).
+
+-doc "STOMP rejects connections at the real license session limit and recovers after clients disconnect.".
+t_license_quota_rejection(_) ->
+    {ok, #{max_sessions := Limit}} = emqx_license_checker:limits(),
+    ?assertEqual(25, Limit),
+    check_hook_connect(accepted),
+    wait_for_license_sessions(0),
+    with_stomp_connections(Limit, fun() ->
+        wait_for_license_sessions(Limit),
+        check_hook_connect({rejected, <<"Login Failed: Quota exceeded">>})
+    end),
+    wait_for_license_sessions(0),
+    check_hook_connect(accepted).
+
+-doc "STOMP sends a readable numeric hook rejection and connects after recovery.".
+t_connect_hook_rejection(_) ->
+    ListenerId = {'stomp:tcp:default', 61613},
+    Before = proplists:get_value(quota_exceeded, esockd:get_shutdown_count(ListenerId), 0),
+    emqx_gateway_test_utils:with_quota_exceeded(fun() ->
+        check_hook_connect({rejected, <<"Login Failed: Quota exceeded">>})
+    end),
+    ?retry(
+        20,
+        100,
+        ?assertEqual(
+            Before + 1,
+            proplists:get_value(quota_exceeded, esockd:get_shutdown_count(ListenerId), 0)
+        )
+    ),
+    check_hook_connect(accepted).
+
+-doc "Connection hook rejections support text, atoms, unknown codes, and compound reasons.".
+t_stomp_hook_rejections(_) ->
+    Reasons = [
+        {not_authorized, <<"not_authorized">>},
+        {'access denied', <<"access denied">>},
+        {"access denied", <<"access denied">>},
+        {<<"access denied">>, <<"access denied">>},
+        {[16#62D2, 16#7EDD], unicode:characters_to_binary([16#62D2, 16#7EDD])},
+        {binary_to_list(<<"拒绝"/utf8>>), <<"拒绝"/utf8>>},
+        {[binary_to_list(<<"拒"/utf8>>), <<"绝"/utf8>>], <<"拒绝"/utf8>>},
+        {<<255>>, <<"<<255>>">>},
+        {<<16#E4, 16#B8>>, <<"<<228,184>>">>},
+        {[invalid], <<"[invalid]">>},
+        {[16#110000], <<"[1114112]">>},
+        {255, <<"Unknown error">>},
+        {{access_denied, policy}, <<"{access_denied,policy}">>}
+    ],
+    lists:foreach(
+        fun({Reason, Text}) ->
+            emqx_gateway_test_utils:with_connect_rejection(Reason, fun() ->
+                check_hook_connect({rejected, <<"Login Failed: ", Text/binary>>})
+            end),
+            check_hook_connect(accepted)
+        end,
+        Reasons
+    ).
+
+%% TODO: Mountpoint, AuthChain, Authorization + Mountpoint, ClientInfoOverride,
+%%       Listeners, Metrics, Stats, ClientInfo
+%%
+%% TODO: Start/Stop, List Instance
+%%
+%% TODO: RateLimit, OOM,
+
+%%--------------------------------------------------------------------
+%% helpers
+
+default_config() ->
+    ?CONF_DEFAULT.
+
+stomp_ver() ->
+    ?STOMP_VER.
+
+update_stomp_with_mountpoint(Mountpoint) ->
+    Conf = emqx:get_raw_config([gateway, stomp]),
+    emqx_gateway_conf:update_gateway(
+        stomp,
+        Conf#{<<"mountpoint">> => Mountpoint}
+    ).
+
+update_stomp_transaction(TransConf) ->
+    RawConfig = emqx_config:get_raw([gateway, stomp]),
+    RawConfig1 = emqx_utils_maps:deep_put([<<"transaction">>], RawConfig, TransConf),
+    {ok, _} = emqx_gateway_conf:update_gateway(stomp, RawConfig1),
+    ok.
+
+%% Read and restore the raw listener config: `set_gateway_listeners_authn/2'
+%% writes through the raw-config path, so capturing a typed config here and
+%% restoring it leaves `enable_authn' stored as an atom key, and the next raw
+%% write of that listener is then rejected as an unknown field.
+with_stomp_tcp_listener_authn(EnableAuthn, Fun) ->
+    ListenerPath = [gateway, stomp, listeners, tcp, default],
+    PrevListenerConf = emqx:get_raw_config(ListenerPath),
+    try
+        ok = emqx_gateway_test_utils:set_gateway_listeners_authn(stomp, EnableAuthn),
+        Fun()
+    after
+        ok = update_stomp_tcp_listener(PrevListenerConf)
+    end.
+
+update_stomp_tcp_listener(ListenerConf) ->
+    case emqx_gateway_conf:update_listener(stomp, {tcp, default}, ListenerConf) of
+        ok -> ok;
+        {ok, _} -> ok
+    end.
+
+with_connection(DoFun) ->
+    {ok, Sock} = gen_tcp:connect(
+        {127, 0, 0, 1},
+        61613,
+        [binary, {packet, raw}, {active, false}],
+        3000
+    ),
+    try
+        DoFun(Sock)
+    after
+        erase(parser),
+        erase(rest),
+        gen_tcp:close(Sock)
+    end.
+
+serialize(Command, Headers) ->
+    emqx_stomp_frame:serialize_pkt(emqx_stomp_frame:make(Command, Headers), #{}).
+
+serialize(Command, Headers, Body) ->
+    emqx_stomp_frame:serialize_pkt(emqx_stomp_frame:make(Command, Headers, Body), #{}).
+
+recv_a_frame(Sock) ->
+    Parser =
+        case get(parser) of
+            undefined ->
+                ProtoEnv = #{
+                    max_headers => 1024,
+                    max_header_length => 10240,
+                    max_body_length => 81920
+                },
+                emqx_stomp_frame:initial_parse_state(ProtoEnv);
+            P ->
+                P
+        end,
+    LastRest =
+        case get(rest) of
+            undefined -> <<>>;
+            R -> R
+        end,
+    case emqx_stomp_frame:parse(LastRest, Parser) of
+        {more, NParser} ->
+            case gen_tcp:recv(Sock, 0, 5000) of
+                {ok, Data} ->
+                    put(parser, NParser),
+                    put(rest, <<LastRest/binary, Data/binary>>),
+                    recv_a_frame(Sock);
+                {error, _} = Err1 ->
+                    erase(parser),
+                    erase(rest),
+                    Err1
+            end;
+        {ok, Frame, Rest, NParser} ->
+            put(parser, NParser),
+            put(rest, Rest),
+            ct:pal("recv_a_frame: ~p~n", [Frame]),
+            {ok, Frame};
+        {error, _} = Err ->
+            erase(parser),
+            erase(rest),
+            Err
+    end.
+
+parse(Data) ->
+    ProtoEnv = #{
+        max_headers => 1024,
+        max_header_length => 10240,
+        max_body_length => 81920
+    },
+    Parser = emqx_stomp_frame:initial_parse_state(ProtoEnv),
+    emqx_stomp_frame:parse(Data, Parser).
+
+get_field(command, #stomp_frame{command = Command}) ->
+    Command;
+get_field(body, #stomp_frame{body = Body}) ->
+    Body.
+
+send_connection_frame(Sock, Username, Password) ->
+    send_connection_frame(Sock, Username, Password, <<"10000,10000">>).
+
+send_connection_frame(Sock, Username, Password, Heartbeat) ->
+    Headers =
+        case Username == undefined of
+            true -> [];
+            false -> [{<<"login">>, Username}]
+        end ++
+            case Password == undefined of
+                true -> [];
+                false -> [{<<"passcode">>, Password}]
+            end,
+    Headers1 = [
+        {<<"accept-version">>, ?STOMP_VER},
+        {<<"host">>, <<"127.0.0.1:61613">>},
+        {<<"heart-beat">>, Heartbeat}
+        | Headers
+    ],
+    ok = gen_tcp:send(Sock, serialize(<<"CONNECT">>, Headers1)).
+
+send_subscribe_frame(Sock, Id, Topic) ->
+    Headers =
+        [
+            {<<"id">>, Id},
+            {<<"receipt">>, Id},
+            {<<"destination">>, Topic},
+            {<<"ack">>, <<"auto">>}
+        ],
+    ok = gen_tcp:send(Sock, serialize(<<"SUBSCRIBE">>, Headers)).
+
+send_unsubscribe_frame(Sock, Id) when is_integer(Id) ->
+    Headers =
+        [
+            {<<"id">>, Id},
+            {<<"receipt">>, <<"rp-", (integer_to_binary(Id))/binary>>}
+        ],
+    gen_tcp:send(Sock, serialize(<<"UNSUBSCRIBE">>, Headers)).
+
+send_message_frame(Sock, Topic, Payload) ->
+    send_message_frame(Sock, Topic, Payload, []).
+
+send_message_frame(Sock, Topic, Payload, Headers0) ->
+    Headers =
+        [
+            {<<"destination">>, Topic},
+            {<<"receipt">>, <<"rp-", Topic/binary>>}
+            | Headers0
+        ],
+    ok = gen_tcp:send(Sock, serialize(<<"SEND">>, Headers, Payload)).
+
+stomp_message_ingress(Ctx, Msg, TestPid, RewrittenTopic) ->
+    TestPid ! {message_ingress, Ctx, Msg},
+    {ok, emqx_message:set_header(ingress, true, Msg#message{topic = RewrittenTopic})}.
+
+send_begin_frame(Sock, TxId) ->
+    Headers =
+        [
+            {<<"transaction">>, TxId},
+            {<<"receipt">>, <<"rp-", TxId/binary>>}
+        ],
+    ok = gen_tcp:send(Sock, serialize(<<"BEGIN">>, Headers)).
+
+assert_error_and_closed(Sock) ->
+    ?assertMatch({ok, #stomp_frame{command = <<"ERROR">>}}, recv_a_frame(Sock)),
+    ?assertMatch({error, closed}, recv_a_frame(Sock)).
+
+send_disconnect_frame(Sock) ->
+    ok = gen_tcp:send(Sock, serialize(<<"DISCONNECT">>, [])).
+
+send_disconnect_frame(Sock, ReceiptId) ->
+    Headers = [{<<"receipt">>, ReceiptId}],
+    ok = gen_tcp:send(Sock, serialize(<<"DISCONNECT">>, Headers)).
+
+clients() ->
+    {200, Clients} = request(get, "/gateways/stomp/clients"),
+    maps:get(data, Clients).
+
+create_subscription(ClientId, Topic, SubId) ->
+    Path = io_lib:format("/gateways/stomp/clients/~s/subscriptions", [ClientId]),
+    Body = #{
+        topic => Topic,
+        qos => 1,
+        sub_props => #{subid => SubId}
+    },
+    case request(post, Path, Body) of
+        {201, _} ->
+            ok;
+        {400, #{message := Message}} ->
+            {error, Message}
+    end.
+
+check_hook_connect(Expected) ->
+    with_connection(fun(Socket) ->
+        ok = send_connection_frame(Socket, <<"guest">>, <<"guest">>, <<"0,0">>),
+        {ok, Frame} = recv_a_frame(Socket),
+        case Expected of
+            accepted ->
+                ?assertEqual(<<"CONNECTED">>, Frame#stomp_frame.command);
+            {rejected, Text} ->
+                ?assertEqual(<<"ERROR">>, Frame#stomp_frame.command),
+                ?assertEqual(Text, Frame#stomp_frame.body),
+                ?assertEqual({error, closed}, gen_tcp:recv(Socket, 0, 5000))
+        end
+    end).
+
+test_frame_error(Frame, AssertFun) ->
+    with_connection(fun(Sock) ->
+        send_connection_frame(Sock, <<"guest">>, <<"guest">>),
+        ?assertMatch({ok, #stomp_frame{command = <<"CONNECTED">>}}, recv_a_frame(Sock)),
+        gen_tcp:send(Sock, Frame),
+        AssertFun(Sock)
+    end).
+
+transaction_commit_receipt_order(CommitReceipt) ->
+    with_connection(fun(Sock) ->
+        ok = send_connection_frame(Sock, <<"guest">>, <<"guest">>, <<"0,0">>),
+        ?assertMatch({ok, #stomp_frame{command = <<"CONNECTED">>}}, recv_a_frame(Sock)),
+        Topic = <<"/queue/commit-receipt-order">>,
+        ok = send_subscribe_frame(Sock, <<"sub">>, Topic),
+        assert_receipt(Sock, <<"sub">>),
+        ok = begin_frame(Sock, <<"tx1">>),
+        assert_receipt(Sock, <<"begin-tx1">>),
+        lists:foreach(
+            fun(Id) ->
+                ok = send_transactional_frame(
+                    Sock,
+                    <<"SEND">>,
+                    [
+                        transaction_header(<<"tx1">>),
+                        {<<"destination">>, Topic},
+                        {<<"receipt">>, Id}
+                    ],
+                    Id
+                )
+            end,
+            [<<"first">>, <<"second">>]
+        ),
+        ?assertEqual({error, timeout}, gen_tcp:recv(Sock, 0, 100)),
+        ok = send_transactional_frame(
+            Sock, <<"COMMIT">>, [transaction_header(<<"tx1">>) | CommitReceipt]
+        ),
+        ExpectedReceipts = [<<"first">>, <<"second">>] ++ [Id || {_, Id} <- CommitReceipt],
+        Frames = [
+            begin
+                {ok, Frame} = recv_a_frame(Sock),
+                Frame
+            end
+         || _ <- lists:seq(1, 2 + length(ExpectedReceipts))
+        ],
+        ?assertEqual(
+            ExpectedReceipts,
+            [
+                proplists:get_value(<<"receipt-id">>, Headers)
+             || #stomp_frame{command = <<"RECEIPT">>, headers = Headers} <- Frames
+            ]
+        ),
+        ?assertEqual(
+            [<<"first">>, <<"second">>],
+            [Body || #stomp_frame{command = <<"MESSAGE">>, body = Body} <- Frames]
+        )
+    end).
+
+assert_receipt(Sock, ReceiptId) ->
+    ?assertMatch(
+        {ok, #stomp_frame{
+            command = <<"RECEIPT">>,
+            headers = [{<<"receipt-id">>, ReceiptId}]
+        }},
+        recv_a_frame(Sock)
+    ).
+
+transaction_header(TxId) ->
+    {<<"transaction">>, TxId}.
+
+begin_frame(Sock, TxId) ->
+    send_transactional_frame(
+        Sock,
+        <<"BEGIN">>,
+        [transaction_header(TxId), {<<"receipt">>, <<"begin-", TxId/binary>>}]
+    ).
+
+send_transactional_frame(Sock, Command, Headers) ->
+    gen_tcp:send(Sock, serialize(Command, Headers)).
+
+send_transactional_frame(Sock, Command, Headers, Body) ->
+    gen_tcp:send(Sock, serialize(Command, Headers, Body)).
+
+with_stomp_connections(0, Fun) ->
+    Fun();
+with_stomp_connections(Count, Fun) ->
+    with_connection(fun(Socket) ->
+        ok = send_connection_frame(Socket, <<"guest">>, <<"guest">>, <<"0,0">>),
+        ?assertMatch({ok, #stomp_frame{command = <<"CONNECTED">>}}, recv_a_frame(Socket)),
+        with_stomp_connections(Count - 1, Fun)
+    end).
+
+wait_for_license_sessions(Count) ->
+    ?retry(
+        100,
+        20,
+        begin
+            ok = emqx_license_resources:update_now(),
+            _ = sys:get_state(emqx_license_resources),
+            ?assertEqual(Count, emqx_license_resources:cached_connection_count())
+        end
+    ).

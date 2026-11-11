@@ -1,0 +1,1590 @@
+%%--------------------------------------------------------------------
+%% Copyright (c) 2020-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
+%%--------------------------------------------------------------------
+
+%% @doc Web dashboard admin authentication with username and password.
+
+-module(emqx_dashboard_admin).
+
+-include("emqx_dashboard.hrl").
+-include("emqx_dashboard_rbac.hrl").
+-include_lib("emqx_utils/include/emqx_api_key_scopes.hrl").
+-include_lib("emqx/include/logger.hrl").
+-include_lib("stdlib/include/ms_transform.hrl").
+-include_lib("emqx/include/emqx_config.hrl").
+
+-behaviour(emqx_db_backup).
+
+-export([create_tables/0]).
+
+-export([
+    add_user/4,
+    disable_mfa/2,
+    clear_mfa_state/1,
+    set_mfa_state/2,
+    get_mfa_state/1,
+    mfa_enforced_for/1,
+    mfa_status/1,
+    clear_login_lock/1,
+    set_login_lock/2,
+    get_login_lock/1,
+    force_add_user/5,
+    remove_user/1,
+    update_user/3,
+    lookup_user/1,
+    change_password_trusted/2,
+    change_password/3,
+    enable_mfa_from_cli/2,
+    reinit_mfa/3,
+    set_mfa_pending/2,
+    clear_mfa_pending/1,
+    get_mfa_pending/1,
+    set_sso_code/2,
+    clear_sso_code/1,
+    get_sso_code/1,
+    %% Login user scope + MFA admin override fields (stored in extra map)
+    admin_override_of/1,
+    set_admin_override/2,
+    scopes_of/1,
+    effective_scopes_of/1,
+    effective_scopes_of_admin/1,
+    ensure_namespaced_scopes_allowed/0,
+    role_default_scopes/1,
+    set_user_scopes/2,
+    clear_user_scopes/1,
+    all_users/0,
+    admin_users/0,
+    check/2,
+    check/3,
+    complete_scram_login/2
+]).
+
+-export([
+    sign_token/2,
+    sign_token/3,
+    verify_token/3,
+    destroy_token_by_username/2
+]).
+-export([
+    hash/1,
+    hash_api_secret/1,
+    verify_hash/2
+]).
+
+-export([
+    add_default_user/0,
+    default_username/0
+]).
+
+-export([role/1, namespace_of/1, serialize_role/1]).
+
+-export([format_username/1]).
+
+-export([to_external_user/1]).
+
+-export([backup_tables/0]).
+
+-export([add_sso_user/4, upsert_sso_user/5, lookup_user/2]).
+
+-export([remove_all_users_from_namespace/1]).
+
+-ifdef(TEST).
+-export([unsafe_update_user/1, default_password/0]).
+-endif.
+
+-export_type([
+    dashboard_sso_backend/0,
+    dashboard_username/0,
+    dashboard_user_role/0,
+    emqx_admin/0,
+    actor_props/0
+]).
+
+-type emqx_admin() :: #?ADMIN{}.
+
+-type actor_props() :: #{
+    role := role(),
+    namespace := emqx_config:maybe_namespace()
+}.
+-type role() :: binary().
+
+-define(USERNAME_ALREADY_EXISTS_ERROR, <<"username_already_exists">>).
+-define(INSECURE_DEFAULT_PASSWORD, <<"public">>).
+
+%% Password / API-secret hashing parameters.
+%% Stored format is PHC-style: `$1$<iterations>$<salt_b64>$<dk_b64>'.
+%% `1' is the storage schema version, not the KDF version.
+-define(HASH_VERSION_PREFIX, <<"$1$">>).
+-define(SALT_BYTES, 16).
+-define(DK_LENGTH, 32).
+-define(PBKDF2_ITERATIONS, 600000).
+%% Legacy layout: 4 ASCII hex bytes of salt + 32 bytes raw sha256.
+-define(LEGACY_HASH_SIZE, 36).
+-define(LEGACY_SALT_SIZE, 4).
+
+%%--------------------------------------------------------------------
+%% Mnesia bootstrap
+%%--------------------------------------------------------------------
+
+create_tables() ->
+    ok = mria:create_table(?ADMIN, [
+        {type, set},
+        {rlog_shard, ?DASHBOARD_SHARD},
+        {storage, disc_copies},
+        {record_name, ?ADMIN},
+        {attributes, record_info(fields, ?ADMIN)},
+        {storage_properties, [
+            {ets, [
+                {read_concurrency, true},
+                {write_concurrency, true}
+            ]}
+        ]}
+    ]),
+    [?ADMIN].
+
+%%--------------------------------------------------------------------
+%% Data backup
+%%--------------------------------------------------------------------
+
+backup_tables() -> {<<"dashboard_users">>, [?ADMIN]}.
+
+%%--------------------------------------------------------------------
+%% bootstrap API
+%%--------------------------------------------------------------------
+
+-spec add_default_user() -> {ok, map() | empty | default_user_exists} | {error, any()}.
+add_default_user() ->
+    add_default_user(default_username(), default_password()).
+
+%%--------------------------------------------------------------------
+%% API
+%%--------------------------------------------------------------------
+
+-spec add_user(
+    dashboard_username(), _Password :: binary(), dashboard_user_role(), _Desc :: binary()
+) ->
+    {ok, map()} | {error, any()}.
+add_user(Username, Password, Role0, Desc) when is_binary(Username), is_binary(Password) ->
+    maybe
+        ok ?= legal_username(Username),
+        ok ?= legal_password(Password),
+        {ok, ParsedRole} ?= parse_role(Role0),
+        #{?role := Role} = ParsedRole,
+        Extra = parsed_role_to_extra(ParsedRole),
+        ActorProps = Extra#{?role => Role},
+        ok ?= emqx_hooks:run_fold('api_actor.pre_create', [ActorProps], ok),
+        do_add_user(Username, Password, Role, Desc, Extra)
+    end.
+
+parsed_role_to_extra(#{?namespace := Ns}) ->
+    #{?namespace => Ns};
+parsed_role_to_extra(_) ->
+    #{?namespace => ?global_ns}.
+
+%% @doc Internal admin/SSO-user creation entry point.
+%%
+%% `Extra' is a map carrying optional fields written into the new record's
+%% `extra' map.  Recognised keys:
+%%
+%%   * `?namespace'  - the namespace this admin belongs to (defaults to
+%%     `?global_ns' if absent).
+%%
+%%   * `scopes' (binary list) - if present, the listed scopes are written
+%%     into the record atomically inside the same mria transaction as the
+%%     row insertion.  Used by paths that do NOT have a follow-up
+%%     `set_user_scopes' step (SSO auto-provisioning) so a new row never
+%%     appears in the legacy "no scopes key" state.  The default-admin
+%%     bootstrap deliberately omits it: that account stays on implicit
+%%     role-default scopes.  If the `scopes' key is omitted, no scopes field is written
+%%     and the caller is expected to materialise scopes afterwards (e.g.
+%%     the API POST handler does `maybe_set_user_scopes/2' with
+%%     role-default scopes).
+do_add_user(Username, Password, Role, Desc, Extra) ->
+    Res = mria:sync_transaction(
+        ?DASHBOARD_SHARD,
+        fun add_user_/5,
+        [Username, Password, Role, Desc, Extra]
+    ),
+    return(Res).
+
+get_mfa_enabled_state(Username) ->
+    case get_mfa_state(Username) of
+        {ok, disabled} ->
+            {error, disabled};
+        Result ->
+            Result
+    end.
+
+get_mfa_state(Username) ->
+    case get_extra(Username) of
+        {ok, #{mfa_state := S}} ->
+            {ok, S};
+        {ok, _} ->
+            {error, no_mfa_state};
+        {error, _} = Error ->
+            Error
+    end.
+
+%% @doc Delete MFA state from user record.
+%% This should allow the user to re-initialize MFA state according to `default_mfa' config.
+clear_mfa_state(Username) ->
+    Res = mria:sync_transaction(?DASHBOARD_SHARD, fun clear_mfa_state2/1, [Username]),
+    return(Res).
+
+clear_mfa_state2(Username) ->
+    update_extra(Username, fun(Extra) -> maps:without([mfa_state], Extra) end).
+
+%% @doc Disable MFA for a user.
+%% Verifies MFA is currently enabled before disabling.
+%% Clears the secret so re-enabling requires a fresh TOTP setup.
+%% @doc Disable MFA for a user. Admin-initiated disable writes
+%% admin_override=mfa_exempted so the user is unlocked from any
+%% policy snapshot — subsequent backend force_mfa changes will not
+%% re-lock this user. Self-initiated disable does not touch the
+%% admin_override field.
+-spec disable_mfa(dashboard_username(), boolean()) -> ok | {error, term()}.
+disable_mfa(Username, ByAdmin) ->
+    case lookup_user(Username) of
+        [] ->
+            {error, <<"username_not_found">>};
+        [_] ->
+            do_disable_mfa(Username, ByAdmin)
+    end.
+
+do_disable_mfa(Username, ByAdmin) ->
+    case get_mfa_state(Username) of
+        {ok, disabled} ->
+            {error, <<"MFA is already disabled">>};
+        _ ->
+            %% Allow disabling regardless of current state (not configured, or enabled).
+            Res = mria:sync_transaction(?DASHBOARD_SHARD, fun() ->
+                update_extra(Username, fun(Extra) ->
+                    maps:without([mfa_pending], Extra#{mfa_state => disabled})
+                end)
+            end),
+            case Res of
+                {atomic, ok} ->
+                    %% Admin disable expresses "this user is exempt from
+                    %% MFA policy"; self disable doesn't.
+                    ok = maybe_set_admin_override(Username, ByAdmin, ?ADMIN_MFA_EXEMPTED),
+                    ok;
+                {aborted, Reason} ->
+                    {error, Reason}
+            end
+    end.
+
+%% @doc Enable MFA state.
+%% Return error if it's already enabled.
+%% Called from CLI (emqx ctl admins mfa <user> enable totp), so the
+%% caller is treated as admin.
+enable_mfa_from_cli(Username, Mechanism) ->
+    case get_mfa_enabled_state(Username) of
+        {ok, #{mechanism := Mechanism0}} ->
+            {error, binfmt("MFA is already enabled using '~p'", [Mechanism0])};
+        {error, username_not_found} ->
+            {error, <<"username_not_found">>};
+        {error, _} ->
+            case lookup_user(Username) of
+                [] ->
+                    {error, <<"username_not_found">>};
+                [_] ->
+                    reinit_mfa(Username, Mechanism, _ByAdmin = true)
+            end
+    end.
+
+%% @doc Reinitialize MFA state for a user (generate new TOTP secret,
+%% clear any pending state). The `ByAdmin' flag determines whether the
+%% caller's admin_override decision is applied:
+%%
+%%   * ByAdmin=true (admin reinit) — write admin_override=mfa_required.
+%%     Admin's decision overrides whatever policy snapshot says — this
+%%     user must keep MFA regardless of backend force_mfa changes.
+%%   * ByAdmin=false (self reinit) — leave admin_override untouched.
+%%     Self cannot revoke an existing admin decision (required or
+%%     exempted); voluntary setup/rotate stays under the admin
+%%     decision if any.
+reinit_mfa(Username, Mechanism, ByAdmin) ->
+    {ok, State} = emqx_dashboard_mfa:init(Mechanism),
+    case reset_mfa_state(Username, State) of
+        {ok, ok} ->
+            ok = maybe_set_admin_override(Username, ByAdmin, ?ADMIN_MFA_REQUIRED),
+            _ = emqx_dashboard_token:destroy_by_username(Username),
+            ok;
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+%% Conditional admin_override write — applied only when the operation
+%% was performed by an admin acting on another user (ByAdmin=true).
+%% Self operations never write admin_override: self cannot override
+%% the admin's decision.
+maybe_set_admin_override(_Username, _ByAdmin = false, _Override) ->
+    ok;
+maybe_set_admin_override(Username, _ByAdmin = true, Override) ->
+    log_admin_override_write(Username, Override, set_admin_override(Username, Override)).
+
+log_admin_override_write(_Username, _Value, {ok, ok}) ->
+    ok;
+log_admin_override_write(Username, Value, {error, Reason}) ->
+    ?SLOG(warning, #{
+        msg => "set_admin_override_failed",
+        username => Username,
+        value => Value,
+        reason => Reason
+    }),
+    ok.
+
+%% @doc Set MFA state in the extra map.
+set_mfa_state(Username, MfaState) ->
+    Res = mria:sync_transaction(?DASHBOARD_SHARD, fun() ->
+        update_extra(Username, fun(Extra) -> Extra#{mfa_state => MfaState} end)
+    end),
+    return(Res).
+
+%% @doc Set MFA state and clear mfa_pending in the extra map.
+reset_mfa_state(Username, MfaState) ->
+    Res = mria:sync_transaction(?DASHBOARD_SHARD, fun() ->
+        update_extra(
+            Username,
+            fun(Extra) -> maps:without([mfa_pending], Extra#{mfa_state => MfaState}) end
+        )
+    end),
+    return(Res).
+
+%% @doc Set MFA pending info in the extra map.
+set_mfa_pending(Username, Pending) ->
+    Res = mria:sync_transaction(?DASHBOARD_SHARD, fun() ->
+        update_extra(Username, fun(Extra) -> Extra#{mfa_pending => Pending} end)
+    end),
+    return(Res).
+
+%% @doc Clear MFA pending info from the extra map.
+clear_mfa_pending(Username) ->
+    Res = mria:sync_transaction(?DASHBOARD_SHARD, fun() ->
+        update_extra(Username, fun(Extra) -> maps:without([mfa_pending], Extra) end)
+    end),
+    return(Res).
+
+%% @doc Get MFA pending info from the extra map for a given username.
+%% Direct O(1) lookup by username key.
+get_mfa_pending(Username) ->
+    case get_extra(Username) of
+        {ok, #{mfa_pending := Pending}} -> {ok, Pending};
+        _ -> {error, not_found}
+    end.
+
+%% @doc Store a one-time SSO code in the extra map.
+set_sso_code(Username, SsoCode) ->
+    Res = mria:sync_transaction(?DASHBOARD_SHARD, fun() ->
+        update_extra(Username, fun(Extra) -> Extra#{sso_code => SsoCode} end)
+    end),
+    return(Res).
+
+%% @doc Clear the SSO code from the extra map.
+clear_sso_code(Username) ->
+    Res = mria:sync_transaction(?DASHBOARD_SHARD, fun() ->
+        update_extra(Username, fun(Extra) -> maps:without([sso_code], Extra) end)
+    end),
+    return(Res).
+
+%% @doc Get the SSO code from the extra map for a given username.
+%% Direct O(1) lookup by username key.
+get_sso_code(Username) ->
+    case get_extra(Username) of
+        {ok, #{sso_code := SsoCode}} -> {ok, SsoCode};
+        _ -> {error, not_found}
+    end.
+
+set_login_lock(Username, LockedUntil) ->
+    Res = mria:sync_transaction(?DASHBOARD_SHARD, fun set_login_lock2/2, [Username, LockedUntil]),
+    return(Res).
+
+set_login_lock2(Username, LockedUntil) ->
+    update_extra(Username, fun(Extra) -> Extra#{login_lock => LockedUntil} end).
+
+get_login_lock(Username) ->
+    case get_extra(Username) of
+        {ok, #{login_lock := LockedUntil}} ->
+            {ok, LockedUntil};
+        _ ->
+            not_found
+    end.
+
+clear_login_lock(Username) ->
+    Res = mria:sync_transaction(?DASHBOARD_SHARD, fun clear_login_lock2/1, [Username]),
+    return(Res).
+
+clear_login_lock2(Username) ->
+    update_extra(Username, fun(Extra) -> maps:without([login_lock], Extra) end).
+
+%%--------------------------------------------------------------------
+%% Login user scope + admin_override fields
+%%
+%% Two extra-map keys introduced for the dashboard user scopes feature:
+%%
+%%   admin_override :: undefined | mfa_required | mfa_exempted
+%%     Admin's explicit per-user MFA decision that overrides the live
+%%     backend force_mfa policy in either direction:
+%%       * mfa_required: this user must keep MFA regardless of policy
+%%       * mfa_exempted: this user is exempt from MFA regardless
+%%       * undefined  : no admin decision — fall back to backend's
+%%                      live force_mfa at MFA-setup-required time
+%%
+%%   scopes :: [binary()]
+%%     Login user's scope list. undefined (key absent) means "fall
+%%     back to role default" (see role_default_scopes/2):
+%%       * global administrator → ?GENERIC_SCOPES ++ ?LOGIN_ONLY_SCOPES
+%%       * global viewer        → ?GENERIC_SCOPES
+%%       * namespaced administrator → ?NS_ADMIN_ALLOWED_SCOPES
+%%       * namespaced viewer        → ?NS_VIEWER_ALLOWED_SCOPES
+%%     Explicit [] means "all mapped paths denied, unmapped paths
+%%     still allowed" (consistent with API key empty scope semantics).
+
+-type admin_override() :: undefined | ?ADMIN_MFA_REQUIRED | ?ADMIN_MFA_EXEMPTED.
+
+-spec admin_override_of(dashboard_username()) -> admin_override().
+admin_override_of(Username) ->
+    case get_extra(Username) of
+        {ok, #{admin_override := V}} when
+            V =:= ?ADMIN_MFA_REQUIRED;
+            V =:= ?ADMIN_MFA_EXEMPTED
+        ->
+            V;
+        _ ->
+            undefined
+    end.
+
+-spec set_admin_override(dashboard_username(), admin_override()) ->
+    {ok, ok} | {error, term()}.
+set_admin_override(Username, undefined) ->
+    Res = mria:sync_transaction(?DASHBOARD_SHARD, fun() ->
+        update_extra(Username, fun(Extra) -> maps:remove(admin_override, Extra) end)
+    end),
+    return(Res);
+set_admin_override(Username, V) when
+    V =:= ?ADMIN_MFA_REQUIRED;
+    V =:= ?ADMIN_MFA_EXEMPTED
+->
+    Res = mria:sync_transaction(?DASHBOARD_SHARD, fun() ->
+        update_extra(Username, fun(Extra) -> Extra#{admin_override => V} end)
+    end),
+    return(Res).
+
+-spec scopes_of(dashboard_username()) -> undefined | [binary()].
+scopes_of(Username) ->
+    case get_extra(Username) of
+        {ok, #{scopes := S}} -> S;
+        _ -> undefined
+    end.
+
+%% @doc Return the EFFECTIVE scope list for a user — expands the
+%% role-default fallback when the user has no explicit `scopes' field
+%% in their extra map (the "lazy migration" case for users created
+%% before this feature).
+%%
+%%   any role      + no explicit scopes -> role_default_scopes/2 for the
+%%                                         role and the user's namespace
+%%   any role      + explicit []         -> []
+%%   any role      + explicit [X, ...]   -> [X, ...]
+%%
+%% This is what RBAC checks and what the /users and /current_user APIs
+%% surface in responses.
+-spec effective_scopes_of(dashboard_username()) -> [binary()].
+effective_scopes_of(Username) ->
+    case lookup_user(Username) of
+        [#?ADMIN{} = Admin] -> effective_scopes_of_admin(Admin);
+        _ -> []
+    end.
+
+-spec effective_scopes_of_admin(emqx_admin()) -> [binary()].
+effective_scopes_of_admin(#?ADMIN{username = Username, role = Role} = Admin) ->
+    case scopes_of(Username) of
+        undefined -> role_default_scopes(Role, namespace_of(Admin));
+        Scopes when is_list(Scopes) -> Scopes
+    end.
+
+-doc """
+Return the default scope list for a role string as the user API receives
+it: a bare role (`viewer`) or a namespaced role (`ns:<ns>::viewer`).
+""".
+-spec role_default_scopes(binary()) -> [binary()].
+role_default_scopes(Role) ->
+    case emqx_dashboard_rbac:parse_dashboard_role(Role) of
+        {ok, #{?role := BaseRole, ?namespace := Namespace}} ->
+            role_default_scopes(BaseRole, Namespace);
+        _ ->
+            ?GENERIC_SCOPES
+    end.
+
+-doc """
+Return the default scope list for a base role and a namespace. The admin
+record stores the base role and keeps the namespace in `extra`, so callers
+that start from a record must pass both.
+""".
+role_default_scopes(?ROLE_SUPERUSER, ?global_ns) ->
+    ?GENERIC_SCOPES ++ ?LOGIN_ONLY_SCOPES;
+role_default_scopes(?ROLE_SUPERUSER, Namespace) when is_binary(Namespace) ->
+    ?NS_ADMIN_ALLOWED_SCOPES;
+role_default_scopes(_Role, Namespace) when is_binary(Namespace) ->
+    ?NS_VIEWER_ALLOWED_SCOPES;
+role_default_scopes(_Role, _Namespace) ->
+    ?GENERIC_SCOPES.
+
+-doc """
+Remove the scopes a namespaced role may not hold from every namespaced
+user's explicit scope list. When the remaining list equals the role
+default, clear the list so the user follows the role default. Runs at
+boot and is idempotent.
+""".
+-spec ensure_namespaced_scopes_allowed() -> ok.
+ensure_namespaced_scopes_allowed() ->
+    lists:foreach(fun ensure_namespaced_scopes_allowed/1, ets:tab2list(?ADMIN)).
+
+ensure_namespaced_scopes_allowed(#?ADMIN{username = Username, role = Role} = Admin) ->
+    case {namespace_of(Admin), scopes_of(Username)} of
+        {Namespace, Scopes} when is_binary(Namespace), is_list(Scopes) ->
+            Default = role_default_scopes(Role, Namespace),
+            case [S || S <- Scopes, lists:member(S, Default)] of
+                Scopes ->
+                    ok;
+                Kept ->
+                    narrow_namespaced_scopes(Username, Scopes, Kept, Default)
+            end;
+        _ ->
+            ok
+    end.
+
+narrow_namespaced_scopes(Username, Scopes, Kept, Default) ->
+    Res =
+        case lists:usort(Kept) =:= lists:usort(Default) of
+            true -> clear_user_scopes(Username);
+            false -> set_user_scopes(Username, Kept)
+        end,
+    ?SLOG(info, #{
+        msg => "namespaced_user_scopes_narrowed",
+        username => Username,
+        removed_scopes => Scopes -- Kept,
+        result => Res
+    }),
+    ok.
+
+-spec set_user_scopes(dashboard_username(), [binary()]) ->
+    {ok, ok} | {error, term()}.
+set_user_scopes(Username, Scopes) when is_list(Scopes) ->
+    Res = mria:sync_transaction(?DASHBOARD_SHARD, fun() ->
+        update_extra(Username, fun(Extra) -> Extra#{scopes => Scopes} end)
+    end),
+    return(Res).
+
+%% @doc Clear a user's explicit scope list back to the "unset" state, i.e.
+%% remove the `scopes' field from the extra map entirely so `scopes_of/1'
+%% returns `undefined' and the runtime falls back to the role default.
+%% Used by the write paths when a request is "unset"-equivalent so a
+%% read-modify-write never sediments the implicit full set into a frozen
+%% explicit list.
+-spec clear_user_scopes(dashboard_username()) -> {ok, ok} | {error, term()}.
+clear_user_scopes(Username) ->
+    Res = mria:sync_transaction(?DASHBOARD_SHARD, fun() ->
+        update_extra(Username, fun(Extra) -> maps:remove(scopes, Extra) end)
+    end),
+    return(Res).
+
+%%--------------------------------------------------------------------
+
+%% @doc Management of `extra' field.
+
+update_extra(Username, Fun) ->
+    case mnesia:wread({?ADMIN, Username}) of
+        [] ->
+            mnesia:abort(<<"username_not_found">>);
+        [#?ADMIN{extra = Extra0} = Admin] ->
+            Extra1 = upgrade_extra(Extra0),
+            ok = mnesia:write(Admin#?ADMIN{extra = Fun(Extra1)})
+    end.
+
+get_extra(Username) ->
+    case ets:lookup(?ADMIN, Username) of
+        [#?ADMIN{extra = Extra}] ->
+            {ok, upgrade_extra(Extra)};
+        [] ->
+            {error, username_not_found}
+    end.
+
+%% Before 5.3, extra is never used and initialized to [].
+%% Defensive upgrade paths for pre-5.3 records where `role` was `undefined`
+%% and `extra` was `[]` — dialyzer sees these as unreachable given the
+%% current record spec, but they still fire in production when mnesia
+%% returns rows written by older nodes during a rolling upgrade.
+-dialyzer({no_match, [upgrade_extra/1, update_user_/4, ensure_role/1, role/1]}).
+upgrade_extra([]) -> #{};
+upgrade_extra(Map) when is_map(Map) -> Map.
+
+%% 0-9 or A-Z or a-z or $_
+legal_username(<<>>) ->
+    {error, <<"Username cannot be empty">>};
+legal_username(Username) ->
+    case re:run(Username, "^[_a-zA-Z0-9]*$", [{capture, none}]) of
+        nomatch ->
+            {error, <<
+                "Bad Username."
+                " Only upper and lower case letters, numbers and underscores are supported"
+            >>};
+        match ->
+            ok
+    end.
+
+-define(LOW_LETTER_CHARS, "abcdefghijklmnopqrstuvwxyz").
+-define(UPPER_LETTER_CHARS, "ABCDEFGHIJKLMNOPQRSTUVWXYZ").
+-define(LETTER, ?LOW_LETTER_CHARS ++ ?UPPER_LETTER_CHARS).
+-define(NUMBER, "0123456789").
+-define(SPECIAL_CHARS, "!@#$%^&*()_+-=[]{}\"|;':,./<>?`~ ").
+-define(INVALID_PASSWORD_MSG, <<
+    "Bad password. "
+    "At least two different kind of characters from groups of letters, numbers, and special characters. "
+    "For example, if password is composed from letters, it must contain at least one number or a special character."
+>>).
+-define(BAD_PASSWORD_LEN, <<"The range of password length is 8~64">>).
+
+legal_password(Password) when is_binary(Password) ->
+    legal_password(binary_to_list(Password));
+legal_password(Password) when is_list(Password) ->
+    legal_password(Password, erlang:length(Password)).
+
+legal_password(Password, Len) when Len >= 8 andalso Len =< 64 ->
+    case is_mixed_password(Password) of
+        true -> ascii_character_validate(Password);
+        false -> {error, ?INVALID_PASSWORD_MSG}
+    end;
+legal_password(_Password, _Len) ->
+    {error, ?BAD_PASSWORD_LEN}.
+
+%% The password must contain at least two different kind of characters
+%% from groups of letters, numbers, and special characters.
+is_mixed_password(Password) -> is_mixed_password(Password, [?NUMBER, ?LETTER, ?SPECIAL_CHARS], 0).
+
+is_mixed_password(_Password, _Chars, 2) ->
+    true;
+is_mixed_password(_Password, [], _Count) ->
+    false;
+is_mixed_password(Password, [Chars | Rest], Count) ->
+    NewCount =
+        case contain(Password, Chars) of
+            true -> Count + 1;
+            false -> Count
+        end,
+    is_mixed_password(Password, Rest, NewCount).
+
+%% regex-non-ascii-character, such as Chinese, Japanese, Korean, etc.
+ascii_character_validate(Password) ->
+    case re:run(Password, "[^\\x00-\\x7F]+", [unicode, {capture, none}]) of
+        match -> {error, <<"Only ascii characters are allowed in the password">>};
+        nomatch -> ok
+    end.
+
+contain(Xs, Spec) -> lists:any(fun(X) -> lists:member(X, Spec) end, Xs).
+
+%% black-magic: force overwrite a user
+force_add_user(Username, Password, Role, Desc, Extra) ->
+    AddFun = fun() ->
+        mnesia:write(#?ADMIN{
+            username = Username,
+            pwdhash = hash(Password),
+            role = Role,
+            description = Desc,
+            extra = Extra#{password_ts => erlang:system_time(second)}
+        })
+    end,
+    case mria:sync_transaction(?DASHBOARD_SHARD, AddFun) of
+        {atomic, ok} -> ok;
+        {aborted, Reason} -> {error, Reason}
+    end.
+
+%% @private
+add_user_(Username, Password, Role, Desc, Extra) ->
+    #{flattened_user := FlattenedUser} = do_add_user_(Username, Password, Role, Desc, Extra),
+    FlattenedUser.
+
+do_add_user_(Username, Password, Role, Desc, Extra) ->
+    Namespace = maps:get(?namespace, Extra, ?global_ns),
+    case mnesia:wread({?ADMIN, Username}) of
+        [] ->
+            %% `Extra' carries any caller-supplied `?namespace' / `scopes'
+            %% keys. Layer `password_ts' on top — both seedings (namespace
+            %% and initial scopes) happen inside this same mria transaction
+            %% as the row insertion, so a fresh row never appears in the
+            %% "no scopes key" state for SSO / default-admin / API-key
+            %% creation paths. That state is reserved exclusively for legacy
+            %% records upgraded from versions before the scope feature shipped.
+            Admin = #?ADMIN{
+                username = Username,
+                pwdhash = hash(Password),
+                role = Role,
+                description = Desc,
+                extra = Extra#{password_ts => erlang:system_time(second)}
+            },
+            mnesia:write(Admin),
+            ?SLOG(info, #{
+                msg => "dashboard_sso_user_added",
+                username => Username,
+                ?role => Role,
+                ?namespace => Namespace
+            }),
+            FlattenedUser = flatten_username(#{
+                username => Username,
+                ?role => Role,
+                description => Desc,
+                ?namespace => Namespace
+            }),
+            #{
+                flattened_user => FlattenedUser,
+                user_record => Admin
+            };
+        [_] ->
+            ?SLOG(info, #{
+                msg => "dashboard_sso_user_add_failed",
+                reason => "username_already_exists",
+                username => Username,
+                ?role => Role,
+                ?namespace => Namespace
+            }),
+            mnesia:abort(?USERNAME_ALREADY_EXISTS_ERROR)
+    end.
+
+ensure_sso_user_tx(Backend, Username, MaybeRole, MaybeNamespace, Desc) ->
+    Password = <<"">>,
+    SSOUsername = ?SSO_USERNAME(Backend, Username),
+    case mnesia:wread({?ADMIN, SSOUsername}) of
+        [] ->
+            Role = emqx_maybe:define(MaybeRole, ?ROLE_VIEWER),
+            Namespace = emqx_maybe:define(MaybeNamespace, ?global_ns),
+            Extra = #{?namespace => Namespace},
+            ActorProps = Extra#{?role => Role},
+            case emqx_hooks:run_fold('api_actor.pre_create', [ActorProps], ok) of
+                ok ->
+                    ok;
+                {error, Reason} ->
+                    mnesia:abort(Reason);
+                Error ->
+                    mnesia:abort(Error)
+            end,
+            do_add_user_(SSOUsername, Password, Role, Desc, Extra);
+        [User0] ->
+            #?ADMIN{
+                role = PrevRole,
+                extra = Extra0
+            } = User0,
+            PrevNamespace = maps:get(?namespace, Extra0, ?global_ns),
+            Role = emqx_maybe:define(MaybeRole, PrevRole),
+            Namespace = emqx_maybe:define(MaybeNamespace, PrevNamespace),
+            Extra = Extra0#{
+                ?namespace => Namespace,
+                password_ts => erlang:system_time(second)
+            },
+            ActorProps = Extra#{?role => Role},
+            case emqx_hooks:run_fold('api_actor.pre_create', [ActorProps], ok) of
+                ok ->
+                    ok;
+                {error, Reason} ->
+                    mnesia:abort(Reason);
+                Error ->
+                    mnesia:abort(Error)
+            end,
+            User = User0#?ADMIN{
+                role = Role,
+                extra = Extra
+            },
+            mnesia:write(User),
+            ?SLOG(info, #{
+                msg => "dashboard_sso_user_updated",
+                username => SSOUsername,
+                ?role => Role,
+                ?namespace => Namespace
+            }),
+            FlattenedUser = flatten_username(#{
+                username => SSOUsername,
+                ?role => Role,
+                description => Desc,
+                ?namespace => Namespace
+            }),
+            #{
+                flattened_user => FlattenedUser,
+                user_record => User
+            }
+    end.
+
+-spec remove_user(dashboard_username()) -> {ok, any()} | {error, any()}.
+remove_user(Username) ->
+    Trans = fun() ->
+        case lookup_user(Username) of
+            [] -> mnesia:abort(<<"username_not_found">>);
+            _ -> mnesia:delete({?ADMIN, Username})
+        end
+    end,
+    case return(mria:sync_transaction(?DASHBOARD_SHARD, Trans)) of
+        {ok, Result} ->
+            _ = emqx_dashboard_token:destroy_by_username(Username),
+            {ok, Result};
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+-spec update_user(dashboard_username(), dashboard_user_role(), binary()) ->
+    {ok, map()} | {error, term()}.
+update_user(Username, Role0, Desc) ->
+    case parse_role(Role0) of
+        {ok, #{role := Role} = ParsedRole} ->
+            Extra = parsed_role_to_extra(ParsedRole),
+            case
+                return(
+                    mria:sync_transaction(
+                        ?DASHBOARD_SHARD,
+                        fun update_user_/4,
+                        [Username, Role, Desc, Extra]
+                    )
+                )
+            of
+                {ok, {true, Result}} ->
+                    {ok, Result};
+                {ok, {false, Result}} ->
+                    %% role has changed, destroy the related token
+                    _ = emqx_dashboard_token:destroy_by_username(Username),
+                    {ok, Result};
+                Error ->
+                    Error
+            end;
+        Error ->
+            Error
+    end.
+
+remove_all_users_from_namespace(Namespace) when is_binary(Namespace) ->
+    MS = ets:fun2ms(
+        fun(#?ADMIN{username = U, extra = #{?namespace := Ns}}) when Ns == Namespace ->
+            U
+        end
+    ),
+    Usernames = ets:select(?ADMIN, MS),
+    lists:foreach(fun remove_user/1, Usernames).
+
+-spec hash(binary()) -> binary().
+hash(Password) ->
+    do_hash(Password, ?PBKDF2_ITERATIONS).
+
+%% @doc Hash an API key secret.
+%%
+%% API secrets are generated by `crypto:strong_rand_bytes/1' (>=32 bytes,
+%% ~190 bits of entropy), so a slow KDF buys nothing against brute force
+%% and would add ~500ms per HTTP API request. We keep the same `$1$' format
+%% (random 16-byte salt, base64 fields) but use a single PBKDF2 iteration —
+%% effectively a salted HMAC-SHA256 — so the verifier code path stays unified.
+-spec hash_api_secret(binary()) -> binary().
+hash_api_secret(ApiSecret) ->
+    do_hash(ApiSecret, 1).
+
+do_hash(Input, Iterations) ->
+    Salt = crypto:strong_rand_bytes(?SALT_BYTES),
+    DK = crypto:pbkdf2_hmac(sha256, Input, Salt, Iterations, ?DK_LENGTH),
+    encode_v1(Iterations, Salt, DK).
+
+-spec verify_hash(binary(), binary()) -> ok | error.
+verify_hash(Origin, <<"$1$", Rest/binary>>) ->
+    case parse_v1(Rest) of
+        {ok, Iter, Salt, ExpectedDK} ->
+            ActualDK = crypto:pbkdf2_hmac(sha256, Origin, Salt, Iter, byte_size(ExpectedDK)),
+            case crypto:hash_equals(ExpectedDK, ActualDK) of
+                true -> ok;
+                false -> error
+            end;
+        error ->
+            error
+    end;
+verify_hash(Origin, <<Salt:?LEGACY_SALT_SIZE/binary, Hash/binary>> = Legacy) when
+    byte_size(Legacy) =:= ?LEGACY_HASH_SIZE
+->
+    %% Legacy layout. We do NOT rehash-on-login: during a rolling
+    %% upgrade an older node would be unable to verify the new format,
+    %% so an upgraded hash could lock the user out at the next request
+    %% routed to an old node. Existing legacy hashes are replaced only
+    %% when the user changes their password.
+    case crypto:hash_equals(Hash, legacy_sha256(Salt, Origin)) of
+        true -> ok;
+        false -> error
+    end;
+verify_hash(_Origin, _Other) ->
+    error.
+
+encode_v1(Iter, Salt, DK) ->
+    iolist_to_binary([
+        ?HASH_VERSION_PREFIX,
+        integer_to_binary(Iter),
+        $$,
+        base64:encode(Salt, #{padding => false}),
+        $$,
+        base64:encode(DK, #{padding => false})
+    ]).
+
+parse_v1(Rest) ->
+    case binary:split(Rest, <<"$">>, [global]) of
+        [IterBin, SaltB64, DKB64] ->
+            try
+                Iter = binary_to_integer(IterBin),
+                Salt = base64:decode(SaltB64, #{padding => false}),
+                DK = base64:decode(DKB64, #{padding => false}),
+                true = Iter > 0,
+                true = byte_size(Salt) > 0,
+                true = byte_size(DK) > 0,
+                {ok, Iter, Salt, DK}
+            catch
+                _:_ -> error
+            end;
+        _ ->
+            error
+    end.
+
+legacy_sha256(SaltBin, Password) ->
+    crypto:hash('sha256', <<SaltBin/binary, Password/binary>>).
+
+verify_password_expiration(0, _User) ->
+    {ok, #{}};
+verify_password_expiration(ValidityDuration, #?ADMIN{extra = #{password_ts := Ts}}) ->
+    Diff = Ts + ValidityDuration - erlang:system_time(second),
+    {ok, #{password_expire_in_seconds => Diff}};
+verify_password_expiration(ValidityDuration, #?ADMIN{extra = Extra} = User) ->
+    case
+        unsafe_update_user(User#?ADMIN{extra = Extra#{password_ts => erlang:system_time(second)}})
+    of
+        ok ->
+            {ok, #{password_expire_in_seconds => ValidityDuration}};
+        Error ->
+            Error
+    end.
+
+%% @private
+update_user_(Username, Role, Desc, Extra) ->
+    case mnesia:wread({?ADMIN, Username}) of
+        [] ->
+            mnesia:abort(<<"username_not_found">>);
+        [Admin] ->
+            #?ADMIN{extra = Extra0} = Admin,
+            {OldExtra, NewExtra} =
+                case is_map(Extra0) of
+                    false -> {#{}, Extra};
+                    true -> {Extra0, maps:merge(Extra0, Extra)}
+                end,
+            NewNamespace = maps:get(?namespace, NewExtra, ?global_ns),
+            PreviousNamespace = maps:get(?namespace, OldExtra, ?global_ns),
+            case PreviousNamespace /= NewNamespace of
+                true ->
+                    %% Namespace is part of the RBAC boundary.  Require delete/recreate
+                    %% instead of moving an existing user (and its tokens) across scopes.
+                    mnesia:abort(<<"changing_namespace_is_forbidden">>);
+                false ->
+                    ok
+            end,
+            mnesia:write(Admin#?ADMIN{role = Role, description = Desc, extra = NewExtra}),
+            {
+                role(Admin) =:= Role,
+                flatten_username(#{
+                    username => Username,
+                    role => Role,
+                    description => Desc,
+                    ?namespace => maps:get(?namespace, NewExtra, ?global_ns)
+                })
+            }
+    end.
+
+%% @doc Change password from API/Dashboard, must check old password.
+change_password(Username, OldPasswd, NewPasswd) when is_binary(Username) ->
+    change_password(Username, OldPasswd, NewPasswd, ?TRUSTED_MFA_TOKEN).
+
+%% @doc Change password from dashboard, must provide MFA token.
+change_password(Username, OldPasswd, NewPasswd, MfaToken) ->
+    case check(Username, OldPasswd, MfaToken) of
+        {ok, _} -> change_password_trusted(Username, NewPasswd);
+        Error -> Error
+    end.
+
+%% @doc Change password from CLI.
+change_password_trusted(Username, Password) when is_binary(Username), is_binary(Password) ->
+    case legal_password(Password) of
+        ok ->
+            ok = emqx_dashboard_login_lock:reset(Username),
+            change_password_hash(Username, hash(Password));
+        Error ->
+            Error
+    end.
+
+change_password_hash(Username, PasswordHash) ->
+    ChangePWD =
+        fun(User) ->
+            Extra = upgrade_extra(User#?ADMIN.extra),
+            User#?ADMIN{
+                pwdhash = PasswordHash,
+                extra = Extra#{password_ts => erlang:system_time(second)}
+            }
+        end,
+    case update_pwd(Username, ChangePWD) of
+        {ok, Result} ->
+            _ = emqx_dashboard_token:destroy_by_username(Username),
+            {ok, Result};
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+update_pwd(Username, Fun) ->
+    Trans =
+        fun() ->
+            User =
+                case lookup_user(Username) of
+                    [Admin] -> Admin;
+                    [] -> mnesia:abort(<<"username_not_found">>)
+                end,
+            mnesia:write(Fun(User))
+        end,
+    return(mria:sync_transaction(?DASHBOARD_SHARD, Trans)).
+
+%% used to directly update user data
+unsafe_update_user(User) ->
+    Trans = fun() -> mnesia:write(User) end,
+    case mria:sync_transaction(?DASHBOARD_SHARD, Trans) of
+        {atomic, ok} -> ok;
+        {aborted, Reason} -> {error, Reason}
+    end.
+
+-spec lookup_user(dashboard_username()) -> [emqx_admin()].
+lookup_user(Username) ->
+    Fun = fun() -> mnesia:read(?ADMIN, Username) end,
+    {atomic, User} = mria:ro_transaction(?DASHBOARD_SHARD, Fun),
+    User.
+
+-spec all_users() -> [map()].
+all_users() ->
+    lists:map(fun to_external_user/1, ets:tab2list(?ADMIN)).
+
+-spec admin_users() -> [map()].
+admin_users() ->
+    MS = ets:fun2ms(fun(#?ADMIN{role = ?ROLE_SUPERUSER} = User) -> User end),
+    Admins = ets:select(?ADMIN, MS),
+    lists:map(fun to_external_user/1, Admins).
+
+to_external_user(UserRecord) ->
+    #?ADMIN{
+        username = Username,
+        description = Desc,
+        role = Role
+    } = UserRecord,
+    Namespace = namespace_of(UserRecord),
+    flatten_username(#{
+        username => Username,
+        description => Desc,
+        ?role => ensure_role(Role),
+        ?namespace => Namespace,
+        mfa => format_mfa(Username),
+        %% @doc Surface raw scope state with a tri-state contract:
+        %%   - `[]`            : explicit deny-all
+        %%   - `[binary(), …]` : explicit allow-list
+        %%   - `<<"unset">>`   : the persisted record has no `scopes' field at all (legacy
+        %%                       upgrade artefact from before #17235 landed).  The runtime
+        %%                       authorization path falls back to role default:
+        %%                       administrator -> generic + login-only scopes;
+        %%                       viewer        -> generic scopes;
+        %%                       publisher     -> hard-coded `/publish*'.
+        %%                       Newly created users never end up in this state: the POST
+        %%                       and SSO-provisioning paths both materialize role-default
+        %%                       scopes at creation time.
+        %% Authorization keeps using {@link effective_scopes_of_admin/1} which still
+        %% expands the role default for legacy records.  The API surface intentionally
+        %% does not expose the expanded list so that read-modify-write does not sediment
+        %% role-default into an explicit scope list.  `<<"unset">>' is a stable string
+        %% sentinel (not JSON `null') so HTTP/JSON intermediaries cannot conflate it with
+        %% `field missing' or `field cleared'.
+        scopes =>
+            case scopes_of(Username) of
+                undefined -> <<"unset">>;
+                Scopes when is_list(Scopes) -> Scopes
+            end
+    }).
+
+format_mfa(Username) ->
+    case get_mfa_state(Username) of
+        {ok, disabled} -> disabled;
+        {ok, #{mechanism := totp}} -> totp;
+        _ -> none
+    end.
+
+-type mfa_status() :: complete | pending_enforced | pending_voluntary | disabled.
+
+%% @doc What the account has to do about MFA, as opposed to `format_mfa/1',
+%% which reports what is stored. Derived from the stored state plus the policy
+%% that applies to the account.
+%%
+%%   complete          enrolled, and one TOTP code has been verified
+%%   pending_enforced  not complete while MFA is required. Login issues no
+%%                     token on it and `GET /current_user' ends the account's
+%%                     sessions on it, so no response reports it.
+%%   pending_voluntary no MFA and nothing requires it: the user may opt in
+%%   disabled          opted out, and nothing requires them to opt back in
+-spec mfa_status(dashboard_username()) -> mfa_status().
+mfa_status(Username) ->
+    case get_mfa_state(Username) of
+        {ok, #{mechanism := _, first_verify_ts := _}} ->
+            complete;
+        {ok, #{mechanism := _}} ->
+            %% A secret was issued and never verified. Login stops on it
+            %% either way, so the enrollment being voluntary does not make
+            %% this state dismissible.
+            pending_enforced;
+        {ok, disabled} ->
+            pending_or(disabled, Username);
+        _ ->
+            pending_or(pending_voluntary, Username)
+    end.
+
+pending_or(Otherwise, Username) ->
+    case mfa_required_for(Username) of
+        true -> pending_enforced;
+        false -> Otherwise
+    end.
+
+%% Whether the next login of this account sets up MFA when it has none:
+%% `emqx_dashboard_sso_mfa:mfa_required_for_user/2' for an SSO account,
+%% `mfa_enforced_for/1' for a local one.
+mfa_required_for(?SSO_USERNAME(Backend, _Name) = Username) ->
+    emqx_dashboard_sso_mfa:mfa_required_for_user(Username, Backend);
+mfa_required_for(Username) ->
+    mfa_enforced_for(Username).
+
+-spec return({atomic | aborted, term()}) -> {ok, term()} | {error, Reason :: binary()}.
+return({atomic, Result}) ->
+    {ok, Result};
+return({aborted, Reason}) ->
+    {error, Reason}.
+
+check(Username, Password) ->
+    check(Username, Password, ?NO_MFA_TOKEN).
+
+check(undefined, _, _) ->
+    {error, <<"username_not_provided">>};
+check(_, undefined, _) ->
+    {error, <<"password_not_provided">>};
+check(Username, Password, MfaToken) ->
+    case lookup_user(Username) of
+        [#?ADMIN{pwdhash = PwdHash} = User] ->
+            IsPwdOk = (ok =:= verify_hash(Password, PwdHash)),
+            MfaVerifyResult = verify_mfa_token(Username, MfaToken, IsPwdOk),
+            maybe
+                ok ?= check_mfa_pwd(MfaVerifyResult, IsPwdOk),
+                ok ?= check_unchanged_default_credentials(Password),
+                {ok, User}
+            else
+                Error -> Error
+            end;
+        [] ->
+            {error, <<"username_not_found">>}
+    end.
+
+check_mfa_pwd(ok, true) ->
+    ok;
+check_mfa_pwd(ok, false) ->
+    {error, <<"password_error">>};
+check_mfa_pwd({error, MfaError}, IsPwdOk) ->
+    %% MFA error
+    case emqx_dashboard_mfa:is_need_setup_error(MfaError) of
+        true when not IsPwdOk ->
+            %% MFA needs setup, but password is NOT OK,
+            %% return password check result.
+            %% Because only valid login can trigger MFA initialization.
+            %% Meaning: before MFA is setup, this user is still
+            %% vulnerable to brute-force attack (like no MFA).
+            {error, <<"password_error">>};
+        _ ->
+            %% - MFA needs setup (password is OK)
+            %% - MFA is setup, but token is NOT provided
+            %% - MFA is setup, but bad token prvoided
+            {error, MfaError}
+    end.
+
+check_unchanged_default_credentials(Password) ->
+    %% NOTE
+    %% This intentionally triggers if the username was changed but the password is still the standard default.
+    case Password =:= ?INSECURE_DEFAULT_PASSWORD of
+        true ->
+            case emqx_security_profile:policy(dashboard_unchanged_default_credentials) of
+                allow ->
+                    ok;
+                deny ->
+                    {error, <<"default_credentials_not_changed">>}
+            end;
+        false ->
+            ok
+    end.
+
+%% @doc Apply the same default-password policy after SCRAM has proved
+%% knowledge of the password.  The password itself is intentionally not
+%% available at this seam, so compare the stored verifier with the verifier
+%% for the known insecure default instead.
+check_unchanged_default_credentials_hash(PwdHash) ->
+    case emqx_security_profile:policy(dashboard_unchanged_default_credentials) of
+        allow ->
+            ok;
+        deny ->
+            case is_default_password_hash(PwdHash) of
+                true -> {error, <<"default_credentials_not_changed">>};
+                false -> ok
+            end
+    end.
+
+is_default_password_hash(<<"$1$", _/binary>> = PwdHash) ->
+    case emqx_dashboard_scram:from_pwdhash(PwdHash) of
+        {ok, #{salt := Salt, iterations := Iterations, salted_password := Expected}} ->
+            Actual = crypto:pbkdf2_hmac(
+                sha256, ?INSECURE_DEFAULT_PASSWORD, Salt, Iterations, 32
+            ),
+            crypto:hash_equals(Expected, Actual);
+        _ ->
+            false
+    end;
+is_default_password_hash(<<Salt:4/binary, Expected:32/binary>>) ->
+    crypto:hash_equals(
+        Expected,
+        legacy_sha256(Salt, ?INSECURE_DEFAULT_PASSWORD)
+    );
+is_default_password_hash(_) ->
+    false.
+
+verify_mfa_token(_Username, ?TRUSTED_MFA_TOKEN, _IsPwdOk) ->
+    %% e.g. when handing change_pwd request which is authenticated
+    %% by bearer token
+    ok;
+verify_mfa_token(Username, MfaToken, IsPwdOk) ->
+    ok = maybe_init_mfa_state(Username, IsPwdOk),
+    do_verify_mfa_token(Username, MfaToken, IsPwdOk).
+
+do_verify_mfa_token(Username, MfaToken, _IsPwdOk) when ?IS_NO_MFA_TOKEN(MfaToken) ->
+    %% MFA token is not provided
+    case get_mfa_enabled_state(Username) of
+        {ok, State} ->
+            %% Expected to receive MFA token, but not provided
+            %% Disregard IsPwdOk because we do not want to return
+            %% password_error when token is missing (so the to protect from
+            %% brute password being forced)
+            {error, emqx_dashboard_mfa:make_token_missing_error(State)};
+        _ ->
+            %% No MFA state, proceed to password check
+            ok
+    end;
+do_verify_mfa_token(Username, MfaToken, IsPwdOk) ->
+    %% MFA token is provided
+    case get_mfa_enabled_state(Username) of
+        {ok, State} ->
+            %% MFA is configured, and a token is provided
+            case emqx_dashboard_mfa:verify(State, MfaToken) of
+                ok ->
+                    %% Token is ok, no state change
+                    ok;
+                {ok, _NewState} when not IsPwdOk ->
+                    %% Bad password, ignore state change
+                    ok;
+                {ok, NewState} when IsPwdOk ->
+                    %% Token is ok, state changed, should update DB if password is OK
+                    {ok, ok} = set_mfa_state(Username, NewState),
+                    ok;
+                {error, Reason} ->
+                    %% Token is not OK
+                    {error, Reason}
+            end;
+        _ ->
+            %% MFA is not enabled, but provided with a token
+            %% Can happen if MFA is disabled for this user but the
+            %% dashboad is still providing a token for some reason,
+            %% proceed to password check
+            ok
+    end.
+
+%% @doc Whether `dashboard.default_mfa' requires MFA for this account.
+%% It applies to every local account except the ones an admin has
+%% exempted by setting `admin_override' to mfa_exempted. An SSO account
+%% follows its backend's `force_mfa', see `emqx_dashboard_sso_mfa'.
+-spec mfa_enforced_for(dashboard_username()) -> boolean().
+mfa_enforced_for(?SSO_USERNAME(_Backend, _Name)) ->
+    false;
+mfa_enforced_for(Username) when is_binary(Username) ->
+    default_mfa() =/= none andalso
+        admin_override_of(Username) =/= ?ADMIN_MFA_EXEMPTED.
+
+default_mfa() ->
+    emqx:get_config([dashboard, default_mfa], none).
+
+%% Initialize MFA state if there is a default MFA settings configured.
+maybe_init_mfa_state(Username, true) ->
+    case default_mfa() of
+        none ->
+            ok;
+        #{mechanism := Mechanism} ->
+            case get_mfa_state(Username) of
+                {ok, disabled} ->
+                    %% A user who disabled their own MFA is enrolled
+                    %% again here at the next login. An account an admin
+                    %% has exempted keeps the disabled state.
+                    case mfa_enforced_for(Username) of
+                        true ->
+                            reinit_mfa(Username, Mechanism, _ByAdmin = false);
+                        false ->
+                            ok
+                    end;
+                {ok, _} ->
+                    %% already enabled
+                    ok;
+                _ ->
+                    %% Triggered by `dashboard.default_mfa' config on
+                    %% user creation. Treat as non-admin call — the user
+                    %% can still self-rotate.
+                    reinit_mfa(Username, Mechanism, _ByAdmin = false)
+            end
+    end;
+maybe_init_mfa_state(_Username, false) ->
+    %% do nothing
+    ok.
+
+%%--------------------------------------------------------------------
+%% token
+
+sign_token(Username, Password) ->
+    sign_token(Username, Password, ?NO_MFA_TOKEN).
+
+sign_token(Username, Password, MfaToken) ->
+    ExpiredTime = emqx:get_config([dashboard, password_expired_time], 0),
+    maybe
+        ok ?= emqx_dashboard_login_lock:verify(Username),
+        {ok, User} ?= check(Username, Password, MfaToken),
+        {ok, Result} ?= verify_password_expiration(ExpiredTime, User),
+        {ok, MfaStatus} ?= login_mfa_status(Username),
+        {ok, Role, Token, Namespace} ?= emqx_dashboard_token:sign(User),
+        {ok, Result#{
+            ?role => Role, token => Token, namespace => Namespace, mfa_status => MfaStatus
+        }}
+    end.
+
+-spec complete_scram_login(#?ADMIN{}, term()) ->
+    {ok, map()} | {error, term()}.
+complete_scram_login(#?ADMIN{username = Username, pwdhash = PwdHash} = User, MfaToken) ->
+    ExpiredTime = emqx:get_config([dashboard, password_expired_time], 0),
+    maybe
+        ok ?= emqx_dashboard_login_lock:verify(Username),
+        MfaVerifyResult = verify_mfa_token(Username, MfaToken, true),
+        ok ?= check_mfa_pwd(MfaVerifyResult, true),
+        ok ?= check_unchanged_default_credentials_hash(PwdHash),
+        {ok, Result} ?= verify_password_expiration(ExpiredTime, User),
+        {ok, MfaStatus} ?= login_mfa_status(Username),
+        {ok, Role, Token, Namespace} ?= emqx_dashboard_token:sign(User),
+        {ok, Result#{
+            ?role => Role, token => Token, namespace => Namespace, mfa_status => MfaStatus
+        }}
+    end.
+
+%% An account still `pending_enforced' after the earlier MFA checks gets no token.
+login_mfa_status(Username) ->
+    case mfa_status(Username) of
+        pending_enforced ->
+            ?SLOG(error, #{
+                msg => "dashboard_login_refused",
+                username => Username,
+                reason => mfa_setup_required
+            }),
+            {error, mfa_setup_required};
+        MfaStatus ->
+            {ok, MfaStatus}
+    end.
+
+-spec verify_token(emqx_dashboard:request(), emqx_dashboard:handler_info(), Token :: binary()) ->
+    {ok, emqx_dashboard_rbac:actor_context()}
+    | {error, token_timeout | not_found | {unauthorized_role, binary(), dashboard_username()}}.
+verify_token(Req, HandlerInfo, Token) ->
+    emqx_dashboard_token:verify(Req, HandlerInfo, Token).
+
+destroy_token_by_username(Username, Token) ->
+    case emqx_dashboard_token:lookup(Token) of
+        {ok, #?ADMIN_JWT{username = Username}} ->
+            emqx_dashboard_token:destroy(Token);
+        _ ->
+            {error, not_found}
+    end.
+
+%%--------------------------------------------------------------------
+%% Internal functions
+%%--------------------------------------------------------------------
+binfmt(Fmt, Args) ->
+    iolist_to_binary(io_lib:format(Fmt, Args)).
+
+default_username() ->
+    emqx:get_config([dashboard, default_username], <<>>).
+
+default_password() ->
+    RawWrapped = emqx_conf:get([dashboard, default_password], <<"">>),
+    Raw = emqx_secret:unwrap(RawWrapped),
+    iolist_to_binary(Raw).
+
+add_default_user(Username, Password) when ?EMPTY_KEY(Username) orelse ?EMPTY_KEY(Password) ->
+    {ok, empty};
+add_default_user(Username, Password) ->
+    case lookup_user(Username) of
+        [] ->
+            AllAdminUsers = admin_users(),
+            OtherAdminUsers = lists:filter(
+                fun(#{username := U}) -> U /= Username end, AllAdminUsers
+            ),
+            case OtherAdminUsers of
+                [_ | _] ->
+                    %% Other admins exist; no need to create default one.
+                    {ok, other_admins_exist};
+                [] ->
+                    do_add_default_user(Username, Password)
+            end;
+        _ ->
+            ok = ensure_default_admin_scopes_unset(Username),
+            {ok, default_user_exists}
+    end.
+
+%% The default administrator must hold no explicit scope list — it always
+%% follows the role default implicitly (GET surfaces "unset"), so it keeps
+%% forward-compatible scopes instead of a frozen list; the user API rejects
+%% explicit lists for it on the same grounds.
+do_add_default_user(Username, Password) ->
+    maybe
+        {error, ?USERNAME_ALREADY_EXISTS_ERROR} ?=
+            do_add_user(Username, Password, ?ROLE_SUPERUSER, <<"administrator">>, #{}),
+        %% race condition: multiple nodes booting at the same time?
+        {ok, default_user_exists}
+    end.
+
+%% Earlier releases seeded the default admin with an explicit role-default
+%% list at bootstrap; clear it on boot so upgraded clusters regain the
+%% implicit (forward-compatible) scope set.
+ensure_default_admin_scopes_unset(Username) ->
+    case scopes_of(Username) of
+        undefined ->
+            ok;
+        _Explicit ->
+            _ = clear_user_scopes(Username),
+            ok
+    end.
+
+%% ensure the `role` is correct when it is directly read from the table
+%% this value in old data is `undefined`
+ensure_role(undefined) ->
+    ?ROLE_SUPERUSER;
+ensure_role(Role) when is_binary(Role) ->
+    Role.
+
+parse_role(Role) ->
+    emqx_dashboard_rbac:parse_dashboard_role(Role).
+
+serialize_role(Opts) ->
+    emqx_dashboard_rbac:serialize_role(Opts).
+
+%% For compatibility
+role(#?ADMIN{role = undefined}) ->
+    ?ROLE_SUPERUSER;
+role(#?ADMIN{role = Role}) ->
+    Role;
+%% For compatibility
+role([]) ->
+    ?ROLE_SUPERUSER;
+role(#{?role := Role}) ->
+    Role;
+role(Role) when is_binary(Role) ->
+    Role.
+
+namespace_of(#?ADMIN{extra = #{?namespace := Namespace}}) when is_binary(Namespace) ->
+    Namespace;
+namespace_of(#?ADMIN{}) ->
+    ?global_ns.
+
+flatten_username(#{username := ?SSO_USERNAME(Backend, Name)} = Data) ->
+    Data#{
+        username := Name,
+        backend => Backend
+    };
+flatten_username(#{username := Username} = Data) when is_binary(Username) ->
+    Data#{backend => ?BACKEND_LOCAL}.
+
+%% `Username' is normally a `dashboard_username()', but during SSO
+%% pre-authentication (before any user identity is known) the audit hook
+%% may pass the bare backend atom instead, e.g. `oidc'.
+-spec format_username(dashboard_username() | dashboard_sso_backend()) -> binary().
+format_username(?SSO_USERNAME(Backend, Name)) ->
+    iolist_to_binary([atom_to_binary(Backend), <<":">>, Name]);
+format_username(Username) when is_binary(Username) ->
+    Username;
+format_username(Backend) when is_atom(Backend) ->
+    atom_to_binary(Backend).
+
+-spec add_sso_user(dashboard_sso_backend(), binary(), dashboard_user_role(), binary()) ->
+    {ok, map()} | {error, any()}.
+add_sso_user(Backend, Username0, Role0, Desc) when is_binary(Username0) ->
+    maybe
+        {ok, #{?role := Role, ?namespace := Namespace} = ParsedRole} ?= parse_role(Role0),
+        %% SSO auto-provisioning has no follow-up `set_user_scopes' step
+        %% (LDAP / OIDC / SAML `ensure_user_exists' callers just call
+        %% `add_sso_user' and stop). Seed the role default into the
+        %% same mria transaction so a fresh SSO row never appears in
+        %% the "no scopes key" state — that state is reserved for legacy
+        %% records upgraded from versions before the scope feature shipped.
+        Extra = (parsed_role_to_extra(ParsedRole))#{
+            scopes => role_default_scopes(Role, Namespace)
+        },
+        ActorProps = Extra#{?role => Role},
+        ok ?= emqx_hooks:run_fold('api_actor.pre_create', [ActorProps], ok),
+        Username = ?SSO_USERNAME(Backend, Username0),
+        do_add_user(Username, <<>>, Role, Desc, Extra)
+    end.
+
+upsert_sso_user(Backend, Username, MaybeRole, MaybeNamespace, Desc) ->
+    Res = mria:sync_transaction(
+        ?DASHBOARD_SHARD,
+        fun ensure_sso_user_tx/5,
+        [Backend, Username, MaybeRole, MaybeNamespace, Desc]
+    ),
+    return(Res).
+
+-spec lookup_user(dashboard_sso_backend(), binary()) -> [emqx_admin()].
+lookup_user(Backend, Username) when is_atom(Backend) ->
+    lookup_user(?SSO_USERNAME(Backend, Username)).
+
+-ifdef(TEST).
+-include_lib("eunit/include/eunit.hrl").
+
+legal_password_test() ->
+    ?assertEqual({error, ?BAD_PASSWORD_LEN}, legal_password(<<"123">>)),
+    MaxPassword = iolist_to_binary([lists:duplicate(63, "x"), "1"]),
+    ?assertEqual(ok, legal_password(MaxPassword)),
+    TooLongPassword = lists:duplicate(65, "y"),
+    ?assertEqual({error, ?BAD_PASSWORD_LEN}, legal_password(TooLongPassword)),
+
+    ?assertEqual({error, ?INVALID_PASSWORD_MSG}, legal_password(<<"12345678">>)),
+    ?assertEqual({error, ?INVALID_PASSWORD_MSG}, legal_password(?LETTER)),
+    ?assertEqual({error, ?INVALID_PASSWORD_MSG}, legal_password(?NUMBER)),
+    ?assertEqual({error, ?INVALID_PASSWORD_MSG}, legal_password(?SPECIAL_CHARS)),
+    ?assertEqual({error, ?INVALID_PASSWORD_MSG}, legal_password(<<"映映映映无天在请"/utf8>>)),
+    ?assertEqual(
+        {error, <<"Only ascii characters are allowed in the password">>},
+        legal_password(<<"️test_for_non_ascii1中"/utf8>>)
+    ),
+    ?assertEqual(
+        {error, <<"Only ascii characters are allowed in the password">>},
+        legal_password(<<"云☁️test_for_unicode"/utf8>>)
+    ),
+
+    ?assertEqual(ok, legal_password(?LOW_LETTER_CHARS ++ ?NUMBER)),
+    ?assertEqual(ok, legal_password(?UPPER_LETTER_CHARS ++ ?NUMBER)),
+    ?assertEqual(ok, legal_password(?LOW_LETTER_CHARS ++ ?SPECIAL_CHARS)),
+    ?assertEqual(ok, legal_password(?UPPER_LETTER_CHARS ++ ?SPECIAL_CHARS)),
+    ?assertEqual(ok, legal_password(?SPECIAL_CHARS ++ ?NUMBER)),
+
+    ?assertEqual(ok, legal_password(<<"abckldiekflkdf12">>)),
+    ?assertEqual(ok, legal_password(<<"abckldiekflkdf w">>)),
+    ?assertEqual(ok, legal_password(<<"# abckldiekflkdf w">>)),
+    ?assertEqual(ok, legal_password(<<"# 12344858">>)),
+    ?assertEqual(ok, legal_password(<<"# %12344858">>)),
+    ok.
+
+-endif.

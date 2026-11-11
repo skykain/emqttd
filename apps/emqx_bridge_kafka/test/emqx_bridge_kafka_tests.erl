@@ -1,0 +1,395 @@
+%%--------------------------------------------------------------------
+%% Copyright (c) 2023-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
+%%--------------------------------------------------------------------
+
+-module(emqx_bridge_kafka_tests).
+
+-include_lib("eunit/include/eunit.hrl").
+
+-export([atoms/0]).
+
+%% ensure atoms exist
+atoms() -> [myproducer, my_consumer].
+
+%%===========================================================================
+%% Test cases
+%%===========================================================================
+
+message_key_dispatch_validations_test() ->
+    ?assertThrow(
+        {_, [
+            #{
+                path := "actions.kafka_producer.x.parameters",
+                reason := "Message key cannot be empty when `key_dispatch` strategy is used"
+            }
+        ]},
+        emqx_bridge_kafka_testlib:action_config(#{
+            <<"parameters">> => #{
+                <<"message">> => #{<<"key">> => <<"">>},
+                <<"partition_strategy">> => <<"key_dispatch">>
+            }
+        })
+    ),
+    ok.
+
+tcp_keepalive_validation_test_() ->
+    ProducerConf = emqx_bridge_kafka_testlib:action_connector_config(#{}),
+    ConsumerConf = emqx_bridge_kafka_testlib:source_connector_config(#{}),
+    test_keepalive_validation(action, ProducerConf) ++
+        test_keepalive_validation(source, ConsumerConf).
+
+test_keepalive_validation(Kind, Conf) ->
+    Check = fun(X) ->
+        case Kind of
+            action -> check_action_connector(X);
+            source -> check_source_connector(X)
+        end
+    end,
+    Path = [<<"socket_opts">>, <<"tcp_keepalive">>],
+    Conf1 = emqx_utils_maps:deep_force_put(Path, Conf, <<"5,6,7">>),
+    Conf2 = emqx_utils_maps:deep_force_put(Path, Conf, <<"none">>),
+    ValidConfs = [Conf, Conf1, Conf2],
+    InvalidConf = emqx_utils_maps:deep_force_put(Path, Conf, <<"invalid">>),
+    InvalidConf1 = emqx_utils_maps:deep_force_put(Path, Conf, <<"5,6">>),
+    InvalidConf2 = emqx_utils_maps:deep_force_put(Path, Conf, <<"5,6,1000">>),
+    InvalidConfs = [InvalidConf, InvalidConf1, InvalidConf2],
+    [?_assertMatch(#{}, Check(C)) || C <- ValidConfs] ++
+        [?_assertThrow(_, Check(C)) || C <- InvalidConfs].
+
+ipv6_bootstrap_hosts_validation_test_() ->
+    ProducerConf = emqx_bridge_kafka_testlib:action_connector_config(#{}),
+    ConsumerConf = emqx_bridge_kafka_testlib:source_connector_config(#{}),
+    test_ipv6_bootstrap_hosts(fun check_action_connector/1, ProducerConf) ++
+        test_ipv6_bootstrap_hosts(fun check_source_connector/1, ConsumerConf).
+
+test_ipv6_bootstrap_hosts(Check, Conf) ->
+    WithHosts = fun(Hosts) -> Conf#{<<"bootstrap_hosts">> => Hosts} end,
+    ValidHosts = [<<"[::1]:9092">>, <<"[::1]">>, <<"[fd00::5]:9092,host2:9093">>],
+    [?_assertMatch(#{<<"bootstrap_hosts">> := H}, Check(WithHosts(H))) || H <- ValidHosts] ++
+        [?_assertThrow(_, Check(WithHosts(<<"::1:9092">>)))].
+
+hosts_test_() ->
+    Hosts = fun emqx_bridge_kafka_impl:hosts/1,
+    [
+        ?_assertEqual([{"::1", 9092}], Hosts(<<"[::1]:9092">>)),
+        ?_assertEqual(
+            [{"fd00::5", 9092}, {"host2", 9093}],
+            Hosts(<<"[fd00::5]:9092,host2:9093">>)
+        ),
+        ?_assertEqual(
+            [{"::1", 9092}],
+            Hosts(emqx_schema:parse_servers(<<"[::1]">>, #{default_port => 9092}))
+        )
+    ].
+
+socket_opts_ip_family_test_() ->
+    Conf = emqx_bridge_kafka_testlib:action_connector_config(#{}),
+    WithFamily = fun(Family) ->
+        emqx_utils_maps:deep_force_put([<<"socket_opts">>, <<"ip_family">>], Conf, Family)
+    end,
+    Families = fun(C) ->
+        #{socket_opts := Opts} = check_action_connector_atom_key(C),
+        [F || F <- emqx_bridge_kafka_impl:socket_opts(Opts), F =:= inet orelse F =:= inet6]
+    end,
+    [
+        {"default adds no family option", ?_assertEqual([], Families(Conf))},
+        {"auto adds no family option", ?_assertEqual([], Families(WithFamily(<<"auto">>)))},
+        {"ipv4 adds inet", ?_assertEqual([inet], Families(WithFamily(<<"ipv4">>)))},
+        {"ipv6 adds inet6", ?_assertEqual([inet6], Families(WithFamily(<<"ipv6">>)))},
+        {"bad value", ?_assertThrow(_, check_action_connector(WithFamily(<<"inet6">>)))}
+    ].
+
+%% `max_batch_age' and `max_retries' accept `infinity' (the default) or a
+%% duration / non-negative integer, and are rejected otherwise.
+producer_max_batch_age_max_retries_schema_test_() ->
+    Check = fun(Overrides) ->
+        emqx_bridge_kafka_testlib:action_config(#{<<"parameters">> => Overrides})
+    end,
+    [
+        {"defaults are infinity",
+            ?_assertMatch(
+                #{
+                    <<"parameters">> := #{
+                        <<"max_batch_age">> := <<"infinity">>,
+                        <<"max_retries">> := <<"infinity">>
+                    }
+                },
+                Check(#{})
+            )},
+        {"duration and integer accepted",
+            ?_assertMatch(
+                #{
+                    <<"parameters">> := #{
+                        <<"max_batch_age">> := <<"500ms">>,
+                        <<"max_retries">> := 3
+                    }
+                },
+                Check(#{<<"max_batch_age">> => <<"500ms">>, <<"max_retries">> => 3})
+            )},
+        {"zero retries accepted",
+            ?_assertMatch(
+                #{<<"parameters">> := #{<<"max_retries">> := 0}},
+                Check(#{<<"max_retries">> => 0})
+            )},
+        {"negative retries rejected", ?_assertThrow(_, Check(#{<<"max_retries">> => -1}))},
+        {"bad duration rejected",
+            ?_assertThrow(_, Check(#{<<"max_batch_age">> => <<"not_a_duration">>}))}
+    ].
+
+%% `reconnect_delay' (producer) defaults to 2s; `request_timeout' (connector)
+%% defaults to 30s; both accept durations.
+producer_reconnect_delay_request_timeout_schema_test_() ->
+    CheckAction = fun(Overrides) ->
+        emqx_bridge_kafka_testlib:action_config(#{<<"parameters">> => Overrides})
+    end,
+    CheckConnector = fun(Overrides) ->
+        check_action_connector(
+            emqx_utils_maps:deep_merge(
+                emqx_bridge_kafka_testlib:action_connector_config(#{}), Overrides
+            )
+        )
+    end,
+    [
+        {"reconnect_delay default is 2s",
+            ?_assertMatch(
+                #{<<"parameters">> := #{<<"reconnect_delay">> := <<"2s">>}},
+                CheckAction(#{})
+            )},
+        {"reconnect_delay is settable",
+            ?_assertMatch(
+                #{<<"parameters">> := #{<<"reconnect_delay">> := <<"1500ms">>}},
+                CheckAction(#{<<"reconnect_delay">> => <<"1500ms">>})
+            )},
+        {"request_timeout default is 30s",
+            ?_assertMatch(
+                #{<<"request_timeout">> := <<"30s">>},
+                CheckConnector(#{})
+            )},
+        {"request_timeout is settable",
+            ?_assertMatch(
+                #{<<"request_timeout">> := <<"1m">>},
+                CheckConnector(#{<<"request_timeout">> => <<"1m">>})
+            )}
+    ].
+
+authentication_union_selector_test_() ->
+    Check = fun(Authentication) ->
+        RawConfig = emqx_bridge_kafka_testlib:source_connector_config(#{
+            <<"authentication">> => Authentication
+        }),
+        CheckedConfig = emqx_bridge_v2_testlib:parse_and_check_connector_not_seriailzable(
+            kafka_consumer, <<"x">>, RawConfig
+        ),
+        emqx_bridge_v2_testlib:parse_and_check_connector_not_seriailzable(
+            kafka_consumer, <<"x">>, CheckedConfig
+        )
+    end,
+    CheckError = fun(Authentication) ->
+        try Check(Authentication) of
+            _ -> no_error
+        catch
+            throw:{_, [Error]} -> Error
+        end
+    end,
+    UsernamePassword = fun(Mechanism) ->
+        #{
+            <<"mechanism">> => Mechanism,
+            <<"username">> => <<"username">>,
+            <<"password">> => <<"password">>
+        }
+    end,
+    Valid = [
+        {"default none", none},
+        {"explicit none", <<"none">>},
+        {"MSK IAM", <<"msk_iam">>},
+        {"OAuth", #{
+            <<"mechanism">> => <<"oauth">>,
+            <<"client_id">> => <<"client-id">>,
+            <<"client_secret">> => <<"client-secret">>,
+            <<"endpoint_uri">> => <<"http://127.0.0.1/oauth/token">>
+        }},
+        {"plain", UsernamePassword(<<"plain">>)},
+        {"SCRAM-SHA-256", UsernamePassword(<<"scram_sha_256">>)},
+        {"SCRAM-SHA-512", UsernamePassword(<<"scram_sha_512">>)},
+        {"Kerberos", #{
+            <<"kerberos_principal">> => <<"principal">>,
+            <<"kerberos_keytab_file">> => <<"keytab-file">>
+        }}
+    ],
+    [
+        {Name, ?_assertMatch(#{}, Check(Authentication))}
+     || {Name, Authentication} <- Valid
+    ] ++
+        [
+            {"unknown mechanism", ?_assertThrow(_, Check(#{<<"mechanism">> => <<"unknown">>}))},
+            {"unknown authentication", ?_assertThrow(_, Check(<<"unknown">>))},
+            {"invalid authentication map is not exposed",
+                ?_test(begin
+                    Error = CheckError(#{<<"client_secret">> => <<"secret">>}),
+                    ?assertMatch(#{field_name := authentication}, Error),
+                    ?assertNot(maps:is_key(got, Error))
+                end)}
+        ].
+
+%% The wolff ack callback for the wolff 4.2.0 drop reasons: `message_expired'
+%% is reported as `request_expired' (concludes the rule action without bumping
+%% resource metrics; `dropped'/`dropped.expired' are bumped via the
+%% [wolff, dropped_expired] telemetry handler), while `max_retry_exceeded' is
+%% reported as a regular error (counted as `failed' by the reply path).
+on_kafka_ack_drop_reasons_test_() ->
+    AckResult = fun(Reason) ->
+        Ref = make_ref(),
+        Self = self(),
+        ReplyFn = {fun(R) -> Self ! {Ref, R} end, []},
+        ok = emqx_bridge_kafka_impl_producer:on_kafka_ack(0, Reason, ReplyFn),
+        receive
+            {Ref, Result} -> Result
+        after 1_000 -> timeout
+        end
+    end,
+    [
+        {"message_expired -> request_expired",
+            ?_assertEqual({error, request_expired}, AckResult(message_expired))},
+        {"max_retry_exceeded -> max_retry_exceeded",
+            ?_assertEqual({error, max_retry_exceeded}, AckResult(max_retry_exceeded))}
+    ].
+
+custom_group_id_test() ->
+    BadSourceConfig = emqx_bridge_kafka_testlib:source_config(#{
+        <<"parameters">> =>
+            #{<<"group_id">> => <<"">>}
+    }),
+    %% Empty strings will be treated as absent by the connector.
+    ?assertMatch(
+        #{<<"parameters">> := #{<<"group_id">> := <<"">>}},
+        check_source(BadSourceConfig)
+    ),
+    CustomId = <<"custom_id">>,
+    OkSourceConfig = emqx_bridge_kafka_testlib:source_config(#{
+        <<"parameters">> =>
+            #{<<"group_id">> => CustomId}
+    }),
+    ?assertMatch(
+        #{<<"parameters">> := #{<<"group_id">> := CustomId}},
+        check_source(OkSourceConfig)
+    ),
+    ok.
+
+%% `client_opts/1` only forwards connection options that the user configured.
+client_opts_test_() ->
+    ClientOpts = fun emqx_bridge_kafka_impl:client_opts/1,
+    [
+        ?_assertEqual(#{}, ClientOpts(#{})),
+        ?_assertEqual(#{}, ClientOpts(#{kafka_client_id => <<>>})),
+        ?_assertEqual(
+            #{client_id => <<"test-client">>}, ClientOpts(#{kafka_client_id => <<"test-client">>})
+        )
+    ].
+
+producer_client_options_schema_test_() ->
+    [
+        ?_assertMatch(
+            #{<<"kafka_client_id">> := <<"test-client">>},
+            emqx_bridge_kafka_testlib:action_connector_config(#{
+                <<"kafka_client_id">> => <<"test-client">>
+            })
+        ),
+        ?_assertThrow(
+            _,
+            emqx_bridge_kafka_testlib:source_connector_config(#{
+                <<"kafka_client_id">> => <<"test-client">>
+            })
+        ),
+        ?_test(begin
+            lists:foreach(
+                fun(Name) ->
+                    Fields = emqx_bridge_kafka:fields(Name),
+                    ?assert(lists:keymember(kafka_client_id, 1, Fields)),
+                    ?assertNot(lists:keymember(query_api_versions, 1, Fields)),
+                    ?assertNot(lists:keymember(api_versions_request_version, 1, Fields))
+                end,
+                ["post_connector", "config_connector_producer"]
+            )
+        end),
+        ?_test(begin
+            lists:foreach(
+                fun(Name) ->
+                    ?assertNot(lists:keymember(kafka_client_id, 1, emqx_bridge_kafka:fields(Name)))
+                end,
+                ["config_producer", "config_bridge_v2"]
+            )
+        end),
+        ?_test(begin
+            ?assertNot(
+                lists:keymember(
+                    kafka_client_id, 1, emqx_bridge_kafka:kafka_connector_config_fields()
+                )
+            ),
+            ?assertNot(
+                lists:keymember(kafka_client_id, 1, emqx_bridge_kafka:fields("config_connector"))
+            )
+        end),
+        ?_assertThrow(
+            _,
+            emqx_bridge_kafka_testlib:action_connector_config(#{<<"query_api_versions">> => false})
+        ),
+        ?_assertThrow(
+            _,
+            emqx_bridge_kafka_testlib:action_connector_config(#{
+                <<"api_versions_request_version">> => 1
+            })
+        )
+    ].
+
+producer_client_id_length_schema_test_() ->
+    WithClientId = fun(Id) ->
+        emqx_bridge_kafka_testlib:action_connector_config(#{
+            <<"kafka_client_id">> => Id
+        })
+    end,
+    ThreeByteChar = <<16#20AC/utf8>>,
+    %% 10922 three-byte UTF-8 characters plus a one- or two-byte ASCII suffix.
+    Utf8Id = fun(AsciiBytes) ->
+        iolist_to_binary([
+            binary:copy(ThreeByteChar, 10922),
+            binary:copy(<<"a">>, AsciiBytes)
+        ])
+    end,
+    [
+        {"32767 bytes is accepted",
+            ?_assertMatch(
+                #{<<"kafka_client_id">> := _},
+                WithClientId(binary:copy(<<"a">>, 32767))
+            )},
+        {"32768 bytes is rejected", ?_assertThrow(_, WithClientId(binary:copy(<<"a">>, 32768)))},
+        {"empty string is accepted",
+            ?_assertMatch(#{<<"kafka_client_id">> := <<>>}, WithClientId(<<>>))},
+        {"32767 bytes of UTF-8 text is accepted",
+            ?_assertMatch(#{<<"kafka_client_id">> := _}, WithClientId(Utf8Id(1)))},
+        {"32768 bytes of UTF-8 text is rejected", ?_assertThrow(_, WithClientId(Utf8Id(2)))}
+    ].
+
+%%===========================================================================
+%% Helper functions
+%%===========================================================================
+
+check_source(Conf) ->
+    emqx_bridge_v2_testlib:parse_and_check(source, kafka_consumer, <<"x">>, Conf).
+
+check_action_connector(Conf) ->
+    emqx_bridge_v2_testlib:parse_and_check_connector(kafka_producer, <<"x">>, Conf).
+
+check_source_connector(Conf) ->
+    emqx_bridge_v2_testlib:parse_and_check_connector(kafka_consumer, <<"x">>, Conf).
+
+check_action_connector_atom_key(Conf) ->
+    RawConf = #{<<"connectors">> => #{<<"kafka_producer">> => #{<<"myproducer">> => Conf}}},
+    #{connectors := #{kafka_producer := #{myproducer := Checked}}} =
+        hocon_tconf:check_plain(
+            emqx_connector_schema, RawConf, #{atom_key => true, required => false}
+        ),
+    Checked.
+
+%%===========================================================================
+%% Data section
+%%===========================================================================

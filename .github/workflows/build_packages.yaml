@@ -1,465 +1,406 @@
 name: Cross build packages
 
+concurrency:
+  group: build-packages-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
 on:
-  schedule:
-    - cron:  '0 */6 * * *'
-  push:
-    tags:
-      - v*
-      - e*
-  release:
-    types:
-      - published
+  workflow_call:
+    inputs:
+      profile:
+        required: true
+        type: string
+      publish:
+        required: true
+        type: boolean
+      notarize:
+        required: false
+        type: boolean
+        default: false
+      otp_vsn:
+        required: true
+        type: string
+      elixir_vsn:
+        required: true
+        type: string
+      builder_vsn:
+        required: true
+        type: string
+    secrets:
+      AWS_ACCESS_KEY_ID:
+        required: true
+      AWS_SECRET_ACCESS_KEY:
+        required: true
+      AWS_DEFAULT_REGION:
+        required: true
+      AWS_S3_BUCKET:
+        required: true
+      AWS_CLOUDFRONT_ID:
+        required: true
+      APPLE_ID_PASSWORD:
+        required: true
+      APPLE_DEVELOPER_IDENTITY:
+        required: true
+      APPLE_DEVELOPER_ID_BUNDLE:
+        required: true
+      APPLE_DEVELOPER_ID_BUNDLE_PASSWORD:
+        required: true
+      APPLE_DEVELOPER_ID_BUNDLE_NEW:
+        required: true
+      APPLE_DEVELOPER_ID_BUNDLE_PASSWORD_NEW:
+        required: true
   workflow_dispatch:
+    inputs:
+      ref:
+        required: false
+      profile:
+        required: true
+        default: 'emqx-enterprise'
+      publish:
+        required: false
+        type: boolean
+        default: false
+      notarize:
+        required: false
+        type: boolean
+        default: false
+      otp_vsn:
+        required: false
+        type: string
+        default: '28.5.0.7-6'
+      elixir_vsn:
+        required: false
+        type: string
+        default: '1.19.1'
+      builder_vsn:
+        required: false
+        type: string
+        default: '6.2-5'
+
+permissions:
+  contents: read
 
 jobs:
-  prepare:
-    runs-on: ubuntu-20.04
-    container: emqx/build-env:erl23.2.7.1-emqx-1-ubuntu20.04
-
+  # scripts/rel/build_matrix.py is the single source of truth for the platforms
+  # offered as emqx.com downloads (it also drives the download-links script).
+  # The linux and mac jobs below read their os/arch dimensions from these
+  # outputs via fromJSON, so the build matrix cannot drift from the
+  # download-links matrix. (Snap is not an emqx.com download; its matrix stays
+  # inline in the snap job.)
+  prepare-matrix:
+    runs-on: ubuntu-latest
     outputs:
-      profiles: ${{ steps.set_profile.outputs.profiles}}
-
+      linux_os: ${{ steps.matrix.outputs.linux_os }}
+      linux_arch: ${{ steps.matrix.outputs.linux_arch }}
+      linux_exclude: ${{ steps.matrix.outputs.linux_exclude }}
+      mac_os: ${{ steps.matrix.outputs.mac_os }}
     steps:
-      - uses: actions/checkout@v2
-        with:
-          path: source
-      - name: set profile
-        id: set_profile
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        ref: ${{ github.event.inputs.ref }}
+    - name: compute package matrix
+      id: matrix
+      run: ./scripts/rel/build_matrix.py --github >> "$GITHUB_OUTPUT"
+
+  plugins-linux-debian13-amd64:
+    runs-on: ${{ github.repository_owner == 'emqx' && 'aws-ubuntu22.04-amd64' || 'ubuntu-22.04' }}
+    defaults:
+      run:
         shell: bash
-        run: |
-          if make -C source emqx-ee --dry-run > /dev/null 2>&1; then
-            echo "::set-output name=profiles::[\"emqx-ee\"]"
-          else
-            echo "::set-output name=profiles::[\"emqx\", \"emqx-edge\"]"
-          fi
-      - name: get_all_deps
-        if: endsWith(github.repository, 'emqx')
-        run: |
-          make -C source deps-all
-          zip -ryq source.zip source
-      - name: get_all_deps
-        if: endsWith(github.repository, 'enterprise')
-        run: |
-          echo "https://ci%40emqx.io:${{ secrets.CI_GIT_TOKEN }}@github.com" > $HOME/.git-credentials
-          git config --global credential.helper store
-          echo "${{ secrets.CI_GIT_TOKEN }}" >> source/scripts/git-token
-          make -C source deps-all
-          zip -ryq source.zip source
-      - uses: actions/upload-artifact@v2
-        with:
-          name: source
-          path: source.zip
-
-  windows:
-    runs-on: windows-2019
-
-    needs: prepare
-    if: endsWith(github.repository, 'emqx')
-
-    strategy:
-      matrix:
-        profile: ${{fromJSON(needs.prepare.outputs.profiles)}}
-        exclude:
-          - profile: emqx-edge
-
     steps:
-    - uses: actions/download-artifact@v2
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
-        name: source
-        path: .
-    - name: unzip source code
-      run: Expand-Archive -Path source.zip -DestinationPath ./
-    - uses: ilammy/msvc-dev-cmd@v1
-    - uses: gleam-lang/setup-erlang@v1.1.0
-      id: install_erlang
-      with:
-        otp-version: 23.2
-    - name: build
+        ref: ${{ github.event.inputs.ref }}
+        fetch-depth: 0
+    - name: build plugins in debian13 builder
       env:
-        PYTHON: python
+        BUILDER: "ghcr.io/emqx/emqx-builder/${{ inputs.builder_vsn }}:${{ inputs.elixir_vsn }}-${{ inputs.otp_vsn }}-debian13"
       run: |
-        $env:PATH = "${{ steps.install_erlang.outputs.erlpath }}\bin;$env:PATH"
-
-        $version = $( "${{ github.ref }}" -replace "^(.*)/(.*)/" )
-        if ($version -match "^v[0-9]+\.[0-9]+(\.[0-9]+)?") {
-          $regex = "[0-9]+\.[0-9]+(-alpha|-beta|-rc)?\.[0-9]"
-          $pkg_name = "${{ matrix.profile }}-windows-$([regex]::matches($version, $regex).value).zip"
-          }
-        else {
-          $pkg_name = "${{ matrix.profile }}-windows-$($version -replace '/').zip"
-          }
-        cd source
-        ## We do not build/release bcrypt for windows package
-        Remove-Item -Recurse -Force -Path _build/default/lib/bcrypt/
-        if (Test-Path rebar.lock) {
-            Remove-Item -Force -Path rebar.lock
-        }
-        make ${{ matrix.profile }}
-        mkdir -p _packages/${{ matrix.profile }}
-        Compress-Archive -Path _build/${{ matrix.profile }}/rel/emqx -DestinationPath _build/${{ matrix.profile }}/rel/$pkg_name
-        mv _build/${{ matrix.profile }}/rel/$pkg_name _packages/${{ matrix.profile }}
-        Get-FileHash -Path "_packages/${{ matrix.profile }}/$pkg_name" | Format-List | grep 'Hash' | awk '{print $3}'  > _packages/${{ matrix.profile }}/$pkg_name.sha256
-    - name: run emqx
-      timeout-minutes: 1
-      run: |
-        cd source
-        ./_build/${{ matrix.profile }}/rel/emqx/bin/emqx start
-        Start-Sleep -s 5
-        ./_build/${{ matrix.profile }}/rel/emqx/bin/emqx stop
-        ./_build/${{ matrix.profile }}/rel/emqx/bin/emqx install
-        ./_build/${{ matrix.profile }}/rel/emqx/bin/emqx uninstall
-    - uses: actions/upload-artifact@v1
-      if: startsWith(github.ref, 'refs/tags/')
+        docker run --rm \
+          -v "$PWD:/emqx" \
+          -w /emqx \
+          "$BUILDER" \
+          bash -lc "git config --global --add safe.directory /emqx && make emqx-enterprise-compile && make plugins"
+    - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
       with:
-        name: ${{ matrix.profile }}
-        path: source/_packages/${{ matrix.profile }}/.
+        name: "plugins"
+        path: |
+          _build/plugins/*.tar.gz
+          _build/plugins/*.sha256
+        retention-days: 7
 
   mac:
-    runs-on: macos-10.15
-
-    needs: prepare
-
+    needs: prepare-matrix
     strategy:
+      fail-fast: false
       matrix:
-        profile: ${{fromJSON(needs.prepare.outputs.profiles)}}
-        exclude:
-          - profile: emqx-edge
-
+        profile:
+          - ${{ inputs.profile }}
+        os: ${{ fromJSON(needs.prepare-matrix.outputs.mac_os) }}
+        otp:
+          - ${{ inputs.otp_vsn }}
+        elixir:
+          - ${{ inputs.elixir_vsn }}
+    runs-on: ${{ matrix.os }}
     steps:
-    - uses: actions/download-artifact@v2
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
-        name: source
-        path: .
-    - name: unzip source code
-      run: unzip -q source.zip
-    - name: prepare
+        ref: ${{ github.event.inputs.ref }}
+        fetch-depth: 0
+    - uses: ./.github/actions/package-macos
+      with:
+        profile: ${{ matrix.profile }}
+        otp: ${{ matrix.otp }}
+        elixir: ${{ matrix.elixir }}
+        os: ${{ matrix.os }}
+        notarize: false
+        apple_id_password: ${{ secrets.APPLE_ID_PASSWORD }}
+        apple_developer_identity: ${{ secrets.APPLE_DEVELOPER_IDENTITY }}
+        apple_developer_id_bundle: ${{ secrets.APPLE_DEVELOPER_ID_BUNDLE_NEW }}
+        apple_developer_id_bundle_password: ${{ secrets.APPLE_DEVELOPER_ID_BUNDLE_PASSWORD_NEW }}
+    - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      if: success() && inputs.publish
+      with:
+        name: build-${{ matrix.profile }}-${{ matrix.os }}-${{ matrix.otp }}
+        path: _packages/${{ matrix.profile }}/
+        retention-days: 7
+    - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      if: success() && !inputs.publish
+      with:
+        name: package-${{ matrix.profile }}-${{ matrix.os }}-${{ matrix.otp }}
+        path: _packages/${{ matrix.profile }}/
+        retention-days: 7
+
+  finalize-mac:
+    needs:
+      - mac
+      - prepare-matrix
+    if: inputs.publish
+    strategy:
+      fail-fast: false
+      matrix:
+        profile:
+          - ${{ inputs.profile }}
+        os: ${{ fromJSON(needs.prepare-matrix.outputs.mac_os) }}
+        otp:
+          - ${{ inputs.otp_vsn }}
+
+    runs-on: ${{ matrix.os }}
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        ref: ${{ github.event.inputs.ref }}
+    - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+      with:
+        name: build-${{ matrix.profile }}-${{ matrix.os }}-${{ matrix.otp }}
+    - name: Finalize macOS package
+      shell: bash
+      env:
+        APPLE_SIGN_BINARIES: 1
+        APPLE_NOTARIZE_PACKAGE: ${{ inputs.notarize }}
+        APPLE_ID: developers@emqx.io
+        APPLE_TEAM_ID: 26N6HYJLZA
+        APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
       run: |
-        brew install curl zip unzip gnu-sed kerl unixodbc freetds
-        echo "/usr/local/bin" >> $GITHUB_PATH
-        git config --global credential.helper store
-    - name: build erlang
-      timeout-minutes: 60
-      run: |
-        kerl build 23.2.7
-        kerl install 23.2.7 $HOME/.kerl/23.2.7
-    - name: build
-      run: |
-        . $HOME/.kerl/23.2.7/activate
-        make -C source ${{ matrix.profile }}-pkg
-    - name: test
-      run: |
-        cd source
-        pkg_name=$(basename _packages/${{ matrix.profile }}/${{ matrix.profile }}-*.zip)
-        unzip _packages/${{ matrix.profile }}/$pkg_name
-        gsed -i '/emqx_telemetry/d' ./emqx/data/loaded_plugins
-        ./emqx/bin/emqx start || cat emqx/log/erlang.log.1
-        ready='no'
-        for i in {1..10}; do
-          if curl -fs 127.0.0.1:18083 > /dev/null; then
-            ready='yes'
-            break
-          fi
-          sleep 1
-        done
-        if [ "$ready" != "yes" ]; then
-          echo "Timed out waiting for emqx to be ready"
-          cat emqx/log/erlang.log.1
-          exit 1
+        set -euo pipefail
+        pkg_name=$(find . -mindepth 1 -maxdepth 1 -iname \*.zip)
+        if [ "${APPLE_NOTARIZE_PACKAGE}" = "true" ]; then
+          ./scripts/rel/macos-notarize-package.sh "$pkg_name"
+        else
+          echo "Skipping macOS package notarization for this ref"
         fi
-        ./emqx/bin/emqx_ctl status
-        ./emqx/bin/emqx stop
-        rm -rf emqx
-        openssl dgst -sha256 ./_packages/${{ matrix.profile }}/$pkg_name | awk '{print $2}'  > ./_packages/${{ matrix.profile }}/$pkg_name.sha256
-    - uses: actions/upload-artifact@v1
-      if: startsWith(github.ref, 'refs/tags/')
+        openssl dgst -sha256 "$pkg_name" | cut -d ' ' -f 2 > "$pkg_name.sha256"
+    - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
       with:
-        name: ${{ matrix.profile }}
-        path: source/_packages/${{ matrix.profile }}/.
+        name: package-${{ matrix.profile }}-${{ matrix.os }}-${{ matrix.otp }}
+        path: |
+          *.zip
+          *.zip.sha256
+        retention-days: 7
 
   linux:
-    runs-on: ubuntu-20.04
-
-    needs: prepare
-
+    needs: prepare-matrix
+    runs-on: ${{ github.repository_owner == 'emqx' && format('aws-ubuntu22.04-{0}', matrix.arch) || (matrix.arch == 'arm64' && 'ubuntu-22.04-arm' || 'ubuntu-22.04') }}
     strategy:
+      fail-fast: false
       matrix:
-        profile: ${{fromJSON(needs.prepare.outputs.profiles)}}
-        arch:
-          - amd64
-          - arm64
-        os:
-          - ubuntu20.04
-          - ubuntu18.04
-          - ubuntu16.04
-          - debian10
-          - debian9
-          # - opensuse
-          - centos8
-          - centos7
-          - centos6
-          - raspbian10
-          - raspbian9
-        exclude:
-        - os: centos6
-          arch: arm64
-        - os: raspbian9
-          arch: amd64
-        - os: raspbian10
-          arch: amd64
-        - os: raspbian9
-          profile: emqx
-        - os: raspbian10
-          profile: emqx
-        - os: raspbian9
-          profile: emqx-ee
-        - os: raspbian10
-          profile: emqx-ee
+        profile:
+          - ${{ inputs.profile }}
+        os: ${{ fromJSON(needs.prepare-matrix.outputs.linux_os) }}
+        arch: ${{ fromJSON(needs.prepare-matrix.outputs.linux_arch) }}
+        otp:
+          - ${{ inputs.otp_vsn }}
+        builder:
+          - ${{ inputs.builder_vsn }}
+        elixir:
+          - ${{ inputs.elixir_vsn }}
+        exclude: ${{ fromJSON(needs.prepare-matrix.outputs.linux_exclude) }}
 
     defaults:
       run:
         shell: bash
 
     steps:
-    - name: prepare docker
-      run: |
-        mkdir -p $HOME/.docker
-        echo '{ "experimental": "enabled" }' | tee $HOME/.docker/config.json
-        echo '{ "experimental": true, "storage-driver": "overlay2", "max-concurrent-downloads": 50, "max-concurrent-uploads": 50}' | sudo tee /etc/docker/daemon.json
-        sudo systemctl restart docker
-        docker info
-        docker buildx create --use --name mybuild
-        docker run --rm --privileged tonistiigi/binfmt --install all
-    - uses: actions/download-artifact@v2
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
-        name: source
-        path: .
-    - name: unzip source code
-      run: unzip -q source.zip
-    - name: downloads emqx zip packages
+        ref: ${{ github.event.inputs.ref }}
+        fetch-depth: 0
+    - name: build tgz
       env:
         PROFILE: ${{ matrix.profile }}
         ARCH: ${{ matrix.arch }}
-        SYSTEM: ${{ matrix.os }}
+        OS: ${{ matrix.os }}
+        BUILDER: "ghcr.io/emqx/emqx-builder/${{ matrix.builder }}:${{ matrix.elixir }}-${{ matrix.otp }}-${{ matrix.os }}"
+        BUILDER_SYSTEM: force_docker
       run: |
-        set -e -u -x
-        cd source
-        if [ $PROFILE = "emqx" ];then broker="emqx-ce"; else broker="$PROFILE"; fi
-        if [ $PROFILE = "emqx-ee" ];then edition='enterprise'; else edition='opensource'; fi
-
-        vsn="$(grep -E "define.+EMQX_RELEASE.+${edition}" include/emqx_release.hrl | cut -d '"' -f2)"
-        pre_vsn="$(echo $vsn | grep -oE '^[0-9]+.[0-9]')"
-        if  [ $PROFILE = "emqx-ee" ]; then
-            old_vsns=($(git tag -l "e$pre_vsn.[0-9]" | sed "s/e$vsn//"))
-        else
-            old_vsns=($(git tag -l "v$pre_vsn.[0-9]" | sed "s/v$vsn//"))
-        fi
-
-        mkdir -p tmp/relup_packages/$PROFILE
-        cd tmp/relup_packages/$PROFILE
-        for tag in ${old_vsns[@]};do
-          if [ ! -z "$(echo  $(curl -I -m 10 -o /dev/null -s -w %{http_code} https://s3-${{ secrets.AWS_DEFAULT_REGION }}.amazonaws.com/${{ secrets.AWS_S3_BUCKET }}/$broker/$tag/$PROFILE-$SYSTEM-${tag#[e|v]}-$ARCH.zip) | grep -oE "^[23]+")" ];then
-            wget https://s3-${{ secrets.AWS_DEFAULT_REGION }}.amazonaws.com/${{ secrets.AWS_S3_BUCKET }}/$broker/$tag/$PROFILE-$SYSTEM-${tag#[e|v]}-$ARCH.zip
-            wget https://s3-${{ secrets.AWS_DEFAULT_REGION }}.amazonaws.com/${{ secrets.AWS_S3_BUCKET }}/$broker/$tag/$PROFILE-$SYSTEM-${tag#[e|v]}-$ARCH.zip.sha256
-            echo "$(cat $PROFILE-$SYSTEM-${tag#[e|v]}-$ARCH.zip.sha256) $PROFILE-$SYSTEM-${tag#[e|v]}-$ARCH.zip" | sha256sum -c || exit 1
-          fi
-        done
-        cd -
-    - name: build emqx packages
+        ./scripts/buildx.sh \
+          --profile $PROFILE \
+          --arch $ARCH \
+          --builder $BUILDER \
+          --pkgtype tgz
+    - name: build pkg
       env:
-        ERL_OTP: erl23.2.7.1-emqx-1
         PROFILE: ${{ matrix.profile }}
         ARCH: ${{ matrix.arch }}
-        SYSTEM: ${{ matrix.os }}
+        OS: ${{ matrix.os }}
+        BUILDER: "ghcr.io/emqx/emqx-builder/${{ matrix.builder }}:${{ matrix.elixir }}-${{ matrix.otp }}-${{ matrix.os }}"
+        BUILDER_SYSTEM: force_docker
       run: |
-        set -e -u
-        cd source
-        docker buildx build --no-cache \
-          --platform=linux/$ARCH \
-          -t cross_build_emqx_for_$SYSTEM \
-          -f .ci/build_packages/Dockerfile \
-          --build-arg BUILD_FROM=emqx/build-env:$ERL_OTP-$SYSTEM \
-          --build-arg EMQX_NAME=$PROFILE \
-          --output type=tar,dest=/tmp/cross-build-$PROFILE-for-$SYSTEM.tar .
-
-        mkdir -p /tmp/packages/$PROFILE
-        tar -xvf /tmp/cross-build-$PROFILE-for-$SYSTEM.tar --wildcards emqx/_packages/$PROFILE/*
-        mv emqx/_packages/$PROFILE/* /tmp/packages/$PROFILE/
-        rm -rf /tmp/cross-build-$PROFILE-for-$SYSTEM.tar
-
-        docker rm -f $(docker ps -a -q)
-        docker volume prune -f
-    - name: create sha256
-      env:
-        PROFILE: ${{ matrix.profile}}
-      run: |
-        if [ -d /tmp/packages/$PROFILE ]; then
-          cd /tmp/packages/$PROFILE
-            for var in $(ls emqx-* ); do
-              bash -c "echo $(sha256sum $var | awk '{print $1}') > $var.sha256"
-            done
-          cd -
-        fi
-    - uses: actions/upload-artifact@v1
-      if: startsWith(github.ref, 'refs/tags/')
+        ./scripts/buildx.sh \
+          --profile $PROFILE \
+          --arch $ARCH \
+          --builder $BUILDER \
+          --pkgtype pkg
+    - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
       with:
-        name: ${{ matrix.profile }}
-        path: /tmp/packages/${{ matrix.profile }}/.
+        name: package-${{ matrix.profile }}-${{ matrix.os }}-${{ matrix.arch }}-${{ matrix.builder }}-${{ matrix.otp }}-${{ matrix.elixir }}
+        path: _packages/${{ matrix.profile }}/
+        retention-days: 7
 
-  docker:
-    runs-on: ubuntu-20.04
-
-    needs: prepare
-
+  snap:
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-22.04-arm' || 'ubuntu-22.04' }}
     strategy:
+      fail-fast: false
       matrix:
-        profile: ${{fromJSON(needs.prepare.outputs.profiles)}}
+        profile:
+          - ${{ inputs.profile }}
+        # Snap is published to the Snap Store, not emqx.com, so it is not part
+        # of the download-links matrix in scripts/rel/build_matrix.py; its arch
+        # list is kept inline here.
         arch:
-          - [amd64, x86_64]
-          - [arm64v8, aarch64]
-          - [arm32v7, arm]
-          - [i386, i386]
-          - [s390x, s390x]
-        exclude:
-          - profile: emqx-ee
-            arch: [i386, i386]
-          - profile: emqx-ee
-            arch: [s390x, s390x]
+          - amd64
+          - arm64
+
+    defaults:
+      run:
+        shell: bash
+
+    env:
+      PROFILE: ${{ matrix.profile }}
+      ARCH: ${{ matrix.arch }}
 
     steps:
-    - uses: actions/download-artifact@v2
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
-        name: source
-        path: .
-    - name: unzip source code
-      run: unzip -q source.zip
-    - name: build emqx docker image
+        ref: ${{ github.event.inputs.ref }}
+        fetch-depth: 0
+
+    - name: Build tar.gz
+      env:
+        BUILDER: "ghcr.io/emqx/emqx-builder/${{ inputs.builder_vsn }}:${{ inputs.elixir_vsn }}-${{ inputs.otp_vsn }}-ubuntu22.04"
+        BUILDER_SYSTEM: force_docker
+        SNAP_BASE: core22
+      run: |
+        ./scripts/buildx.sh \
+          --profile $PROFILE \
+          --arch $ARCH \
+          --builder $BUILDER \
+          --pkgtype tgz
+
+        export EMQX_VERSION="$(./pkg-vsn.sh $PROFILE)"
+        export PACKAGE_SOURCE="_packages/${PROFILE}/${PROFILE}-${EMQX_VERSION}-ubuntu22.04-$ARCH.tar.gz"
+        # ensure package version length is capped at 32 characters (enforced by snap)
+        export EMQX_VERSION="${EMQX_VERSION:0:32}"
+        echo "EMQX_VERSION=$EMQX_VERSION" >> $GITHUB_ENV
+        echo "PACKAGE_SOURCE=$PACKAGE_SOURCE" >> $GITHUB_ENV
+        envsubst '${PROFILE},${EMQX_VERSION},${PACKAGE_SOURCE},${SNAP_BASE}' < deploy/snap/snapcraft.yaml > ./snapcraft.yaml
+        cat snapcraft.yaml
+
+    - name: Build snap
+      id: snapcraft
+      uses: snapcore/action-build@3bdaa03e1ba6bf59a65f84a751d943d549a54e79 # v1.3.0
+
+    - name: Show logs if failed
+      if: failure()
+      run: |
+        cat ~/.local/state/snapcraft/log/*.log
+
+    - name: Test snap
+      if: success()
+      run: |
+        sudo snap install "${{ steps.snapcraft.outputs.snap }}" --dangerous --devmode
+        # kill any process potentially running on emqx ports
+        for port in 1883 8883 8083 8084 18083; do
+          sudo fuser -k $port/tcp || true
+        done
+        sudo snap start "${PROFILE}"
+        for i in {1..30}; do
+          echo .
+          sudo snap logs "${PROFILE}" | grep -Eq "EMQX Enterprise ${EMQX_VERSION}.* is running now!" && break
+          sleep 1
+        done
+        if [ $i -eq 30 ]; then
+          sudo snap logs -n=all "${PROFILE}"
+          exit 1
+        fi
+        sudo snap remove "${PROFILE}"
+
+    - name: Upload Snap as an artifact
+      if: success()
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: "package-${{ matrix.profile }}-${{ matrix.arch }}-snap"
+        path: "${{ steps.snapcraft.outputs.snap }}"
+
+  publish_artifacts:
+    runs-on: ubuntu-latest
+    needs:
+      - plugins-linux-debian13-amd64
+      - finalize-mac
+      - linux
+      - snap
+    if: inputs.publish
+    strategy:
+      fail-fast: false
+      matrix:
+        profile:
+          - ${{ inputs.profile }}
+    steps:
+    - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+      with:
+        # Only package artifacts. A broader `<profile>-*` pattern also matched artifacts from other
+        # workflows in the same run (docker images, release and test builds, schema dump) and
+        # published them to S3 and to the GitHub release.
+        pattern: "package-${{ matrix.profile }}-*"
+        path: packages/${{ matrix.profile }}
+        merge-multiple: true
+    - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+      with:
+        name: plugins
+        path: packages/plugins
+    - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ secrets.AWS_DEFAULT_REGION }}
+    - name: upload to aws s3
       env:
         PROFILE: ${{ matrix.profile }}
-        ARCH: ${{ matrix.arch[0] }}
-        QEMU_ARCH: ${{ matrix.arch[1] }}
+        REF_NAME: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.ref || github.ref_name }}
+        AWS_S3_BUCKET: ${{ secrets.AWS_S3_BUCKET }}
+        AWS_CLOUDFRONT_ID: ${{ secrets.AWS_CLOUDFRONT_ID }}
       run: |
-        sudo docker run --rm --privileged multiarch/qemu-user-static --reset -p yes
-
-        cd source
-        sudo TARGET=emqx/$PROFILE ARCH=$ARCH QEMU_ARCH=$QEMU_ARCH  make docker
-        cd _packages/$PROFILE && for var in $(ls ${PROFILE}-docker-* ); do sudo bash -c "echo $(sha256sum $var | awk '{print $1}') > $var.sha256"; done && cd -
-    - uses: actions/upload-artifact@v1
-      if: startsWith(github.ref, 'refs/tags/')
-      with:
-        name: ${{ matrix.profile }}
-        path: source/_packages/${{ matrix.profile }}/.
-
-  delete-artifact:
-    runs-on: ubuntu-20.04
-    needs: [prepare, mac, linux, docker]
-    steps:
-    - uses: geekyeggo/delete-artifact@v1
-      with:
-        name: source
-
-  upload:
-    runs-on: ubuntu-20.04
-
-    if: startsWith(github.ref, 'refs/tags/')
-
-    needs: [prepare, mac, linux, docker]
-
-    strategy:
-      matrix:
-        profile: ${{fromJSON(needs.prepare.outputs.profiles)}}
-
-    steps:
-    - uses: actions/checkout@v2
-    - name: get_version
-      run: |
-        echo 'version<<EOF' >> $GITHUB_ENV
-        echo ${{ github.ref }} | sed -r  "s ^refs/heads/|^refs/tags/(.*) \1 g" >> $GITHUB_ENV
-        echo 'EOF' >> $GITHUB_ENV
-    - uses: actions/download-artifact@v2
-      with:
-        name: ${{ matrix.profile }}
-        path: ./_packages/${{ matrix.profile }}
-    - name: install dos2unix
-      run: sudo apt-get update && sudo apt install -y dos2unix
-    - name: get packages
-      run: |
-        set -e -u
-        cd _packages/${{ matrix.profile }}
-        for var in $( ls |grep emqx |grep -v sha256); do
-          dos2unix $var.sha256
-          echo "$(cat $var.sha256) $var" | sha256sum -c || exit 1
-        done
-        cd -
-    - name: upload aws s3
-      run: |
-        set -e -u
-        if [ "${{ matrix.profile }}"  == "emqx" ];then
-            broker="emqx-ce"
-        else
-            broker=${{ matrix.profile }}
-        fi
-        aws configure set aws_access_key_id ${{ secrets.AWS_ACCESS_KEY_ID }}
-        aws configure set aws_secret_access_key ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        aws configure set default.region ${{ secrets.AWS_DEFAULT_REGION }}
-
-        aws s3 cp --recursive _packages/${{ matrix.profile }} s3://${{ secrets.AWS_S3_BUCKET }}/$broker/${{ env.version }}
-        aws cloudfront create-invalidation --distribution-id ${{ secrets.AWS_CLOUDFRONT_ID }} --paths "/$broker/${{ env.version }}/*"
-    - uses: Rory-Z/upload-release-asset@v1
-      if: github.event_name == 'release'
-      with:
-        repo: emqx
-        path: "_packages/${{ matrix.profile }}/emqx-*"
-        token: ${{ github.token }}
-    - name: update to emqx.io
-      if: github.event_name == 'release'
-      run: |
-        set -e -x -u
-        curl -w %{http_code} \
-             --insecure \
-             -H "Content-Type: application/json" \
-             -H "token: ${{ secrets.EMQX_IO_TOKEN }}" \
-             -X POST \
-             -d "{\"repo\":\"emqx/emqx\", \"tag\": \"${{ env.version }}\" }" \
-             ${{ secrets.EMQX_IO_RELEASE_API }}
-    - name: push docker image to docker hub
-      if: github.event_name == 'release'
-      run: |
-        set -e -x -u
-        sudo make docker-prepare
-        cd _packages/${{ matrix.profile }} && for var in $(ls |grep docker |grep -v sha256); do unzip $var; sudo docker load < ${var%.*}; rm -f ${var%.*}; done && cd -
-        echo ${{ secrets.DOCKER_HUB_TOKEN }} |sudo docker login -u ${{ secrets.DOCKER_HUB_USER }} --password-stdin
-        sudo TARGET=emqx/${{ matrix.profile }} make docker-push
-        sudo TARGET=emqx/${{ matrix.profile }} make docker-manifest-list
-    - name: update repo.emqx.io
-      if: github.event_name == 'release' && endsWith(github.repository, 'enterprise') && matrix.profile == 'emqx-ee'
-      run: |
-        curl --silent --show-error \
-          -H "Authorization: token ${{ secrets.CI_GIT_TOKEN }}" \
-          -H "Accept: application/vnd.github.v3+json" \
-          -X POST \
-          -d "{\"ref\":\"v1.0.1\",\"inputs\":{\"version\": \"${{ env.version }}\", \"emqx_ee\": \"true\"}}" \
-          "https://api.github.com/repos/emqx/emqx-ci-helper/actions/workflows/update_emqx_repos.yaml/dispatches"
-    - name: update repo.emqx.io
-      if: github.event_name == 'release' && endsWith(github.repository, 'emqx') && matrix.profile == 'emqx'
-      run: |
-        curl --silent --show-error \
-          -H "Authorization: token ${{ secrets.CI_GIT_TOKEN }}" \
-          -H "Accept: application/vnd.github.v3+json" \
-          -X POST \
-          -d "{\"ref\":\"v1.0.1\",\"inputs\":{\"version\": \"${{ env.version }}\", \"emqx_ce\": \"true\"}}" \
-          "https://api.github.com/repos/emqx/emqx-ci-helper/actions/workflows/update_emqx_repos.yaml/dispatches"
-    - name: update homebrew packages
-      if: github.event_name == 'release' && endsWith(github.repository, 'emqx') && matrix.profile == 'emqx'
-      run: |
-        if [ -z $(echo $version | grep -oE "(alpha|beta|rc)\.[0-9]") ]; then
-            curl --silent --show-error \
-              -H "Authorization: token ${{ secrets.CI_GIT_TOKEN }}" \
-              -H "Accept: application/vnd.github.v3+json" \
-              -X POST \
-              -d "{\"ref\":\"v1.0.1\",\"inputs\":{\"version\": \"${{ env.version }}\"}}" \
-              "https://api.github.com/repos/emqx/emqx-ci-helper/actions/workflows/update_emqx_homebrew.yaml/dispatches"
-        fi
-    - uses: geekyeggo/delete-artifact@v1
-      with:
-        name: ${{ matrix.profile }}
+        set -eu
+        aws s3 cp --recursive packages/$PROFILE s3://$AWS_S3_BUCKET/emqx-ee/$REF_NAME
+        aws s3 cp --recursive packages/plugins s3://$AWS_S3_BUCKET/emqx-plugins/$REF_NAME/
+        aws cloudfront create-invalidation --distribution-id "$AWS_CLOUDFRONT_ID" --paths "/emqx-ee/$REF_NAME/*" "/emqx-plugins/$REF_NAME/*"

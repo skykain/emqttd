@@ -1,305 +1,530 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_retainer).
 
 -behaviour(gen_server).
 
+%% Backend size/1 calls do not call erlang:size/1.
+-elvis([{elvis_style, no_common_caveats_call, disable}]).
+
 -include("emqx_retainer.hrl").
--include_lib("emqx/include/emqx.hrl").
 -include_lib("emqx/include/logger.hrl").
--include_lib("stdlib/include/ms_transform.hrl").
+-include_lib("emqx/include/emqx_mqtt.hrl").
+-include_lib("emqx/include/emqx_hooks.hrl").
+-include_lib("snabbkaffe/include/snabbkaffe.hrl").
 
--logger_header("[Retainer]").
+-export([start_link/0]).
 
--export([start_link/1]).
+-export([
+    get_expiry_time/1,
+    clean/0,
+    delete/1,
+    read_message/1,
+    page_read/3,
+    page_read/4,
+    match_messages/3,
+    store_retained/1,
+    retained_count/0,
+    is_enabled/0,
+    is_started/0,
+    batch_read_number/0
+]).
 
--export([ load/1
-        , unload/0
-        ]).
+%% Hooks
+-export([
+    on_message_publish/1,
+    post_config_update/5
+]).
 
--export([ on_session_subscribed/3
-        , on_message_publish/2
-        ]).
-
--export([clean/1]).
-
-%% for emqx_pool task func
--export([dispatch/2]).
+%% Internal APIs
+-export([
+    update_config/1,
+    stats_fun/0,
+    backend_module/0,
+    backend_module/1,
+    backend_state/1,
+    context/0,
+    with_backend/1,
+    with_backend/2
+]).
 
 %% gen_server callbacks
--export([ init/1
-        , handle_call/3
-        , handle_cast/2
-        , handle_info/2
-        , terminate/2
-        , code_change/3
-        ]).
+-export([
+    init/1,
+    handle_call/3,
+    handle_cast/2,
+    handle_info/2,
+    terminate/2
+]).
 
--record(state, {stats_fun, stats_timer, expiry_timer}).
+-export_type([
+    deadline/0,
+    cursor/0,
+    context/0,
+    index_incarnation/0,
+    backend_state/0,
+    match_opts/0,
+    match_result/1,
+    read_cost/0
+]).
 
-%%--------------------------------------------------------------------
-%% Load/Unload
-%%--------------------------------------------------------------------
+%% exported for `emqx_telemetry'
+-export([get_basic_usage_info/0]).
 
-load(Env) ->
-    _ = emqx:hook('session.subscribed', fun ?MODULE:on_session_subscribed/3, []),
-    _ = emqx:hook('message.publish', fun ?MODULE:on_message_publish/2, [Env]),
-    ok.
+-type state() :: #{
+    is_started := boolean(),
+    clear_timer := undefined | reference()
+}.
 
-unload() ->
-    emqx:unhook('message.publish', fun ?MODULE:on_message_publish/2),
-    emqx:unhook('session.subscribed', fun ?MODULE:on_session_subscribed/3).
+-type backend_state() :: term().
 
-on_session_subscribed(_, _, #{share := ShareName}) when ShareName =/= undefined ->
-    ok;
-on_session_subscribed(_, Topic, #{rh := Rh, is_new := IsNew}) ->
-    case Rh =:= 0 orelse (Rh =:= 1 andalso IsNew) of
-        true -> emqx_pool:async_submit(fun ?MODULE:dispatch/2, [self(), Topic]);
-        _ -> ok
-    end.
+-type context() ::
+    #{
+        module := module(),
+        state := backend_state()
+    }
+    | undefined.
 
-%% @private
-dispatch(Pid, Topic) ->
-    Msgs = case emqx_topic:wildcard(Topic) of
-               false -> read_messages(Topic);
-               true  -> match_messages(Topic)
-           end,
-    [Pid ! {deliver, Topic, Msg} || Msg  <- sort_retained(Msgs)].
+-type topic() :: emqx_types:topic().
+-type message() :: emqx_types:message().
+-type deadline() :: emqx_utils_calendar:epoch_millisecond().
+-type cursor() :: undefined | term().
+-type has_next() :: boolean().
+-type index_incarnation() :: integer().
+%% `tokens': the topic filter split into words, so that the backend need not split it again.
+-type match_opts() :: #{
+    batch_read_number => pos_integer() | all_remaining,
+    tokens => emqx_types:words()
+}.
+-type read_cost() :: non_neg_integer().
+-type match_result(Cursor) :: {ok, [message()], Cursor, read_cost()}.
+
+-define(CONTEXT_KEY, {?MODULE, context}).
+-define(BATCH_READ_NUM_PD_KEY, {?MODULE, batch_read_num}).
+
+-callback create(hocon:config()) -> backend_state().
+-callback update(backend_state(), hocon:config()) -> ok | need_recreate.
+-callback close(backend_state()) -> ok.
+-callback delete_message(backend_state(), topic()) -> ok.
+-callback store_retained(backend_state(), message()) -> ok.
+-callback page_read(
+    backend_state(),
+    emqx_maybe:t(topic()),
+    deadline(),
+    non_neg_integer(),
+    non_neg_integer()
+) ->
+    {ok, has_next(), list(message())}.
+-callback read_message(backend_state(), topic()) -> {ok, list(message())}.
+-callback match_messages(backend_state(), topic(), cursor(), match_opts()) ->
+    match_result(cursor()).
+-callback clean(backend_state()) -> ok.
+-callback size(backend_state()) -> non_neg_integer().
+-callback current_index_incarnation(backend_state()) -> index_incarnation().
+
+%%------------------------------------------------------------------------------
+%% Hook API
+%%------------------------------------------------------------------------------
 
 %% RETAIN flag set to 1 and payload containing zero bytes
-on_message_publish(Msg = #message{flags   = #{retain := true},
-                                  topic   = Topic,
-                                  payload = <<>>}, _Env) ->
-    mnesia:dirty_delete(?TAB, topic2tokens(Topic)),
-    {ok, Msg};
-
-on_message_publish(Msg = #message{flags = #{retain := true}}, Env) ->
+on_message_publish(
+    Msg = #message{
+        flags = #{retain := true},
+        topic = Topic,
+        payload = <<>>
+    }
+) ->
+    emqx_retainer_publisher:delete_message(Topic),
+    case get_stop_publish_clear_msg() of
+        true ->
+            {ok, emqx_message:set_header(allow_publish, false, Msg)};
+        _ ->
+            {ok, Msg}
+    end;
+on_message_publish(Msg = #message{flags = #{retain := true}}) ->
     Msg1 = emqx_message:set_header(retained, true, Msg),
-    store_retained(Msg1, Env),
+    emqx_retainer_publisher:store_retained(Msg1),
     {ok, Msg};
-on_message_publish(Msg, _Env) ->
+on_message_publish(Msg) ->
     {ok, Msg}.
 
-%%--------------------------------------------------------------------
+%%------------------------------------------------------------------------------
+%% Config API
+%%------------------------------------------------------------------------------
+
+post_config_update([retainer], _UpdateReq, NewConf, OldConf, _AppEnvs) ->
+    ok = call({update_config, NewConf, OldConf}).
+
+%%------------------------------------------------------------------------------
 %% APIs
-%%--------------------------------------------------------------------
+%%------------------------------------------------------------------------------
 
 %% @doc Start the retainer
--spec(start_link(Env :: list()) -> emqx_types:startlink_ret()).
-start_link(Env) ->
-    gen_server:start_link({local, ?MODULE}, ?MODULE, [Env], []).
+-spec start_link() -> emqx_types:startlink_ret().
+start_link() ->
+    gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
 
--spec(clean(emqx_types:topic()) -> non_neg_integer()).
-clean(Topic) when is_binary(Topic) ->
-    case emqx_topic:wildcard(Topic) of
-        true -> match_delete_messages(Topic);
-        false ->
-            Tokens = topic2tokens(Topic),
-            Fun = fun() ->
-                      case mnesia:read({?TAB, Tokens}) of
-                          [] -> 0;
-                          [_M] -> mnesia:delete({?TAB, Tokens}), 1
-                      end
-                  end,
-            {atomic, N} = mnesia:transaction(Fun), N
-    end.
-
-%%--------------------------------------------------------------------
-%% gen_server callbacks
-%%--------------------------------------------------------------------
-
-init([Env]) ->
-    Copies = case proplists:get_value(storage_type, Env, disc) of
-                 ram       -> ram_copies;
-                 disc      -> disc_copies;
-                 disc_only -> disc_only_copies
-             end,
-    StoreProps = [{ets, [compressed,
-                         {read_concurrency, true},
-                         {write_concurrency, true}]},
-                  {dets, [{auto_save, 1000}]}],
-    ok = ekka_mnesia:create_table(?TAB, [
-                {type, set},
-                {Copies, [node()]},
-                {record_name, retained},
-                {attributes, record_info(fields, retained)},
-                {storage_properties, StoreProps}]),
-    ok = ekka_mnesia:copy_table(?TAB, Copies),
-    case mnesia:table_info(?TAB, storage_type) of
-        Copies -> ok;
-        _Other ->
-            {atomic, ok} = mnesia:change_table_copy_type(?TAB, node(), Copies),
-            ok
-    end,
-    StatsFun = emqx_stats:statsfun('retained.count', 'retained.max'),
-    {ok, StatsTimer} = timer:send_interval(timer:seconds(1), stats),
-    State = #state{stats_fun = StatsFun, stats_timer = StatsTimer},
-    {ok, start_expire_timer(proplists:get_value(expiry_interval, Env, 0), State)}.
-
-start_expire_timer(0, State) ->
-    State;
-start_expire_timer(undefined, State) ->
-    State;
-start_expire_timer(Ms, State) ->
-    {ok, Timer} = timer:send_interval(Ms, expire),
-    State#state{expiry_timer = Timer}.
-
-handle_call(Req, _From, State) ->
-    ?LOG(error, "Unexpected call: ~p", [Req]),
-    {reply, ignored, State}.
-
-handle_cast(Msg, State) ->
-    ?LOG(error, "Unexpected cast: ~p", [Msg]),
-    {noreply, State}.
-
-handle_info(stats, State = #state{stats_fun = StatsFun}) ->
-    StatsFun(retained_count()),
-    {noreply, State, hibernate};
-
-handle_info(expire, State) ->
-    ok = expire_messages(),
-    {noreply, State, hibernate};
-
-handle_info(Info, State) ->
-    ?LOG(error, "Unexpected info: ~p", [Info]),
-    {noreply, State}.
-
-terminate(_Reason, #state{stats_timer = TRef1, expiry_timer = TRef2}) ->
-    _ = timer:cancel(TRef1),
-    _ = timer:cancel(TRef2),
-    ok.
-
-code_change(_OldVsn, State, _Extra) ->
-    {ok, State}.
-
-%%--------------------------------------------------------------------
-%% Internal functions
-%%--------------------------------------------------------------------
-
-sort_retained([]) -> [];
-sort_retained([Msg]) -> [Msg];
-sort_retained(Msgs)  ->
-    lists:sort(fun(#message{timestamp = Ts1}, #message{timestamp = Ts2}) ->
-                   Ts1 =< Ts2
-               end, Msgs).
-
-store_retained(Msg = #message{topic = Topic, payload = Payload}, Env) ->
-    case {is_table_full(Env), is_too_big(size(Payload), Env)} of
-        {false, false} ->
-            ok = emqx_metrics:set('messages.retained', retained_count()),
-            mnesia:dirty_write(?TAB, #retained{topic = topic2tokens(Topic),
-                                               msg = Msg,
-                                               expiry_time = get_expiry_time(Msg, Env)});
-        {true, false} ->
-            {atomic, _} = mnesia:transaction(
-                fun() ->
-                    case mnesia:read(?TAB, Topic) of
-                        [_] ->
-                            mnesia:write(?TAB, #retained{topic = topic2tokens(Topic),
-                                                         msg = Msg,
-                                                         expiry_time = get_expiry_time(Msg, Env)}, write);
-                        [] ->
-                            ?LOG(error, "Cannot retain message(topic=~s) for table is full!", [Topic])
-                    end
-                end),
-            ok;
-        {true, _} ->
-            ?LOG(error, "Cannot retain message(topic=~s) for table is full!", [Topic]);
-        {_, true} ->
-            ?LOG(error, "Cannot retain message(topic=~s, payload_size=~p) "
-                        "for payload is too big!", [Topic, iolist_size(Payload)])
-    end.
-
-is_table_full(Env) ->
-    Limit = proplists:get_value(max_retained_messages, Env, 0),
-    Limit > 0 andalso (retained_count() > Limit).
-
-is_too_big(Size, Env) ->
-    Limit = proplists:get_value(max_payload_size, Env, 0),
-    Limit > 0 andalso (Size > Limit).
-
-get_expiry_time(#message{headers = #{properties := #{'Message-Expiry-Interval' := 0}}}, _Env) ->
+-spec get_expiry_time(message()) -> non_neg_integer().
+get_expiry_time(#message{headers = #{properties := #{'Message-Expiry-Interval' := 0}}}) ->
     0;
-get_expiry_time(#message{headers = #{properties := #{'Message-Expiry-Interval' := Interval}}, timestamp = Ts}, _Env) ->
+get_expiry_time(#message{
+    headers = #{properties := #{'Message-Expiry-Interval' := Interval}},
+    timestamp = Ts
+}) ->
     Ts + Interval * 1000;
-get_expiry_time(#message{timestamp = Ts}, Env) ->
-    case proplists:get_value(expiry_interval, Env, 0) of
+get_expiry_time(#message{timestamp = Ts}) ->
+    Interval = emqx_conf:get([retainer, msg_expiry_interval]),
+    case Interval of
         0 -> 0;
-        Interval -> Ts + Interval
+        _ -> Ts + Interval
     end.
 
-%%--------------------------------------------------------------------
-%% Internal funcs
-%%--------------------------------------------------------------------
+-spec update_config(hocon:config()) -> {ok, _} | {error, _}.
+update_config(Conf) ->
+    emqx_conf:update([retainer], Conf, #{override_to => cluster}).
 
--spec(retained_count() -> non_neg_integer()).
-retained_count() -> mnesia:table_info(?TAB, size).
+-spec clean() -> ok.
+clean() ->
+    with_backend(fun(Mod, BackendState) -> Mod:clean(BackendState) end).
 
-topic2tokens(Topic) ->
-    emqx_topic:words(Topic).
+-spec delete(topic()) -> ok.
+delete(Topic) ->
+    with_backend(fun(Mod, BackendState) -> Mod:delete_message(BackendState, Topic) end).
 
-expire_messages() ->
-    NowMs = erlang:system_time(millisecond),
-    MsHd = #retained{topic = '$1', msg = '_', expiry_time = '$3'},
-    Ms = [{MsHd, [{'=/=','$3',0}, {'<','$3',NowMs}], ['$1']}],
-    {atomic, _} = mnesia:transaction(
-        fun() ->
-            Keys = mnesia:select(?TAB, Ms, write),
-            lists:foreach(fun(Key) -> mnesia:delete({?TAB, Key}) end, Keys)
-        end),
+-spec retained_count() -> non_neg_integer().
+retained_count() ->
+    with_backend(fun(Mod, BackendState) -> Mod:size(BackendState) end, 0).
+
+-spec read_message(topic()) -> {ok, list(message())}.
+read_message(Topic) ->
+    with_backend(
+        fun(Mod, BackendState) -> Mod:read_message(BackendState, Topic) end,
+        {ok, []}
+    ).
+
+-spec page_read(emqx_maybe:t(topic()), non_neg_integer(), non_neg_integer()) ->
+    {ok, has_next(), list(message())}.
+page_read(Topic, Page, Limit) ->
+    page_read(Topic, erlang:system_time(millisecond), Page, Limit).
+
+-spec page_read(emqx_maybe:t(topic()), deadline(), non_neg_integer(), non_neg_integer()) ->
+    {ok, has_next(), list(message())}.
+page_read(Topic, Deadline, Page, Limit) ->
+    with_backend(
+        fun(Mod, BackendState) -> Mod:page_read(BackendState, Topic, Deadline, Page, Limit) end,
+        {ok, false, []}
+    ).
+
+-spec match_messages(topic(), cursor(), match_opts()) ->
+    {ok, [message()], cursor()} | {error, any()}.
+match_messages(TopicFilter, Cursor, Opts) ->
+    emqx_retainer:with_backend(
+        fun(Mod, State) ->
+            {ok, Messages, NextCursor, _ReadCost} = Mod:match_messages(
+                State, TopicFilter, Cursor, Opts
+            ),
+            {ok, Messages, NextCursor}
+        end,
+        {error, no_backend}
+    ).
+
+-spec store_retained(message()) -> ok | {error, any()}.
+store_retained(Msg) ->
+    emqx_retainer:with_backend(
+        fun(Mod, State) ->
+            Mod:store_retained(State, Msg)
+        end,
+        {error, no_backend}
+    ).
+
+-spec context() -> context().
+context() ->
+    persistent_term:get(?CONTEXT_KEY, undefined).
+
+-spec is_started() -> boolean().
+is_started() ->
+    call(?FUNCTION_NAME).
+
+-spec is_enabled() -> boolean().
+is_enabled() ->
+    emqx_conf:get([retainer, enable], true).
+
+%%------------------------------------------------------------------------------
+%% Internal APIs
+%%------------------------------------------------------------------------------
+
+stats_fun() ->
+    emqx_stats:setstat('retained.count', 'retained.max', retained_count()).
+
+-spec get_basic_usage_info() -> #{retained_messages => non_neg_integer()}.
+get_basic_usage_info() ->
+    try
+        #{retained_messages => retained_count()}
+    catch
+        _:_ ->
+            #{retained_messages => 0}
+    end.
+
+with_backend(Fun, Default) ->
+    Context = context(),
+    case backend_module(Context) of
+        undefined ->
+            Default;
+        Mod ->
+            BackendState = backend_state(Context),
+            Fun(Mod, BackendState)
+    end.
+
+with_backend(Fun) ->
+    with_backend(Fun, ok).
+
+batch_read_number() ->
+    case emqx:get_config([retainer, flow_control, batch_read_number]) of
+        0 ->
+            all_remaining;
+        BatchNum when is_integer(BatchNum) ->
+            BatchNum
+    end.
+
+%%------------------------------------------------------------------------------
+%% gen_server callbacks
+%%------------------------------------------------------------------------------
+
+init([]) ->
+    erlang:process_flag(trap_exit, true),
+    emqx_conf:add_handler([retainer], ?MODULE),
+    ok = emqx_retainer_channel:register_unsubscribe_hook(),
+    State = new_state(),
+    RetainerConfig = emqx:get_config([retainer]),
+    {ok,
+        case maps:get(enable, RetainerConfig) of
+            false ->
+                %% Cleanup in case of previous crash
+                stop_retainer(State);
+            true ->
+                BackendConfig = enabled_backend_config(RetainerConfig),
+                start_retainer(State, RetainerConfig, BackendConfig)
+        end}.
+
+handle_call({update_config, NewConf, OldConf}, _From, State) ->
+    State2 = update_config(State, NewConf, OldConf),
+    case maps:get(enable, NewConf) of
+        true -> ok = emqx_retainer_limiter:update(NewConf);
+        false -> ok
+    end,
+    {reply, ok, State2};
+handle_call(is_started, _From, State = #{is_started := IsStarted}) ->
+    {reply, IsStarted, State};
+handle_call(Req, _From, State) ->
+    ?SLOG(error, #{msg => "unexpected_call", call => Req}),
+    {reply, ignored, State}.
+handle_cast(Msg, State) ->
+    ?SLOG(error, #{msg => "unexpected_cast", cast => Msg}),
+    {noreply, State}.
+
+handle_info(
+    {timeout, TRef, clear_expired}, #{clear_timer := TRef, is_started := IsStarted} = State
+) ->
+    IsStarted andalso start_clear_expired(),
+    ClearInterval = emqx_conf:get([retainer, msg_clear_interval]),
+    {noreply, State#{clear_timer := maybe_start_timer(ClearInterval, clear_expired)}};
+handle_info(Info, State) ->
+    ?SLOG(error, #{msg => "unexpected_info", info => Info}),
+    {noreply, State}.
+
+terminate(_Reason, #{is_started := IsStarted} = State) ->
+    emqx_conf:remove_handler([retainer]),
+    IsStarted andalso stop_retainer(State),
+    ok = emqx_retainer_channel:unregister_unsubscribe_hook(),
     ok.
 
--spec(read_messages(emqx_types:topic())
-      -> [emqx_types:message()]).
-read_messages(Topic) ->
-    Tokens = topic2tokens(Topic),
-    case mnesia:dirty_read(?TAB, Tokens) of
-        [] -> [];
-        [#retained{msg = Msg, expiry_time = Et}] ->
-            case Et =:= 0 orelse Et >= erlang:system_time(millisecond) of
-                true -> [Msg];
-                false -> []
-            end
+%%------------------------------------------------------------------------------
+%% Internal functions
+%%------------------------------------------------------------------------------
+
+call(Req) ->
+    gen_server:call(?MODULE, Req, infinity).
+
+get_stop_publish_clear_msg() ->
+    emqx_conf:get([retainer, stop_publish_clear_msg], false).
+
+-spec new_state() -> state().
+new_state() ->
+    #{
+        is_started => false,
+        clear_timer => undefined
+    }.
+
+-spec start_clear_expired() -> ok.
+start_clear_expired() ->
+    Opts = #{
+        deadline => erlang:system_time(millisecond),
+        limit => emqx_conf:get([retainer, msg_clear_limit], all)
+    },
+    _Result = emqx_retainer_sup:start_gc(context(), Opts),
+    ok.
+
+-spec update_config(state(), hocon:config(), hocon:config()) -> state().
+update_config(State, NewConfig, OldConfig) ->
+    update_config(
+        maps:get(enable, NewConfig),
+        maps:get(enable, OldConfig),
+        State,
+        NewConfig,
+        OldConfig
+    ).
+
+-spec update_config(boolean(), boolean(), state(), hocon:config(), hocon:config()) -> state().
+update_config(false, _, State, _, _) ->
+    stop_retainer(State);
+update_config(true, false, State, NewConfig, _) ->
+    start_retainer(State, NewConfig, enabled_backend_config(NewConfig));
+update_config(
+    true,
+    true,
+    #{clear_timer := ClearTimer} = State,
+    NewConfig,
+    OldConfig
+) ->
+    #{msg_clear_interval := ClearInterval} = NewConfig,
+    OldBackendConfig = enabled_backend_config(OldConfig),
+    NewBackendConfig = enabled_backend_config(NewConfig),
+    OldMod = config_backend_module(OldBackendConfig),
+    NewMod = config_backend_module(NewBackendConfig),
+
+    SameBackendType = NewMod =:= OldMod,
+    case SameBackendType andalso ok =:= OldMod:update(context(), NewBackendConfig) of
+        true ->
+            State#{
+                clear_timer := update_timer(
+                    ClearTimer,
+                    ClearInterval,
+                    clear_expired
+                )
+            };
+        false ->
+            State2 = stop_retainer(State),
+            start_retainer(State2, NewConfig, NewBackendConfig)
     end.
 
--spec(match_messages(emqx_types:topic())
-      -> [emqx_types:message()]).
-match_messages(Filter) ->
-    NowMs = erlang:system_time(millisecond),
-    Cond = condition(emqx_topic:words(Filter)),
-    MsHd = #retained{topic = Cond, msg = '$2', expiry_time = '$3'},
-    Ms = [{MsHd, [{'=:=','$3',0}], ['$2']},
-          {MsHd, [{'>','$3',NowMs}], ['$2']}],
-    mnesia:dirty_select(?TAB, Ms).
+-spec start_retainer(state(), hocon:config(), hocon:config()) -> state().
+start_retainer(
+    State,
+    #{msg_clear_interval := ClearInterval} = _RetainerConfig,
+    BackendConfig
+) ->
+    ok = create_context(BackendConfig),
+    ok = emqx_retainer_sup:start_workers(),
+    ok = load_hooks(),
+    State#{
+        is_started := true,
+        clear_timer := maybe_start_timer(ClearInterval, clear_expired)
+    }.
 
--spec(match_delete_messages(emqx_types:topic())
-      -> DeletedCnt :: non_neg_integer()).
-match_delete_messages(Filter) ->
-    Cond = condition(emqx_topic:words(Filter)),
-    MsHd = #retained{topic = Cond, msg = '_', expiry_time = '_'},
-    Ms = [{MsHd, [], ['$_']}],
-    Rs = mnesia:dirty_select(?TAB, Ms),
-    lists:foreach(fun(R) -> mnesia:dirty_delete_object(?TAB, R) end, Rs),
-    length(Rs).
+-spec stop_retainer(state()) -> state().
+stop_retainer(
+    #{
+        clear_timer := ClearTimer
+    } = State
+) ->
+    ok = unload_hooks(),
+    ok = emqx_retainer_sup:stop_workers(),
+    ok = close_context(),
+    State#{
+        is_started := false,
+        clear_timer := stop_timer(ClearTimer)
+    }.
 
-%% @private
-condition(Ws) ->
-    Ws1 = [case W =:= '+' of true -> '_'; _ -> W end || W <- Ws],
-    case lists:last(Ws1) =:= '#' of
-        false -> Ws1;
-        _ -> (Ws1 -- ['#']) ++ '_'
+-spec stop_timer(undefined | reference()) -> undefined.
+stop_timer(undefined) ->
+    undefined;
+stop_timer(TimerRef) ->
+    _ = emqx_utils:cancel_timer(TimerRef),
+    undefined.
+
+maybe_start_timer(0, _) ->
+    undefined;
+maybe_start_timer(undefined, _) ->
+    undefined;
+maybe_start_timer(Ms, Content) ->
+    start_timer(Ms, Content).
+
+start_timer(Ms, Content) ->
+    emqx_utils:start_timer(Ms, self(), Content).
+
+update_timer(undefined, Ms, Context) ->
+    maybe_start_timer(Ms, Context);
+update_timer(Timer, 0, _) ->
+    stop_timer(Timer);
+update_timer(Timer, undefined, _) ->
+    stop_timer(Timer);
+update_timer(Timer, _, _) ->
+    Timer.
+
+-spec enabled_backend_config(hocon:config()) -> hocon:config() | no_return().
+enabled_backend_config(#{backend := Backend, external_backends := ExternalBackends} = Config) ->
+    AllBackends = [Backend | maps:values(ExternalBackends)],
+    case lists:search(fun(#{enable := Enable}) -> Enable end, AllBackends) of
+        {value, EnabledBackend} -> EnabledBackend;
+        false -> error({no_enabled_backend, Config})
     end.
+
+-spec config_backend_module(hocon:config()) -> module().
+config_backend_module(Config) ->
+    case Config of
+        #{type := built_in_database} -> emqx_retainer_mnesia;
+        #{module := Module} -> Module
+    end.
+
+-spec backend_module(context()) -> module() | undefined.
+backend_module(#{module := Module}) -> Module;
+backend_module(undefined) -> undefined.
+
+-spec backend_state(context()) -> backend_state().
+backend_state(#{state := State}) -> State.
+
+-spec backend_module() -> module() | no_return().
+backend_module() ->
+    Config = enabled_backend_config(emqx:get_config([retainer])),
+    config_backend_module(Config).
+
+-spec create_context(hocon:config()) -> ok.
+create_context(Cfg) ->
+    Mod = config_backend_module(Cfg),
+    Context = #{
+        module => Mod,
+        state => Mod:create(Cfg)
+    },
+    _ = persistent_term:put(?CONTEXT_KEY, Context),
+    ok.
+
+-spec close_context() -> ok | {error, term()}.
+close_context() ->
+    try
+        with_backend(fun(Mod, BackendState) -> Mod:close(BackendState) end)
+    after
+        persistent_term:erase(?CONTEXT_KEY)
+    end.
+
+-spec load_hooks() -> ok.
+load_hooks() ->
+    %% TODO: customize buffer size?
+    ok = emqx_extsub_handler_registry:register(emqx_retainer_extsub_handler, #{
+        handle_generic_messages => false,
+        multi_topic => false,
+        ignore_resubscribe => false
+    }),
+    ok = emqx_retainer_channel:register_hooks(),
+    ok = emqx_hooks:put('message.publish', {?MODULE, on_message_publish, []}, ?HP_RETAINER),
+    emqx_stats:update_interval(emqx_retainer_stats, fun ?MODULE:stats_fun/0),
+    ok.
+
+-spec unload_hooks() -> ok.
+unload_hooks() ->
+    ok = emqx_hooks:del('message.publish', {?MODULE, on_message_publish}),
+    ok = emqx_retainer_channel:unregister_hooks(),
+    ok = emqx_extsub_handler_registry:unregister(emqx_retainer_extsub_handler),
+    emqx_stats:cancel_update(emqx_retainer_stats),
+    ok.

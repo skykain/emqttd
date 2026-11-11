@@ -1,745 +1,1881 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2023-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_mgmt_data_backup).
 
--include("emqx_mgmt.hrl").
--include_lib("emqx_rule_engine/include/rule_engine.hrl").
--include_lib("emqx/include/emqx.hrl").
+-export([
+    export/0,
+    all_table_set_names/0,
+    compile_mnesia_table_filter/1,
+    export/1,
+    import/1,
+    import/2,
+    import_local/1,
+    import_local/2,
+    format_error/1
+]).
+
+%% HTTP API
+-export([
+    upload/2,
+    upload/3,
+    %% RPC target (v1)
+    maybe_copy_and_import/2,
+    %% RPC target (v2)
+    maybe_copy_and_import/3,
+    read_file/1,
+    delete_file/1,
+    list_files/0,
+    %% RPC target (v3): namespace-scoped file operations
+    read_file/2,
+    delete_file/2,
+    list_files/1,
+    format_conf_errors/1,
+    format_db_errors/1,
+    sensitive_table_set_names/0,
+    peek_sensitive_table_sets/1,
+    peek_backup_scope/2,
+    peek_backup_scope_of_content/1
+]).
+
+-export([default_validate_mnesia_backup/1]).
+
+-export([
+    validate_export_root_keys/1,
+    parse_export_request/1
+]).
+
+%% Only exposed for tests/mocking.
+-export([conf_keys/0]).
+
+-export_type([import_res/0]).
+
+-ifdef(TEST).
+-compile(export_all).
+-compile(nowarn_export_all).
+-include_lib("eunit/include/eunit.hrl").
+-endif.
+
+-elvis([
+    {elvis_style, no_invalid_dynamic_calls, disable},
+    {elvis_style, no_catch_expressions, disable}
+]).
+
 -include_lib("kernel/include/file.hrl").
+-include_lib("emqx/include/logger.hrl").
+-include_lib("emqx/include/emqx_config.hrl").
+-include_lib("snabbkaffe/include/snabbkaffe.hrl").
 
--ifdef(EMQX_ENTERPRISE).
--export([ export_modules/0
-        , export_schemas/0
-        , export_confs/0
-        , import_modules/1
-        , import_schemas/1
-        , import_confs/2
-        ]).
--endif.
+-define(ROOT_BACKUP_DIR, "backup").
+%% Namespaced backups are isolated under `<root>/ns/<Namespace>/'.
+-define(NS_BACKUP_SUBDIR, "ns").
+-define(BACKUP_MNESIA_DIR, "mnesia").
+-define(TAR_SUFFIX, ".tar.gz").
+-define(META_FILENAME, "META.hocon").
+-define(CLUSTER_HOCON_FILENAME, "cluster.hocon").
+-define(DEFAULT_MNESIA_RESTORE_MODE, merge).
+-define(CONF_KEYS, [
+    [<<"delayed">>],
+    [<<"rewrite">>],
+    [<<"retainer">>],
+    [<<"mqtt">>],
+    [<<"alarm">>],
+    [<<"sysmon">>],
+    [<<"sys_topics">>],
+    [<<"limiter">>],
+    [<<"log">>],
+    [<<"persistent_session_store">>],
+    [<<"durable_sessions">>],
+    [<<"prometheus">>],
+    [<<"crl_cache">>],
+    [<<"conn_congestion">>],
+    [<<"force_shutdown">>],
+    [<<"flapping_detect">>],
+    [<<"broker">>],
+    [<<"force_gc">>],
+    [<<"zones">>],
+    [<<"slow_subs">>],
+    [<<"cluster">>, <<"links">>]
+]).
 
--export([ export_rules/0
-        , export_resources/0
-        , export_blacklist/0
-        , export_applications/0
-        , export_users/0
-        , export_auth_mnesia/0
-        , export_acl_mnesia/0
-        , import_resources_and_rules/3
-        , import_rules/1
-        , import_resources/1
-        , import_blacklist/1
-        , import_applications/1
-        , import_users/1
-        , import_auth_clientid/1 %% BACKW: 4.1.x
-        , import_auth_username/1 %% BACKW: 4.1.x
-        , import_auth_mnesia/2
-        , import_acl_mnesia/2
-        , to_version/1
-        ]).
+-define(DEFAULT_OPTS, #{}).
 
--export([ export/0
-        , import/2
-        ]).
+-define(HOCON_NS_INTERNAL_TAR_PATH(BASE_NAME, NAMESPACE), [
+    BASE_NAME, "ns", NAMESPACE, ?CLUSTER_HOCON_FILENAME
+]).
+-define(HOCON_NS_INTERNAL_TAR_PATH_REV_PAT(NAMESPACE), [
+    ?CLUSTER_HOCON_FILENAME, NAMESPACE, "ns" | _
+]).
 
-%%--------------------------------------------------------------------
-%% Data Export and Import
-%%--------------------------------------------------------------------
+-type backup_file_info() :: #{
+    filename := binary(),
+    size := non_neg_integer(),
+    created_at := binary(),
+    created_at_sec := integer(),
+    node := node(),
+    atom() => _
+}.
 
-export_rules() ->
-    lists:map(fun(#rule{id = RuleId,
-                        rawsql = RawSQL,
-                        actions = Actions,
-                        enabled = Enabled,
-                        description = Desc}) ->
-                   [{id, RuleId},
-                    {rawsql, RawSQL},
-                    {actions, actions_to_prop_list(Actions)},
-                    {enabled, Enabled},
-                    {description, Desc}]
-               end, emqx_rule_registry:get_rules()).
+-type db_error_details() :: #{mria:table() => {error, _}}.
+-type config_error_details() :: #{emqx_utils_maps:config_key_path() => {error, _}}.
+-type import_res() ::
+    {ok, #{db_errors => db_error_details(), config_errors => config_error_details()}} | {error, _}.
 
-export_resources() ->
-    lists:map(fun(#resource{id = Id,
-                            type = Type,
-                            config = Config,
-                            created_at = CreatedAt,
-                            description = Desc}) ->
-                   NCreatedAt = case CreatedAt of
-                                    undefined -> null;
-                                    _ -> CreatedAt
-                                end,
-                   [{id, Id},
-                    {type, Type},
-                    {config, maps:to_list(Config)},
-                    {created_at, NCreatedAt},
-                    {description, Desc}]
-               end, emqx_rule_registry:get_resources()).
+-type export_opts() :: #{
+    mnesia_table_filter => mnesia_table_filter(),
+    print_fun => fun((io:format(), [term()]) -> ok),
+    raw_conf_transform => fun((raw_config()) -> raw_config()),
+    namespace => emqx_config:maybe_namespace()
+}.
+-type import_opts() :: #{
+    mnesia_restore_mode => merge | snapshot,
+    print_fun => fun((io:format(), [term()]) -> ok),
+    namespace => emqx_config:maybe_namespace(),
+    allow_security_profile_mismatch => boolean()
+}.
+-type raw_config() :: #{binary() => any()}.
+-type mnesia_table_filter() :: fun((atom()) -> boolean()).
+-type maybe_namespace() :: ?global_ns | binary().
+-type backup_scope() :: #{global := boolean(), namespaces := [binary()]}.
 
-export_blacklist() ->
-    lists:map(fun(#banned{who = Who, by = By, reason = Reason, at = At, until = Until}) ->
-                  NWho = case Who of
-                             {peerhost, Peerhost} -> {peerhost, inet:ntoa(Peerhost)};
-                             _ -> Who
-                         end,
-                  [{who, [NWho]}, {by, By}, {reason, Reason}, {at, At}, {until, Until}]
-              end, ets:tab2list(emqx_banned)).
+%%------------------------------------------------------------------------------
+%% APIs
+%%------------------------------------------------------------------------------
 
-export_applications() ->
-    lists:map(fun({_, AppID, AppSecret, Name, Desc, Status, Expired}) ->
-                  [{id, AppID}, {secret, AppSecret}, {name, Name}, {desc, Desc}, {status, Status}, {expired, Expired}]
-              end, ets:tab2list(mqtt_app)).
-
-export_users() ->
-    lists:map(fun({_, Username, Password, Tags}) ->
-                  [{username, Username}, {password, base64:encode(Password)}, {tags, Tags}]
-              end, ets:tab2list(mqtt_admin)).
-
-export_auth_mnesia() ->
-    case ets:info(emqx_user) of
-        undefined -> [];
-        _ ->
-            lists:map(fun({_, {Type, Login}, Password, CreatedAt}) ->
-                          [{login, Login}, {type, Type}, {password, base64:encode(Password)}, {created_at, CreatedAt}]
-                      end, ets:tab2list(emqx_user))
-    end.
-
-export_acl_mnesia() ->
-    case ets:info(emqx_acl) of
-        undefined -> [];
-        _ ->
-            lists:map(fun({_, Filter, Action, Access, CreatedAt}) ->
-                          Filter1 = case Filter of
-                              {{Type, TypeValue}, Topic} ->
-                                  [{type, Type}, {type_value, TypeValue}, {topic, Topic}];
-                              {Type, Topic} ->
-                                  [{type, Type}, {topic, Topic}]
-                          end,
-                          Filter1 ++ [{action, Action}, {access, Access}, {created_at, CreatedAt}]
-                      end, ets:tab2list(emqx_acl))
-    end.
-
--ifdef(EMQX_ENTERPRISE).
-export_modules() ->
-    case ets:info(emqx_modules) of
-        undefined -> [];
-        _ ->
-           lists:map(fun({_, Id, Type, Config, Enabled, CreatedAt, Description}) ->
-                          [{id, Id},
-                           {type, Type},
-                           {config, Config},
-                           {enabled, Enabled},
-                           {created_at, CreatedAt},
-                           {description, Description}
-                          ]
-                      end, ets:tab2list(emqx_modules))
-    end.
-
-export_schemas() ->
-    case ets:info(emqx_schema) of
-        undefined -> [];
-        _ ->
-            [emqx_schema_api:format_schema(Schema) || Schema <- emqx_schema_registry:get_all_schemas()]
-    end.
-
-export_confs() ->
-    case ets:info(emqx_conf_info) of
-        undefined -> {[], []};
-        _ ->
-            {lists:map(fun({_, Key, Confs}) ->
-                case Key of
-                    {_Zone, Name} ->
-                        [{zone, list_to_binary(Name)},
-                         {confs, confs_to_binary(Confs)}];
-                    {_Listener, Type, Name} ->
-                        [{type, list_to_binary(Type)},
-                         {name, list_to_binary(Name)},
-                         {confs, confs_to_binary(Confs)}];
-                    Name ->
-                        [{name, list_to_binary(Name)},
-                         {confs, confs_to_binary(Confs)}]
-                end
-            end, ets:tab2list(emqx_conf_b)),
-            lists:map(fun({_, {_Listener, Type, Name}, Status}) ->
-                [{type, list_to_binary(Type)},
-                 {name, list_to_binary(Name)},
-                 {status, Status}]
-            end, ets:tab2list(emqx_listeners_state))}
-    end.
-
-confs_to_binary(Confs) ->
-    [{list_to_binary(Key), list_to_binary(Val)} || {Key, Val} <-Confs].
-
--endif.
-
-import_rule(#{<<"id">> := RuleId,
-              <<"rawsql">> := RawSQL,
-              <<"actions">> := Actions,
-              <<"enabled">> := Enabled,
-              <<"description">> := Desc}) ->
-    Rule = #{id => RuleId,
-             rawsql => RawSQL,
-             actions => map_to_actions(Actions),
-             enabled => Enabled,
-             description => Desc},
-    try emqx_rule_engine:create_rule(Rule)
-    catch throw:{resource_not_initialized, _ResId} ->
-        emqx_rule_engine:create_rule(Rule#{enabled => false})
-    end.
-
-map_to_actions(Maps) ->
-    [map_to_action(M) || M <- Maps].
-
-map_to_action(Map = #{<<"id">> := ActionInstId, <<"name">> := Name, <<"args">> := Args}) ->
-    #{id => ActionInstId,
-      name => any_to_atom(Name),
-      args => Args,
-      fallbacks => map_to_actions(maps:get(<<"fallbacks">>, Map, []))}.
-
-
-import_rules(Rules) ->
-    lists:foreach(fun(Rule) ->
-                      import_rule(Rule)
-                  end, Rules).
-
-import_resources(Reources) ->
-    lists:foreach(fun(Resource) ->
-                      import_resource(Resource)
-                  end, Reources).
-
-import_resource(#{<<"id">> := Id,
-                  <<"type">> := Type,
-                  <<"config">> := Config,
-                  <<"created_at">> := CreatedAt,
-                  <<"description">> := Desc}) ->
-    NCreatedAt = case CreatedAt of
-                     null -> undefined;
-                     _ -> CreatedAt
-                 end,
-    emqx_rule_engine:create_resource(#{id => Id,
-                                       type => any_to_atom(Type),
-                                       config => Config,
-                                       created_at => NCreatedAt,
-                                       description => Desc}).
-
--ifdef(EMQX_ENTERPRISE).
-import_resources_and_rules(Resources, Rules, _FromVersion) ->
-    import_resources(Resources),
-    import_rules(Rules).
--else.
-
-import_resources_and_rules(Resources, Rules, FromVersion)
-  when FromVersion =:= "4.0" orelse
-       FromVersion =:= "4.1" orelse
-       FromVersion =:= "4.2" ->
-    Configs = lists:foldl(fun compatible_version/2 , [], Resources),
-    lists:foreach(fun(#{<<"actions">> := Actions} = Rule) ->
-                      NActions = apply_new_config(Actions, Configs),
-                      import_rule(Rule#{<<"actions">> := NActions})
-                  end, Rules);
-import_resources_and_rules(Resources, Rules, _FromVersion) ->
-    import_resources(Resources),
-    import_rules(Rules).
-
-%% 4.2.5 +
-compatible_version(#{<<"id">> := ID,
-                     <<"type">> := <<"web_hook">>,
-                     <<"config">> := #{<<"connect_timeout">> := ConnectTimeout,
-                                       <<"content_type">> := ContentType,
-                                       <<"headers">> := Headers,
-                                       <<"method">> := Method,
-                                       <<"pool_size">> := PoolSize,
-                                       <<"request_timeout">> := RequestTimeout,
-                                       <<"url">> := URL}} = Resource, Acc) ->
-    CovertFun = fun(Int) ->
-        list_to_binary(integer_to_list(Int) ++ "s")
-    end,
-    Cfg = make_new_config(#{<<"pool_size">> => PoolSize,
-                            <<"connect_timeout">> => CovertFun(ConnectTimeout),
-                            <<"request_timeout">> => CovertFun(RequestTimeout),
-                            <<"url">> => URL}),
-    {ok, _Resource} = import_resource(Resource#{<<"config">> := Cfg}),
-    NHeaders = maps:put(<<"content-type">>, ContentType, covert_empty_headers(Headers)),
-    [{ID, #{headers => NHeaders, method => Method}} | Acc];
-% 4.2.0
-compatible_version(#{<<"id">> := ID,
-                    <<"type">> := <<"web_hook">>,
-                    <<"config">> := #{<<"headers">> := Headers,
-                                    <<"method">> := Method,%% 4.2.0 Different here
-                                    <<"url">> := URL}} = Resource, Acc) ->
-    Cfg = make_new_config(#{<<"url">> => URL}),
-    {ok, _Resource} = import_resource(Resource#{<<"config">> := Cfg}),
-    NHeaders = maps:put(<<"content-type">>, <<"application/json">> , covert_empty_headers(Headers)),
-    [{ID, #{headers => NHeaders, method => Method}} | Acc];
-
-%% bridge mqtt
-%% 4.2.0 - 4.2.5 bridge_mqtt, ssl enabled from on/off to true/false
-compatible_version(#{<<"type">> := <<"bridge_mqtt">>,
-                     <<"id">> := ID, %% begin 4.2.0.
-                     <<"config">> := #{<<"ssl">> := Ssl} = Config} = Resource, Acc) ->
-    NewConfig = Config#{<<"ssl">> := flag_to_boolean(Ssl),
-                        <<"pool_size">> => case maps:get(<<"pool_size">>, Config, undefined) of %% 4.0.x, compatible `pool_size`
-                                                undefined -> 8;
-                                                PoolSize -> PoolSize
-                                            end},
-    {ok, _Resource} = import_resource(Resource#{<<"config">> := NewConfig}),
-    [{ID, NewConfig} | Acc];
-
-% 4.2.3, add :content_type
-compatible_version(#{<<"id">> := ID,
-                    <<"type">> := <<"web_hook">>,
-                    <<"config">> := #{<<"headers">> := Headers,
-                                      <<"content_type">> := ContentType,%% 4.2.3 Different here
-                                      <<"method">> := Method,
-                                      <<"url">> := URL}} = Resource, Acc) ->
-    Cfg = make_new_config(#{<<"url">> => URL}),
-    {ok, _Resource} = import_resource(Resource#{<<"config">> := Cfg}),
-    NHeaders = maps:put(<<"content-type">>, ContentType, covert_empty_headers(Headers)),
-    [{ID, #{headers => NHeaders, method => Method}} | Acc];
-% normal version
-compatible_version(Resource, Acc) ->
-    {ok, _Resource} = import_resource(Resource),
-    Acc.
-
-make_new_config(Cfg) ->
-    Config = #{<<"pool_size">> => 8,
-               <<"connect_timeout">> => <<"5s">>,
-               <<"request_timeout">> => <<"5s">>,
-               <<"cacertfile">> => <<>>,
-               <<"certfile">> => <<>>,
-               <<"keyfile">> => <<>>,
-               <<"verify">> => false},
-    maps:merge(Cfg, Config).
-
-apply_new_config(Actions, Configs) ->
-    apply_new_config(Actions, Configs, []).
-
-apply_new_config([], _Configs, Acc) ->
-    Acc;
-apply_new_config([Action = #{<<"name">> := <<"data_to_webserver">>,
-                             <<"args">> := #{<<"$resource">> := ID,
-                                            <<"path">> := Path,
-                                            <<"payload_tmpl">> := PayloadTmpl}} | More], Configs, Acc) ->
-    case proplists:get_value(ID, Configs, undefined) of
-        undefined ->
-            apply_new_config(More, Configs, [Action | Acc]);
-        #{headers := Headers, method := Method} ->
-            Args = #{<<"$resource">> => ID,
-                     <<"body">> => PayloadTmpl,
-                     <<"headers">> => Headers,
-                     <<"method">> => Method,
-                     <<"path">> => Path},
-            apply_new_config(More, Configs, [Action#{<<"args">> := Args} | Acc])
-    end;
-
-apply_new_config([Action = #{<<"args">> := #{<<"$resource">> := ResourceId,
-                                             <<"forward_topic">> := ForwardTopic,
-                                             <<"payload_tmpl">> := PayloadTmpl},
-                           <<"fallbacks">> := _Fallbacks,
-                           <<"id">> := _Id,
-                           <<"name">> := <<"data_to_mqtt_broker">>} | More], Configs, Acc) ->
-            Args = #{<<"$resource">> => ResourceId,
-                     <<"payload_tmpl">> => PayloadTmpl,
-                     <<"forward_topic">> => ForwardTopic},
-            apply_new_config(More, Configs, [Action#{<<"args">> := Args} | Acc]).
-
--endif.
-
-actions_to_prop_list(Actions) ->
-    [action_to_prop_list(Act) || Act <- Actions].
-
-action_to_prop_list({action_instance, ActionInstId, Name, FallbackActions, Args}) ->
-    [{id, ActionInstId},
-     {name, Name},
-     {fallbacks, actions_to_prop_list(FallbackActions)},
-     {args, Args}].
-
-import_blacklist(Blacklist) ->
-    lists:foreach(fun(#{<<"who">> := Who,
-                        <<"by">> := By,
-                        <<"reason">> := Reason,
-                        <<"at">> := At,
-                        <<"until">> := Until}) ->
-                      NWho = case Who of
-                                 #{<<"peerhost">> := Peerhost} ->
-                                     {ok, NPeerhost} = inet:parse_address(Peerhost),
-                                     {peerhost, NPeerhost};
-                                 #{<<"clientid">> := ClientId} -> {clientid, ClientId};
-                                 #{<<"username">> := Username} -> {username, Username}
-                             end,
-                     emqx_banned:create(#banned{who = NWho, by = By, reason = Reason, at = At, until = Until})
-                  end, Blacklist).
-
-import_applications(Apps) ->
-    lists:foreach(fun(#{<<"id">> := AppID,
-                        <<"secret">> := AppSecret,
-                        <<"name">> := Name,
-                        <<"desc">> := Desc,
-                        <<"status">> := Status,
-                        <<"expired">> := Expired}) ->
-                      NExpired = case is_integer(Expired) of
-                                     true -> Expired;
-                                     false -> undefined
-                                 end,
-                      emqx_mgmt_auth:force_add_app(AppID, Name, AppSecret, Desc, Status, NExpired)
-                  end, Apps).
-
-import_users(Users) ->
-    lists:foreach(fun(#{<<"username">> := Username,
-                        <<"password">> := Password,
-                        <<"tags">> := Tags}) ->
-                      NPassword = base64:decode(Password),
-                      emqx_dashboard_admin:force_add_user(Username, NPassword, Tags)
-                  end, Users).
-
-import_auth_clientid(Lists) ->
-    case ets:info(emqx_user) of
-        undefined -> ok;
-        _ ->
-            lists:foreach(fun(#{<<"clientid">> := Clientid, <<"password">> := Password}) ->
-                                  mnesia:dirty_write({emqx_user, {clientid, Clientid}
-                                                               , base64:decode(Password)
-                                                               , erlang:system_time(millisecond)})
-                          end, Lists)
-    end.
-
-import_auth_username(Lists) ->
-    case ets:info(emqx_user) of
-        undefined -> ok;
-        _ ->
-            lists:foreach(fun(#{<<"username">> := Username, <<"password">> := Password}) ->
-                            mnesia:dirty_write({emqx_user, {username, Username}, base64:decode(Password), erlang:system_time(millisecond)})
-                          end, Lists)
-    end.
-
--ifdef(EMQX_ENTERPRISE).
-import_auth_mnesia(Auths, FromVersion) when FromVersion =:= "4.0" orelse
-                                            FromVersion =:= "4.1" ->
-    do_import_auth_mnesia_by_old_data(Auths);
-import_auth_mnesia(Auths, _) ->
-    do_import_auth_mnesia(Auths).
-
-import_acl_mnesia(Acls, FromVersion) when FromVersion =:= "4.0" orelse
-                                          FromVersion =:= "4.1" ->
-    do_import_acl_mnesia_by_old_data(Acls);
-
-import_acl_mnesia(Acls, _) ->
-    do_import_acl_mnesia(Acls).
--else.
-import_auth_mnesia(Auths, FromVersion) when FromVersion =:= "4.3" ->
-    do_import_auth_mnesia(Auths);
-import_auth_mnesia(Auths, _FromVersion) ->
-    do_import_auth_mnesia_by_old_data(Auths).
-
-import_acl_mnesia(Acls, FromVersion) when FromVersion =:= "4.3" ->
-    do_import_acl_mnesia(Acls);
-import_acl_mnesia(Acls, _FromVersion) ->
-    do_import_acl_mnesia_by_old_data(Acls).
-
--endif.
-
-do_import_auth_mnesia_by_old_data(Auths) ->
-    case ets:info(emqx_user) of
-        undefined -> ok;
-        _ ->
-            CreatedAt = erlang:system_time(millisecond),
-            lists:foreach(fun(#{<<"login">> := Login,
-                                <<"password">> := Password}) ->
-                            mnesia:dirty_write({emqx_user, {get_old_type(), Login}, base64:decode(Password), CreatedAt})
-                          end, Auths)
-    end.
-
-
-do_import_auth_mnesia(Auths) ->
-    case ets:info(emqx_user) of
-        undefined -> ok;
-        _ ->
-            lists:foreach(fun(#{<<"login">> := Login,
-                                <<"type">> := Type,
-                                <<"password">> := Password } = Map) ->
-                            CreatedAt = maps:get(<<"created_at">>, Map, erlang:system_time(millisecond)),
-                            mnesia:dirty_write({emqx_user, {any_to_atom(Type), Login}, base64:decode(Password), CreatedAt})
-                          end, Auths)
-    end.
-
-do_import_acl_mnesia_by_old_data(Acls) ->
-    case ets:info(emqx_acl) of
-        undefined -> ok;
-        _ ->
-            CreatedAt = erlang:system_time(millisecond),
-            lists:foreach(fun(#{<<"login">> := Login,
-                                <<"topic">> := Topic,
-                                <<"allow">> := Allow,
-                                <<"action">> := Action}) ->
-                            Allow1 = case any_to_atom(Allow) of
-                                         true -> allow;
-                                         false -> deny
-                                     end,
-                            mnesia:dirty_write({emqx_acl, {{get_old_type(), Login}, Topic}, any_to_atom(Action), Allow1, CreatedAt})
-                          end, Acls)
-    end.
-do_import_acl_mnesia(Acls) ->
-    case ets:info(emqx_acl) of
-        undefined -> ok;
-        _ ->
-            lists:foreach(fun(Map = #{<<"action">> := Action,
-                                      <<"access">> := Access}) ->
-                            Topic = maps:get(<<"topic">>, Map),
-                            Login = case maps:get(<<"type_value">>, Map, undefined) of
-                                undefined ->
-                                    all;
-                                Value ->
-                                    {any_to_atom(maps:get(<<"type">>, Map)), Value}
-                            end,
-                            emqx_acl_mnesia_cli:add_acl(Login, Topic, any_to_atom(Action), any_to_atom(Access))
-                          end, Acls)
-    end.
-
--ifdef(EMQX_ENTERPRISE).
-import_modules(Modules) ->
-    case ets:info(emqx_modules) of
-        undefined -> [];
-        _ ->
-           lists:foreach(fun(#{<<"id">> := Id,
-                               <<"type">> := Type,
-                               <<"config">> := Config,
-                               <<"enabled">> := Enabled,
-                               <<"created_at">> := CreatedAt,
-                               <<"description">> := Description}) ->
-                            emqx_modules:import_module({Id, any_to_atom(Type), Config, Enabled, CreatedAt, Description})
-                         end, Modules)
-    end.
-
-
-import_schemas(Schemas) ->
-    case ets:info(emqx_schema) of
-        undefined -> ok;
-        _ -> [emqx_schema_registry:add_schema(emqx_schema_api:make_schema_params(Schema)) || Schema <- Schemas]
-    end.
-
-import_confs(Configs, ListenersState) ->
-    case ets:info(emqx_conf_info) of
-        undefined -> ok;
-        _ ->
-            emqx_conf:import_confs(Configs, ListenersState)
-    end.
-
--endif.
-
-any_to_atom(L) when is_list(L) -> list_to_atom(L);
-any_to_atom(B) when is_binary(B) -> binary_to_atom(B, utf8);
-any_to_atom(A) when is_atom(A) -> A.
-
-to_version(Version) when is_integer(Version) ->
-    integer_to_list(Version);
-to_version(Version) when is_binary(Version) ->
-    binary_to_list(Version);
-to_version(Version) when is_list(Version) ->
-    Version.
-
+-spec export() -> {ok, backup_file_info()} | {error, _}.
 export() ->
-    Seconds = erlang:system_time(second),
-    Data = do_export_data() ++ [{date, erlang:list_to_binary(emqx_mgmt_util:strftime(Seconds))}],
-    {{Y, M, D}, {H, MM, S}} = emqx_mgmt_util:datetime(Seconds),
-    Filename = io_lib:format("emqx-export-~p-~p-~p-~p-~p-~p.json", [Y, M, D, H, MM, S]),
-    NFilename = filename:join([emqx:get_env(data_dir), Filename]),
-    ok = filelib:ensure_dir(NFilename),
-    case file:write_file(NFilename, emqx_json:encode(Data)) of
-        ok ->
-            case file:read_file_info(NFilename) of
-                {ok, #file_info{size = Size, ctime = {{Y1, M1, D1}, {H1, MM1, S1}}}} ->
-                    CreatedAt = io_lib:format("~p-~p-~p ~p:~p:~p", [Y1, M1, D1, H1, MM1, S1]),
-                    {ok, #{filename => list_to_binary(NFilename),
-                           size => Size,
-                           created_at => list_to_binary(CreatedAt),
-                           node => node()
-                          }};
-                Error -> Error
-            end;
-        Error -> Error
+    export(?DEFAULT_OPTS).
+
+-spec compile_mnesia_table_filter([binary()]) -> {ok, mnesia_table_filter()} | {error, any()}.
+compile_mnesia_table_filter(TableSets) ->
+    Mapping = table_set_to_tables_mapping(),
+    {TableNames, Errors} =
+        lists:foldl(
+            fun(TableSetName, {TableAcc, ErrorAcc}) ->
+                case maps:find(TableSetName, Mapping) of
+                    {ok, Tables} ->
+                        {lists:usort(Tables ++ TableAcc), ErrorAcc};
+                    error ->
+                        {TableAcc, [TableSetName | ErrorAcc]}
+                end
+            end,
+            {[], []},
+            TableSets
+        ),
+    case Errors of
+        [] ->
+            Filter = fun(Table) -> lists:member(Table, TableNames) end,
+            {ok, Filter};
+        _ ->
+            {error, Errors}
     end.
 
-do_export_data() ->
-    Version = string:sub_string(emqx_sys:version(), 1, 3),
-    [{version, erlang:list_to_binary(Version)},
-     {rules, export_rules()},
-     {resources, export_resources()},
-     {blacklist, export_blacklist()},
-     {apps, export_applications()},
-     {users, export_users()},
-     {auth_mnesia, export_auth_mnesia()},
-     {acl_mnesia, export_acl_mnesia()}
-     ] ++ do_export_extra_data().
-
--ifdef(EMQX_ENTERPRISE).
-do_export_extra_data() ->
-    {Configs, State} = export_confs(),
-    [{modules, export_modules()},
-     {schemas, export_schemas()},
-     {configs, Configs},
-     {listeners_state, State}
-    ].
--else.
-do_export_extra_data() -> [].
--endif.
-
--ifdef(EMQX_ENTERPRISE).
-import(Filename, OverridesJson) ->
-    case file:read_file(Filename) of
-        {ok, Json} ->
-            Imported = emqx_json:decode(Json, [return_maps]),
-            Overrides = emqx_json:decode(OverridesJson, [return_maps]),
-            Data = maps:merge(Imported, Overrides),
-            Version = to_version(maps:get(<<"version">>, Data)),
-            read_global_auth_type(Data),
-            try
-                do_import_data(Data, Version),
-                logger:debug("The emqx data has been imported successfully"),
-                ok
-            catch Class:Reason:Stack ->
-                logger:error("The emqx data import failed: ~0p", [{Class, Reason, Stack}]),
-                {error, import_failed}
-            end;
-        Error -> Error
+-spec export(export_opts()) -> {ok, backup_file_info()} | {error, _}.
+export(Opts) ->
+    maybe
+        {ok, {BackupName, TarDescriptor}} ?= prepare_new_backup(Opts),
+        try
+            do_export(BackupName, TarDescriptor, Opts)
+        catch
+            Class:Reason:Stack ->
+                ?SLOG(error, #{
+                    msg => "emqx_data_export_failed",
+                    exception => Class,
+                    reason => Reason,
+                    stacktrace => Stack
+                }),
+                {error, Reason}
+        after
+            %% erl_tar:close/1 raises error if called on an already closed tar
+            catch erl_tar:close(TarDescriptor),
+            file:del_dir_r(BackupName)
+        end
     end.
--else.
-import(Filename, OverridesJson) ->
-    case file:read_file(Filename) of
-        {ok, Json} ->
-            Imported = emqx_json:decode(Json, [return_maps]),
-            Overrides = emqx_json:decode(OverridesJson, [return_maps]),
-            Data = maps:merge(Imported, Overrides),
-            Version = to_version(maps:get(<<"version">>, Data)),
-            read_global_auth_type(Data),
-            case is_version_supported(Data, Version) of
-                true  ->
-                    try
-                        do_import_data(Data, Version),
-                        logger:debug("The emqx data has been imported successfully"),
-                        ok
-                    catch Class:Reason:Stack ->
-                        logger:error("The emqx data import failed: ~0p", [{Class, Reason, Stack}]),
-                        {error, import_failed}
-                    end;
+
+-spec all_table_set_names() -> [binary()].
+all_table_set_names() ->
+    Key = {?MODULE, all_table_set_names},
+    case persistent_term:get(Key, undefined) of
+        undefined ->
+            Names = build_all_table_set_names(),
+            persistent_term:put(Key, Names),
+            Names;
+        Names ->
+            Names
+    end.
+
+build_all_table_set_names() ->
+    Mods = modules_with_mnesia_tabs_to_backup(),
+    lists:usort(
+        lists:map(
+            fun(Mod) ->
+                {TableSetName, _Tabs} = emqx_db_backup:backup_tables(Mod),
+                TableSetName
+            end,
+            Mods
+        )
+    ).
+
+%% Table sets that contain credentials/identities an API key must never be able
+%% to read or write through data backup, mirroring the `?SCOPE_DENIED' guard
+%% on /users and /api_key endpoints.
+-spec sensitive_table_set_names() -> [binary()].
+sensitive_table_set_names() ->
+    [<<"dashboard_users">>, <<"api_keys">>].
+
+%% Inspect a previously-uploaded backup file and return which sensitive table
+%% sets are present in it. Used by the HTTP handler to reject API-key-driven
+%% imports of backups containing dashboard_users / api_keys data.
+-spec peek_sensitive_table_sets(file:filename_all()) ->
+    {ok, [binary()]} | {error, _}.
+peek_sensitive_table_sets(Filename) ->
+    maybe
+        {ok, FilePath} ?= backup_path(Filename),
+        ok ?= validate_file_exists(FilePath),
+        {ok, Entries} ?= tar_table(FilePath),
+        {ok, sensitive_sets_in_entries(Entries)}
+    end.
+
+tar_table(FilePath) ->
+    case erl_tar:table(FilePath, [compressed]) of
+        {ok, _} = Ok -> Ok;
+        {error, Reason} -> {error, {bad_backup_file, Reason}}
+    end.
+
+sensitive_sets_in_entries(Entries) ->
+    SensitiveTabMap = sensitive_tab_to_set_map(),
+    lists:usort(
+        lists:filtermap(
+            fun(Path) -> match_sensitive_entry(Path, SensitiveTabMap) end,
+            Entries
+        )
+    ).
+
+%% #{<<"emqx_admin">> => <<"dashboard_users">>, <<"emqx_app">> => <<"api_keys">>}
+sensitive_tab_to_set_map() ->
+    Mapping = table_set_to_tables_mapping(),
+    Sensitive = sensitive_table_set_names(),
+    maps:fold(
+        fun(SetName, Tabs, Acc) ->
+            case lists:member(SetName, Sensitive) of
+                true ->
+                    lists:foldl(
+                        fun(Tab, A2) -> A2#{atom_to_binary(Tab, utf8) => SetName} end,
+                        Acc,
+                        Tabs
+                    );
                 false ->
-                    logger:error("Unsupported version: ~p", [Version]),
-                    {error, unsupported_version, Version}
+                    Acc
+            end
+        end,
+        #{},
+        Mapping
+    ).
+
+%% Tar entries are paths like "<base>/mnesia/<atom_to_list(TabName)>".
+match_sensitive_entry(Path, SensitiveTabMap) ->
+    case lists:reverse(filename:split(str(Path))) of
+        [TabName, ?BACKUP_MNESIA_DIR | _] ->
+            case maps:find(list_to_binary(TabName), SensitiveTabMap) of
+                {ok, SetName} -> {true, SetName};
+                error -> false
             end;
-        Error -> Error
-    end.
--endif.
-
-do_import_data(Data, Version) ->
-    do_import_extra_data(Data, Version),
-    import_resources_and_rules(maps:get(<<"resources">>, Data, []), maps:get(<<"rules">>, Data, []), Version),
-    import_blacklist(maps:get(<<"blacklist">>, Data, [])),
-    import_applications(maps:get(<<"apps">>, Data, [])),
-    import_users(maps:get(<<"users">>, Data, [])),
-    import_auth_clientid(maps:get(<<"auth_clientid">>, Data, [])),
-    import_auth_username(maps:get(<<"auth_username">>, Data, [])),
-    import_auth_mnesia(maps:get(<<"auth_mnesia">>, Data, []), Version),
-    import_acl_mnesia(maps:get(<<"acl_mnesia">>, Data, []), Version).
-
--ifdef(EMQX_ENTERPRISE).
-do_import_extra_data(Data, _Version) ->
-    import_confs(maps:get(<<"configs">>, Data, []), maps:get(<<"listeners_state">>, Data, [])),
-    import_modules(maps:get(<<"modules">>, Data, [])),
-    import_schemas(maps:get(<<"schemas">>, Data, [])),
-    ok.
--else.
-do_import_extra_data(_Data, _Version) -> ok.
--endif.
-
--ifndef(EMQX_ENTERPRISE).
-covert_empty_headers([]) -> #{};
-covert_empty_headers(Other) -> Other.
-
-flag_to_boolean(<<"on">>) -> true;
-flag_to_boolean(<<"off">>) -> false;
-flag_to_boolean(Other) -> Other.
--endif.
-
--ifndef(EMQX_ENTERPRISE).
-is_version_supported(Data, Version) ->
-    case { maps:get(<<"auth_clientid">>, Data, [])
-         , maps:get(<<"auth_username">>, Data, [])
-         , maps:get(<<"auth_mnesia">>, Data, [])} of
-        {[], [], []} -> lists:member(Version, ?VERSIONS);
-        _ -> is_version_supported2(Version)
-    end.
-
-is_version_supported2("4.1") ->
-    true;
-is_version_supported2("4.3") ->
-    true;
-is_version_supported2(Version) ->
-    case re:run(Version, "^4.[02].\\d+$", [{capture, none}]) of
-        match ->
-            try lists:map(fun erlang:list_to_integer/1, string:tokens(Version, ".")) of 
-                [4, 2, N] -> N >= 11;
-                [4, 0, N] -> N >= 13;
-                _ -> false
-            catch
-                _ : _ -> false
-            end;
-        nomatch ->
+        _ ->
             false
     end.
--endif.
 
-read_global_auth_type(Data) ->
-    case {maps:get(<<"auth_mnesia">>, Data, []), maps:get(<<"acl_mnesia">>, Data, [])} of
-        {[], []} ->
-            %% Auth mnesia plugin is not used:
-            ok;
-        _ ->
-            do_read_global_auth_type(Data)
+-doc """
+Inspect a previously-uploaded backup file owned by `Namespace` and return the
+configuration scopes its entries contain. See `peek_backup_scope_of_content/1`.
+""".
+-spec peek_backup_scope(maybe_namespace(), file:filename_all()) ->
+    {ok, backup_scope()} | {error, _}.
+peek_backup_scope(Namespace, Filename) ->
+    maybe
+        {ok, FilePath} ?= backup_path(Namespace, Filename),
+        ok ?= validate_file_exists(FilePath),
+        {ok, Entries} ?= tar_table(FilePath),
+        {ok, scope_of_entries(Entries)}
     end.
 
--ifdef(EMQX_ENTERPRISE).
-do_read_global_auth_type(Data) ->
-    case Data of
-        #{<<"auth.mnesia.as">> := <<"username">>} ->
-            application:set_env(emqx_auth_mnesia, as, username);
-        #{<<"auth.mnesia.as">> := <<"clientid">>} ->
-            application:set_env(emqx_auth_mnesia, as, clientid);
+-doc """
+Classify the configuration scopes present in an in-memory backup archive:
+`global` is true when the archive holds global content (a top-level
+cluster.hocon or any mnesia table dump); `namespaces` lists every namespace
+with a `ns/<NS>/cluster.hocon` entry. The HTTP handlers use this to confine
+namespaced upload/import operations to archives holding only the resolved
+namespace's data.
+""".
+-spec peek_backup_scope_of_content(binary()) -> {ok, backup_scope()} | {error, _}.
+peek_backup_scope_of_content(BackupFileContent) ->
+    maybe
+        {ok, Entries} ?= tar_table({binary, BackupFileContent}),
+        {ok, scope_of_entries(Entries)}
+    end.
+
+scope_of_entries(Entries) ->
+    lists:foldl(
+        fun(Entry, Acc) ->
+            classify_entry_scope(lists:reverse(filename:split(str(Entry))), Acc)
+        end,
+        #{global => false, namespaces => []},
+        Entries
+    ).
+
+classify_entry_scope(?HOCON_NS_INTERNAL_TAR_PATH_REV_PAT(Namespace), #{namespaces := NSs} = Acc) ->
+    Acc#{namespaces := lists:usort([bin(Namespace) | NSs])};
+classify_entry_scope([?CLUSTER_HOCON_FILENAME | _], Acc) ->
+    Acc#{global := true};
+classify_entry_scope([_TabName, ?BACKUP_MNESIA_DIR | _], Acc) ->
+    Acc#{global := true};
+classify_entry_scope(_Entry, Acc) ->
+    Acc.
+
+validate_export_root_keys(Params) ->
+    RootKeys0 = maps:get(<<"root_keys">>, Params, []),
+    RootKeys = lists:usort(RootKeys0),
+    RootNames = emqx_config:get_root_names(),
+    UnknownKeys = RootKeys -- RootNames,
+    case UnknownKeys of
+        [] ->
+            ok;
+        [_ | _] ->
+            {error, {unknown_root_keys, UnknownKeys}}
+    end.
+
+parse_export_request(Params) ->
+    Namespace = maps:get(<<"namespace">>, Params, ?global_ns),
+    OutDir = maps:get(<<"out_dir">>, Params, undefined),
+    Opts0 = emqx_utils_maps:put_if(#{}, out_dir, OutDir, OutDir /= undefined),
+    Opts1 =
+        maybe
+            {ok, Keys0} ?= maps:find(<<"root_keys">>, Params),
+            Keys = lists:usort(Keys0),
+            Transform = fun(RawConf) ->
+                maps:with(Keys, RawConf)
+            end,
+            Opts0#{raw_conf_transform => Transform}
+        else
+            error -> Opts0
+        end,
+    CheckNamespaceValid =
+        case Namespace of
+            ?global_ns -> ok;
+            _ when is_binary(Namespace) -> ok;
+            _ -> {error, {invalid_namespace, Namespace}}
+        end,
+    Opts2 = Opts1#{namespace => Namespace},
+    maybe
+        ok ?= CheckNamespaceValid,
+        {ok, TableSetNames0} ?= maps:find(<<"table_sets">>, Params),
+        TableSetNames = lists:usort(TableSetNames0),
+        {ok, Filter} ?= emqx_mgmt_data_backup:compile_mnesia_table_filter(TableSetNames),
+        {ok, Opts2#{mnesia_table_filter => Filter}}
+    else
+        error ->
+            {ok, Opts2};
+        {error, {invalid_namespace, _}} = Error ->
+            Error;
+        {error, InvalidSetNames0} ->
+            InvalidSetNames = lists:sort(InvalidSetNames0),
+            {error, {bad_table_sets, InvalidSetNames}}
+    end.
+
+-doc """
+This function is called from CLI.
+Tries to interpret the backup file path as a full local backup file path,
+and on fail tries to install from backup data directory.
+""".
+-spec import_local(file:filename_all()) -> import_res().
+import_local(BackupFilePath) ->
+    import_local(BackupFilePath, ?DEFAULT_OPTS).
+
+-spec import_local(file:filename_all(), import_opts()) -> import_res().
+import_local(BackupFilePath, Opts) ->
+    case import_from_path(BackupFilePath, Opts) of
+        {error, not_found} ->
+            case import(BackupFilePath, Opts) of
+                {error, bad_backup_name} ->
+                    {error, not_found};
+                Res ->
+                    Res
+            end;
+        Res ->
+            Res
+    end.
+
+-doc """
+This function is called from CLI.
+Backup file is manually placed somewhere in the local file system.
+""".
+-spec import_from_path(file:filename_all(), import_opts()) -> import_res().
+import_from_path(BackupFilePath, Opts) ->
+    maybe
+        ok ?= validate_import_allowed(),
+        ok ?= validate_file_exists(BackupFilePath),
+        do_import(str(BackupFilePath), Opts)
+    end.
+
+-doc """
+This function is called from API.
+It receives file name of the backup file in the backup data folder.
+Backup file should be previously created by `upload/2` function.
+""".
+-spec import(file:filename_all()) -> import_res().
+import(BackupFilename) ->
+    import(BackupFilename, ?DEFAULT_OPTS).
+
+-spec import(file:filename_all(), import_opts()) -> import_res().
+import(BackupFilename, Opts) ->
+    Namespace = maps:get(namespace, Opts, ?global_ns),
+    maybe
+        ok ?= validate_import_allowed(),
+        {ok, BackupFilePath} ?= backup_path(Namespace, BackupFilename),
+        ok ?= validate_file_exists(BackupFilePath),
+        do_import(BackupFilePath, Opts)
+    end.
+
+-doc """
+This function is an RPC target (v1) and is called from the API handler.
+It runs on a core node.
+
+`FileNode` is the node to take backup file from.
+""".
+-spec maybe_copy_and_import(node(), file:filename_all()) -> import_res().
+maybe_copy_and_import(FileNode, BackupFilename) ->
+    maybe_copy_and_import(FileNode, BackupFilename, _Opts = #{}).
+
+-doc """
+This function is an RPC target (v2) and is called from the API handler.
+It runs on a core node.
+
+`FileNode` is the node to take backup file from.
+""".
+-spec maybe_copy_and_import(node(), file:filename_all(), import_opts()) -> import_res().
+maybe_copy_and_import(FileNode, BackupFilename, Opts) ->
+    Namespace = maps:get(namespace, Opts, ?global_ns),
+    maybe
+        ok ?= maybe_copy(FileNode, BackupFilename, Namespace),
+        import(BackupFilename, Opts)
+    end.
+
+-spec read_file(file:filename_all()) ->
+    {ok, #{filename => file:filename_all(), file => binary()}} | {error, _}.
+read_file(BackupFilename) ->
+    read_file(?global_ns, BackupFilename).
+
+%% RPC target (v3). `Namespace' scopes the lookup to the caller's backup
+%% directory, keeping tenants isolated from each other and from global backups.
+-spec read_file(maybe_namespace(), file:filename_all()) ->
+    {ok, #{filename => file:filename_all(), file => binary()}} | {error, _}.
+read_file(Namespace, BackupFilename) ->
+    maybe
+        {ok, FilePath} ?= backup_path(Namespace, BackupFilename),
+        maybe_not_found(file:read_file(FilePath))
+    end.
+
+-spec delete_file(file:filename_all()) -> ok | {error, _}.
+delete_file(BackupFilename) ->
+    delete_file(?global_ns, BackupFilename).
+
+%% RPC target (v3). See `read_file/2'.
+-spec delete_file(maybe_namespace(), file:filename_all()) -> ok | {error, _}.
+delete_file(Namespace, BackupFilename) ->
+    maybe
+        {ok, FilePath} ?= backup_path(Namespace, BackupFilename),
+        maybe_not_found(file:delete(FilePath))
+    end.
+
+-spec upload(file:filename_all(), binary()) -> ok | {error, _}.
+upload(BackupFilename, BackupFileContent) ->
+    upload(?global_ns, BackupFilename, BackupFileContent).
+
+-spec upload(maybe_namespace(), file:filename_all(), binary()) -> ok | {error, _}.
+upload(Namespace, BackupFilename, BackupFileContent) ->
+    maybe
+        {ok, FilePath} ?= backup_path(Namespace, BackupFilename),
+        case filelib:is_file(FilePath) of
+            true -> {error, {already_exists, BackupFilename}};
+            false -> do_upload(Namespace, FilePath, BackupFileContent)
+        end
+    end.
+
+-spec list_files() -> [backup_file_info()].
+list_files() ->
+    list_files(?global_ns).
+
+%% RPC target (v3). Lists only the backups owned by `Namespace'; global backups
+%% (including legacy ones created before namespace isolation) live in the root
+%% directory and are only visible to global administrators.
+-spec list_files(maybe_namespace()) -> [backup_file_info()].
+list_files(Namespace) ->
+    Filter =
+        fun(File) ->
+            case file:read_file_info(File, [{time, posix}]) of
+                {ok, #file_info{size = Size, ctime = CTimeSec}} ->
+                    BaseFilename = bin(filename:basename(File)),
+                    Info = #{
+                        filename => BaseFilename,
+                        size => Size,
+                        created_at => emqx_utils_calendar:epoch_to_rfc3339(CTimeSec, second),
+                        created_at_sec => CTimeSec,
+                        node => node()
+                    },
+                    {true, Info};
+                _ ->
+                    false
+            end
+        end,
+    lists:filtermap(Filter, backup_files(Namespace)).
+
+-spec backup_files(maybe_namespace()) -> [file:filename()].
+backup_files(Namespace) ->
+    %% A namespace without a resolvable backup directory owns no backups.
+    %% List the directory instead of globbing: the namespace name is caller
+    %% controlled and must never be interpreted as wildcard syntax.
+    case backup_root_dir(Namespace) of
+        {ok, Dir} -> list_tar_files(Dir);
+        {error, _} -> []
+    end.
+
+list_tar_files(Dir) ->
+    case file:list_dir(Dir) of
+        {ok, Filenames} ->
+            lists:sort([
+                filename:join(Dir, Filename)
+             || Filename <- Filenames, lists:suffix(?TAR_SUFFIX, Filename)
+            ]);
+        {error, _} ->
+            []
+    end.
+
+-spec format_error(atom()) -> string() | term().
+format_error(not_core_node) ->
+    str(
+        io_lib:format(
+            "backup data import is only allowed on core EMQX nodes, but requested node ~p is not core",
+            [node()]
+        )
+    );
+format_error(ee_to_ce_backup) ->
+    "importing EMQX Enterprise data backup to EMQX is not allowed";
+format_error(missing_backup_meta) ->
+    "invalid backup archive file: missing " ?META_FILENAME;
+format_error(invalid_edition) ->
+    "invalid backup archive content: wrong EMQX edition value in " ?META_FILENAME;
+format_error(invalid_version) ->
+    "invalid backup archive content: wrong EMQX version value in " ?META_FILENAME;
+format_error(bad_archive_dir) ->
+    "invalid backup archive content: all files in the archive must be under <backup name> directory";
+format_error(bad_archive_member) ->
+    "invalid backup archive content: only regular files and directories are allowed in the archive";
+format_error(not_found) ->
+    "backup file not found";
+format_error(bad_backup_name) ->
+    "invalid backup name: file name must have " ?TAR_SUFFIX " extension";
+format_error(unsafe_backup_name) ->
+    "unsafe backup name";
+format_error(bad_namespace) ->
+    "invalid namespace: cannot resolve a backup directory for this namespace name";
+format_error({unsupported_version, ImportVersion}) ->
+    str(
+        io_lib:format(
+            "[warning] Backup version ~p is incompatible with EMQX version ~p, import is not allowed.~n",
+            [str(ImportVersion), str(emqx_release:version())]
+        )
+    );
+format_error({security_profile_mismatch, BackupProfile}) ->
+    str(
+        io_lib:format(
+            "backup was exported under the \"~s\" security profile, but this node runs the "
+            "\"hardened\" profile, whose stricter defaults can behave differently for restored "
+            "data: bare-port listener binds resolve to loopback, an authenticator chain left "
+            "empty or disabled denies every client, a restored dashboard account on the default "
+            "password can no longer log in, and authentication/authorization backend failures "
+            "now deny the operation. Override with allow_security_profile_mismatch to import "
+            "anyway.~n",
+            [BackupProfile]
+        )
+    );
+format_error({already_exists, BackupFilename}) ->
+    str(io_lib:format("Backup file \"~s\" already exists", [BackupFilename]));
+format_error({bad_backup_file, Reason}) ->
+    str(io_lib:format("Bad backup file: ~p", [Reason]));
+format_error(Reason) ->
+    Reason.
+
+-spec format_conf_errors(#{maybe_namespace() => map()}) -> #{maybe_namespace() => iodata()}.
+format_conf_errors(ErrorsPerNamespace) ->
+    Opts = #{print_fun => fun io_lib:format/2},
+    maps:map(
+        fun(_Namespace, Errors) ->
+            Formatted = maps:map(conf_error_formatter(Opts), Errors),
+            maps:values(Formatted)
+        end,
+        ErrorsPerNamespace
+    ).
+
+-spec format_db_errors(map()) -> list().
+format_db_errors(Errors) ->
+    Opts = #{print_fun => fun io_lib:format/2},
+    maps:values(
+        maps:map(
+            fun(Tab, Err) -> maybe_print_mnesia_import_err(Tab, Err, Opts) end,
+            Errors
+        )
+    ).
+
+%%------------------------------------------------------------------------------
+%% Internal functions
+%%------------------------------------------------------------------------------
+
+maybe_copy(FileNode, _BackupFilename, _Namespace) when FileNode =:= node() ->
+    ok;
+maybe_copy(FileNode, BackupFilename, Namespace) ->
+    maybe
+        {ok, FilePath} ?= backup_path(Namespace, BackupFilename),
+        %% The file can be already present locally.
+        case filelib:is_regular(FilePath) of
+            true ->
+                ok;
+            false ->
+                copy(FileNode, BackupFilename, Namespace)
+        end
+    end.
+
+copy(FileNode, BackupFilename, ?global_ns) ->
+    maybe
+        {ok, BackupFileContent} ?=
+            emqx_mgmt_data_backup_proto_v1:read_file(FileNode, BackupFilename, infinity),
+        ok ?= upload(?global_ns, BackupFilename, BackupFileContent)
+    end;
+copy(FileNode, BackupFilename, Namespace) when is_binary(Namespace) ->
+    maybe
+        {ok, BackupFileContent} ?=
+            emqx_mgmt_data_backup_proto_v3:read_file(
+                FileNode, Namespace, BackupFilename, infinity
+            ),
+        ok ?= upload(Namespace, BackupFilename, BackupFileContent)
+    end.
+
+maybe_not_found({error, enoent}) ->
+    {error, not_found};
+maybe_not_found(Other) ->
+    Other.
+
+do_upload(Namespace, BackupFilePath, BackupFileContent) ->
+    try
+        maybe
+            {ok, BackupDir} ?= backup_dir(Namespace, BackupFilePath),
+            ok ?= file:write_file(BackupFilePath, BackupFileContent),
+            ok ?= extract_backup(Namespace, BackupFilePath),
+            {ok, _} ?= validate_backup(BackupDir),
+            HoconFilename = filename:join(BackupDir, ?CLUSTER_HOCON_FILENAME),
+            ok ?=
+                case filelib:is_regular(HoconFilename) of
+                    true ->
+                        maybe
+                            {ok, RawConf} ?= hocon:files([HoconFilename]),
+                            RawConf1 = upgrade_raw_conf(emqx_conf:schema_module(), RawConf),
+                            {ok, _} ?= validate_cluster_hocon(RawConf1),
+                            ok
+                        end;
+                    false ->
+                        %% cluster.hocon can be missing in the backup
+                        ok
+                end,
+            ?SLOG(info, #{msg => "emqx_data_upload_success"})
+        else
+            {error, Error} ->
+                ?SLOG(error, #{
+                    msg => "emqx_data_upload_failed",
+                    reason => Error,
+                    backup_file_path => BackupFilePath
+                }),
+                _ = file:delete(BackupFilePath),
+                {error, Error}
+        end
+    catch
+        Class:Reason:Stack ->
+            _ = file:delete(BackupFilePath),
+            ?SLOG(error, #{
+                msg => "emqx_data_upload_failed",
+                backup_file_path => BackupFilePath,
+                exception => Class,
+                reason => Reason,
+                stacktrace => Stack
+            }),
+            {error, Reason}
+    after
+        cleanup_backup_dir(Namespace, BackupFilePath)
+    end.
+
+prepare_new_backup(Opts) ->
+    Ts = erlang:system_time(millisecond),
+    {{Y, M, D}, {HH, MM, SS}} = local_datetime(Ts),
+    BackupBaseName = str(
+        io_lib:format(
+            "emqx-export-~0p-~2..0b-~2..0b-~2..0b-~2..0b-~2..0b.~3..0b",
+            [Y, M, D, HH, MM, SS, Ts rem 1000]
+        )
+    ),
+    Namespace = maps:get(namespace, Opts, ?global_ns),
+    maybe
+        {ok, DefaultDir} ?= backup_root_dir(Namespace),
+        BackupDir = maps:get(out_dir, Opts, DefaultDir),
+        BackupName = filename:join(BackupDir, BackupBaseName),
+        BackupTarName = tar(BackupName),
+        maybe_print("Exporting data to ~p...~n", [BackupTarName], Opts),
+        {ok, TarDescriptor} ?= format_tar_error(erl_tar:open(BackupTarName, [write, compressed])),
+        {ok, {BackupName, TarDescriptor}}
+    end.
+
+do_export(BackupName, TarDescriptor, Opts) ->
+    BackupBaseName = filename:basename(BackupName),
+    BackupTarName = tar(BackupName),
+    Meta = #{
+        version => emqx_release:version(),
+        edition => emqx_release:edition(),
+        security_profile => emqx_security_profile:profile()
+    },
+    MetaBin = bin(hocon_pp:do(Meta, #{})),
+    MetaFilename = filename:join(BackupBaseName, ?META_FILENAME),
+    Namespace = maps:get(namespace, Opts, ?global_ns),
+
+    ok = format_tar_error(erl_tar:add(TarDescriptor, MetaBin, MetaFilename, [])),
+    case Namespace of
+        ?global_ns ->
+            %% A global export is a full-cluster artifact: global configuration
+            %% and mnesia tables plus every namespace's configuration.
+            ok = export_cluster_hocon(TarDescriptor, BackupBaseName, Opts),
+            ok = export_all_namespaced_cluster_hocon(TarDescriptor, BackupBaseName, Opts),
+            ok = export_mnesia_tabs(TarDescriptor, BackupName, BackupBaseName, Opts);
+        _ when is_binary(Namespace) ->
+            ok = export_namespaced_cluster_hocon(TarDescriptor, BackupBaseName, Namespace, Opts)
+    end,
+    ok = format_tar_error(erl_tar:close(TarDescriptor)),
+    {ok, #file_info{
+        size = Size,
+        ctime = CTime
+    }} = file:read_file_info(BackupTarName, [{time, posix}]),
+    {ok, #{
+        filename => bin(BackupTarName),
+        size => Size,
+        created_at => emqx_utils_calendar:epoch_to_rfc3339(CTime, second),
+        created_at_sec => CTime,
+        node => node()
+    }}.
+
+export_cluster_hocon(TarDescriptor, BackupBaseName, Opts) ->
+    maybe_print("Exporting cluster configuration...~n", [], Opts),
+    RawConf1 = emqx_config:read_override_conf(#{override_to => cluster}),
+    maybe_print(
+        "Exporting additional files from EMQX data_dir: ~p...~n", [str(emqx:data_dir())], Opts
+    ),
+    RawConf2 = read_data_files(RawConf1),
+    TransformFn = maps:get(raw_conf_transform, Opts, fun(Raw) -> Raw end),
+    RawConf = TransformFn(RawConf2),
+    RawConfBin = bin(hocon_pp:do(RawConf, #{})),
+    NameInArchive = filename:join(BackupBaseName, ?CLUSTER_HOCON_FILENAME),
+    ok = format_tar_error(erl_tar:add(TarDescriptor, RawConfBin, NameInArchive, [])).
+
+export_namespaced_cluster_hocon(TarDescriptor, BackupBaseName, Namespace, Opts) ->
+    RootConfig = emqx_config:get_all_roots_from_namespace(Namespace),
+    add_namespaced_cluster_hocon(TarDescriptor, BackupBaseName, Namespace, RootConfig, Opts).
+
+export_all_namespaced_cluster_hocon(TarDescriptor, BackupBaseName, Opts) ->
+    maps:foreach(
+        fun(Namespace, RootConfig) ->
+            ok = add_namespaced_cluster_hocon(
+                TarDescriptor, BackupBaseName, Namespace, RootConfig, Opts
+            )
+        end,
+        emqx_config:get_all_raw_namespaced_configs()
+    ).
+
+add_namespaced_cluster_hocon(TarDescriptor, BackupBaseName, Namespace, RootConfig0, Opts) ->
+    maybe_print("Exporting cluster configuration for namespace ~s...~n", [Namespace], Opts),
+    TransformFn = maps:get(raw_conf_transform, Opts, fun(Raw) -> Raw end),
+    RootConfig = TransformFn(RootConfig0),
+    RawConfBin = bin(hocon_pp:do(RootConfig, #{})),
+    NameInArchive = str(
+        filename:join(?HOCON_NS_INTERNAL_TAR_PATH(BackupBaseName, Namespace))
+    ),
+    ok = format_tar_error(erl_tar:add(TarDescriptor, RawConfBin, NameInArchive, [])),
+    ok.
+
+export_mnesia_tabs(TarDescriptor, BackupName, BackupBaseName, Opts) ->
+    maybe_print("Exporting built-in database...~n", [], Opts),
+    FilterFn = maps:get(mnesia_table_filter, Opts, fun(_TableName) -> true end),
+    lists:foreach(
+        fun(Mod) ->
+            {_Name, Tabs} = emqx_db_backup:backup_tables(Mod),
+            lists:foreach(
+                fun(Tab) ->
+                    export_mnesia_tab(TarDescriptor, Tab, BackupName, BackupBaseName, Opts)
+                end,
+                lists:filter(FilterFn, Tabs)
+            )
+        end,
+        tabs_to_backup()
+    ).
+
+export_mnesia_tab(TarDescriptor, TabName, BackupName, BackupBaseName, Opts) ->
+    maybe_print("Exporting ~p database table...~n", [TabName], Opts),
+    {ok, MnesiaBackupName} = do_export_mnesia_tab(TabName, BackupName),
+    NameInArchive = mnesia_backup_name(BackupBaseName, TabName),
+    ok = format_tar_error(erl_tar:add(TarDescriptor, MnesiaBackupName, NameInArchive, [])),
+    _ = file:delete(MnesiaBackupName),
+    ok.
+
+do_export_mnesia_tab(TabName, BackupName) ->
+    Node = node(),
+    try
+        Opts0 = [{name, TabName}, {min, [TabName]}, {allow_remote, false}],
+        Opts =
+            case mnesia:table_info(TabName, storage_type) of
+                ram_copies -> [{ram_overrides_dump, true} | Opts0];
+                _ -> Opts0
+            end,
+        {ok, TabName, [Node]} = mnesia:activate_checkpoint(Opts),
+        MnesiaBackupName = mnesia_backup_name(BackupName, TabName),
+        ok = filelib:ensure_dir(MnesiaBackupName),
+        ok = mnesia:backup_checkpoint(TabName, MnesiaBackupName),
+        {ok, MnesiaBackupName}
+    after
+        mnesia:deactivate_checkpoint(TabName)
+    end.
+
+-ifdef(TEST).
+tabs_to_backup() ->
+    %% Allow mocking in tests
+    ?MODULE:modules_with_mnesia_tabs_to_backup().
+
+import_skip_root_keys_test() ->
+    %% A root listed in import_skip_root_keys/0 must not also appear as the
+    %% first segment of any ?CONF_KEYS path: those would silently never be
+    %% imported.
+    ConfRoots = lists:usort([hd(KP) || KP <- ?CONF_KEYS]),
+    Overlap = [K || K <- import_skip_root_keys(), lists:member(K, ConfRoots)],
+    ?assertEqual([], Overlap).
+
+assert_expected_table_test() ->
+    %% A backup file is chosen for restore by its name, but its schema
+    %% records name the table `mnesia:restore/2' actually writes. Records
+    %% may only ever land in the requested table: a schema record naming
+    %% any other table must be rejected (before the restore, which commits).
+    ok = assert_expected_table({some_record, key, value}, emqx_banned),
+    ok = assert_expected_table({schema, emqx_banned, []}, emqx_banned),
+    ?assertThrow(
+        {error, {unexpected_table, other_table}},
+        assert_expected_table({schema, other_table, []}, emqx_banned)
+    ).
+-else.
+tabs_to_backup() ->
+    modules_with_mnesia_tabs_to_backup().
+-endif.
+
+modules_with_mnesia_tabs_to_backup() ->
+    lists:flatten([M || M <- find_behaviours(emqx_db_backup)]).
+
+mnesia_backup_name(Path, TabName) ->
+    filename:join([Path, ?BACKUP_MNESIA_DIR, atom_to_list(TabName)]).
+
+validate_import_allowed() ->
+    case mria_rlog:role() of
+        core -> ok;
+        _ -> {error, not_core_node}
+    end.
+
+validate_file_exists(FilePath) ->
+    case filelib:is_regular(FilePath) of
+        true -> ok;
+        false -> {error, not_found}
+    end.
+
+validate_backup(BackupDir) ->
+    case hocon:files([filename:join(BackupDir, ?META_FILENAME)]) of
+        {ok, #{
+            <<"edition">> := Edition,
+            <<"version">> := Version
+        }} = Meta ->
+            validate(
+                [
+                    fun() -> check_edition(Edition) end,
+                    fun() -> check_version(Version) end
+                ],
+                Meta
+            );
         _ ->
+            ?SLOG(error, #{msg => "missing_backup_meta", backup => BackupDir}),
+            {error, missing_backup_meta}
+    end.
+
+validate([ValidatorFun | T], OkRes) ->
+    case ValidatorFun() of
+        ok -> validate(T, OkRes);
+        Err -> Err
+    end;
+validate([], OkRes) ->
+    OkRes.
+
+%% Deliberately not part of `validate_backup/1''s validator list: that function
+%% also runs at upload time, before an import override can be in scope. Staging
+%% a backup for review must never require the override, so this check only runs
+%% from `do_import/2', which has `Opts' in scope.
+check_security_profile(Meta, Opts) ->
+    case maps:get(allow_security_profile_mismatch, Opts, false) of
+        true ->
+            ok;
+        false ->
+            case emqx_security_profile:profile() of
+                hardened ->
+                    BackupProfile = maps:get(<<"security_profile">>, Meta, <<"legacy">>),
+                    case BackupProfile of
+                        <<"hardened">> -> ok;
+                        _ -> {error, {security_profile_mismatch, BackupProfile}}
+                    end;
+                legacy ->
+                    ok
+            end
+    end.
+
+check_edition(BackupEdition) when BackupEdition =:= <<"ce">>; BackupEdition =:= <<"ee">> ->
+    Edition = bin(emqx_release:edition()),
+    case {BackupEdition, Edition} of
+        {<<"ee">>, <<"ce">>} ->
+            {error, ee_to_ce_backup};
+        _ ->
+            ok
+    end;
+check_edition(BackupEdition) ->
+    ?SLOG(error, #{msg => "invalid_backup_edition", edition => BackupEdition}),
+    {error, invalid_edition}.
+
+check_version(ImportVersion) ->
+    case parse_version_no_patch(ImportVersion) of
+        {ok, {ImportMajorInt, ImportMinorInt}} ->
+            Version = emqx_release:version(),
+            {ok, {MajorInt, MinorInt}} = parse_version_no_patch(bin(Version)),
+            case
+                ImportMajorInt =< 4 orelse ImportMajorInt > MajorInt orelse
+                    (ImportMajorInt =:= MajorInt andalso ImportMinorInt > MinorInt)
+            of
+                true ->
+                    %% - do not allow import of backups from version 4 and older
+                    %% - do not allow import of backups from newer versions to older versions
+                    {error, {unsupported_version, str(ImportVersion)}};
+                false ->
+                    ok
+            end;
+        Err ->
+            Err
+    end.
+
+parse_version_no_patch(VersionBin) ->
+    case string:split(VersionBin, ".", all) of
+        [Major, Minor | _] ->
+            {MajorInt, _} = emqx_utils_binary:bin_to_int(Major),
+            {MinorInt, _} = emqx_utils_binary:bin_to_int(Minor),
+            {ok, {MajorInt, MinorInt}};
+        _ ->
+            ?SLOG(error, #{msg => "failed_to_parse_backup_version", version => VersionBin}),
+            {error, invalid_version}
+    end.
+
+do_import(BackupFilePath, Opts) ->
+    maybe_print("Importing data from ~p...~n", [BackupFilePath], Opts),
+    Namespace = maps:get(namespace, Opts, ?global_ns),
+    try
+        maybe
+            {ok, BackupDir} ?= backup_dir(Namespace, BackupFilePath),
+            ok ?= validate_backup_basename(BackupFilePath),
+            ok ?= extract_backup(Namespace, BackupFilePath),
+            {ok, Meta} ?= validate_backup(BackupDir),
+            ok ?= check_security_profile(Meta, Opts),
+            {ok, #{conf_errors := ConfErrors, mnesia_errors := MnesiaErrors}} ?=
+                do_import_for_namespace(Namespace, BackupDir, Opts),
+            Result = #{db_errors => MnesiaErrors, config_errors => ConfErrors},
+            log_import_result(BackupFilePath, Result),
+            {ok, Result}
+        else
+            {error, Error} ->
+                ?SLOG(error, #{
+                    msg => "emqx_data_import_failed",
+                    reason => Error,
+                    backup_file_path => BackupFilePath
+                }),
+                {error, Error}
+        end
+    catch
+        Class:Reason:Stack ->
+            ?SLOG(error, #{
+                msg => "emqx_data_import_failed",
+                backup_file_path => BackupFilePath,
+                exception => Class,
+                reason => Reason,
+                stacktrace => Stack
+            }),
+            {error, Reason}
+    after
+        cleanup_backup_dir(Namespace, BackupFilePath)
+    end.
+
+log_import_result(_BackupFilePath, #{db_errors := DbErrors, config_errors := ConfErrors}) when
+    map_size(DbErrors) =:= 0,
+    map_size(ConfErrors) =:= 0
+->
+    ?SLOG(info, #{msg => "emqx_data_import_success"});
+log_import_result(BackupFilePath, #{db_errors := DbErrors, config_errors := ConfErrors}) ->
+    ?SLOG(warning, #{
+        msg => "emqx_data_import_completed_with_errors",
+        db_errors => DbErrors,
+        config_errors => ConfErrors,
+        backup_file_path => BackupFilePath
+    }).
+
+do_import_for_namespace(?global_ns, BackupDir, Opts) ->
+    maybe
+        {ok, GlobalConfErrors} ?= import_cluster_hocon(BackupDir, Opts),
+        {ok, NSConfErrors} ?= import_all_namespaced_cluster_hocon(BackupDir, Opts),
+        MnesiaErrors = import_mnesia_tabs(BackupDir, Opts),
+        ConfErrors0 =
+            case map_size(GlobalConfErrors) of
+                0 -> #{};
+                _ -> #{?global_ns => GlobalConfErrors}
+            end,
+        ConfErrors = maps:merge(ConfErrors0, NSConfErrors),
+        {ok, #{
+            mnesia_errors => MnesiaErrors,
+            conf_errors => ConfErrors
+        }}
+    end;
+do_import_for_namespace(Namespace, BackupDir, Opts) when is_binary(Namespace) ->
+    maybe
+        {ok, NSConfErrors} ?= import_namespaced_cluster_hocon(Namespace, BackupDir, Opts),
+        {ok, #{conf_errors => NSConfErrors, mnesia_errors => #{}}}
+    end.
+
+import_mnesia_tabs(BackupDir, Opts) ->
+    maybe_print("Importing built-in database...~n", [], Opts),
+    filter_errors(
+        lists:foldr(
+            fun(Mod, Acc) ->
+                {_Name, Tabs} = emqx_db_backup:backup_tables(Mod),
+                lists:foldr(
+                    fun(Tab, InAcc) ->
+                        InAcc#{Tab => import_mnesia_tab(BackupDir, Mod, Tab, Opts)}
+                    end,
+                    Acc,
+                    Tabs
+                )
+            end,
+            #{},
+            tabs_to_backup()
+        )
+    ).
+
+-spec import_mnesia_tab(file:filename_all(), module(), mria:table(), map()) ->
+    ok | {ok, no_backup_file} | {error, term()} | no_return().
+import_mnesia_tab(BackupDir, Mod, TabName, Opts) ->
+    MnesiaBackupFilename = mnesia_backup_name(BackupDir, TabName),
+    case filelib:is_regular(MnesiaBackupFilename) of
+        true ->
+            maybe_print("Importing ~p database table...~n", [TabName], Opts),
+            restore_mnesia_tab(BackupDir, MnesiaBackupFilename, Mod, TabName, Opts);
+        false ->
+            maybe_print("No backup file for ~p database table...~n", [TabName], Opts),
+            ?SLOG(info, #{msg => "missing_mnesia_backup", table => TabName, backup => BackupDir}),
             ok
     end.
 
--else.
-do_read_global_auth_type(Data) ->
-    case Data of
-        #{<<"auth.mnesia.as">> := <<"username">>} ->
-            application:set_env(emqx_auth_mnesia, as, username);
-        #{<<"auth.mnesia.as">> := <<"clientid">>} ->
-            application:set_env(emqx_auth_mnesia, as, clientid);
-        _ ->
-            logger:error("While importing data from EMQX versions prior to 4.3 "
-                         "it is necessary to specify the value of \"auth.mnesia.as\" parameter "
-                         "as it was configured in etc/plugins/emqx_auth_mnesia.conf.\n"
-                         "Use the following command to import data:\n"
-                         "  $ emqx_ctl data import <filename> --env '{\"auth.mnesia.as\":\"username\"}'\n"
-                         "or\n"
-                         "  $ emqx_ctl data import <filename> --env '{\"auth.mnesia.as\":\"clientid\"}'",
-                         []),
-            error(import_failed)
+restore_mnesia_tab(BackupDir, MnesiaBackupFilename, Mod, TabName, Opts) ->
+    Validated = validate_mnesia_backup(MnesiaBackupFilename, Mod, TabName),
+    try
+        case Validated of
+            {ok, #{backup_file := BackupFile}} ->
+                Restored = restore_mnesia_tab(BackupFile, TabName, mnesia_restore_mode(Opts)),
+                case Restored of
+                    ok ->
+                        on_table_imported(Mod, TabName, Opts);
+                    RestoreErr ->
+                        ?SLOG(error, #{
+                            msg => "failed_to_restore_mnesia_backup",
+                            table => TabName,
+                            backup => BackupDir,
+                            reason => RestoreErr
+                        }),
+                        maybe_print_mnesia_import_err(TabName, RestoreErr, Opts),
+                        RestoreErr
+                end;
+            PrepareErr ->
+                ?SLOG(error, #{
+                    msg => "failed_to_prepare_mnesia_backup_for_restoring",
+                    table => TabName,
+                    backup => BackupDir,
+                    reason => PrepareErr
+                }),
+                maybe_print_mnesia_import_err(TabName, PrepareErr, Opts),
+                PrepareErr
+        end
+    after
+        %% Cleanup files as soon as they are not needed any more for more efficient disk usage
+        _ = file:delete(MnesiaBackupFilename)
     end.
--endif.
 
-get_old_type() ->
-    {ok, Type} = application:get_env(emqx_auth_mnesia, as),
-    Type.
+mnesia_restore_mode(Opts) ->
+    maps:get(mnesia_restore_mode, Opts, ?DEFAULT_MNESIA_RESTORE_MODE).
+
+restore_mnesia_tab(BackupFile, TabName, merge) ->
+    %% keep_tables is the legacy Data Backup import behavior: backup records are
+    %% merged into existing local tables and local-only records are preserved.
+    case mnesia:restore(BackupFile, [{default_op, keep_tables}]) of
+        {atomic, [TabName]} ->
+            ok;
+        RestoreErr ->
+            {error, RestoreErr}
+    end;
+restore_mnesia_tab(BackupFile, TabName, snapshot) ->
+    restore_mnesia_tab_as_snapshot(BackupFile, TabName).
+
+restore_mnesia_tab_as_snapshot(BackupFile, TabName) ->
+    case read_mnesia_backup_records(BackupFile, TabName) of
+        {ok, Records} ->
+            restore_mnesia_records_as_snapshot(TabName, Records);
+        Error ->
+            Error
+    end.
+
+restore_mnesia_records_as_snapshot(TabName, Records) ->
+    case mria_config:shard_rlookup(TabName) of
+        undefined ->
+            {error, {unknown_mria_shard, TabName}};
+        Shard ->
+            run_restore_mnesia_transaction(Shard, TabName, Records)
+    end.
+
+run_restore_mnesia_transaction(Shard, TabName, Records) ->
+    Result = mria:sync_transaction(Shard, fun() ->
+        do_restore_mnesia_tab(TabName, Records)
+    end),
+    case Result of
+        {atomic, ok} ->
+            ok;
+        {timeout, {atomic, ok}} ->
+            ok;
+        {aborted, Reason} ->
+            {error, Reason};
+        {timeout, {aborted, Reason}} ->
+            {error, Reason};
+        {timeout, {error, Reason}} ->
+            {error, Reason}
+    end.
+
+do_restore_mnesia_tab(TabName, Records) ->
+    lists:foreach(
+        fun(Key) ->
+            ok = mnesia:delete(TabName, Key, write)
+        end,
+        mnesia:all_keys(TabName)
+    ),
+    lists:foreach(
+        fun(Record) ->
+            ok = mnesia:write(TabName, Record, write)
+        end,
+        Records
+    ).
+
+read_mnesia_backup_records(BackupFile, TabName) ->
+    RecordName = mnesia:table_info(TabName, record_name),
+    Arity = length(mnesia:table_info(TabName, attributes)) + 1,
+    Result =
+        try_traverse_backup(fun() ->
+            mnesia:traverse_backup(
+                BackupFile,
+                mnesia_backup,
+                dummy,
+                read_only,
+                fun(Item, Acc) ->
+                    case read_mnesia_backup_item(TabName, RecordName, Arity, Item) of
+                        {ok, schema} ->
+                            {[], Acc};
+                        {ok, Record} ->
+                            {[], [Record | Acc]};
+                        Error ->
+                            throw(Error)
+                    end
+                end,
+                []
+            )
+        end),
+    case Result of
+        {ok, RecordsRev} ->
+            {ok, lists:reverse(RecordsRev)};
+        {error, _} = Error ->
+            Error;
+        Error ->
+            {error, Error}
+    end.
+
+read_mnesia_backup_item(_TabName, _RecordName, _Arity, {schema, _Tab, _CreateList}) ->
+    {ok, schema};
+read_mnesia_backup_item(TabName, RecordName, Arity, Record) when
+    is_tuple(Record), tuple_size(Record) =:= Arity
+->
+    case element(1, Record) of
+        RecordName ->
+            {ok, Record};
+        TabName ->
+            {ok, setelement(1, Record, RecordName)};
+        _ ->
+            {error, {bad_backup_record, TabName, Record}}
+    end;
+read_mnesia_backup_item(TabName, _RecordName, _Arity, Record) ->
+    {error, {bad_backup_record, TabName, Record}}.
+
+on_table_imported(Mod, Tab, Opts) ->
+    case erlang:function_exported(Mod, on_backup_table_imported, 2) of
+        true ->
+            try
+                Mod:on_backup_table_imported(Tab, Opts)
+            catch
+                Class:Reason:Stack ->
+                    ?SLOG(error, #{
+                        msg => "post_database_import_callback_failed",
+                        table => Tab,
+                        module => Mod,
+                        exception => Class,
+                        reason => Reason,
+                        stacktrace => Stack
+                    }),
+                    {error, Reason}
+            end;
+        false ->
+            ok
+    end.
+
+%% NOTE: if backup file is valid, we keep traversing it, though we only need to validate schema.
+%% Looks like there is no clean way to abort traversal without triggering any error reporting,
+%% `mnesia_bup:read_schema/2` is an option but its direct usage should also be avoided...
+validate_mnesia_backup(MnesiaBackupFilename, Mod, ExpectedTab) ->
+    Init = #{backup_file => MnesiaBackupFilename},
+    Validated =
+        try_traverse_backup(fun() ->
+            mnesia:traverse_backup(
+                MnesiaBackupFilename,
+                mnesia_backup,
+                dummy,
+                read_only,
+                mnesia_backup_validator(Mod, ExpectedTab),
+                Init
+            )
+        end),
+    case Validated of
+        ok ->
+            {ok, Init};
+        {error, {_, over}} ->
+            {ok, Init};
+        {error, {_, migrate}} ->
+            migrate_mnesia_backup(MnesiaBackupFilename, Mod, Init);
+        Error ->
+            Error
+    end.
+
+%% if the module has validator callback, use it else use the default
+mnesia_backup_validator(Mod, ExpectedTab) ->
+    Validator =
+        case erlang:function_exported(Mod, validate_mnesia_backup, 1) of
+            true ->
+                fun Mod:validate_mnesia_backup/1;
+            _ ->
+                fun default_validate_mnesia_backup/1
+        end,
+    fun(Schema, Acc) ->
+        %% The importer picks the table to restore by the archive file
+        %% name, but `mnesia:restore/2' writes to the table named in the
+        %% backup's own schema records. Reject any schema that declares a
+        %% table other than the requested one, so records can only ever
+        %% land in `ExpectedTab'. Enforced here (not only in the per-module
+        %% validator) so a module callback cannot relax it, and before the
+        %% restore, which commits.
+        ok = assert_expected_table(Schema, ExpectedTab),
+        case Validator(Schema) of
+            ok ->
+                {[Schema], Acc};
+            {ok, Break} ->
+                throw({error, Break});
+            Error ->
+                throw(Error)
+        end
+    end.
+
+assert_expected_table({schema, Tab, _CreateList}, ExpectedTab) when Tab =/= ExpectedTab ->
+    throw({error, {unexpected_table, Tab}});
+assert_expected_table(_Schema, _ExpectedTab) ->
+    ok.
+
+default_validate_mnesia_backup({schema, Tab, CreateList}) ->
+    ImportAttributes = proplists:get_value(attributes, CreateList),
+    Attributes = mnesia:table_info(Tab, attributes),
+    case ImportAttributes == Attributes of
+        true ->
+            ok;
+        false ->
+            {error, different_table_schema}
+    end;
+default_validate_mnesia_backup(_Other) ->
+    ok.
+
+migrate_mnesia_backup(MnesiaBackupFilename, Mod, Acc) ->
+    case erlang:function_exported(Mod, migrate_mnesia_backup, 1) of
+        true ->
+            MigrateFile = MnesiaBackupFilename ++ ".migrate",
+            Migrator = fun(Schema, InAcc) ->
+                case Mod:migrate_mnesia_backup(Schema) of
+                    {ok, NewSchema} ->
+                        {[NewSchema], InAcc};
+                    Error ->
+                        throw(Error)
+                end
+            end,
+            try_traverse_backup(fun() ->
+                mnesia:traverse_backup(
+                    MnesiaBackupFilename,
+                    MigrateFile,
+                    Migrator,
+                    Acc#{backup_file := MigrateFile}
+                )
+            end);
+        _ ->
+            {error, no_migrator}
+    end.
+
+try_traverse_backup(Fun) ->
+    try Fun() of
+        Result ->
+            Result
+    catch
+        throw:Reason ->
+            Reason;
+        exit:Reason ->
+            {'EXIT', Reason};
+        error:Reason:Stacktrace ->
+            {'EXIT', {Reason, Stacktrace}}
+    end.
+
+extract_backup(Namespace, BackupFilePath) ->
+    ?SLOG(debug, #{msg => "extract_backup", backup_file_path => BackupFilePath}),
+    maybe
+        {ok, RootBackupDir} ?= backup_root_dir(Namespace),
+        ok ?= validate_filenames(BackupFilePath),
+        ?SLOG(debug, #{
+            msg => "extracting_backup", backup => BackupFilePath, root_backup_dir => RootBackupDir
+        }),
+        format_tar_error(erl_tar:extract(BackupFilePath, [{cwd, RootBackupDir}, compressed]))
+    end.
+
+validate_filenames(BackupFilePath) ->
+    maybe
+        {ok, Members} ?= format_tar_error(erl_tar:table(BackupFilePath, [compressed, verbose])),
+        BackupName = filename:basename(BackupFilePath, ?TAR_SUFFIX),
+        validate_tar_members(BackupName, Members)
+    end.
+
+validate_tar_members(_BackupName, []) ->
+    ok;
+validate_tar_members(BackupName, [Member | Rest]) ->
+    case validate_tar_member(BackupName, Member) of
+        ok -> validate_tar_members(BackupName, Rest);
+        Error -> Error
+    end.
+
+%% Only regular files and directories confined to the `<backup name>/' subtree may be
+%% extracted: link members or path traversal could reach files outside the backup directory.
+validate_tar_member(BackupName, {Filename, Type, _Size, _MTime, _Mode, _Uid, _Gid}) when
+    Type =:= regular; Type =:= directory
+->
+    [Root | _] = Components = filename:split(Filename),
+    IsValid =
+        filename:pathtype(Filename) =:= relative andalso
+            Root =:= BackupName andalso
+            not lists:member("..", Components),
+    case IsValid of
+        true -> ok;
+        false -> {error, bad_archive_dir}
+    end;
+validate_tar_member(_BackupName, {Filename, Type, _Size, _MTime, _Mode, _Uid, _Gid}) ->
+    ?SLOG(warning, #{
+        msg => "bad_backup_archive_member",
+        filename => Filename,
+        type => Type
+    }),
+    {error, bad_archive_member}.
+
+import_cluster_hocon(BackupDir, Opts) ->
+    HoconFilename = filename:join(BackupDir, ?CLUSTER_HOCON_FILENAME),
+    do_import_cluster_hocon(?global_ns, BackupDir, HoconFilename, Opts).
+
+%% A global (full-cluster) archive may carry any number of `ns/<NS>/' entries;
+%% restore each one into its own namespace.
+import_all_namespaced_cluster_hocon(BackupDir, Opts) ->
+    Pattern = filename:join(?HOCON_NS_INTERNAL_TAR_PATH(BackupDir, "*")),
+    lists:foldl(
+        fun
+            (NSHoconPath, {ok, Acc}) ->
+                ?HOCON_NS_INTERNAL_TAR_PATH_REV_PAT(Namespace) =
+                    lists:reverse(filename:split(NSHoconPath)),
+                maybe
+                    {ok, Errors} ?=
+                        import_namespaced_cluster_hocon(bin(Namespace), BackupDir, Opts),
+                    {ok, maps:merge(Acc, Errors)}
+                end;
+            (_NSHoconPath, {error, _} = Error) ->
+                Error
+        end,
+        {ok, #{}},
+        filelib:wildcard(Pattern)
+    ).
+
+import_namespaced_cluster_hocon(Namespace, BackupDir, Opts) when is_binary(Namespace) ->
+    NSHoconPath = filename:join(?HOCON_NS_INTERNAL_TAR_PATH(BackupDir, Namespace)),
+    case do_import_cluster_hocon(Namespace, BackupDir, NSHoconPath, Opts) of
+        {ok, Res} when map_size(Res) == 0 ->
+            {ok, #{}};
+        {ok, Res} ->
+            {ok, #{Namespace => Res}};
+        {error, Reason} ->
+            {error, #{Namespace => Reason}}
+    end.
+
+do_import_cluster_hocon(Namespace, BackupDir, Filename, Opts) ->
+    case filelib:is_regular(Filename) of
+        true ->
+            maybe
+                {ok, RawConf0} ?= hocon:files([Filename]),
+                RawConf1 = upgrade_raw_conf(emqx_conf:schema_module(), RawConf0),
+                RawConf2 = drop_global_only_roots(Namespace, RawConf1, Opts),
+                {ok, RawConf} ?= validate_cluster_hocon(RawConf2),
+                maybe_print(
+                    "Importing cluster configuration for namespace ~s...~n", [Namespace], Opts
+                ),
+                %% At this point, when all validations have been passed, we want to log errors (if any)
+                %% but proceed with the next items, instead of aborting the whole import operation
+                {ok, do_import_conf(Namespace, RawConf, Opts)}
+            end;
+        false ->
+            maybe_print("No cluster configuration to be imported.~n", [], Opts),
+            ?SLOG(info, #{
+                msg => "no_backup_hocon_config_to_import",
+                namespace => Namespace,
+                backup => BackupDir
+            }),
+            {ok, #{}}
+    end.
+
+%% A namespaced import applies only the roots in the namespaced-config
+%% allow-list. Most `emqx_config_backup' importers write the global
+%% configuration regardless of the namespace they are given, so every other
+%% root is dropped before the schema check and the importer dispatch.
+drop_global_only_roots(?global_ns, RawConf, _Opts) ->
+    RawConf;
+drop_global_only_roots(Namespace, RawConf, Opts) when is_binary(Namespace) ->
+    Allowed = emqx_config:namespaced_config_allowed_roots(),
+    case lists:sort([Root || Root <- maps:keys(RawConf), not is_map_key(Root, Allowed)]) of
+        [] ->
+            RawConf;
+        Roots ->
+            maybe_print(
+                "Skipping config roots ~s: not namespace-writable.~n",
+                [lists:join(", ", Roots)],
+                Opts
+            ),
+            ?tp(warning, "data_import_skipped_global_roots", #{
+                namespace => Namespace,
+                root_keys => Roots
+            }),
+            maps:without(Roots, RawConf)
+    end.
+
+upgrade_raw_conf(SchemaMod, RawConf) ->
+    ok = emqx_utils:interactive_load(SchemaMod),
+    case erlang:function_exported(SchemaMod, upgrade_raw_conf, 1) of
+        true ->
+            %% TODO make it a schema module behaviour in hocon_schema
+            apply(SchemaMod, upgrade_raw_conf, [RawConf]);
+        false ->
+            RawConf
+    end.
+
+read_data_files(RawConf0) ->
+    DataDir = bin(emqx:data_dir()),
+    {ok, Cwd} = file:get_cwd(),
+    AbsDataDir = bin(filename:join(Cwd, DataDir)),
+    RawConf1 = emqx_authz:maybe_read_files(RawConf0),
+    RawConf2 = emqx_schema_registry_config:prepare_protobuf_files_for_export(RawConf1),
+    emqx_utils_maps:deep_convert(
+        RawConf2, fun read_data_file/4, [filename:split(DataDir), filename:split(AbsDataDir)]
+    ).
+
+read_data_file(Key, Val, DataDirParts, AbsDataDirParts) when is_binary(Val) ->
+    Parts = filename:split(Val),
+    Val1 =
+        case is_in_dir(DataDirParts, Parts) orelse is_in_dir(AbsDataDirParts, Parts) of
+            true -> do_read_file(Val);
+            false -> Val
+        end,
+    {Key, Val1};
+read_data_file(Key, Val, _DataDirParts, _AbsDataDirParts) ->
+    {Key, Val}.
+
+-doc """
+A path is in the directory when the directory's path components are a strict
+prefix of its own, so `data_source` is not in `data`, and `data` itself is not.
+""".
+is_in_dir(DirParts, Parts) ->
+    length(Parts) > length(DirParts) andalso lists:prefix(DirParts, Parts).
+
+do_read_file(Filename) ->
+    case file:read_file(Filename) of
+        {ok, Content} ->
+            Content;
+        {error, Reason} ->
+            ?SLOG(warning, #{
+                msg => "failed_to_read_data_file",
+                filename => Filename,
+                reason => Reason
+            }),
+            Filename
+    end.
+
+validate_cluster_hocon(RawConf0) ->
+    %% Drop read-only root keys (e.g. `node', `rpc') from the imported config
+    %% before merging with the running raw config. The importer never applies
+    %% those roots, and a partial sub-tree from the backup would shallow-replace
+    %% the running value and drop required fields without defaults such as
+    %% `node.cookie'.
+    RawConfFiltered = maps:without(import_skip_root_keys(), RawConf0),
+    %% Write ACL file(s) locally so the `authz:file` schema's path validator
+    %% (which calls file:consult/1) passes during the schema check below.
+    RawConf1 = emqx_authz:maybe_write_files(RawConfFiltered),
+    maybe
+        {ok, RawConf} ?=
+            emqx_hocon:check(
+                emqx_conf:schema_module(),
+                maps:merge(emqx:get_raw_config([]), RawConf1),
+                #{atom_key => false, required => false, make_serializable => true}
+            ),
+        Filtered = maps:with(maps:keys(RawConfFiltered), RawConf),
+        %% For every file authz source whose *input* form carried inline
+        %% `rules`, restore that `rules` field before the config is shipped
+        %% via cluster_rpc. Otherwise remote nodes would receive only a
+        %% `path` — pointing at the file we just wrote on this node — and
+        %% fail with `failed_to_read_acl_file` because they have no such
+        %% file locally. Sources whose input was a bare `path` (user-
+        %% specified) are left untouched so the user's intent is preserved.
+        {ok, restore_inline_authz_rules(Filtered, RawConfFiltered)}
+    end.
+
+%% Roots that are dropped from the imported cluster.hocon before the
+%% pre-flight schema check. These roots are never applied by the importer
+%% (they are not in ?CONF_KEYS and no emqx_config_backup handler covers
+%% them), so validating a partial sub-tree from the backup would only
+%% cause false negatives - in particular wiping required-no-default
+%% fields like `node.cookie' that only the running node has. Keep this
+%% list disjoint from ?CONF_KEYS (see import_skip_root_keys_test/0).
+import_skip_root_keys() ->
+    [<<"node">>, <<"rpc">>].
+
+restore_inline_authz_rules(
+    #{<<"authorization">> := #{<<"sources">> := NewSources} = NewAuthz} = NewConf,
+    #{<<"authorization">> := #{<<"sources">> := OldSources}}
+) ->
+    Restored = [maybe_restore_source_rules(S, OldSources) || S <- NewSources],
+    NewConf#{<<"authorization">> := NewAuthz#{<<"sources">> := Restored}};
+restore_inline_authz_rules(NewConf, _OldConf) ->
+    NewConf.
+
+maybe_restore_source_rules(
+    #{<<"type">> := <<"file">>, <<"path">> := _} = NewSrc, OldSources
+) ->
+    case
+        lists:search(
+            fun
+                (#{<<"type">> := <<"file">>, <<"rules">> := _}) -> true;
+                (_) -> false
+            end,
+            OldSources
+        )
+    of
+        {value, #{<<"rules">> := Rules}} ->
+            maps:remove(<<"path">>, NewSrc#{<<"rules">> => Rules});
+        false ->
+            NewSrc
+    end;
+maybe_restore_source_rules(NewSrc, _OldSources) ->
+    NewSrc.
+
+do_import_conf(Namespace, RawConf, Opts) ->
+    GenConfErrs = filter_errors(maps:from_list(import_generic_conf(Namespace, RawConf))),
+    maybe_print_conf_errors(GenConfErrs, Opts),
+    Modules = emqx_conf_dep_registry:sorted_importer_modules(),
+    Errors = lists:foldl(
+        print_ok_results_collect_errors(Namespace, RawConf, Opts),
+        GenConfErrs,
+        Modules
+    ),
+    maybe_print_conf_errors(Errors, Opts),
+    Errors.
+
+print_ok_results_collect_errors(Namespace, RawConf, Opts) ->
+    fun(Module, Errors) ->
+        case Module:import_config(Namespace, RawConf) of
+            {results, {OkResults, ErrResults}} ->
+                print_ok_results(OkResults, Opts),
+                collect_errors(ErrResults, Errors);
+            {ok, OkResult} ->
+                print_ok_results([OkResult], Opts),
+                Errors;
+            {error, ErrResult} ->
+                collect_errors([ErrResult], Errors)
+        end
+    end.
+
+print_ok_results(Results, Opts) ->
+    lists:foreach(
+        fun(#{changed := Changed}) ->
+            maybe_print_changed(Changed, Opts)
+        end,
+        Results
+    ).
+
+collect_errors(Results, Errors) ->
+    lists:foldr(
+        fun(#{root_key := RootKey, reason := Reason}, Acc) ->
+            Acc#{[RootKey] => Reason}
+        end,
+        Errors,
+        Results
+    ).
+
+import_generic_conf(Namespace, Data) ->
+    lists:map(
+        fun(KeyPath) ->
+            case emqx_utils_maps:deep_get(KeyPath, Data, undefined) of
+                undefined ->
+                    {[KeyPath], ok};
+                Conf ->
+                    UpdateRes = emqx_conf:update(
+                        KeyPath,
+                        Conf,
+                        with_namespace(#{override_to => cluster}, Namespace)
+                    ),
+                    {[KeyPath], UpdateRes}
+            end
+        end,
+        ?MODULE:conf_keys()
+    ).
+
+%% Only exposed for tests/mocking.
+conf_keys() ->
+    ?CONF_KEYS.
+
+maybe_print_changed(Changed, Opts) ->
+    lists:foreach(
+        fun(ChangedPath) ->
+            maybe_print(
+                "Config key path ~p was present before import and "
+                "has been overwritten.~n",
+                [pretty_path(ChangedPath)],
+                Opts
+            )
+        end,
+        Changed
+    ).
+
+maybe_print_conf_errors(Errors, Opts) ->
+    maps:foreach(conf_error_formatter(Opts), Errors).
+
+conf_error_formatter(Opts) ->
+    fun(Path, Err) ->
+        maybe_print(
+            "Failed to import the following config path: ~p, reason: ~p~n",
+            [pretty_path(Path), Err],
+            Opts
+        )
+    end.
+
+filter_errors(Results) ->
+    maps:filter(
+        fun
+            (_Path, {error, _}) -> true;
+            (_, _) -> false
+        end,
+        Results
+    ).
+
+pretty_path(Path) ->
+    str(lists:join(".", [str(Part) || Part <- Path])).
+
+str(Data) when is_atom(Data) ->
+    atom_to_list(Data);
+str(Data) ->
+    unicode:characters_to_list(Data).
+
+bin(Data) when is_atom(Data) ->
+    atom_to_binary(Data, utf8);
+bin(Data) ->
+    unicode:characters_to_binary(Data).
+
+root_backup_dir() ->
+    Dir = filename:join(emqx:data_dir(), ?ROOT_BACKUP_DIR),
+    ok = ensure_path(Dir),
+    Dir.
+
+ensure_path(Path) ->
+    filelib:ensure_path(Path).
+
+local_datetime(MillisecondTs) ->
+    calendar:system_time_to_local_time(MillisecondTs, millisecond).
+
+maybe_print(Format, Args, #{print_fun := PrintFun}) ->
+    PrintFun(Format, Args);
+maybe_print(_Format, _Args, _Opts) ->
+    ok.
+
+maybe_print_mnesia_import_err(TabName, Error, Opts) ->
+    maybe_print(
+        "[error] Failed to import built-in database table: ~p, reason: ~p~n",
+        [TabName, Error],
+        Opts
+    ).
+
+find_behaviours(Behaviour) ->
+    emqx_behaviour_utils:find_behaviours(Behaviour).
+
+-spec table_set_to_tables_mapping() -> #{binary() => module()}.
+table_set_to_tables_mapping() ->
+    Key = {?MODULE, table_set_to_tables_mapping},
+    case persistent_term:get(Key, undefined) of
+        undefined ->
+            Mapping = build_table_set_to_tables_mapping(),
+            persistent_term:put(Key, Mapping),
+            Mapping;
+        Mapping ->
+            Mapping
+    end.
+
+build_table_set_to_tables_mapping() ->
+    Mods = modules_with_mnesia_tabs_to_backup(),
+    lists:foldl(
+        fun(Mod, Acc) ->
+            {Name, Tabs} = emqx_db_backup:backup_tables(Mod),
+            maps:update_with(
+                Name,
+                fun(PrevTabs) -> Tabs ++ PrevTabs end,
+                Tabs,
+                Acc
+            )
+        end,
+        #{},
+        Mods
+    ).
+
+tar(Filename) ->
+    Filename ++ ?TAR_SUFFIX.
+
+format_tar_error(Expr) ->
+    case Expr of
+        {error, Reason} -> {error, erl_tar:format_error(Reason)};
+        Other -> Other
+    end.
+
+validate_backup_basename(BackupFilePath) ->
+    BaseNameNoExt = filename:basename(BackupFilePath, ?TAR_SUFFIX),
+    BaseName = filename:basename(BackupFilePath),
+    case BaseName =:= BaseNameNoExt ++ ?TAR_SUFFIX of
+        true -> ok;
+        false -> {error, bad_backup_name}
+    end.
+
+backup_dir(Namespace, BackupFilePath) ->
+    BaseName = filename:basename(BackupFilePath, ?TAR_SUFFIX),
+    maybe
+        ok ?= validate_extract_dir_name(Namespace, BaseName),
+        {ok, RootBackupDir} ?= backup_root_dir(Namespace),
+        case filelib:safe_relative_path(BaseName, RootBackupDir) of
+            unsafe -> {error, unsafe_backup_name};
+            _ -> {ok, filename:join(RootBackupDir, BaseName)}
+        end
+    end.
+
+%% In the global root, `ns/' holds the namespaced backups; a backup named `ns' would
+%% extract into it and its cleanup would delete it.
+validate_extract_dir_name(?global_ns, ?NS_BACKUP_SUBDIR) ->
+    {error, unsafe_backup_name};
+validate_extract_dir_name(_Namespace, _BaseName) ->
+    ok.
+
+backup_path(Filename) ->
+    backup_path(?global_ns, Filename).
+
+backup_path(Namespace, Filename) when is_binary(Filename) ->
+    backup_path(Namespace, str(Filename));
+backup_path(Namespace, Filename) when is_list(Filename) ->
+    maybe
+        [Filename] ?= filename:split(Filename),
+        ok ?= validate_backup_basename(Filename),
+        {ok, Dir} ?= backup_root_dir(Namespace),
+        {ok, filename:join(Dir, Filename)}
+    else
+        {error, _} = Error -> Error;
+        _ -> {error, bad_backup_name}
+    end.
+
+%% Global (and legacy) backups live directly in the root backup directory;
+%% namespaced backups are isolated under `<root>/ns/<Namespace>/'. This is the
+%% single choke point that keeps tenants from reaching each other's or the
+%% global administrator's archives.
+backup_root_dir(?global_ns) ->
+    {ok, root_backup_dir()};
+backup_root_dir(Namespace) when is_binary(Namespace) ->
+    namespaced_backup_dir(Namespace).
+
+%% The namespace comes from the authenticated caller, but implicitly created
+%% namespaces are not validated, so the name may be any binary. The name must
+%% map to exactly one directory leaf under `<root>/ns/': the resolved path must
+%% be `ns/<name>' verbatim. Anything else means the name contains path
+%% components that alias another directory and must be rejected. Note that
+%% `filelib:safe_relative_path/2' collapses `..' segments and returns `[]'
+%% (not `unsafe') when the path resolves to the base directory itself: `..'
+%% resolves `ns/..' to `[]' (the global backup root), `.' resolves to the
+%% shared `ns' container, and `a/../b' resolves to `ns/b' (another
+%% namespace's directory).
+namespaced_backup_dir(Namespace) ->
+    Root = root_backup_dir(),
+    NsStr = str(Namespace),
+    RelPath = filename:join(?NS_BACKUP_SUBDIR, NsStr),
+    case filelib:safe_relative_path(RelPath, Root) of
+        unsafe ->
+            {error, bad_namespace};
+        SafeRel ->
+            case filename:split(SafeRel) of
+                [?NS_BACKUP_SUBDIR, NsStr] ->
+                    Dir = filename:join(Root, SafeRel),
+                    ok = ensure_path(Dir),
+                    {ok, Dir};
+                _ ->
+                    {error, bad_namespace}
+            end
+    end.
+
+cleanup_backup_dir(Namespace, BackupFilePath) ->
+    maybe
+        {ok, BackupDir} ?= backup_dir(Namespace, BackupFilePath),
+        file:del_dir_r(BackupDir)
+    end.
+
+with_namespace(UpdateOpts, ?global_ns) ->
+    UpdateOpts;
+with_namespace(UpdateOpts, Namespace) when is_binary(Namespace) ->
+    UpdateOpts#{namespace => Namespace}.

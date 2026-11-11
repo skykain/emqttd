@@ -1,0 +1,31 @@
+emqx_stomp_schema {
+
+stomp.desc:
+"""The Stomp Gateway configuration.
+This gateway supports v1.2/1.1/1.0"""
+
+stomp_frame_max_headers.desc:
+"""The maximum number of Header"""
+
+stomp_frame_max_headers_length.desc:
+"""The maximum string length of the Header Value"""
+
+stomp_frame_max_body_length.desc:
+"""Maximum number of bytes of Body allowed per Stomp packet"""
+
+stomp_transaction.desc:
+"""Limits for Stomp transactions."""
+
+stomp_transaction_max_transactions.desc:
+"""Maximum number of transactions that can be open at the same time on a connection"""
+
+stomp_transaction_max_actions_per_transaction.desc:
+"""Maximum number of frames that can be buffered in a single transaction"""
+
+stomp_transaction_max_retained_bytes.desc:
+"""Maximum number of bytes retained by all open transactions on a connection"""
+
+stomp_transaction_timeout.desc:
+"""How long a transaction may stay open without being committed or aborted. Must be greater than zero."""
+
+}

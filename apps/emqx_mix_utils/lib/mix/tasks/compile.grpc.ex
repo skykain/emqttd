@@ -1,0 +1,344 @@
+defmodule Mix.Tasks.Compile.Grpc do
+  use Mix.Task.Compiler
+
+  alias EMQXUmbrella.MixProject, as: UMP
+
+  @recursive true
+  @manifest_vsn 1
+  # TODO: use manifest to track generated files?
+  @manifest "compile.grpc"
+
+  @client_quoted_pt_key {__MODULE__, :client_quoted}
+  @service_quoted_pt_key {__MODULE__, :service_quoted}
+
+  @stale? {__MODULE__, :stale?}
+
+  @impl true
+  def manifests(), do: [manifest()]
+  defp manifest(), do: Path.join(Mix.Project.manifest_path(), @manifest)
+
+  @impl true
+  def clean() do
+    Mix.Project.get!()
+    config = Mix.Project.config()
+
+    %{
+      out_dir: out_dir
+    } = config[:grpc_opts]
+
+    File.rm_rf!(out_dir)
+  end
+
+  @impl true
+  def run(_args) do
+    Mix.Project.get!()
+    config = Mix.Project.config()
+
+    %{
+      gpb_opts: gpb_opts,
+      proto_dirs: proto_dirs,
+      out_dir: out_dir
+    } = config[:grpc_opts]
+
+    add_to_path_and_cache(:syntax_tools)
+    :ok = Application.ensure_loaded(:syntax_tools)
+    :ok = Application.ensure_loaded(:gpb)
+
+    app_root = File.cwd!()
+    app_build_path = Mix.Project.app_path(config)
+
+    proto_srcs =
+      proto_dirs
+      |> Enum.map(&Path.join([app_root, &1]))
+      |> Mix.Utils.extract_files([:proto])
+
+    manifest_data = read_manifest(manifest())
+
+    gpb_opts_overrides = Map.get(config[:grpc_opts], :gpb_opts_overrides, %{})
+
+    context =
+      %{
+        manifest_data: manifest_data,
+        app_root: app_root,
+        app_build_path: app_build_path,
+        out_dir: out_dir,
+        proto_dirs: proto_dirs,
+        gpb_opts: gpb_opts,
+        gpb_opts_overrides: gpb_opts_overrides
+      }
+      |> Map.merge(Map.take(config[:grpc_opts], [:generate_server?, :generate_client?]))
+
+    Enum.each(proto_srcs, &compile_pb(&1, context))
+
+    manifest_data =
+      manifest_data
+      |> Map.put(:app_gpb_opts, gpb_opts)
+      |> Map.put(:overridden_gpb_opts, gpb_opts_overrides)
+
+    if Process.get(@stale?, false) do
+      write_manifest(manifest(), manifest_data)
+    end
+
+    :noop
+  after
+    Process.delete(@stale?)
+    Application.unload(:gpb)
+    Application.unload(:syntax_tools)
+  end
+
+  defp compile_pb(proto_src, context) do
+    %{
+      app_root: app_root,
+      app_build_path: app_build_path,
+      manifest_data: manifest_data,
+      out_dir: out_dir,
+      proto_dirs: proto_dirs,
+      gpb_opts: gpb_opts0,
+      gpb_opts_overrides: gpb_opts_overrides
+    } = context
+
+    relative_proto_src = Path.relative_to(proto_src, app_root)
+    gpb_opts = Map.get(gpb_opts_overrides, relative_proto_src, gpb_opts0)
+    manifest_modified_time = Mix.Utils.last_modified(manifest())
+    ebin_path = Path.join([app_build_path, "ebin"])
+    basename = proto_src |> Path.basename(".proto") |> to_charlist()
+    prefix = Keyword.get(gpb_opts, :module_name_prefix, ~c"")
+    suffix = Keyword.get(gpb_opts, :module_name_suffix, ~c"")
+    mod_name = ~c"#{prefix}#{basename}#{suffix}"
+    generated_src = Path.join([app_root, out_dir, "#{mod_name}.erl"])
+
+    includes = Enum.map(proto_dirs, &{:i, to_charlist(&1)})
+
+    opts = [o: out_dir] ++ includes ++ gpb_opts
+
+    proto_compilation_needed? =
+      stale?(proto_src, manifest_modified_time) ||
+        stale?(generated_src, manifest_modified_time) ||
+        compile_opts_stale?(relative_proto_src, gpb_opts, manifest_data)
+
+    if proto_compilation_needed? do
+      Process.put(@stale?, true)
+      debug("compiling proto file: #{proto_src}")
+      debug("opts: #{inspect(opts, pretty: true)}")
+      File.mkdir_p!(out_dir)
+      # TODO: better error logging...
+      :ok = :gpb_compile.file(to_charlist(proto_src), opts)
+    else
+      debug("proto file and generated source up to date, not compiling: #{proto_src}")
+    end
+
+    gpb_include_dir = :code.lib_dir(:gpb) |> Path.join("include")
+
+    if stale?(generated_src, manifest_modified_time) do
+      Process.put(@stale?, true)
+      debug("compiling proto module: #{generated_src}")
+
+      compile_res =
+        :compile.file(
+          to_charlist(generated_src),
+          [
+            :return_errors,
+            i: to_charlist(gpb_include_dir),
+            outdir: to_charlist(ebin_path)
+          ] ++ UMP.erlc_options()
+        )
+
+      # todo: error handling & logging
+      case compile_res do
+        {:ok, _} ->
+          :ok
+
+        {:ok, _, _warnings} ->
+          :ok
+      end
+    else
+      debug("file up to date, not compiling: #{generated_src}")
+    end
+
+    context
+    |> Map.merge(%{
+      mod_name: mod_name,
+      ebin_path: ebin_path,
+      manifest_modified_time: manifest_modified_time
+    })
+    |> generate_service_files()
+
+    :ok
+  end
+
+  defp generate_service_files(%{generate_server?: false, generate_client?: false}) do
+    :ok
+  end
+
+  defp generate_service_files(context) do
+    generate_server? = Map.get(context, :generate_server?, true)
+    generate_client? = Map.get(context, :generate_client?, true)
+
+    %{
+      mod_name: mod_name,
+      ebin_path: ebin_path,
+      app_root: app_root,
+      manifest_modified_time: manifest_modified_time,
+      out_dir: out_dir
+    } = context
+
+    mod_name
+    |> List.to_atom()
+    |> :code.purge()
+
+    {:module, _mod} =
+      ebin_path
+      |> Path.join(mod_name)
+      |> to_charlist()
+      |> :code.load_abs()
+
+    mod_name = List.to_atom(mod_name)
+    service_quoted = get_service_quoted_template()
+    client_quoted = get_client_quoted_template()
+
+    mod_name.get_service_names()
+    |> Enum.each(fn service ->
+      service
+      |> mod_name.get_service_def()
+      |> then(fn {{:service, service_name}, methods} ->
+        methods =
+          Enum.map(methods, fn method ->
+            snake_case = method.name |> to_string() |> Macro.underscore()
+            message_type = mod_name.msg_name_to_fqbin(method.input)
+
+            method
+            |> Map.put(:message_type, message_type)
+            |> Map.put(:snake_case, snake_case)
+            |> Map.put(:pb_module, mod_name)
+            |> Map.put(:unmodified_method, method.name)
+          end)
+
+        snake_service =
+          service_name
+          |> to_string()
+          |> Macro.underscore()
+          |> String.replace("/", "_")
+          |> String.replace(~r/(.)([0-9]+)/, "\\1_\\2")
+
+        bindings = [
+          methods: methods,
+          pb_module: mod_name,
+          module_name: snake_service,
+          unmodified_service_name: service_name
+        ]
+
+        bhvr_output_src = Path.join([app_root, out_dir, "#{snake_service}_bhvr.erl"])
+
+        if generate_server? do
+          if stale?(bhvr_output_src, manifest_modified_time) do
+            Process.put(@stale?, true)
+            render_and_write(service_quoted, bhvr_output_src, bindings)
+          else
+            debug("file up to date, not compiling: #{bhvr_output_src}")
+          end
+        end
+
+        client_output_src = Path.join([app_root, out_dir, "#{snake_service}_client.erl"])
+
+        if generate_client? do
+          if stale?(client_output_src, manifest_modified_time) do
+            Process.put(@stale?, true)
+            render_and_write(client_quoted, client_output_src, bindings)
+          else
+            debug("file up to date, not compiling: #{client_output_src}")
+          end
+        end
+
+        :ok
+      end)
+    end)
+
+    :ok
+  end
+
+  defp get_service_quoted_template() do
+    get_memoized(@service_quoted_pt_key, fn ->
+      [__DIR__, "../../", "emqx/grpc/template/service.eex"]
+      |> Path.join()
+      |> Path.expand()
+      |> EEx.compile_file()
+    end)
+  end
+
+  defp get_client_quoted_template() do
+    get_memoized(@client_quoted_pt_key, fn ->
+      [__DIR__, "../../", "emqx/grpc/template/client.eex"]
+      |> Path.join()
+      |> Path.expand()
+      |> EEx.compile_file()
+    end)
+  end
+
+  defp get_memoized(k, compute_fn) do
+    case :persistent_term.get(k, :undefined) do
+      :undefined ->
+        res = compute_fn.()
+        :persistent_term.put(k, res)
+        res
+
+      res ->
+        res
+    end
+  end
+
+  defp stale?(file, manifest_modified_time) do
+    with true <- File.exists?(file),
+         false <- Mix.Utils.stale?([file], [manifest_modified_time]) do
+      false
+    else
+      _ -> true
+    end
+  end
+
+  defp compile_opts_stale?(relative_proto_src, gpb_opts, manifest_data) do
+    previous_gpb_opts =
+      get_in(manifest_data, [:overridden_gpb_opts, relative_proto_src]) ||
+        get_in(manifest_data, [:app_gpb_opts]) || :undefined
+
+    previous_gpb_opts != gpb_opts
+  end
+
+  defp read_manifest(file) do
+    try do
+      file |> File.read!() |> :erlang.binary_to_term()
+    rescue
+      _ -> %{}
+    else
+      {@manifest_vsn, data} when is_map(data) -> data
+      _ -> %{}
+    end
+  end
+
+  defp write_manifest(file, data) do
+    debug("writing manifest #{file}")
+    File.mkdir_p!(Path.dirname(file))
+    File.write!(file, :erlang.term_to_binary({@manifest_vsn, data}))
+  end
+
+  defp render_and_write(quoted_file, output_src, bindings) do
+    {result, _bindings} = Code.eval_quoted(quoted_file, bindings)
+    result = String.replace(result, ~r/\n\n\n+/, "\n\n\n")
+    File.write!(output_src, result)
+  end
+
+  def add_to_path_and_cache(lib_name) do
+    :code.lib_dir()
+    |> Path.join("#{lib_name}-*")
+    |> Path.wildcard()
+    |> hd()
+    |> Path.join("ebin")
+    |> to_charlist()
+    |> :code.add_path(:cache)
+  end
+
+  defp debug(iodata) do
+    if Mix.debug?() do
+      Mix.shell().info(IO.ANSI.format([:cyan, iodata]))
+    end
+  end
+end

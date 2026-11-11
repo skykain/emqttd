@@ -1,0 +1,1057 @@
+%%--------------------------------------------------------------------
+%% Copyright (c) 2021-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
+%%--------------------------------------------------------------------
+
+-module(emqx_authn_api_SUITE).
+
+-compile(nowarn_export_all).
+-compile(export_all).
+
+-import(emqx_mgmt_api_test_util, [request/3, uri/1]).
+
+-include("emqx_authn.hrl").
+-include_lib("emqx/include/emqx.hrl").
+-include_lib("eunit/include/eunit.hrl").
+-include_lib("common_test/include/ct.hrl").
+
+-define(TCP_DEFAULT, 'tcp:default').
+
+-define(assertAuthenticatorsMatch(Guard, Path),
+    (fun() ->
+        {ok, 200, Response} = request(get, uri(Path)),
+        ?assertMatch(Guard, emqx_utils_json:decode(Response))
+    end)()
+).
+
+all() ->
+    [{group, legacy}, {group, hardened}].
+
+groups() ->
+    Tests = emqx_common_test_helpers:all(?MODULE),
+    [{legacy, [], Tests}, {hardened, [], Tests}].
+
+init_per_testcase(t_authenticator_fail, Config) ->
+    meck:expect(emqx_authn_proto_v1, lookup_from_all_nodes, 3, [{error, {exception, badarg}}]),
+    init_per_testcase(default, Config);
+init_per_testcase(_Case, Config) ->
+    emqx_authn_test_lib:delete_authenticators(
+        [?CONF_NS_ATOM],
+        ?GLOBAL
+    ),
+
+    emqx_authn_test_lib:delete_authenticators(
+        [listeners, tcp, default, ?CONF_NS_ATOM],
+        ?TCP_DEFAULT
+    ),
+    Config.
+
+end_per_testcase(t_authenticator_fail, Config) ->
+    meck:unload(emqx_authn_proto_v1),
+    Config;
+end_per_testcase(_, Config) ->
+    Config.
+
+init_per_suite(Config) ->
+    emqx_common_test_helpers:clear_security_profile(),
+    Config.
+
+end_per_suite(_Config) ->
+    emqx_common_test_helpers:clear_security_profile().
+
+init_per_group(Profile, Config) when Profile =:= legacy; Profile =:= hardened ->
+    ok = emqx_common_test_helpers:set_security_profile(Profile),
+    Apps = emqx_cth_suite:start(
+        [
+            {emqx_conf,
+                emqx_authn_test_lib:emqx_appspec(#{
+                    config => "log.audit { enable = true, level = info }",
+                    %% `emqx_cth_suite' would otherwise pick a schema that does not
+                    %% declare `log.audit'. dev-63 folded the enterprise schema into
+                    %% `emqx_conf_schema', which its own audit suite also uses.
+                    schema_mod => emqx_conf_schema
+                })},
+            {emqx_auth, #{after_start => fun() -> ok end}},
+            %% to load schema
+            {emqx_auth_mnesia, #{start => false}},
+            emqx_audit,
+            emqx_management,
+            {emqx_dashboard, "dashboard.listeners.http { enable = true, bind = 18083 }"}
+        ],
+        #{
+            work_dir => emqx_cth_suite:work_dir(Profile, Config)
+        }
+    ),
+    _ = emqx_common_test_http:create_default_app(),
+    ok = emqx_authn_test_lib:register_fake_providers([
+        {password_based, built_in_database},
+        {password_based, redis},
+        {password_based, http},
+        jwt
+    ]),
+    ?AUTHN:delete_chain(?GLOBAL),
+    {ok, Chains} = ?AUTHN:list_chains(),
+    ?assertEqual(length(Chains), 0),
+    [{apps, Apps}, {security_profile, Profile} | Config].
+
+end_per_group(Profile, Config) when Profile =:= legacy; Profile =:= hardened ->
+    _ = emqx_common_test_http:delete_default_app(),
+    ok = emqx_cth_suite:stop(?config(apps, Config)),
+    emqx_common_test_helpers:clear_security_profile().
+
+%%------------------------------------------------------------------------------
+%% Tests
+%%------------------------------------------------------------------------------
+
+t_invalid_listener(_) ->
+    {ok, 404, _} = request(get, uri(["listeners", "invalid", ?CONF_NS])),
+    {ok, 404, _} = request(get, uri(["listeners", "in:valid", ?CONF_NS])).
+
+t_authenticators(_) ->
+    test_authenticators([]).
+
+t_authenticator(_) ->
+    test_authenticator([]).
+
+t_authenticator_fail(_) ->
+    ValidConfig0 = emqx_authn_test_lib:http_example(),
+    {ok, 200, _} = request(
+        post,
+        uri([?CONF_NS]),
+        ValidConfig0
+    ),
+    ?assertMatch(
+        {ok, 500, _},
+        request(
+            get,
+            uri([?CONF_NS, "password_based:http", "status"])
+        )
+    ).
+
+t_create_authenticator_redacts_secrets(_) ->
+    JWTConfig = emqx_authn_test_lib:jwt_example(),
+    {ok, 200, JWTRes} = request(
+        post,
+        uri([?CONF_NS]),
+        JWTConfig
+    ),
+    ?assertMatch(
+        #{<<"id">> := <<"jwt">>, <<"secret">> := <<"******">>},
+        emqx_utils_json:decode(JWTRes)
+    ),
+
+    HTTPConfig0 = emqx_authn_test_lib:http_example(),
+    HTTPConfig = HTTPConfig0#{
+        headers => #{
+            <<"content-type">> => <<"application/json">>,
+            <<"authorization">> => <<"Bearer secret-token">>
+        },
+        body => #{
+            <<"username">> => <<"${username}">>,
+            <<"password">> => <<"secret-password">>
+        }
+    },
+    {ok, 200, HTTPRes} = request(
+        post,
+        uri([?CONF_NS]),
+        HTTPConfig
+    ),
+    ?assertMatch(
+        #{
+            <<"id">> := <<"password_based:http">>,
+            <<"headers">> := #{
+                <<"content-type">> := <<"application/json">>,
+                <<"authorization">> := <<"******">>
+            },
+            <<"body">> := #{
+                <<"username">> := <<"${username}">>,
+                <<"password">> := <<"******">>
+            }
+        },
+        emqx_utils_json:decode(HTTPRes)
+    ),
+    ok.
+
+t_http_authenticator_preserves_redacted_header_across_case_change(_) ->
+    Secret = <<"abcd1234">>,
+    Redacted = emqx_utils_redact:redacted_value(),
+    AuthenticatorID = "password_based:http",
+    Config0 = (emqx_authn_test_lib:http_example())#{
+        method => <<"get">>,
+        headers => #{<<"Authorization">> => Secret}
+    },
+    {ok, 200, _} = request(
+        post,
+        uri([?CONF_NS]),
+        Config0
+    ),
+
+    {ok, 200, GetBody0} = request(
+        get,
+        uri([?CONF_NS, AuthenticatorID])
+    ),
+    #{<<"headers">> := Headers0} = emqx_utils_json:decode(GetBody0),
+    ?assertEqual(Redacted, maps:get(<<"authorization">>, Headers0)),
+
+    Config1 = Config0#{
+        headers => #{<<"Authorization">> => Redacted}
+    },
+    {ok, 204, _} = request(
+        put,
+        uri([?CONF_NS, AuthenticatorID]),
+        Config1
+    ),
+
+    {ok, 200, GetBody1} = request(
+        get,
+        uri([?CONF_NS, AuthenticatorID])
+    ),
+    #{<<"headers">> := Headers1} = emqx_utils_json:decode(GetBody1),
+    ?assertEqual(Redacted, maps:get(<<"authorization">>, Headers1)),
+
+    [#{<<"headers">> := RawHeaders}] = emqx:get_raw_config([authentication]),
+    ?assertEqual(Secret, maps:get(<<"Authorization">>, RawHeaders)),
+    ok.
+
+t_oauth2_client_secret_redacted(_) ->
+    Secret = <<"oauth2-topsecret">>,
+    Redacted = emqx_utils_redact:redacted_value(),
+    Config0 = (emqx_authn_test_lib:http_example())#{
+        oauth2 => #{
+            enable => true,
+            grant_type => <<"client_credentials">>,
+            token_endpoint => <<"http://127.0.0.1:1/token">>,
+            client_id => <<"cid">>,
+            client_secret => Secret
+        }
+    },
+    {ok, 200, PostBody} = request(post, uri([?CONF_NS]), Config0),
+    ?assertEqual(Redacted, oauth2_client_secret(emqx_utils_json:decode(PostBody))),
+    ?assertEqual(nomatch, binary:match(PostBody, Secret)),
+
+    {ok, 200, ListBody} = request(get, uri([?CONF_NS])),
+    [ListConf | _] = emqx_utils_json:decode(ListBody),
+    ?assertEqual(Redacted, oauth2_client_secret(ListConf)),
+    ?assertEqual(nomatch, binary:match(ListBody, Secret)),
+
+    ID = "password_based:http",
+    {ok, 200, GetBody} = request(get, uri([?CONF_NS, ID])),
+    GetConf = emqx_utils_json:decode(GetBody),
+    ?assertEqual(Redacted, oauth2_client_secret(GetConf)),
+    ?assertEqual(nomatch, binary:match(GetBody, Secret)),
+
+    %% The mask only happens at the API boundary; storage keeps the real secret.
+    [#{<<"oauth2">> := #{<<"client_secret">> := RawSecret}}] =
+        emqx:get_raw_config([authentication]),
+    ?assertEqual(Secret, RawSecret),
+
+    %% Re-submitting the redacted GET body must restore the stored secret.
+    PutConf = maps:remove(<<"id">>, GetConf),
+    {ok, 204, _} = request(put, uri([?CONF_NS, ID]), PutConf),
+    {ok, 200, GetBody1} = request(get, uri([?CONF_NS, ID])),
+    GetConf1 = emqx_utils_json:decode(GetBody1),
+    ?assertEqual(Redacted, oauth2_client_secret(GetConf1)),
+    ?assertEqual(nomatch, binary:match(GetBody1, Secret)),
+    [#{<<"oauth2">> := #{<<"client_secret">> := RawSecret1}}] =
+        emqx:get_raw_config([authentication]),
+    ?assertEqual(Secret, RawSecret1),
+    ok.
+
+oauth2_client_secret(Conf) ->
+    maps:get(<<"client_secret">>, maps:get(<<"oauth2">>, Conf)).
+
+t_authenticator_position(_) ->
+    test_authenticator_position([]).
+
+t_authenticators_reorder(_) ->
+    AuthenticatorConfs = [
+        emqx_authn_test_lib:http_example(),
+        %% Disabling an authenticator must not affect the requested order
+        (emqx_authn_test_lib:jwt_example())#{enable => false},
+        emqx_authn_test_lib:built_in_database_example()
+    ],
+    lists:foreach(
+        fun(Conf) ->
+            {ok, 200, _} = request(
+                post,
+                uri([?CONF_NS]),
+                Conf
+            )
+        end,
+        AuthenticatorConfs
+    ),
+    ?assertAuthenticatorsMatch(
+        [
+            #{<<"mechanism">> := <<"password_based">>, <<"backend">> := <<"http">>},
+            #{<<"mechanism">> := <<"jwt">>, <<"enable">> := false},
+            #{<<"mechanism">> := <<"password_based">>, <<"backend">> := <<"built_in_database">>}
+        ],
+        [?CONF_NS]
+    ),
+
+    OrderUri = uri([?CONF_NS, "order"]),
+
+    %% Invalid moves
+
+    %% Bad schema
+    {ok, 400, _} = request(
+        put,
+        OrderUri,
+        [
+            #{<<"not-id">> => <<"password_based:http">>},
+            #{<<"not-id">> => <<"jwt">>}
+        ]
+    ),
+
+    %% Partial order
+    {ok, 400, _} = request(
+        put,
+        OrderUri,
+        [
+            #{<<"id">> => <<"password_based:http">>},
+            #{<<"id">> => <<"jwt">>}
+        ]
+    ),
+
+    %% Not found authenticators
+    {ok, 400, _} = request(
+        put,
+        OrderUri,
+        [
+            #{<<"id">> => <<"password_based:http">>},
+            #{<<"id">> => <<"jwt">>},
+            #{<<"id">> => <<"password_based:built_in_database">>},
+            #{<<"id">> => <<"password_based:mongodb">>}
+        ]
+    ),
+
+    %% Both partial and not found errors
+    {ok, 400, _} = request(
+        put,
+        OrderUri,
+        [
+            #{<<"id">> => <<"password_based:http">>},
+            #{<<"id">> => <<"password_based:built_in_database">>},
+            #{<<"id">> => <<"password_based:mongodb">>}
+        ]
+    ),
+
+    %% Duplicates
+    {ok, 400, _} = request(
+        put,
+        OrderUri,
+        [
+            #{<<"id">> => <<"password_based:http">>},
+            #{<<"id">> => <<"password_based:built_in_database">>},
+            #{<<"id">> => <<"jwt">>},
+            #{<<"id">> => <<"password_based:http">>}
+        ]
+    ),
+
+    %% Valid moves
+    {ok, 204, _} = request(
+        put,
+        OrderUri,
+        [
+            #{<<"id">> => <<"password_based:built_in_database">>},
+            #{<<"id">> => <<"jwt">>},
+            #{<<"id">> => <<"password_based:http">>}
+        ]
+    ),
+
+    ?assertAuthenticatorsMatch(
+        [
+            #{<<"mechanism">> := <<"password_based">>, <<"backend">> := <<"built_in_database">>},
+            #{<<"mechanism">> := <<"jwt">>, <<"enable">> := false},
+            #{<<"mechanism">> := <<"password_based">>, <<"backend">> := <<"http">>}
+        ],
+        [?CONF_NS]
+    ).
+
+%t_listener_authenticators(_) ->
+%    test_authenticators(["listeners", ?TCP_DEFAULT]).
+
+%t_listener_authenticator(_) ->
+%    test_authenticator(["listeners", ?TCP_DEFAULT]).
+
+%t_listener_authenticator_position(_) ->
+%    test_authenticator_position(["listeners", ?TCP_DEFAULT]).
+
+t_aggregate_metrics(_) ->
+    Metrics = #{
+        'emqx@node1.emqx.io' => #{
+            metrics =>
+                #{
+                    failed => 0,
+                    total => 1,
+                    rate => 0.0,
+                    rate_last5m => 0.0,
+                    rate_max => 0.1,
+                    success => 1,
+                    nomatch => 1
+                }
+        },
+        'emqx@node2.emqx.io' => #{
+            metrics =>
+                #{
+                    failed => 0,
+                    total => 1,
+                    rate => 0.0,
+                    rate_last5m => 0.0,
+                    rate_max => 0.1,
+                    success => 1,
+                    nomatch => 2
+                }
+        }
+    },
+    Res = emqx_authn_api:aggregate_metrics(maps:values(Metrics)),
+    ?assertEqual(
+        #{
+            metrics =>
+                #{
+                    failed => 0,
+                    total => 2,
+                    rate => 0.0,
+                    rate_last5m => 0.0,
+                    rate_max => 0.2,
+                    success => 2,
+                    nomatch => 3
+                }
+        },
+        Res
+    ).
+
+test_authenticators(PathPrefix) ->
+    ValidConfig = emqx_authn_test_lib:http_example(),
+    {ok, 200, _} = request(
+        post,
+        uri(PathPrefix ++ [?CONF_NS]),
+        ValidConfig
+    ),
+
+    {ok, 409, _} = request(
+        post,
+        uri(PathPrefix ++ [?CONF_NS]),
+        ValidConfig
+    ),
+
+    InvalidConfig0 = ValidConfig#{method => <<"delete">>},
+    {ok, 400, _} = request(
+        post,
+        uri(PathPrefix ++ [?CONF_NS]),
+        InvalidConfig0
+    ),
+
+    ValidConfig1 = ValidConfig#{
+        method => <<"get">>,
+        headers => #{<<"content-type">> => <<"application/json">>}
+    },
+    {ok, 204, _} = request(
+        put,
+        uri(PathPrefix ++ [?CONF_NS, "password_based:http"]),
+        ValidConfig1
+    ),
+
+    ?assertAuthenticatorsMatch(
+        [#{<<"mechanism">> := <<"password_based">>, <<"backend">> := <<"http">>}],
+        PathPrefix ++ [?CONF_NS]
+    ).
+
+test_authenticator(PathPrefix) ->
+    ValidConfig0 = emqx_authn_test_lib:http_example(),
+    {ok, 200, _} = request(
+        post,
+        uri(PathPrefix ++ [?CONF_NS]),
+        ValidConfig0
+    ),
+    {ok, 200, _} = request(
+        get,
+        uri(PathPrefix ++ [?CONF_NS, "password_based:http"])
+    ),
+    {ok, 200, Res} = request(
+        get,
+        uri(PathPrefix ++ [?CONF_NS, "password_based:http", "status"])
+    ),
+    RMap = emqx_utils_json:decode(Res),
+    LookFun = fun(List) -> emqx_utils_maps:deep_get(List, RMap) end,
+    MetricsList = [
+        {<<"failed">>, 0},
+        {<<"total">>, 0},
+        {<<"rate">>, 0.0},
+        {<<"rate_last5m">>, 0.0},
+        {<<"rate_max">>, 0.0},
+        {<<"success">>, 0}
+    ],
+    EqualFun = fun({M, V}) ->
+        ?assertEqual(
+            V,
+            LookFun([
+                <<"metrics">>,
+                M
+            ])
+        )
+    end,
+    lists:map(EqualFun, MetricsList),
+    ?assertEqual(
+        <<"connected">>,
+        LookFun([<<"status">>])
+    ),
+
+    ?assertMatch(
+        {ok, 404, _},
+        request(
+            get,
+            uri(PathPrefix ++ [?CONF_NS, "unknown_auth_chain", "status"])
+        )
+    ),
+
+    {ok, 404, _} = request(
+        get,
+        uri(PathPrefix ++ [?CONF_NS, "password_based:redis"])
+    ),
+
+    {ok, 404, _} = request(
+        put,
+        uri(PathPrefix ++ [?CONF_NS, "password_based:built_in_database"]),
+        emqx_authn_test_lib:built_in_database_example()
+    ),
+
+    InvalidConfig0 = ValidConfig0#{method => <<"delete">>},
+    {ok, 400, _} = request(
+        put,
+        uri(PathPrefix ++ [?CONF_NS, "password_based:http"]),
+        InvalidConfig0
+    ),
+
+    ValidConfig1 = ValidConfig0#{
+        method => <<"get">>,
+        headers => #{<<"content-type">> => <<"application/json">>}
+    },
+    {ok, 204, _} = request(
+        put,
+        uri(PathPrefix ++ [?CONF_NS, "password_based:http"]),
+        ValidConfig1
+    ),
+
+    ValidConfig2 = ValidConfig0#{pool_size => 9},
+    {ok, 204, _} = request(
+        put,
+        uri(PathPrefix ++ [?CONF_NS, "password_based:http"]),
+        ValidConfig2
+    ),
+
+    %% allow deletion of unknown (not created) authenticator
+    {ok, 204, _} = request(
+        delete,
+        uri(PathPrefix ++ [?CONF_NS, "password_based:redis"])
+    ),
+
+    {ok, 204, _} = request(
+        delete,
+        uri(PathPrefix ++ [?CONF_NS, "password_based:http"])
+    ),
+
+    ?assertAuthenticatorsMatch([], PathPrefix ++ [?CONF_NS]).
+
+test_authenticator_position(PathPrefix) ->
+    AuthenticatorConfs = [
+        emqx_authn_test_lib:http_example(),
+        emqx_authn_test_lib:jwt_example(),
+        emqx_authn_test_lib:built_in_database_example()
+    ],
+
+    lists:foreach(
+        fun(Conf) ->
+            {ok, 200, _} = request(
+                post,
+                uri(PathPrefix ++ [?CONF_NS]),
+                Conf
+            )
+        end,
+        AuthenticatorConfs
+    ),
+
+    ?assertAuthenticatorsMatch(
+        [
+            #{<<"mechanism">> := <<"password_based">>, <<"backend">> := <<"http">>},
+            #{<<"mechanism">> := <<"jwt">>},
+            #{<<"mechanism">> := <<"password_based">>, <<"backend">> := <<"built_in_database">>}
+        ],
+        PathPrefix ++ [?CONF_NS]
+    ),
+
+    %% Invalid moves
+
+    {ok, 400, _} = request(
+        put,
+        uri(PathPrefix ++ [?CONF_NS, "jwt", "position", "up"])
+    ),
+
+    {ok, 404, _} = request(
+        put,
+        uri(PathPrefix ++ [?CONF_NS, "jwt", "position"])
+    ),
+
+    {ok, 404, _} = request(
+        put,
+        uri(PathPrefix ++ [?CONF_NS, "jwt", "position", "before:invalid"])
+    ),
+
+    {ok, 404, _} = request(
+        put,
+        uri(PathPrefix ++ [?CONF_NS, "jwt", "position", "before:password_based:redis"])
+    ),
+
+    %% Valid moves
+
+    %% test front
+    {ok, 204, _} = request(
+        put,
+        uri(PathPrefix ++ [?CONF_NS, "jwt", "position", "front"])
+    ),
+
+    ?assertAuthenticatorsMatch(
+        [
+            #{<<"mechanism">> := <<"jwt">>},
+            #{<<"mechanism">> := <<"password_based">>, <<"backend">> := <<"http">>},
+            #{<<"mechanism">> := <<"password_based">>, <<"backend">> := <<"built_in_database">>}
+        ],
+        PathPrefix ++ [?CONF_NS]
+    ),
+
+    %% test rear
+    {ok, 204, _} = request(
+        put,
+        uri(PathPrefix ++ [?CONF_NS, "jwt", "position", "rear"])
+    ),
+
+    ?assertAuthenticatorsMatch(
+        [
+            #{<<"mechanism">> := <<"password_based">>, <<"backend">> := <<"http">>},
+            #{<<"mechanism">> := <<"password_based">>, <<"backend">> := <<"built_in_database">>},
+            #{<<"mechanism">> := <<"jwt">>}
+        ],
+        PathPrefix ++ [?CONF_NS]
+    ),
+
+    %% test before
+    {ok, 204, _} = request(
+        put,
+        uri(PathPrefix ++ [?CONF_NS, "jwt", "position", "before:password_based:built_in_database"])
+    ),
+
+    ?assertAuthenticatorsMatch(
+        [
+            #{<<"mechanism">> := <<"password_based">>, <<"backend">> := <<"http">>},
+            #{<<"mechanism">> := <<"jwt">>},
+            #{<<"mechanism">> := <<"password_based">>, <<"backend">> := <<"built_in_database">>}
+        ],
+        PathPrefix ++ [?CONF_NS]
+    ),
+
+    %% test after
+    {ok, 204, _} = request(
+        put,
+        uri(
+            PathPrefix ++
+                [
+                    ?CONF_NS,
+                    "password_based%3Abuilt_in_database",
+                    "position",
+                    "after:password_based:http"
+                ]
+        )
+    ),
+
+    ?assertAuthenticatorsMatch(
+        [
+            #{<<"mechanism">> := <<"password_based">>, <<"backend">> := <<"http">>},
+            #{<<"mechanism">> := <<"password_based">>, <<"backend">> := <<"built_in_database">>},
+            #{<<"mechanism">> := <<"jwt">>}
+        ],
+        PathPrefix ++ [?CONF_NS]
+    ).
+
+t_authenticator_users_not_found(_) ->
+    GlobalUser = #{user_id => <<"global_user">>, password => <<"p1">>},
+    {ok, 404, _} = request(
+        get,
+        uri([?CONF_NS, "password_based:built_in_database", "users"])
+    ),
+    {ok, 404, _} = request(
+        post,
+        uri([?CONF_NS, "password_based:built_in_database", "users"]),
+        GlobalUser
+    ),
+    ok.
+
+%% listener authn api is not supported since 5.1.0
+%% Don't support listener switch to global chain.
+ignore_switch_to_global_chain(_) ->
+    {ok, 200, _} = request(
+        post,
+        uri([?CONF_NS]),
+        emqx_authn_test_lib:built_in_database_example()
+    ),
+
+    {ok, 200, _} = request(
+        post,
+        uri([listeners, "tcp:default", ?CONF_NS]),
+        emqx_authn_test_lib:built_in_database_example()
+    ),
+    {ok, 200, _} = request(
+        post,
+        uri([listeners, "tcp:default", ?CONF_NS]),
+        maps:put(enable, false, emqx_authn_test_lib:http_example())
+    ),
+
+    GlobalUser = #{user_id => <<"global_user">>, password => <<"p1">>},
+
+    {ok, 201, _} = request(
+        post,
+        uri([?CONF_NS, "password_based:built_in_database", "users"]),
+        GlobalUser
+    ),
+
+    ListenerUser = #{user_id => <<"listener_user">>, password => <<"p1">>},
+
+    {ok, 201, _} = request(
+        post,
+        uri([listeners, "tcp:default", ?CONF_NS, "password_based:built_in_database", "users"]),
+        ListenerUser
+    ),
+
+    process_flag(trap_exit, true),
+
+    %% Listener user should be OK
+    {ok, Client0} = emqtt:start_link([
+        {username, <<"listener_user">>},
+        {password, <<"p1">>}
+    ]),
+    ?assertMatch(
+        {ok, _},
+        emqtt:connect(Client0)
+    ),
+    ok = emqtt:disconnect(Client0),
+
+    %% Global user should not be OK
+    {ok, Client1} = emqtt:start_link([
+        {username, <<"global_user">>},
+        {password, <<"p1">>}
+    ]),
+    ?assertMatch(
+        {error, {unauthorized_client, _}},
+        emqtt:connect(Client1)
+    ),
+
+    {ok, 204, _} = request(
+        delete,
+        uri([listeners, "tcp:default", ?CONF_NS, "password_based:built_in_database"])
+    ),
+
+    %% Now listener has only disabled authenticators, should allow anonymous access
+    {ok, Client2} = emqtt:start_link([
+        {username, <<"any_user">>},
+        {password, <<"any_password">>}
+    ]),
+    ?assertMatch(
+        {ok, _},
+        emqtt:connect(Client2)
+    ),
+    ok = emqtt:disconnect(Client2),
+
+    {ok, 204, _} = request(
+        delete,
+        uri([listeners, "tcp:default", ?CONF_NS, "password_based:http"])
+    ),
+    %% Delete unknown should retun 204
+    %% There is not even a name validation for it.
+    {ok, 204, _} = request(
+        delete,
+        uri([listeners, "tcp:default", ?CONF_NS, "password_based:httpx"])
+    ),
+
+    %% Local chain is empty now and should be removed
+    %% Listener user should not be OK
+    {ok, Client3} = emqtt:start_link([
+        {username, <<"listener_user">>},
+        {password, <<"p1">>}
+    ]),
+    ?assertMatch(
+        {error, {unauthorized_client, _}},
+        emqtt:connect(Client3)
+    ),
+
+    %% Global user should be now OK, switched back to the global chain
+    {ok, Client4} = emqtt:start_link([
+        {username, <<"global_user">>},
+        {password, <<"p1">>}
+    ]),
+    ?assertMatch(
+        {ok, _},
+        emqtt:connect(Client4)
+    ),
+    ok = emqtt:disconnect(Client4).
+
+t_bcrypt_validation(Config) ->
+    BaseConf = #{
+        mechanism => <<"password_based">>,
+        backend => <<"built_in_database">>,
+        autogenerate_password => false,
+        user_id_type => <<"username">>
+    },
+    BcryptValid = #{
+        name => <<"bcrypt">>,
+        salt_rounds => 10
+    },
+    BcryptInvalid = #{
+        name => <<"bcrypt">>,
+        salt_rounds => 15
+    },
+
+    ConfValid = BaseConf#{password_hash_algorithm => BcryptValid},
+    ConfInvalid = BaseConf#{password_hash_algorithm => BcryptInvalid},
+
+    {ok, 400, _} = request(
+        post,
+        uri([?CONF_NS]),
+        ConfInvalid
+    ),
+
+    ExpectedStatus =
+        case ?config(security_profile, Config) of
+            legacy -> 200;
+            hardened -> 400
+        end,
+    {ok, ExpectedStatus, _} = request(post, uri([?CONF_NS]), ConfValid).
+
+t_cache(_Config) ->
+    {ok, 200, CacheData0} = request(
+        get,
+        uri(["authentication", "settings"])
+    ),
+    ?assertMatch(
+        #{
+            <<"node_cache">> := #{<<"enable">> := true},
+            <<"ignore_backend_failures">> := <<"per_security_profile">>
+        },
+        emqx_utils_json:decode(CacheData0)
+    ),
+    {ok, 200, MetricsData0} = request(
+        get,
+        uri(["authentication", "node_cache", "status"])
+    ),
+    ?assertMatch(
+        #{<<"metrics">> := #{<<"count">> := 0}},
+        emqx_utils_json:decode(MetricsData0)
+    ),
+    {ok, 204, _} = request(
+        put,
+        uri(["authentication", "settings"]),
+        #{
+            <<"node_cache">> => #{<<"enable">> => true},
+            <<"ignore_backend_failures">> => true
+        }
+    ),
+    {ok, 200, CacheData1} = request(
+        get,
+        uri(["authentication", "settings"])
+    ),
+    ?assertMatch(
+        #{
+            <<"node_cache">> := #{<<"enable">> := true},
+            <<"ignore_backend_failures">> := true
+        },
+        emqx_utils_json:decode(CacheData1)
+    ),
+    lists:foreach(
+        fun(Value) ->
+            {ok, 204, _} = request(
+                put,
+                uri(["authentication", "settings"]),
+                #{
+                    <<"node_cache">> => #{<<"enable">> => true},
+                    <<"ignore_backend_failures">> => Value
+                }
+            ),
+            {ok, 200, SettingsData} = request(get, uri(["authentication", "settings"])),
+            Settings = emqx_utils_json:decode(SettingsData),
+            ?assertMatch(#{<<"ignore_backend_failures">> := Value}, Settings),
+            %% The GET response must be accepted back unchanged.
+            {ok, 204, _} = request(put, uri(["authentication", "settings"]), Settings)
+        end,
+        [false, <<"per_security_profile">>, true]
+    ),
+
+    %% We enabled authn cache, let's create
+    %% * authenticator
+    %% * connection to miss the cache
+    {ok, 200, _} = request(
+        post,
+        uri([?CONF_NS]),
+        emqx_authn_test_lib:http_example()
+    ),
+
+    process_flag(trap_exit, true),
+    {ok, Client} = emqtt:start_link([
+        {username, <<"user">>},
+        {password, <<"pass">>}
+    ]),
+    _ = emqtt:connect(Client),
+
+    %% Now check the metrics, the cache should have been populated
+    {ok, 200, MetricsData2} = request(
+        get,
+        uri(["authentication", "node_cache", "status"])
+    ),
+    ?assertMatch(
+        #{<<"metrics">> := #{<<"misses">> := #{<<"value">> := 1}}},
+        emqx_utils_json:decode(MetricsData2)
+    ),
+    ok.
+
+t_cache_reset(_) ->
+    {ok, 204, _} = request(
+        post,
+        uri(["authentication", "node_cache", "reset"])
+    ).
+
+t_metrics_reset(_) ->
+    %% 404 for non-existent authenticator
+    {ok, 404, _} = request(
+        post,
+        uri([?CONF_NS, "password_based:built_in_database", "metrics", "reset"])
+    ),
+
+    %% Create authenticator
+    {ok, 200, _} = request(
+        post,
+        uri([?CONF_NS]),
+        emqx_authn_test_lib:http_example()
+    ),
+
+    %% Check that metrics start at zero
+    {ok, 200, StatusData0} = request(
+        get,
+        uri([?CONF_NS, "password_based:http", "status"])
+    ),
+    Status0 = emqx_utils_json:decode(StatusData0),
+    ?assertEqual(0, emqx_utils_maps:deep_get([<<"metrics">>, <<"total">>], Status0)),
+
+    %% Reset (even when already zero)
+    {ok, 204, _} = request(
+        post,
+        uri([?CONF_NS, "password_based:http", "metrics", "reset"])
+    ),
+
+    %% Verify still zero after reset
+    {ok, 200, StatusData1} = request(
+        get,
+        uri([?CONF_NS, "password_based:http", "status"])
+    ),
+    Status1 = emqx_utils_json:decode(StatusData1),
+    ?assertEqual(0, emqx_utils_maps:deep_get([<<"metrics">>, <<"total">>], Status1)).
+
+-doc """
+Regression test for #18653/#18664's class of bug: audit records for
+`POST /authentication/:id/users` (built-in-database authenticator) must
+identify the namespace, both for a global admin's implicit-global request
+and a namespaced admin's implicit-own-namespace request (no `?ns=` in
+either case).
+""".
+t_authenticator_users_audit_records_namespace(_Config) ->
+    ok = emqx_hooks:add(
+        'namespace.resource_pre_create',
+        {?MODULE, on_namespace_resource_pre_create, []},
+        1000
+    ),
+    try
+        {ok, 200, _} = request(
+            post,
+            uri([?CONF_NS]),
+            emqx_authn_test_lib:built_in_database_example()
+        ),
+        StartAt = erlang:system_time(microsecond),
+        GlobalAuthHeader = emqx_mgmt_api_test_util:auth_header_(),
+        GlobalUser = #{user_id => <<"audit_global_user">>, password => <<"p@ssw0rd1">>},
+        {201, _} = emqx_mgmt_api_test_util:simple_request(#{
+            method => post,
+            url => uri([?CONF_NS, "password_based:built_in_database", "users"]),
+            auth_header => GlobalAuthHeader,
+            body => GlobalUser
+        }),
+        Ns = <<"authn_audit_ns">>,
+        NsAuthHeader = create_namespaced_admin(Ns),
+        NsUser = #{user_id => <<"audit_ns_user">>, password => <<"p@ssw0rd1">>},
+        {201, _} = emqx_mgmt_api_test_util:simple_request(#{
+            method => post,
+            url => uri([?CONF_NS, "password_based:built_in_database", "users"]),
+            auth_header => NsAuthHeader,
+            body => NsUser
+        }),
+        Entries = wait_for_audit_entries(<<"/authentication/:id/users">>, StartAt, 2, 2000),
+        Namespaces = lists:sort([namespace_of(E) || E <- Entries]),
+        ?assertEqual(lists:sort([<<"global">>, Ns]), Namespaces)
+    after
+        ok = emqx_hooks:del(
+            'namespace.resource_pre_create', {?MODULE, on_namespace_resource_pre_create}
+        )
+    end.
+
+on_namespace_resource_pre_create(#{namespace := _Namespace}, ResCtx) ->
+    {stop, ResCtx#{exists := true}}.
+
+create_namespaced_admin(Namespace) ->
+    Username = <<"authn_audit_ns_admin">>,
+    Password = <<"superSecureP@ss1">>,
+    Role = <<"ns:", Namespace/binary, "::administrator">>,
+    case
+        emqx_dashboard_admin:add_user(
+            Username, Password, Role, <<"namespaced admin for audit test">>
+        )
+    of
+        {ok, _} -> ok;
+        {error, <<"username_already_exists">>} -> ok
+    end,
+    {200, #{<<"token">> := Token}} = emqx_dashboard_admin_SUITE:login(#{
+        <<"username">> => Username,
+        <<"password">> => Password
+    }),
+    {"Authorization", <<"Bearer ", Token/binary>>}.
+
+%% The audit write happens after the HTTP response is already sent (see
+%% minirest_handler:init/2), so poll for a bit rather than assume the record
+%% is there the instant the request returns.
+wait_for_audit_entries(_OperationId, _StartAt, _ExpectedCount, RemainMs) when RemainMs =< 0 ->
+    ct:fail(audit_entries_not_found_in_time);
+wait_for_audit_entries(OperationId, StartAt, ExpectedCount, RemainMs) ->
+    Entries = audit_entries_since(OperationId, StartAt),
+    case length(Entries) >= ExpectedCount of
+        true ->
+            Entries;
+        false ->
+            SleepMs = 100,
+            ct:sleep(SleepMs),
+            wait_for_audit_entries(OperationId, StartAt, ExpectedCount, RemainMs - SleepMs)
+    end.
+
+audit_entries_since(OperationId, StartAt) ->
+    URL = uri(["audit"]),
+    QueryParams = #{
+        <<"operation_id">> => OperationId,
+        <<"gte_created_at">> => integer_to_binary(StartAt),
+        <<"limit">> => <<"100">>
+    },
+    {200, #{<<"data">> := Data}} =
+        emqx_mgmt_api_test_util:simple_request(#{
+            method => get, url => URL, query_params => QueryParams
+        }),
+    Data.
+
+namespace_of(#{<<"http_request">> := #{<<"namespace">> := Ns}}) -> Ns.
+
+%%------------------------------------------------------------------------------
+%% Helpers
+%%------------------------------------------------------------------------------
+
+request(Method, Url) ->
+    request(Method, Url, []).

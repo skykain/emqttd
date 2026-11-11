@@ -1,0 +1,176 @@
+%%--------------------------------------------------------------------
+%% Copyright (c) 2022-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
+%%--------------------------------------------------------------------
+
+-module(emqx_license_schema).
+
+-include("emqx_license.hrl").
+-include_lib("typerefl/include/types.hrl").
+-include_lib("hocon/include/hoconsc.hrl").
+
+%%------------------------------------------------------------------------------
+%% hocon_schema callbacks
+%%------------------------------------------------------------------------------
+
+-behaviour(hocon_schema).
+
+-export([namespace/0, roots/0, fields/1, validations/0, desc/1, tags/0]).
+
+-export([
+    default_setting/0,
+    validate_tps_alarm_sustain_duration/1
+]).
+
+namespace() -> "license".
+
+roots() ->
+    [
+        {license,
+            hoconsc:mk(
+                hoconsc:ref(?MODULE, key_license),
+                #{
+                    desc => ?DESC(license_root)
+                }
+            )}
+    ].
+
+tags() ->
+    [<<"License">>].
+
+fields(key_license) ->
+    [
+        {key, #{
+            type => hoconsc:union([default, evaluation, binary()]),
+            default => <<"default">>,
+            %% so it's not logged
+            sensitive => true,
+            required => true,
+            desc => ?DESC(key_field)
+        }},
+        %% This feature is not made GA yet, hence hidden.
+        %% When license is issued to cutomer-type BUSINESS_CRITICAL (code 3)
+        %% This config is taken as the real max_sessions limit.
+        {dynamic_max_connections, #{
+            type => non_neg_integer(),
+            default => default(dynamic_max_connections),
+            required => false,
+            importance => ?IMPORTANCE_HIDDEN,
+            desc => ?DESC(dynamic_max_connections)
+        }},
+        {connection_low_watermark, #{
+            type => emqx_schema:percent(),
+            default => default(connection_low_watermark),
+            example => default(connection_low_watermark),
+            desc => ?DESC(connection_low_watermark_field)
+        }},
+        {connection_high_watermark, #{
+            type => emqx_schema:percent(),
+            default => default(connection_high_watermark),
+            example => default(connection_high_watermark),
+            desc => ?DESC(connection_high_watermark_field)
+        }},
+        {tps_alarm_sustain_duration, #{
+            type => emqx_schema:duration_ms(),
+            default => default(tps_alarm_sustain_duration),
+            example => <<"2m">>,
+            required => false,
+            importance => ?IMPORTANCE_LOW,
+            validator => fun ?MODULE:validate_tps_alarm_sustain_duration/1,
+            desc => ?DESC(tps_alarm_sustain_duration)
+        }},
+        {high_watermark_timezone, #{
+            type => hoconsc:union([system, binary()]),
+            default => default(high_watermark_timezone),
+            required => false,
+            importance => ?IMPORTANCE_LOW,
+            desc => ?DESC(high_watermark_timezone)
+        }}
+    ].
+
+desc(key_license) ->
+    "License provisioned as a string.";
+desc(_) ->
+    undefined.
+
+validations() ->
+    [
+        {check_license_watermark, fun check_license_watermark/1},
+        {check_high_watermark_timezone, fun check_high_watermark_timezone/1}
+    ].
+
+check_license_watermark(Conf) ->
+    case hocon_maps:get("license.connection_low_watermark", Conf) of
+        undefined ->
+            true;
+        Low ->
+            case hocon_maps:get("license.connection_high_watermark", Conf) of
+                undefined ->
+                    {bad_license_watermark, #{high => undefined, low => Low}};
+                High ->
+                    {ok, HighFloat} = emqx_schema:to_percent(High),
+                    {ok, LowFloat} = emqx_schema:to_percent(Low),
+                    case HighFloat > LowFloat of
+                        true -> true;
+                        false -> {bad_license_watermark, #{high => High, low => Low}}
+                    end
+            end
+    end.
+
+check_high_watermark_timezone(Conf) ->
+    case hocon_maps:get("license.high_watermark_timezone", Conf) of
+        undefined ->
+            true;
+        system ->
+            true;
+        <<"system">> ->
+            true;
+        Offset ->
+            try
+                _ = emqx_utils_calendar:offset_second(Offset),
+                true
+            catch
+                error:_ ->
+                    {bad_license_high_watermark_timezone, #{timezone => Offset}}
+            end
+    end.
+
+%% @doc The alarm is what prompts a license upgrade, so the window it can be
+%% held back by is bounded. Without an upper bound a large enough value silences
+%% it for good.
+validate_tps_alarm_sustain_duration(Duration) when
+    is_integer(Duration), Duration >= 0, Duration =< ?MAX_TPS_ALARM_SUSTAIN_DURATION
+->
+    ok;
+validate_tps_alarm_sustain_duration(_Duration) ->
+    {error, <<"must be between 0s and 10m">>}.
+
+%% @doc Exported for testing
+default_setting() ->
+    Keys =
+        [
+            connection_low_watermark,
+            connection_high_watermark,
+            dynamic_max_connections,
+            high_watermark_timezone,
+            tps_alarm_sustain_duration
+        ],
+    maps:from_list(
+        lists:map(
+            fun(K) ->
+                {K, default(K)}
+            end,
+            Keys
+        )
+    ).
+
+default(connection_low_watermark) ->
+    <<"75%">>;
+default(connection_high_watermark) ->
+    <<"80%">>;
+default(high_watermark_timezone) ->
+    system;
+default(tps_alarm_sustain_duration) ->
+    ~"1m";
+default(dynamic_max_connections) ->
+    %% This config is only applicable to CTYPE3
+    ?DEFAULT_MAX_SESSIONS_CTYPE3.

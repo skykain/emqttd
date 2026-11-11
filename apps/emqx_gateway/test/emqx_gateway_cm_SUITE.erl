@@ -1,0 +1,520 @@
+%%--------------------------------------------------------------------
+%% Copyright (c) 2022-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
+%%--------------------------------------------------------------------
+
+-module(emqx_gateway_cm_SUITE).
+
+-include_lib("eunit/include/eunit.hrl").
+-include_lib("common_test/include/ct.hrl").
+
+-compile(export_all).
+-compile(nowarn_export_all).
+
+-define(GWNAME, mqttsn).
+-define(CLIENTID, <<"client1">>).
+
+-define(CONF_DEFAULT, <<"gateway {}">>).
+
+%%--------------------------------------------------------------------
+%% setups
+%%--------------------------------------------------------------------
+
+all() -> emqx_common_test_helpers:all(?MODULE).
+
+init_per_suite(Conf) ->
+    Apps = emqx_cth_suite:start(
+        [
+            emqx,
+            emqx_conf,
+            {emqx_gateway, ?CONF_DEFAULT}
+        ],
+        #{work_dir => emqx_cth_suite:work_dir(Conf)}
+    ),
+    ok = meck:new(emqx_gateway_metrics, [passthrough, no_history, no_link]),
+    ok = meck:expect(emqx_gateway_metrics, inc, fun(_, _) -> ok end),
+    [{apps, Apps} | Conf].
+
+end_per_suite(Conf) ->
+    meck:unload(),
+    ok = emqx_cth_suite:stop(?config(apps, Conf)),
+    ok.
+
+init_per_testcase(_TestCase, Conf) ->
+    process_flag(trap_exit, true),
+    {ok, CMPid} = emqx_gateway_cm:start_link([{gwname, ?GWNAME}]),
+    [{cm, CMPid} | Conf].
+
+end_per_testcase(_TestCase, Conf) ->
+    CMPid = proplists:get_value(cm, Conf),
+    gen_server:stop(CMPid),
+    process_flag(trap_exit, false),
+    Conf.
+
+%%--------------------------------------------------------------------
+%% cases
+%%--------------------------------------------------------------------
+
+-doc "Resume-only opening does not create or register a session when no owner exists.".
+t_open_session_resume_only(_) ->
+    ?assertEqual(
+        {error, not_found},
+        emqx_gateway_cm:open_session(
+            ?GWNAME,
+            {takeover, {resume, #{}}},
+            clientinfo(),
+            conninfo(),
+            fun(_, _) -> error(unexpected_session_creation) end,
+            emqx_session
+        )
+    ),
+    ?assertEqual([], emqx_gateway_cm:lookup_channels(?GWNAME, ?CLIENTID)).
+
+t_open_session_force_discards_stale_on_begin_failure(_) ->
+    assert_stale_channels_on_failure(force, {error, timeout}, timeout).
+
+t_open_session_resume_preserves_stale_on_begin_failure(_) ->
+    assert_stale_channels_on_failure({resume, #{}}, {error, not_authorized}, not_authorized).
+
+t_open_session_force_discards_stale_on_resume_failure(_) ->
+    assert_stale_channels_on_failure(
+        force, {ok, unused, #{session => invalid_session}}, {resume_failed, invalid_session}
+    ).
+
+t_open_session_resume_preserves_stale_on_resume_failure(_) ->
+    assert_stale_channels_on_failure(
+        {resume, #{}}, {ok, unused, #{}}, {resume_failed, invalid_session}
+    ).
+
+assert_stale_channels_on_failure(Mode, BeginResult, Reason) ->
+    Self = self(),
+    Candidate = spawn_link(fun() ->
+        receive
+            stop -> ok
+        end
+    end),
+    ok = emqx_gateway_cm:register_channel(?GWNAME, ?CLIENTID, Self, conninfo()),
+    ok = meck:new(emqx_gateway_cm_registry, [passthrough, no_history, no_link]),
+    ok = meck:new(emqx_gateway_cm_takeover, [passthrough, no_history, no_link]),
+    ok = meck:expect(emqx_gateway_cm_registry, lookup_channels, fun(_, ?CLIENTID) ->
+        [Self, Candidate]
+    end),
+    ok = meck:expect(emqx_gateway_cm_takeover, begin_, fun(
+        ?GWNAME, ?CLIENTID, Pid, OpenMode, _Attempt
+    ) when
+        Pid =:= Candidate, OpenMode =:= Mode
+    ->
+        BeginResult
+    end),
+    try
+        Result = emqx_gateway_cm:open_session(
+            ?GWNAME,
+            {takeover, Mode},
+            clientinfo(),
+            conninfo(),
+            fun(_, _) -> #{} end,
+            ?MODULE
+        ),
+        case Mode of
+            force ->
+                ?assertMatch({ok, #{present := false}}, Result),
+                receive
+                    discard -> ok
+                after 100 ->
+                    ct:fail("Stale channel was not discarded after failed force takeover")
+                end;
+            {resume, _} ->
+                ?assertEqual({error, Reason}, Result),
+                receive
+                    discard -> ct:fail("Stale channel was discarded after failed resume")
+                after 100 ->
+                    ok
+                end
+        end
+    after
+        meck:unload(emqx_gateway_cm_takeover),
+        meck:unload(emqx_gateway_cm_registry),
+        emqx_gateway_cm:unregister_channel(?GWNAME, ?CLIENTID),
+        Candidate ! stop
+    end.
+
+%% Session callbacks for simulating a failed import after takeover begin succeeds.
+resume(_ClientInfo, invalid_session) ->
+    error(invalid_session).
+
+resume(_ClientInfo, _ConnInfo, _Data) ->
+    error(invalid_session).
+
+t_open_session(_) ->
+    {ok, #{
+        present := false,
+        session := #{}
+    }} = emqx_gateway_cm:open_session(
+        ?GWNAME,
+        {takeover, force},
+        clientinfo(),
+        conninfo(),
+        fun(_, _) -> #{} end,
+        emqx_session
+    ),
+
+    {ok, SessionRes} = emqx_gateway_cm:open_session(
+        ?GWNAME,
+        clean,
+        clientinfo(),
+        conninfo(),
+        fun(_, _) -> #{no => 1} end,
+        emqx_session
+    ),
+    ?assertEqual(
+        #{
+            present => false,
+            session => #{no => 1}
+        },
+        SessionRes
+    ),
+
+    %% assert1. check channel infos in ets table
+    Chann = {?CLIENTID, self()},
+    ?assertEqual(
+        [Chann],
+        ets:tab2list(emqx_gateway_cm:tabname(chan, ?GWNAME))
+    ),
+    ?assertEqual(
+        [{Chann, ?MODULE}],
+        ets:tab2list(emqx_gateway_cm:tabname(conn, ?GWNAME))
+    ),
+
+    %% assert2. discard the presented session
+
+    {ok, SessionRes2} = emqx_gateway_cm:open_session(
+        ?GWNAME,
+        clean,
+        clientinfo(),
+        conninfo(),
+        fun(_, _) -> #{no => 2} end,
+        emqx_session
+    ),
+    ?assertEqual(
+        #{
+            present => false,
+            session => #{no => 2}
+        },
+        SessionRes2
+    ),
+
+    emqx_gateway_cm:insert_channel_info(
+        ?GWNAME,
+        ?CLIENTID,
+        #{clientinfo => clientinfo(), conninfo => conninfo()},
+        []
+    ),
+    ?assertEqual(
+        1,
+        ets:info(emqx_gateway_cm:tabname(info, ?GWNAME), size)
+    ),
+
+    receive
+        discard ->
+            emqx_gateway_cm:connection_closed(?GWNAME, ?CLIENTID),
+            emqx_gateway_cm:unregister_channel(?GWNAME, ?CLIENTID)
+    after 100 ->
+        ?assert(false, "waiting discard msg timeout")
+    end,
+
+    %% assert3. no channel infos in ets table
+    ?assertEqual(
+        [],
+        ets:tab2list(emqx_gateway_cm:tabname(chan, ?GWNAME))
+    ),
+    ?assertEqual(
+        [],
+        ets:tab2list(emqx_gateway_cm:tabname(conn, ?GWNAME))
+    ),
+    ?assertEqual(
+        [],
+        ets:tab2list(emqx_gateway_cm:tabname(info, ?GWNAME))
+    ).
+
+t_get_set_chan_info_stats(_) ->
+    {ok, SessionRes} = emqx_gateway_cm:open_session(
+        ?GWNAME,
+        clean,
+        clientinfo(),
+        conninfo(),
+        fun(_, _) -> #{no => 1} end,
+        emqx_session
+    ),
+    ?assertEqual(
+        #{
+            present => false,
+            session => #{no => 1}
+        },
+        SessionRes
+    ),
+    emqx_gateway_cm:insert_channel_info(
+        ?GWNAME,
+        ?CLIENTID,
+        #{clientinfo => clientinfo(), conninfo => conninfo()},
+        []
+    ),
+
+    %% Info: get/set
+    NInfo = #{newinfo => true, node => node()},
+    emqx_gateway_cm:set_chan_info(?GWNAME, ?CLIENTID, NInfo),
+    ?assertEqual(
+        NInfo,
+        emqx_gateway_cm:get_chan_info(?GWNAME, ?CLIENTID)
+    ),
+    ?assertEqual(
+        NInfo,
+        emqx_gateway_cm:get_chan_info(?GWNAME, ?CLIENTID, self())
+    ),
+    ?assertEqual(
+        NInfo,
+        emqx_gateway_cm:get_chan_info(?GWNAME, ?CLIENTID, self(), 1000)
+    ),
+    ?assertEqual(
+        NInfo,
+        emqx_gateway_cm_proto_v2:get_chan_info(?GWNAME, ?CLIENTID, self(), 1000)
+    ),
+    %% Stats: get/set
+    NStats = [{newstats, true}],
+    emqx_gateway_cm:set_chan_stats(?GWNAME, ?CLIENTID, NStats),
+    ?assertEqual(
+        NStats,
+        emqx_gateway_cm:get_chan_stats(?GWNAME, ?CLIENTID)
+    ),
+    ?assertEqual(
+        NStats,
+        emqx_gateway_cm:get_chan_stats(?GWNAME, ?CLIENTID, self())
+    ),
+
+    emqx_gateway_cm:connection_closed(?GWNAME, ?CLIENTID),
+    emqx_gateway_cm:unregister_channel(?GWNAME, ?CLIENTID).
+
+t_connection_closed_defers_cleanup_until_unregister(_) ->
+    {ok, _} = emqx_gateway_cm:open_session(
+        ?GWNAME,
+        clean,
+        clientinfo(),
+        conninfo(),
+        fun(_, _) -> #{no => 1} end,
+        emqx_session
+    ),
+    emqx_gateway_cm:insert_channel_info(
+        ?GWNAME,
+        ?CLIENTID,
+        #{clientinfo => clientinfo(), conninfo => conninfo()},
+        []
+    ),
+
+    true = emqx_gateway_cm:connection_closed(?GWNAME, ?CLIENTID),
+    ok = emqx_gateway_cm:kick_session(?GWNAME, ?CLIENTID),
+    receive
+        kick -> ok
+    after 100 ->
+        ?assert(false, "waiting kick msg timeout")
+    end,
+
+    ?assertEqual(1, ets:info(emqx_gateway_cm:tabname(chan, ?GWNAME), size)),
+    ?assertEqual(1, ets:info(emqx_gateway_cm:tabname(conn, ?GWNAME), size)),
+    ?assertEqual(1, ets:info(emqx_gateway_cm:tabname(info, ?GWNAME), size)),
+
+    emqx_gateway_cm:unregister_channel(?GWNAME, ?CLIENTID),
+    ?assertEqual(0, ets:info(emqx_gateway_cm:tabname(chan, ?GWNAME), size)),
+    ?assertEqual(0, ets:info(emqx_gateway_cm:tabname(conn, ?GWNAME), size)),
+    ?assertEqual(0, ets:info(emqx_gateway_cm:tabname(info, ?GWNAME), size)).
+
+t_handle_process_down(Conf) ->
+    Pid = proplists:get_value(cm, Conf),
+
+    {ok, SessionRes} = emqx_gateway_cm:open_session(
+        ?GWNAME,
+        clean,
+        clientinfo(),
+        conninfo(),
+        fun(_, _) -> #{no => 1} end,
+        emqx_session
+    ),
+    ?assertEqual(
+        #{
+            present => false,
+            session => #{no => 1}
+        },
+        SessionRes
+    ),
+    emqx_gateway_cm:insert_channel_info(
+        ?GWNAME,
+        ?CLIENTID,
+        #{clientinfo => clientinfo(), conninfo => conninfo()},
+        []
+    ),
+
+    _ = Pid ! {'DOWN', mref, process, self(), normal},
+
+    %% wait the async clear task
+    timer:sleep(200),
+    ?assertEqual(
+        [],
+        ets:tab2list(emqx_gateway_cm:tabname(chan, ?GWNAME))
+    ),
+    ?assertEqual(
+        [],
+        ets:tab2list(emqx_gateway_cm:tabname(conn, ?GWNAME))
+    ),
+    ?assertEqual(
+        [],
+        ets:tab2list(emqx_gateway_cm:tabname(info, ?GWNAME))
+    ).
+
+t_kick_session(_) ->
+    %% session1
+    {ok, _} = emqx_gateway_cm:open_session(
+        ?GWNAME,
+        clean,
+        clientinfo(),
+        conninfo(),
+        fun(_, _) -> #{no => 1} end,
+        emqx_session
+    ),
+    emqx_gateway_cm:insert_channel_info(
+        ?GWNAME,
+        ?CLIENTID,
+        #{clientinfo => clientinfo(), conninfo => conninfo()},
+        []
+    ),
+
+    %% meck `lookup_channels`
+    Self = self(),
+    ok = meck:new(
+        emqx_gateway_cm_registry,
+        [passthrough, no_history, no_link]
+    ),
+    ok = meck:expect(
+        emqx_gateway_cm_registry,
+        lookup_channels,
+        fun(_, ?CLIENTID) -> [Self, Self] end
+    ),
+
+    ok = emqx_gateway_cm:kick_session(?GWNAME, ?CLIENTID),
+
+    receive
+        kick -> ok
+    after 100 -> ?assert(false, "waiting discard msg timeout")
+    end,
+    receive
+        kick ->
+            emqx_gateway_cm:connection_closed(?GWNAME, ?CLIENTID),
+            emqx_gateway_cm:unregister_channel(?GWNAME, ?CLIENTID)
+    after 100 ->
+        ?assert(false, "waiting kick msg timeout")
+    end,
+    ?assertMatch({error, not_found}, emqx_gateway_http:kickout_client(?GWNAME, <<"i-dont-exist">>)),
+    meck:unload(emqx_gateway_cm_registry).
+
+-doc "Session creation exposes connection information as data in the hook context.".
+t_session_created_hook_ctx(_) ->
+    Self = self(),
+    ok = meck:new(emqx_hooks, [passthrough, no_history, no_link]),
+    ok = meck:expect(
+        emqx_hooks,
+        run,
+        fun
+            ('session.created', Ctx, Args) ->
+                Self ! {session_created_hook, Ctx, Args},
+                meck:passthrough(['session.created', Ctx, Args]);
+            (HookPoint, Ctx, Args) ->
+                meck:passthrough([HookPoint, Ctx, Args])
+        end
+    ),
+    try
+        {ok, #{
+            present := false,
+            session := #{}
+        }} = emqx_gateway_cm:open_session(
+            ?GWNAME,
+            {takeover, force},
+            clientinfo(),
+            conninfo(),
+            fun(_, _) -> #{} end,
+            emqx_session
+        ),
+        receive
+            {session_created_hook, Ctx, _Args} ->
+                ?assertEqual(#{conninfo => conninfo()}, Ctx)
+        after 100 ->
+            ?assert(false, "waiting session.created hook context timeout")
+        end
+    after
+        meck:unload(emqx_hooks)
+    end.
+
+t_unexpected_handle(Conf) ->
+    Pid = proplists:get_value(cm, Conf),
+    _ = Pid ! unexpected_info,
+    ok = gen_server:call(Pid, unexpected_call),
+    ok = gen_server:cast(Pid, unexpected_cast).
+
+-doc """
+A gateway load that aborts partway through can leave its locker process
+registered. cm:init/1 must reclaim such an orphan so the gateway can still be
+(re)started instead of crashing with `{already_started, _}'.
+""".
+t_init_reclaims_orphan_locker(_) ->
+    GwName = orphan_gw,
+    LockerName = list_to_atom(lists:concat(['emqx_gateway_', GwName, '_locker'])),
+    %% Simulate a locker left behind by a previously aborted load.
+    {ok, Orphan} = ekka_locker:start_link(LockerName),
+    ?assertEqual(Orphan, whereis(LockerName)),
+    %% A fresh cm for the same gateway must still start cleanly.
+    {ok, CMPid} = emqx_gateway_cm:start_link([{gwname, GwName}]),
+    ?assert(is_process_alive(CMPid)),
+    %% The orphan was reclaimed and a live locker is registered under the name.
+    ?assertNot(is_process_alive(Orphan)),
+    NewLocker = whereis(LockerName),
+    ?assert(is_pid(NewLocker) andalso is_process_alive(NewLocker)),
+    ?assertNotEqual(Orphan, NewLocker),
+    ok = gen_server:stop(CMPid).
+
+%%--------------------------------------------------------------------
+%% helpers
+
+clientinfo() ->
+    #{
+        clientid => ?CLIENTID,
+        is_bridge => false,
+        is_superuser => false,
+        listener => 'mqttsn:udp:default',
+        mountpoint => <<"mqttsn/">>,
+        peerhost => {127, 0, 0, 1},
+        protocol => 'mqtt-sn',
+        sockport => 1884,
+        username => undefined,
+        zone => default
+    }.
+
+conninfo() ->
+    #{
+        clean_start => true,
+        clientid => ?CLIENTID,
+        conn_mod => ?MODULE,
+        connected_at => 1641805544652,
+        expiry_interval => 0,
+        keepalive => 10,
+        peercert => nossl,
+        peername => {{127, 0, 0, 1}, 64810},
+        proto_name => <<"MQTT-SN">>,
+        proto_ver => <<"1.2">>,
+        sockname => {{0, 0, 0, 0}, 1884},
+        socktype => udp
+    }.
+
+%%--------------------------------------------------------------------
+%% connection module mock
+
+call(ConnPid, discard, _) ->
+    ConnPid ! discard,
+    ok;
+call(ConnPid, kick, _) ->
+    ConnPid ! kick,
+    ok.

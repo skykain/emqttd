@@ -1,0 +1,182 @@
+%%--------------------------------------------------------------------
+%% Copyright (c) 2023-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
+%%--------------------------------------------------------------------
+
+-module(emqx_bridge_gcp_pubsub_tests).
+
+-include_lib("eunit/include/eunit.hrl").
+
+%%===========================================================================
+%% Data section
+%%===========================================================================
+
+%%===========================================================================
+%% Helper functions
+%%===========================================================================
+
+check_action(Overrides0) when is_map(Overrides0) ->
+    DefaultOverrides = #{
+        <<"connector">> => <<"x">>,
+        <<"parameters">> => #{
+            <<"attributes_template">> => [
+                #{<<"key">> => <<"${payload.key}">>, <<"value">> => <<"fixed_value">>},
+                #{<<"key">> => <<"${payload.key}2">>, <<"value">> => <<"${.payload.value}">>},
+                #{<<"key">> => <<"fixed_key">>, <<"value">> => <<"fixed_value">>},
+                #{<<"key">> => <<"fixed_key2">>, <<"value">> => <<"${.payload.value}">>}
+            ],
+            <<"ordering_key_template">> => <<"${.payload.ok}">>,
+            <<"payload_template">> => <<"${.}">>
+        }
+    },
+    Overrides = emqx_utils_maps:deep_merge(DefaultOverrides, Overrides0),
+    emqx_bridge_gcp_pubsub_producer_SUITE:action_config(Overrides).
+
+check_source(Overrides0) ->
+    DefaultOverrides = #{
+        <<"connector">> => <<"x">>
+    },
+    Overrides = emqx_utils_maps:deep_merge(DefaultOverrides, Overrides0),
+    emqx_bridge_gcp_pubsub_consumer_SUITE:source_config(Overrides).
+
+-define(validation_error(Reason, Value),
+    {emqx_bridge_v2_schema, [
+        #{
+            kind := validation_error,
+            reason := Reason,
+            value := Value
+        }
+    ]}
+).
+
+%%===========================================================================
+%% Test cases
+%%===========================================================================
+
+producer_attributes_validator_test_() ->
+    [
+        {"base config",
+            ?_assertMatch(
+                #{<<"parameters">> := #{<<"attributes_template">> := [_, _, _, _]}},
+                check_action(#{})
+            )},
+        {"empty key template",
+            ?_assertThrow(
+                ?validation_error("Key templates must not be empty", _),
+                check_action(
+                    #{
+                        <<"parameters">> => #{
+                            <<"attributes_template">> => [
+                                #{
+                                    <<"key">> => <<>>,
+                                    <<"value">> => <<"some_value">>
+                                }
+                            ]
+                        }
+                    }
+                )
+            )},
+        {"empty value template",
+            ?_assertMatch(
+                #{<<"parameters">> := #{<<"attributes_template">> := [_]}},
+                check_action(
+                    #{
+                        <<"parameters">> => #{
+                            <<"attributes_template">> => [
+                                #{
+                                    <<"key">> => <<"some_key">>,
+                                    <<"value">> => <<>>
+                                }
+                            ]
+                        }
+                    }
+                )
+            )}
+    ].
+
+-doc """
+Verifies that the topic of both producer actions and consumer sources accepts either a
+bare topic name or a fully-qualified `projects/<project-id>/topics/<topic-name>` path,
+and rejects other slash-containing values.
+""".
+pubsub_topic_validator_test_() ->
+    ErrorMsg = <<
+        "must be either a topic name or a fully-qualified topic path"
+        " 'projects/<project-id>/topics/<topic-name>'"
+    >>,
+    ValidTopics = [
+        <<"my-topic">>,
+        <<"projects/other-project/topics/my-topic">>
+    ],
+    InvalidTopics = [
+        <<"a/b">>,
+        <<"projects/other-project/foo/my-topic">>,
+        <<"projects/other-project/topics/my-topic/">>,
+        <<"projects//topics/my-topic">>,
+        <<"projects/other-project/topics/">>,
+        <<"/projects/other-project/topics/my-topic">>,
+        <<>>
+    ],
+    [
+        {
+            "producer accepts " ++ binary_to_list(Topic),
+            ?_assertMatch(
+                #{},
+                check_action(#{<<"parameters">> => #{<<"pubsub_topic">> => Topic}})
+            )
+        }
+     || Topic <- ValidTopics
+    ] ++
+        [
+            {
+                "consumer accepts " ++ binary_to_list(Topic),
+                ?_assertMatch(
+                    #{},
+                    check_source(#{<<"parameters">> => #{<<"topic">> => Topic}})
+                )
+            }
+         || Topic <- ValidTopics
+        ] ++
+        [
+            {
+                "producer rejects " ++ binary_to_list(Topic),
+                ?_assertThrow(
+                    ?validation_error(ErrorMsg, _),
+                    check_action(#{<<"parameters">> => #{<<"pubsub_topic">> => Topic}})
+                )
+            }
+         || Topic <- InvalidTopics
+        ] ++
+        [
+            {
+                "consumer rejects " ++ binary_to_list(Topic),
+                ?_assertThrow(
+                    ?validation_error(ErrorMsg, _),
+                    check_source(#{<<"parameters">> => #{<<"topic">> => Topic}})
+                )
+            }
+         || Topic <- InvalidTopics
+        ].
+
+-doc """
+Verifies that we clamp the allowed range for ack deadline.
+""".
+consumer_ack_deadline_test_() ->
+    ErrorMsg = <<"Value must be between 10 s and 600 s">>,
+    [
+        ?_assertThrow(
+            ?validation_error(ErrorMsg, 9),
+            check_source(#{<<"parameters">> => #{<<"ack_deadline">> => <<"9s">>}})
+        ),
+        ?_assertThrow(
+            ?validation_error(ErrorMsg, 601),
+            check_source(#{<<"parameters">> => #{<<"ack_deadline">> => <<"601s">>}})
+        ),
+        ?_assertMatch(
+            #{},
+            check_source(#{<<"parameters">> => #{<<"ack_deadline">> => <<"600s">>}})
+        ),
+        ?_assertMatch(
+            #{},
+            check_source(#{<<"parameters">> => #{<<"ack_deadline">> => <<"10s">>}})
+        )
+    ].

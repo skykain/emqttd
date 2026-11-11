@@ -1,0 +1,59 @@
+emqx_bridge_sqlserver {
+
+config_enable.desc:
+"""Enable or disable this bridge"""
+
+config_enable.label:
+"""Enable Or Disable Bridge"""
+
+desc_config.desc:
+"""Configuration for a Microsoft SQL Server bridge."""
+
+desc_config.label:
+"""Microsoft SQL Server Bridge Configuration"""
+
+desc_name.desc:
+"""Bridge name."""
+
+desc_name.label:
+"""Bridge Name"""
+
+desc_type.desc:
+"""The Bridge Type"""
+
+desc_type.label:
+"""Bridge Type"""
+
+driver.desc:
+"""SQL Server Driver Name"""
+
+driver.label:
+"""SQL Server Driver Name"""
+
+sql_template.desc:
+"""A restricted SQL Server INSERT INTO VALUES or UPDATE template. UPDATE requires `resource_opts.batch_size = 1`.
+Placeholders are allowed in value positions and string values, including SET expressions and WHERE conditions.
+Comments, extra statements, multiple configured rows, and dynamic identifiers are not allowed."""
+
+sql_template.label:
+"""SQL Template"""
+
+action_parameters.desc:
+"""Action specific configuration."""
+
+action_parameters.label:
+"""Action"""
+
+sqlserver_action.desc:
+"""Configuration for Microsoft SOL Server action."""
+
+sqlserver_action.label:
+"""Microsoft SOL Server Action Configuration"""
+
+config_connector.desc:
+"""Configuration for a Microsoft SOL Server connector."""
+
+config_connector.label:
+"""Microsoft SOL Server Connector Configuration"""
+
+}

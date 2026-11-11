@@ -1,0 +1,418 @@
+%%--------------------------------------------------------------------
+%% Copyright (c) 2026 EMQ Technologies Co., Ltd. All Rights Reserved.
+%%--------------------------------------------------------------------
+
+-module(emqx_agent_tool_http_SUITE).
+
+-compile(export_all).
+-compile(nowarn_export_all).
+
+-include_lib("eunit/include/eunit.hrl").
+-include_lib("common_test/include/ct.hrl").
+-include_lib("emqx/include/emqx.hrl").
+
+-define(TOOL_TYPE, <<"http">>).
+-define(TOOL_ID, <<"weather-api">>).
+
+all() -> emqx_common_test_helpers:all(?MODULE).
+
+init_per_suite(Config) ->
+    Apps = emqx_cth_suite:start([emqx, emqx_conf, emqx_resource, emqx_agent], #{
+        work_dir => emqx_cth_suite:work_dir(Config)
+    }),
+    [{apps, Apps} | Config].
+
+end_per_suite(Config) ->
+    emqx_cth_suite:stop(?config(apps, Config)).
+
+init_per_testcase(_TestCase, Config) ->
+    ok = emqx_agent_plugin_config_fixture:setup(),
+    {ok, {Port, _Pid}} = emqx_utils_http_test_server:start_link(random, "/[...]", false),
+    BaseUrl = iolist_to_binary(io_lib:format("http://127.0.0.1:~p/api", [Port])),
+    ok = emqx_agent_tool_http:init(),
+    ok = register_tool(test_context([{base_url, BaseUrl} | Config])),
+    [{base_url, BaseUrl} | Config].
+
+end_per_testcase(_TestCase, _Config) ->
+    ok = emqx_agent_tool_http:deinit(),
+    ok = emqx_agent_plugin_config_fixture:teardown(),
+    ok = emqx_utils_http_test_server:stop().
+
+%%--------------------------------------------------------------------
+%% Test cases
+%%--------------------------------------------------------------------
+
+t_create_returns_tool(_Config) ->
+    {ok, Tool} = emqx_agent_tool_registry:lookup(?TOOL_TYPE, ?TOOL_ID),
+    ?assertMatch(#{tool_id := ?TOOL_ID}, Tool),
+    ?assertMatch(#{type := ?TOOL_TYPE}, Tool),
+    #{description := Desc, input_schema := InputSchema, context := #{<<"url">> := Url}} = Tool,
+    ?assertNotEqual(nomatch, binary:match(Desc, Url)),
+    Properties = maps:get(<<"properties">>, InputSchema),
+    ?assertNot(maps:is_key(<<"body">>, Properties)),
+    #{<<"path">> := #{<<"description">> := PathDesc}} = Properties,
+    ?assertNotEqual(nomatch, binary:match(PathDesc, <<"Actual HTTP request path">>)),
+    ?assertNotEqual(nomatch, binary:match(PathDesc, <<"/api">>)).
+
+t_create_rejects_malformed_input_schema(_Config) ->
+    RuntimeContext = #{
+        <<"id">> => ?TOOL_ID,
+        <<"desc">> => <<"bad schema">>,
+        <<"method">> => <<"get">>,
+        <<"url">> => <<"http://127.0.0.1">>,
+        <<"input_schema">> => <<"{">>
+    },
+    ?assertMatch(
+        {error, {invalid_input_schema, {invalid_json, _}}},
+        emqx_agent_tool_http:create(RuntimeContext)
+    ).
+
+t_destroy_accepts_runtime_tool(_Config) ->
+    {ok, Tool} = emqx_agent_tool_registry:lookup(?TOOL_TYPE, ?TOOL_ID),
+    ?assertEqual(ok, emqx_agent_tool_http:destroy(Tool)).
+
+t_append_query_empty_args(_Config) ->
+    ?assertEqual(
+        <<"https://api.example.com/weather">>,
+        emqx_agent_tool_http:append_query(<<"https://api.example.com/weather">>, #{})
+    ).
+
+t_append_query_single_param(_Config) ->
+    Url = emqx_agent_tool_http:append_query(
+        <<"https://api.example.com/weather">>, #{<<"city">> => <<"London">>}
+    ),
+    ?assertMatch(<<"https://api.example.com/weather?", _/binary>>, Url),
+    ?assertNotEqual(nomatch, binary:match(Url, <<"city=London">>)).
+
+t_append_query_integer_param(_Config) ->
+    Url = emqx_agent_tool_http:append_query(
+        <<"https://api.example.com/forecast">>, #{<<"days">> => 5}
+    ),
+    ?assertNotEqual(nomatch, binary:match(Url, <<"days=5">>)).
+
+t_get_invoke_publishes_reply(Config) ->
+    emqx_utils_http_test_server:set_handler(fun(Req0, State) ->
+        ?assertEqual(<<"/api/weather">>, cowboy_req:path(Req0)),
+        QS = maps:from_list(cowboy_req:parse_qs(Req0)),
+        reply_json(
+            200, #{<<"city">> => maps:get(<<"city">>, QS), <<"temperature">> => 22.5}, Req0, State
+        )
+    end),
+    invoke_and_assert(
+        Config,
+        get_args(<<"/api/weather">>, #{
+            <<"city">> => <<"London">>, <<"units">> => <<"metric">>
+        }),
+        fun(Data) ->
+            ?assertMatch(#{<<"city">> := <<"London">>}, Data),
+            ?assertEqual(22.5, maps:get(<<"temperature">>, Data))
+        end
+    ).
+
+t_post_invoke_sends_json_body(Config) ->
+    ok = emqx_agent_config:delete_tool(?TOOL_TYPE, ?TOOL_ID),
+    ok = register_tool(test_context(Config, #{<<"method">> => <<"post">>})),
+    {ok, #{input_schema := InputSchema}} = emqx_agent_tool_registry:lookup(?TOOL_TYPE, ?TOOL_ID),
+    ?assert(maps:is_key(<<"body">>, maps:get(<<"properties">>, InputSchema))),
+    emqx_utils_http_test_server:set_handler(fun(Req0, State) ->
+        ?assertEqual(<<"/api/create">>, cowboy_req:path(Req0)),
+        QS = maps:from_list(cowboy_req:parse_qs(Req0)),
+        ?assertEqual(<<"trace-1">>, maps:get(<<"trace">>, QS)),
+        {ok, RawBody, Req1} = cowboy_req:read_body(Req0),
+        #{<<"city">> := City} = emqx_utils_json:decode(RawBody),
+        reply_json(201, #{<<"status">> => <<"created">>, <<"city">> => City}, Req1, State)
+    end),
+    invoke_and_assert(
+        Config,
+        non_get_args(<<"/api/create">>, #{<<"trace">> => <<"trace-1">>}, #{
+            <<"city">> => <<"Berlin">>, <<"units">> => null
+        }),
+        fun(Data) ->
+            ?assertMatch(#{<<"status">> := <<"created">>, <<"city">> := <<"Berlin">>}, Data)
+        end
+    ).
+
+t_get_passes_headers_to_server(Config) ->
+    Self = self(),
+    emqx_utils_http_test_server:set_handler(fun(Req0, State) ->
+        Self ! {request_headers, cowboy_req:headers(Req0)},
+        reply_json(200, #{<<"ok">> => true}, Req0, State)
+    end),
+    invoke_and_assert(
+        Config, get_args(<<"/api">>, #{<<"city">> => <<"Oslo">>, <<"units">> => null}), fun(_) ->
+            ok
+        end
+    ),
+    receive
+        {request_headers, Headers} ->
+            ?assertEqual(<<"test-key-123">>, maps:get(<<"x-api-key">>, Headers))
+    after 3000 ->
+        ct:fail(no_request_received)
+    end.
+
+t_non_json_response_errors(Config) ->
+    emqx_utils_http_test_server:set_handler(fun(Req0, State) ->
+        Req = cowboy_req:reply(
+            200, #{<<"content-type">> => <<"text/plain">>}, <<"plain text">>, Req0
+        ),
+        {ok, Req, State}
+    end),
+    invoke_and_assert_response(Config, get_args(<<"/api">>, #{}), fun(Response) ->
+        ?assertMatch(
+            #{<<"status">> := <<"error">>, <<"reason">> := Reason} when is_binary(Reason), Response
+        ),
+        ?assertNotEqual(
+            nomatch, binary:match(maps:get(<<"reason">>, Response), <<"invalid_json_response">>)
+        )
+    end).
+
+t_request_failure_errors(Config) ->
+    ok = emqx_agent_config:delete_tool(?TOOL_TYPE, ?TOOL_ID),
+    ok = register_tool(test_context(Config, #{<<"url">> => <<"http://127.0.0.1:1/">>})),
+    invoke_and_assert_response(Config, get_args(<<"/">>, #{}), fun(Response) ->
+        ?assertMatch(
+            #{<<"status">> := <<"error">>, <<"reason">> := Reason} when is_binary(Reason), Response
+        ),
+        ?assertNotEqual(
+            nomatch, binary:match(maps:get(<<"reason">>, Response), <<"request_failed">>)
+        )
+    end).
+
+t_binary_image_response_extracts_attachment(Config) ->
+    ok = emqx_agent_config:delete_tool(?TOOL_TYPE, ?TOOL_ID),
+    ok = register_tool(test_context(Config, #{<<"payload_type">> => <<"binary">>})),
+    emqx_utils_http_test_server:set_handler(fun(Req0, State) ->
+        Req = cowboy_req:reply(
+            200, #{<<"content-type">> => <<"image/png">>}, <<"png bytes">>, Req0
+        ),
+        {ok, Req, State}
+    end),
+    invoke_and_assert_response(Config, get_args(<<"/api">>, #{}), fun(Response) ->
+        ?assertMatch(
+            #{
+                <<"status">> := <<"ok">>,
+                <<"result">> := #{
+                    <<"body">> := <<"Image .">>,
+                    <<"status_code">> := 200,
+                    <<"headers">> := #{<<"content-type">> := <<"image/png">>}
+                },
+                <<"attachments">> := [#{<<"id">> := <<".">>, <<"mime_type">> := <<"image/png">>}]
+            },
+            Response
+        )
+    end).
+
+t_json_image_response_extracts_attachment(Config) ->
+    emqx_utils_http_test_server:set_handler(fun(Req0, State) ->
+        reply_json(200, #{<<"image_url">> => <<"data:image/png;base64,abc123">>}, Req0, State)
+    end),
+    invoke_and_assert_response(
+        Config, get_args(<<"/api">>, #{<<"city">> => <<"Oslo">>, <<"units">> => null}), fun(
+            Response
+        ) ->
+            ?assertMatch(
+                #{
+                    <<"status">> := <<"ok">>,
+                    <<"result">> := #{
+                        <<"body">> := #{<<"image_url">> := <<"Image .image_url">>},
+                        <<"status_code">> := 200
+                    },
+                    <<"attachments">> := [
+                        #{<<"id">> := <<".image_url">>, <<"mime_type">> := <<"image/png">>}
+                    ]
+                },
+                Response
+            )
+        end
+    ).
+
+t_path_outside_configured_prefix_errors(Config) ->
+    Self = self(),
+    emqx_utils_http_test_server:set_handler(fun(Req0, State) ->
+        Self ! unexpected_request,
+        reply_json(200, #{<<"ok">> => true}, Req0, State)
+    end),
+    invoke_and_assert_response(Config, get_args(<<"/other">>, #{}), fun(Response) ->
+        ?assertMatch(
+            #{<<"status">> := <<"error">>, <<"reason">> := Reason} when is_binary(Reason),
+            Response
+        ),
+        ?assertNotEqual(
+            nomatch,
+            binary:match(maps:get(<<"reason">>, Response), <<"path_outside_configured_prefix">>)
+        )
+    end),
+    receive
+        unexpected_request -> ct:fail(unexpected_request)
+    after 100 ->
+        ok
+    end.
+
+-doc "A path with dot segments resolving above the configured prefix is denied.".
+t_dot_segment_traversal_denied(Config) ->
+    assert_path_denied(Config, <<"/api/v1/../../admin/users">>).
+
+-doc "A sibling path sharing the prefix bytes but not a segment boundary is denied.".
+t_sibling_prefix_denied(Config) ->
+    assert_path_denied(Config, <<"/api-internal/secrets">>).
+
+-doc "Percent-encoded dot segments are decoded before the prefix check and denied.".
+t_encoded_traversal_denied(Config) ->
+    assert_path_denied(Config, <<"/api/v1/%2e%2e/%2e%2e/admin">>).
+
+-doc "A segment decoding to a path separator is denied.".
+t_encoded_separator_denied(Config) ->
+    assert_path_denied(Config, <<"/api/..%2f..%2fadmin">>).
+
+-doc "In-prefix paths still reach the server, on their canonical form.".
+t_in_prefix_paths_allowed(Config) ->
+    %% Exact prefix.
+    assert_request_path(Config, <<"/api">>, <<"/api">>),
+    %% Sub-resource at a segment boundary.
+    assert_request_path(Config, <<"/api/sub/resource">>, <<"/api/sub/resource">>),
+    %% Percent-encoded but in-prefix.
+    assert_request_path(Config, <<"/api/hello%20world">>, <<"/api/hello%20world">>),
+    %% Dot segments resolving within the prefix.
+    assert_request_path(Config, <<"/api/sub/../weather">>, <<"/api/weather">>).
+
+t_unregistered_tool_is_silently_ignored(_Config) ->
+    ok = emqx_agent_config:delete_tool(?TOOL_TYPE, ?TOOL_ID),
+    Msg = emqx_message:make(?TOOL_ID, 0, invoke_topic(<<"dummy-req">>), <<"ignored">>),
+    ?assertMatch(#message{}, emqx_hooks:run_fold('message.publish', [], Msg)),
+    ok = register_tool(test_context(_Config)).
+
+t_non_http_topic_is_ignored(_Config) ->
+    Msg = emqx_message:make(?TOOL_ID, 0, <<"other/topic">>, <<"payload">>),
+    ?assertMatch(#message{}, emqx_hooks:run_fold('message.publish', [], Msg)).
+
+%%--------------------------------------------------------------------
+%% Helpers
+%%--------------------------------------------------------------------
+
+invoke_topic(ReqId) ->
+    <<"$cap/http/", ?TOOL_ID/binary, "/request/", ReqId/binary>>.
+
+reply_topic(ReqId) ->
+    <<"$cap/http/", ?TOOL_ID/binary, "/response/", ReqId/binary>>.
+
+invoke_and_assert(_Config, Args, AssertFn) ->
+    invoke_and_assert_response(_Config, Args, fun(Response) ->
+        Result = maps:get(<<"result">>, Response),
+        AssertFn(maps:get(<<"body">>, Result))
+    end).
+
+invoke_and_assert_response(_Config, Args, AssertFn) ->
+    ReqId = base64:encode(crypto:strong_rand_bytes(8), #{mode => urlsafe}),
+    ReplyTopic = reply_topic(ReqId),
+    ok = emqx:subscribe(ReplyTopic),
+
+    Payload = emqx_utils_json:encode(#{
+        <<"trace_id">> => <<"tr-test">>,
+        <<"mode">> => <<"unary">>,
+        <<"args">> => Args
+    }),
+    _ = emqx_broker:publish2(emqx_message:make(?TOOL_ID, 0, invoke_topic(ReqId), Payload)),
+
+    Reply =
+        receive
+            {deliver, ReplyTopic, #message{payload = P}} -> emqx_utils_json:decode(P)
+        after 3000 ->
+            ct:fail(no_reply_received)
+        end,
+
+    ?assertMatch(#{<<"req_id">> := ReqId}, Reply),
+    ?assertMatch(#{<<"type">> := ?TOOL_TYPE, <<"id">> := ?TOOL_ID}, maps:get(<<"tool">>, Reply)),
+    AssertFn(emqx_agent_tool_helpers:cap_response(Reply)),
+
+    ok = emqx:unsubscribe(ReplyTopic).
+
+assert_path_denied(Config, Path) ->
+    Self = self(),
+    emqx_utils_http_test_server:set_handler(fun(Req0, State) ->
+        Self ! {unexpected_request, cowboy_req:path(Req0)},
+        reply_json(200, #{<<"ok">> => true}, Req0, State)
+    end),
+    invoke_and_assert_response(Config, get_args(Path, #{}), fun(Response) ->
+        ?assertMatch(
+            #{<<"status">> := <<"error">>, <<"reason">> := Reason} when is_binary(Reason),
+            Response
+        ),
+        ?assertNotEqual(
+            nomatch,
+            binary:match(maps:get(<<"reason">>, Response), <<"path_outside_configured_prefix">>)
+        )
+    end),
+    receive
+        {unexpected_request, ReqPath} -> ct:fail({unexpected_request, ReqPath})
+    after 100 ->
+        ok
+    end.
+
+assert_request_path(Config, Path, ExpectedPath) ->
+    Self = self(),
+    emqx_utils_http_test_server:set_handler(fun(Req0, State) ->
+        Self ! {request_path, cowboy_req:path(Req0)},
+        reply_json(200, #{<<"ok">> => true}, Req0, State)
+    end),
+    invoke_and_assert(Config, get_args(Path, #{}), fun(Data) ->
+        ?assertMatch(#{<<"ok">> := true}, Data)
+    end),
+    receive
+        {request_path, ReqPath} -> ?assertEqual(ExpectedPath, ReqPath)
+    after 3000 ->
+        ct:fail(no_request_received)
+    end.
+
+get_args(Path, QueryArgs) ->
+    #{<<"path">> => Path, <<"query_args">> => QueryArgs}.
+
+non_get_args(Path, QueryArgs, Body) ->
+    #{<<"path">> => Path, <<"query_args">> => QueryArgs, <<"body">> => Body}.
+
+test_context(Config) ->
+    test_context(Config, #{}).
+
+test_context(Config, Overrides) ->
+    BaseUrl = ?config(base_url, Config),
+    maps:merge(
+        #{
+            <<"type">> => ?TOOL_TYPE,
+            <<"id">> => ?TOOL_ID,
+            <<"desc">> => <<"Fetch current weather for a city.">>,
+            <<"method">> => <<"get">>,
+            <<"url">> => BaseUrl,
+            <<"headers">> => [#{<<"name">> => <<"x-api-key">>, <<"value">> => <<"test-key-123">>}],
+            <<"input_schema">> => #{
+                <<"type">> => <<"object">>,
+                <<"properties">> => #{
+                    <<"city">> => #{<<"type">> => <<"string">>},
+                    <<"units">> => #{
+                        <<"type">> => [<<"string">>, <<"null">>],
+                        <<"enum">> => [<<"metric">>, <<"imperial">>, null]
+                    }
+                },
+                <<"required">> => [<<"city">>, <<"units">>],
+                <<"additionalProperties">> => false
+            }
+        },
+        Overrides
+    ).
+
+register_tool(Context) ->
+    Body = maybe_encode_schema(<<"input_schema">>, Context),
+    emqx_agent_config:create_tool(Body).
+
+maybe_encode_schema(Field, Body) ->
+    case maps:get(Field, Body, undefined) of
+        Schema when is_map(Schema) -> Body#{Field => emqx_utils_json:encode(Schema)};
+        _ -> Body
+    end.
+
+reply_json(Status, Data, Req0, State) ->
+    Req = cowboy_req:reply(
+        Status,
+        #{<<"content-type">> => <<"application/json">>},
+        emqx_utils_json:encode(Data),
+        Req0
+    ),
+    {ok, Req, State}.

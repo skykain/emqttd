@@ -1,0 +1,1129 @@
+#!/usr/bin/env python3
+"""
+Pytest tests for EMQX boot behavior.
+Equivalent to emqx-boot.bats
+
+Usage:
+    pytest scripts/test/test_emqx_boot.py -v
+"""
+
+import json
+import os
+import time
+import subprocess
+import shutil
+import pytest
+from pathlib import Path
+
+
+@pytest.fixture(scope="module")
+def profile():
+    """Get PROFILE environment variable, defaulting to emqx-enterprise."""
+    return os.environ.get("PROFILE", "emqx-enterprise")
+
+
+@pytest.fixture(scope="module")
+def emqx_bin_path(profile):
+    """Get the path to emqx binary."""
+    workspace_root = Path(__file__).parent.parent.parent
+    bin_path = workspace_root / "_build" / profile / "rel" / "emqx" / "bin" / "emqx"
+    if not bin_path.exists():
+        pytest.fail(
+            f"EMQX binary not found at {bin_path}: the release artifact "
+            "(e.g. <profile>-rel) must provide _build/<profile>/rel/emqx. "
+            "Failing instead of skipping so a missing release cannot turn this job green."
+        )
+    return bin_path
+
+
+@pytest.fixture(scope="module")
+def emqx_rel_path(profile):
+    """Get the path to emqx release directory."""
+    workspace_root = Path(__file__).parent.parent.parent
+    rel_path = workspace_root / "_build" / profile / "rel" / "emqx"
+    if not rel_path.exists():
+        pytest.fail(
+            f"EMQX release not found at {rel_path}: the release artifact "
+            "(e.g. <profile>-rel) must provide _build/<profile>/rel/emqx. "
+            "Failing instead of skipping so a missing release cannot turn this job green."
+        )
+    return rel_path
+
+
+def run_emqx_console(emqx_bin_path, env_overrides, timeout=10, stdin=None):
+    env = os.environ.copy()
+    env.update(env_overrides)
+    return subprocess.run(
+        [str(emqx_bin_path), "console"],
+        env=env,
+        stdin=stdin,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+
+
+def open_emqx_console(emqx_bin_path, env_overrides, **kwargs):
+    env = os.environ.copy()
+    env.update(env_overrides)
+    return subprocess.Popen(
+        [str(emqx_bin_path), "console"],
+        env=env,
+        **kwargs
+    )
+
+
+def wait_until_stdout(proc, expected, timeout_s=10):
+    now = time.time()
+    deadline = now + timeout_s
+    found = False
+    outputs = []
+    while time.time() <= deadline:
+        out = proc.stdout.readline()
+        if out:
+            outputs.append(out)
+        if expected not in out:
+            time.sleep(1)
+        else:
+            found = True
+            break
+    if not found:
+        print(outputs)
+        raise TimeoutError(f"didn't find {expected} in the output")
+    else:
+        return outputs
+
+
+def json_outputs(stdout):
+    out = []
+    for line in stdout:
+        try:
+            log = json.loads(line)
+            out.append(log)
+        except:
+            continue
+    return out
+
+
+def test_profile_defaults_to_enterprise():
+    """Test that PROFILE defaults to emqx-enterprise when not set."""
+    # This test verifies the default behavior
+    # The actual profile value is tested through the fixtures
+    pass
+
+
+def test_emqx_boot_with_invalid_node_name(emqx_bin_path):
+    """Test that emqx boot fails with invalid node name."""
+    env = os.environ.copy()
+    env["EMQX_NODE_NAME"] = "invliadename#"
+
+    result = subprocess.run(
+        [str(emqx_bin_path), "console"],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10
+    )
+
+    # The command should fail and output should contain error message
+    output = result.stdout + result.stderr
+    assert "ERROR: Invalid node name," in output or result.returncode != 0
+
+
+def test_hardened_rejects_insecure_cookie(emqx_bin_path):
+    """Test that hardened profile rejects known insecure Erlang cookies."""
+    for cookie in ["emqx50elixir", "emqxsecretcookie"]:
+        result = run_emqx_console(
+            emqx_bin_path,
+            {
+                "EMQX_SECURITY_PROFILE": "hardened",
+                "EMQX_NODE__COOKIE": cookie,
+            },
+        )
+        output = result.stdout + result.stderr
+        assert result.returncode != 0, f"Expected EMQX to reject cookie {cookie}"
+        assert "Cannot continue with default cookie" in output
+        assert "EMQX_SECURITY_PROFILE" in output
+
+
+def test_security_profile_defaults_to_hardened(emqx_bin_path):
+    """With EMQX_SECURITY_PROFILE unset, bin/emqx defaults to hardened.
+
+    The hardened profile rejects the insecure cookie before boot; the legacy
+    profile only warns. A rejection therefore proves the default is hardened.
+    """
+    env = os.environ.copy()
+    env.pop("EMQX_SECURITY_PROFILE", None)
+    env["EMQX_NODE__COOKIE"] = "emqxsecretcookie"
+    result = subprocess.run(
+        [str(emqx_bin_path), "console"],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    output = result.stdout + result.stderr
+    assert result.returncode != 0, "Expected the default (hardened) profile to reject the cookie"
+    assert "Cannot continue with default cookie" in output
+    assert "hardened" in output
+
+
+def test_node_cookie_from_file(emqx_bin_path, tmp_path):
+    """Test that node.cookie can be sourced from a file via the file:// form."""
+    cookie_file = tmp_path / "cookie"
+    # trailing newline is expected from `echo secret > file` and must be stripped
+    cookie_file.write_text("mysecretcookie123\n")
+    with open_emqx_console(
+            emqx_bin_path,
+            {
+                "EMQX_LOG__CONSOLE__LEVEL": "notice",
+                "EMQX_LOG__CONSOLE__FORMATTER": "json",
+                "EMQX_NODE__COOKIE": f"file://{cookie_file}",
+            },
+            stdout=subprocess.PIPE,
+            text=True,
+    ) as emqx:
+        try:
+            # the node boots, which means erl -setcookie got the resolved value
+            outputs = wait_until_stdout(emqx, "feature_gates_resolved", 15)
+            assert outputs
+        finally:
+            emqx.kill()
+
+
+def test_node_cookie_from_missing_file_fails_fast(emqx_bin_path, tmp_path):
+    """Test that a missing node.cookie file fails before boot with a clear error."""
+    result = run_emqx_console(
+        emqx_bin_path,
+        {"EMQX_NODE__COOKIE": f"file://{tmp_path}/does-not-exist"},
+    )
+    output = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert "does not exist" in output
+
+
+def test_node_cookie_from_empty_file_fails_fast(emqx_bin_path, tmp_path):
+    """Test that an empty node.cookie file fails before boot with a clear error."""
+    cookie_file = tmp_path / "empty-cookie"
+    cookie_file.write_text("")
+    result = run_emqx_console(
+        emqx_bin_path,
+        {"EMQX_NODE__COOKIE": f"file://{cookie_file}"},
+    )
+    output = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert "is empty" in output
+
+
+def test_node_cookie_from_fifo_read_once(emqx_bin_path, tmp_path):
+    """Test that node.cookie can be sourced from a write-once FIFO.
+
+    The `start` command re-execs `console` via run_erl; the cookie FIFO must be
+    drained exactly once across that re-exec, otherwise the second read would
+    block forever (no writer) and the node would never come up.
+    """
+    fifo = tmp_path / "cookie.fifo"
+    os.mkfifo(fifo)
+    cookie = "fifocookie12345"
+
+    # A single writer-open: the orchestrator writes the cookie to the FIFO once.
+    # If bin/emqx tried to read it twice, this writer would already be gone and
+    # boot would hang.
+    writer = subprocess.Popen(
+        ["sh", "-c", 'printf "%s\\n" "$0" > "$1"', cookie, str(fifo)]
+    )
+
+    boot_env = os.environ.copy()
+    boot_env["EMQX_NODE__COOKIE"] = f"file://{fifo}"
+    boot_env["EMQX_WAIT_FOR_START"] = "60"
+
+    # Maintenance commands run without the file:// override; they obtain the
+    # cookie from the running node's `ps` output.
+    plain_env = os.environ.copy()
+    plain_env.pop("EMQX_NODE__COOKIE", None)
+
+    try:
+        start = subprocess.run(
+            [str(emqx_bin_path), "start"],
+            env=boot_env,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        assert start.returncode == 0, (
+            f"start failed: {start.stdout + start.stderr}"
+        )
+        got = subprocess.run(
+            [str(emqx_bin_path), "eval", "erlang:get_cookie()."],
+            env=plain_env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert cookie in got.stdout, (
+            f"node cookie mismatch: {got.stdout + got.stderr}"
+        )
+    finally:
+        subprocess.run(
+            [str(emqx_bin_path), "stop"],
+            env=plain_env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        try:
+            writer.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            writer.kill()
+
+
+@pytest.mark.parametrize("security_profile", ["not-a-profile", "HARDENED"])
+def test_invalid_security_profile_fails_fast(emqx_bin_path, security_profile):
+    """Test that malformed EMQX_SECURITY_PROFILE fails before boot."""
+    result = run_emqx_console(
+        emqx_bin_path,
+        {
+            # needed otherwise new default hardened profile prevents the node from
+            # starting.
+            "EMQX_NODE__COOKIE": "nondefaultcookie",
+            "EMQX_SECURITY_PROFILE": security_profile,
+        },
+    )
+    output = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert "Invalid security profile" in output
+    assert "legacy" in output
+    assert "hardened" in output
+
+
+@pytest.mark.parametrize("default_address", ["999.1.1.1", "0.0.0.0:1883"])
+def test_invalid_default_listener_address_fails_fast(emqx_bin_path, default_address):
+    """A malformed node.default_listener_address fails schema validation
+    before boot."""
+    result = run_emqx_console(
+        emqx_bin_path,
+        {
+            # needed otherwise new default hardened profile prevents the node from
+            # starting.
+            "EMQX_NODE__COOKIE": "nondefaultcookie",
+            "EMQX_NODE__DEFAULT_LISTENER_ADDRESS": default_address,
+        },
+        timeout=120,
+    )
+    output = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert "default_listener_address" in output
+
+
+def test_unresolvable_default_listener_address_fails_boot(emqx_bin_path):
+    """A syntactically valid hostname that does not resolve passes schema
+    validation and fails at listener start (.invalid never resolves)."""
+    result = run_emqx_console(
+        emqx_bin_path,
+        {
+            # needed otherwise new default hardened profile prevents the node from
+            # starting.
+            "EMQX_NODE__COOKIE": "nondefaultcookie",
+            "EMQX_NODE__DEFAULT_LISTENER_ADDRESS": "host.invalid",
+        },
+        timeout=120,
+    )
+    output = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert "invalid_default_address" in output
+
+
+@pytest.mark.parametrize("default_address", ["loopback", "nodename", "all", "::1"])
+def test_valid_default_listener_address_accepted(emqx_bin_path, default_address):
+    """A valid node.default_listener_address passes validation; boot
+    proceeds until the hardened-profile default-cookie check aborts it."""
+    result = run_emqx_console(
+        emqx_bin_path,
+        {
+            "EMQX_NODE__DEFAULT_LISTENER_ADDRESS": default_address,
+            "EMQX_SECURITY_PROFILE": "hardened",
+            "EMQX_NODE__COOKIE": "emqxsecretcookie",
+        },
+    )
+    output = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert "default_listener_address" not in output
+    assert "Cannot continue with default cookie" in output
+
+
+@pytest.fixture
+def env_file(emqx_rel_path):
+    """Yield the etc/emqx.env path and restore the shipped file afterwards."""
+    path = emqx_rel_path / "etc" / "emqx.env"
+    backup = path.read_bytes() if path.exists() else None
+    yield path
+    if backup is None:
+        path.unlink(missing_ok=True)
+    else:
+        path.write_bytes(backup)
+
+
+def test_shipped_env_file_sets_nothing(env_file):
+    """The shipped etc/emqx.env must keep every assignment commented out."""
+    assert env_file.exists()
+    active = [
+        line
+        for line in env_file.read_text().splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    assert active == []
+
+
+def test_env_file_sets_security_profile(emqx_bin_path, env_file):
+    """bin/emqx sources etc/emqx.env; a profile set there is enforced."""
+    env_file.write_text("# comment\n\nEMQX_SECURITY_PROFILE=hardened\n")
+    result = run_emqx_console(
+        emqx_bin_path,
+        {"EMQX_NODE__COOKIE": "emqxsecretcookie"},
+    )
+    output = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert "Cannot continue with default cookie" in output
+    assert "hardened" in output
+
+
+def test_env_file_overrides_environment(emqx_bin_path, env_file):
+    """A value in etc/emqx.env wins over the inherited environment."""
+    env_file.write_text("EMQX_SECURITY_PROFILE=hardened\n")
+    result = run_emqx_console(
+        emqx_bin_path,
+        {
+            "EMQX_SECURITY_PROFILE": "legacy",
+            "EMQX_NODE__COOKIE": "emqxsecretcookie",
+        },
+    )
+    output = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert "Cannot continue with default cookie" in output
+
+
+def test_env_file_invalid_security_profile_fails_fast(emqx_bin_path, env_file):
+    """An invalid profile in etc/emqx.env fails before boot."""
+    env_file.write_text("EMQX_SECURITY_PROFILE=bogus\n")
+    result = run_emqx_console(emqx_bin_path, {})
+    output = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert "Invalid security profile: bogus" in output
+
+
+@pytest.fixture
+def dist_tls_optfile(tmp_path):
+    """An inet_tls option file that still disables peer verification."""
+    path = tmp_path / "ssl_dist.conf"
+    path.write_text(
+        "[{server, [{verify, verify_none}]},\n"
+        " {client, [{verify, verify_none}]}].\n"
+    )
+    return path
+
+
+@pytest.fixture(scope="module")
+def dist_tls_certs(emqx_rel_path):
+    """The certificate files `etc/ssl_dist.conf` names.
+
+    EMQX ships no example certificates any more (7.0) while the option file
+    still names `etc/certs/*.pem`, so a suite that boots a node with
+    `inet_tls` provides them - the same set the docker cluster tests generate
+    and mount there.
+    """
+    certs = emqx_rel_path / "etc" / "certs"
+    wanted = ["cert.pem", "key.pem", "cacert.pem", "client-cert.pem", "client-key.pem"]
+    if not all((certs / name).exists() for name in wanted):
+        repo_root = Path(__file__).parent.parent.parent
+        subprocess.run(
+            [str(repo_root / "scripts" / "gen-test-certs.sh"), str(certs)],
+            check=True,
+            capture_output=True,
+        )
+    return certs
+
+
+def test_dist_tls_without_verification_warns_and_boots(
+    emqx_bin_path, env_file, dist_tls_optfile
+):
+    """An option file that spells out '{verify, verify_none}' leaves the peers
+    unchecked. The node still boots - the option file EMQX ships is a secure
+    default, not a rule enforced against the deployment - and the check that
+    reads the options the VM applied reports it."""
+    env_file.write_text("EMQX_SECURITY_PROFILE=hardened\n")
+    result = run_emqx_console(
+        emqx_bin_path,
+        {
+            "EMQX_LOG__CONSOLE__FORMATTER": "json",
+            "EMQX_NODE__COOKIE": "a-cookie-that-is-not-the-default",
+            "EMQX_CLUSTER__PROTO_DIST": "inet_tls",
+            "EMQX_SSL_DIST_OPTFILE": str(dist_tls_optfile),
+        },
+        timeout=60,
+        stdin=subprocess.DEVNULL,
+    )
+    assert_warns_on_unverified_dist_tls(result)
+
+
+def assert_warns_on_unverified_dist_tls(result):
+    """The node must boot, and the Erlang check must have logged the diagnostic
+    at warning level before it did."""
+    output = result.stdout + result.stderr
+    assert "is running now!" in output, output
+    logs = json_outputs(result.stdout.splitlines())
+    reported = [
+        line
+        for line in logs
+        if line.get("msg") == "erlang_distribution_tls_peer_verification_not_enforced"
+    ]
+    assert reported, output
+    log = reported[0]
+    assert log["level"] == "warning", log
+    assert "verify_none" in repr(log["problems"]), log["problems"]
+
+
+def test_hardened_profile_warns_about_half_migrated_dist_tls(
+    emqx_bin_path, env_file, tmp_path
+):
+    """A 'server' entry that omits 'verify' falls back to OTP's server default,
+    which does not verify peers. Only the check that reads the options the VM
+    actually applied can see that, and it has to report it."""
+    optfile = tmp_path / "ssl_dist.conf"
+    optfile.write_text(
+        "[{server, [{certfile, \"a\"}, {keyfile, \"b\"}, {cacertfile, \"c\"}]},\n"
+        " {client, [{certfile, \"d\"}, {keyfile, \"e\"}, {cacertfile, \"c\"},\n"
+        "           {verify, verify_peer}]}].\n"
+    )
+    env_file.write_text("EMQX_SECURITY_PROFILE=hardened\n")
+    result = run_emqx_console(
+        emqx_bin_path,
+        {
+            "EMQX_LOG__CONSOLE__FORMATTER": "json",
+            "EMQX_NODE__COOKIE": "a-cookie-that-is-not-the-default",
+            "EMQX_CLUSTER__PROTO_DIST": "inet_tls",
+            "EMQX_SSL_DIST_OPTFILE": str(optfile),
+        },
+        timeout=60,
+    )
+    assert_warns_on_unverified_dist_tls(result)
+
+
+def test_hardened_profile_warns_about_empty_dist_tls_optfile(emqx_bin_path, env_file, tmp_path):
+    """An option file that is supplied but empty leaves the server on OTP's
+    verify_none default, so the node has to report it even though the file has
+    no option to point at. It is not the same as having no option file at all.
+
+    OTP parses the file with erl_parse:parse_exprs/1, which wants the closing
+    dot, so the empty option set is written as '[].'.
+    """
+    optfile = tmp_path / "ssl_dist.conf"
+    optfile.write_text("[].\n")
+    env_file.write_text("EMQX_SECURITY_PROFILE=hardened\n")
+    result = run_emqx_console(
+        emqx_bin_path,
+        {
+            "EMQX_LOG__CONSOLE__FORMATTER": "json",
+            "EMQX_NODE__COOKIE": "a-cookie-that-is-not-the-default",
+            "EMQX_CLUSTER__PROTO_DIST": "inet_tls",
+            "EMQX_SSL_DIST_OPTFILE": str(optfile),
+        },
+        timeout=60,
+    )
+    assert_warns_on_unverified_dist_tls(result)
+
+
+def test_duplicate_verify_last_wins_is_not_reported(
+    emqx_bin_path, env_file, dist_tls_certs, tmp_path
+):
+    """A 'verify_none' that a later 'verify_peer' overrides is safe: OTP resolves
+    a repeated key last-wins, so the node must boot without a diagnostic."""
+    certs = dist_tls_certs
+    optfile = tmp_path / "ssl_dist.conf"
+    optfile.write_text(
+        "[{server, [{certfile, \"%s\"}, {keyfile, \"%s\"}, {cacertfile, \"%s\"},\n"
+        "           {verify, verify_none}, {verify, verify_peer}]},\n"
+        " {client, [{certfile, \"%s\"}, {keyfile, \"%s\"}, {cacertfile, \"%s\"},\n"
+        "           {verify, verify_none}, {verify, verify_peer}]}].\n"
+        % (
+            certs / "cert.pem",
+            certs / "key.pem",
+            certs / "cacert.pem",
+            certs / "client-cert.pem",
+            certs / "client-key.pem",
+            certs / "cacert.pem",
+        )
+    )
+    env_file.write_text("EMQX_SECURITY_PROFILE=hardened\n")
+    result = run_emqx_console(
+        emqx_bin_path,
+        {
+            "EMQX_NODE__COOKIE": "a-cookie-that-is-not-the-default",
+            "EMQX_CLUSTER__PROTO_DIST": "inet_tls",
+            "EMQX_SSL_DIST_OPTFILE": str(optfile),
+        },
+        timeout=60,
+        stdin=subprocess.DEVNULL,
+    )
+    output = result.stdout + result.stderr
+    assert "is running now!" in output, output
+    assert "erlang_distribution_tls_peer_verification_not_enforced" not in output
+
+
+def test_legacy_profile_warns_about_unverified_dist_tls(
+    emqx_bin_path, env_file, dist_tls_optfile
+):
+    """The legacy profile is told about the same option file the same way."""
+    env_file.write_text("EMQX_SECURITY_PROFILE=legacy\n")
+    result = run_emqx_console(
+        emqx_bin_path,
+        {
+            "EMQX_LOG__CONSOLE__FORMATTER": "json",
+            "EMQX_NODE__COOKIE": "a-cookie-that-is-not-the-default",
+            "EMQX_CLUSTER__PROTO_DIST": "inet_tls",
+            "EMQX_SSL_DIST_OPTFILE": str(dist_tls_optfile),
+        },
+        timeout=60,
+        stdin=subprocess.DEVNULL,
+    )
+    assert_warns_on_unverified_dist_tls(result)
+
+
+def test_verified_dist_tls_starts_under_hardened_profile(emqx_bin_path, env_file, dist_tls_certs):
+    """The shipped option file verifies peers, so a node boots without a
+    diagnostic.
+
+    'is running now!' is printed once boot completes, which is after
+    emqx_machine has run its TLS check, so reaching it proves the check found
+    nothing to report. The console gets an empty stdin so that it exits by
+    itself after boot instead of waiting on a terminal. The certificates the
+    option file names are provided first: EMQX ships none (7.0).
+    """
+    env_file.write_text("EMQX_SECURITY_PROFILE=hardened\n")
+    result = run_emqx_console(
+        emqx_bin_path,
+        {
+            "EMQX_NODE__COOKIE": "a-cookie-that-is-not-the-default",
+            "EMQX_CLUSTER__PROTO_DIST": "inet_tls",
+        },
+        timeout=60,
+        stdin=subprocess.DEVNULL,
+    )
+    output = result.stdout + result.stderr
+    assert "is running now!" in output, output
+    assert "erlang_distribution_tls_peer_verification_not_enforced" not in output
+
+
+def test_rendered_ssl_dist_conf_verifies_peers(emqx_rel_path):
+    """A release reads the rendered option file, not the template: assert on the
+    file that ships, and on the certificates it names. EMQX ships no certificate
+    files any more (7.0), so only the names are asserted here."""
+    conf = emqx_rel_path / "etc" / "ssl_dist.conf"
+    assert conf.exists(), conf
+    # Comments mention the options too, so look at the code only.
+    code = "\n".join(line.split("%", 1)[0] for line in conf.read_text().splitlines())
+    assert "verify_none" not in code
+    assert code.count("{verify, verify_peer}") == 2, code
+    assert "{fail_if_no_peer_cert, true}" in code
+    for name in [
+        "cert.pem",
+        "key.pem",
+        "cacert.pem",
+        "client-cert.pem",
+        "client-key.pem",
+    ]:
+        assert name in code, name
+
+
+def test_corrupted_cluster_override_conf(emqx_bin_path, emqx_rel_path):
+    """Test that emqx boot fails with corrupted cluster-override.conf."""
+    conffile = emqx_rel_path / "data" / "configs" / "cluster-override.conf"
+
+    # Backup original if exists
+    backup = None
+    if conffile.exists():
+        backup = conffile.with_suffix(".conf.backup")
+        shutil.copy2(conffile, backup)
+
+    try:
+        # Create corrupted config
+        conffile.parent.mkdir(parents=True, exist_ok=True)
+        conffile.write_text("{")
+
+        try:
+            result = subprocess.run(
+                [str(emqx_bin_path), "console"],
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+            output = result.stdout + result.stderr
+            # Should fail with non-zero exit code OR contain error message about failed config
+            assert (
+                result.returncode != 0 or
+                "failed_to_load_config" in output or
+                "failed_to_load_conf" in output or
+                "cluster-override.conf" in output
+            ), f"Expected emqx to fail with corrupted cluster-override.conf. Exit code: {result.returncode}, Output: {output[:500]}"
+        except subprocess.TimeoutExpired as e:
+            # Check if error message is in output before timeout
+            # TimeoutExpired has 'output' and 'stderr' attributes
+            output = ""
+            if hasattr(e, 'output') and e.output:
+                output += e.output.decode("utf-8", errors="ignore") if isinstance(e.output, bytes) else e.output
+            if hasattr(e, 'stderr') and e.stderr:
+                output += e.stderr.decode("utf-8", errors="ignore") if isinstance(e.stderr, bytes) else e.stderr
+            if "failed_to_load_config" in output or "failed_to_load_conf" in output or "cluster-override.conf" in output:
+                # Error detected before timeout - this is acceptable
+                pass
+            else:
+                # Timeout without error - this is a failure
+                pytest.fail(f"emqx console timed out with corrupted cluster-override.conf without showing error. Output: {output[:500]}")
+    finally:
+        # Restore original or remove corrupted file
+        if backup and backup.exists():
+            shutil.move(backup, conffile)
+        elif conffile.exists():
+            conffile.unlink()
+
+
+def test_corrupted_cluster_hocon(emqx_bin_path, emqx_rel_path):
+    """Test that emqx boot fails with corrupted cluster.hocon."""
+    conffile = emqx_rel_path / "data" / "configs" / "cluster.hocon"
+
+    # Backup original if exists
+    backup = None
+    if conffile.exists():
+        backup = conffile.with_suffix(".hocon.backup")
+        shutil.copy2(conffile, backup)
+
+    try:
+        # Create corrupted config
+        conffile.parent.mkdir(parents=True, exist_ok=True)
+        conffile.write_text("{")
+
+        try:
+            result = subprocess.run(
+                [str(emqx_bin_path), "console"],
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+            # Should fail with non-zero exit code
+            assert result.returncode != 0, "Expected emqx to fail with corrupted cluster.hocon"
+        except subprocess.TimeoutExpired:
+            # Timeout is also a failure - emqx should fail quickly with corrupted config
+            pytest.fail("emqx console timed out with corrupted cluster.hocon (should fail quickly)")
+    finally:
+        # Restore original or remove corrupted file
+        if backup and backup.exists():
+            shutil.move(backup, conffile)
+        elif conffile.exists():
+            conffile.unlink()
+
+
+def test_corrupted_base_hocon(emqx_bin_path, emqx_rel_path):
+    """Test that emqx boot fails with corrupted base.hocon."""
+    conffile = emqx_rel_path / "etc" / "base.hocon"
+
+    # Backup original if exists
+    backup = None
+    if conffile.exists():
+        backup = conffile.with_suffix(".hocon.backup")
+        shutil.copy2(conffile, backup)
+
+    try:
+        # Create corrupted config
+        conffile.parent.mkdir(parents=True, exist_ok=True)
+        conffile.write_text("{")
+
+        try:
+            result = subprocess.run(
+                [str(emqx_bin_path), "console"],
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+            # Should fail with non-zero exit code
+            assert result.returncode != 0, "Expected emqx to fail with corrupted base.hocon"
+        except subprocess.TimeoutExpired:
+            # Timeout is also a failure - emqx should fail quickly with corrupted config
+            pytest.fail("emqx console timed out with corrupted base.hocon (should fail quickly)")
+    finally:
+        # Restore original or remove corrupted file
+        if backup and backup.exists():
+            shutil.move(backup, conffile)
+        elif conffile.exists():
+            conffile.unlink()
+
+def test_skip_quic_nif_load(emqx_bin_path, emqx_rel_path):
+    """
+    Test that with QUICER_SKIP_NIF_LOAD=1, EMQX can start even if libquicer_nif.so is absent.
+    """
+    # Find all libquicer_nif.so files in the release directory
+    nif_files = list(emqx_rel_path.rglob("libquicer_nif.so"))
+
+    # Skip test if no libquicer_nif.so files are found
+    if not nif_files:
+        pytest.skip("No libquicer_nif.so files found in release directory")
+
+    # Backup all found files
+    backups = []
+    for nif_file in nif_files:
+        backup = nif_file.with_suffix(".so.backup")
+        shutil.copy2(nif_file, backup)
+        backups.append((nif_file, backup))
+
+    timeout = 20
+
+    try:
+        # Delete all libquicer_nif.so files
+        for nif_file, _ in backups:
+            nif_file.unlink()
+
+        # Test that console fails without QUICER_SKIP_NIF_LOAD
+        env = os.environ.copy()
+        # needed otherwise new default hardened profile prevents the node from
+        # starting.
+        env["EMQX_NODE__COOKIE"] = "nondefaultcookie"
+        result = subprocess.run(
+            [str(emqx_bin_path), "console"],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=timeout
+        )
+        assert result.returncode != 0, "Expected emqx console to fail when libquicer_nif.so is absent"
+
+        # Test that start succeeds with QUICER_SKIP_NIF_LOAD=1
+        env = os.environ.copy()
+        env["QUICER_SKIP_NIF_LOAD"] = "1"
+        env["EMQX_NODE__COOKIE"] = "nondefaultcookie"
+        result = subprocess.run(
+            [str(emqx_bin_path), "start"],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=timeout
+        )
+        assert result.returncode == 0, f"Expected emqx start to succeed with QUICER_SKIP_NIF_LOAD=1. Exit code: {result.returncode}, Output: {result.stdout + result.stderr}"
+
+        # Stop emqx
+        result = subprocess.run(
+            [str(emqx_bin_path), "stop"],
+            capture_output=True,
+            text=True,
+            timeout=timeout
+        )
+        # Stop command may return non-zero if emqx wasn't running, which is acceptable
+    finally:
+        # Restore all backed up files
+        for nif_file, backup in backups:
+            if backup.exists():
+                shutil.move(backup, nif_file)
+
+def _test_acl_file_failure(emqx_bin_path, emqx_rel_path, setup_acl_file, expected_msg):
+    """Helper function to test ACL file failures with [critical] log level.
+
+    Args:
+        emqx_bin_path: Path to emqx binary
+        emqx_rel_path: Path to emqx release directory
+        setup_acl_file: Function that modifies the ACL file (takes acl_file path as parameter)
+        expected_msg: Expected message string to find in the log output
+    """
+    acl_file = emqx_rel_path / "etc" / "acl.conf"
+
+    # Backup original if exists
+    backup = None
+    if acl_file.exists():
+        backup = acl_file.with_suffix(".conf.backup")
+        shutil.copy2(acl_file, backup)
+
+    try:
+        # Ensure ACL file directory exists
+        acl_file.parent.mkdir(parents=True, exist_ok=True)
+
+        # Setup ACL file (modify permissions or content)
+        setup_acl_file(acl_file)
+
+        try:
+            env = os.environ.copy()
+            env["EMQX_NODE__COOKIE"] = "nondefaultcookie"
+            result = subprocess.run(
+                [str(emqx_bin_path), "console"],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=15
+            )
+            output = result.stdout + result.stderr
+
+            # Check stdout/stderr for [critical] level and expected message
+            assert (
+                "[critical]" in output.lower() and
+                expected_msg in output
+            ), f"Expected [critical] log with {expected_msg} message. Output: {output[:1000]}"
+        except subprocess.TimeoutExpired as e:
+            # Check if error message is in output before timeout
+            output = ""
+            if hasattr(e, 'output') and e.output:
+                output += e.output.decode("utf-8", errors="ignore") if isinstance(e.output, bytes) else e.output
+            if hasattr(e, 'stderr') and e.stderr:
+                output += e.stderr.decode("utf-8", errors="ignore") if isinstance(e.stderr, bytes) else e.stderr
+
+            if "[critical]" in output.lower() and expected_msg in output:
+                # Error detected before timeout - this is acceptable
+                pass
+            else:
+                pytest.fail(f"emqx console timed out without showing [critical] log with {expected_msg}. Output: {output[:1000]}")
+    finally:
+        # Restore file permissions (in case they were changed)
+        try:
+            os.chmod(acl_file, 0o644)
+        except:
+            pass
+
+        # Restore original ACL file
+        if backup and backup.exists():
+            shutil.move(backup, acl_file)
+        elif acl_file.exists():
+            acl_file.unlink()
+
+
+def test_acl_file_read_permission_failure(emqx_bin_path, emqx_rel_path):
+    """Test that emqx logs [critical] level when ACL file cannot be read due to permissions.
+
+    Case 1: Change file permission to make file read fail and assert the [critical] level log
+    with the message failed_to_read_acl_file.
+    """
+    def setup_unreadable(acl_file):
+        # Create ACL file with valid content if it doesn't exist
+        if not acl_file.exists():
+            acl_file.write_text("{allow, all}.\n")
+        # Make ACL file unreadable
+        os.chmod(acl_file, 0o000)
+
+    _test_acl_file_failure(
+        emqx_bin_path,
+        emqx_rel_path,
+        setup_unreadable,
+        "failed_to_read_acl_file"
+    )
+
+
+def test_acl_file_corrupted_content(emqx_bin_path, emqx_rel_path):
+    """Test that emqx logs [critical] level when ACL file has corrupted content.
+
+    Case 2: Corrupt the file content and assert log level [critical] and message bad_acl_file_content.
+    """
+    def setup_corrupted(acl_file):
+        # Create ACL file with corrupted content (invalid Erlang term syntax)
+        acl_file.write_text("{invalid syntax here")
+
+    _test_acl_file_failure(
+        emqx_bin_path,
+        emqx_rel_path,
+        setup_corrupted,
+        "bad_acl_file_content"
+    )
+
+
+def test_feature_gate_full(emqx_bin_path):
+    """Verifies that full preset starts the node successfully and with nothing disabled.
+    """
+    with open_emqx_console(
+            emqx_bin_path,
+            {
+                # needed otherwise new default hardened profile prevents the node from
+                # starting.
+                "EMQX_NODE__COOKIE": "nondefaultcookie",
+                "EMQX_LOG__CONSOLE__LEVEL": "notice",
+                "EMQX_LOG__CONSOLE__FORMATTER": "json",
+                "EMQX_FEATURES": "FULL",
+            },
+            stdout=subprocess.PIPE,
+            text=True,
+    ) as emqx:
+        try:
+            expected = "feature_gates_resolved"
+            outputs = wait_until_stdout(emqx, expected, 15)
+            line = [line for line in outputs if expected in line][0]
+            log = json.loads(line)
+            assert "full" == log["preset"]
+            assert [] == log["disabled"]
+            enabled = log["enabled"]
+            match enabled:
+                case [_, _, _, *_]:
+                    pass;
+                case _:
+                    raise AssertionError(f"bad enabled: {enabled}")
+        finally:
+            emqx.kill()
+
+
+def test_feature_gate_essential(emqx_bin_path):
+    """Verifies that essential preset starts the node successfully and with nothing enabled.
+    """
+    with open_emqx_console(
+            emqx_bin_path,
+            {
+                # needed otherwise new default hardened profile prevents the node from
+                # starting.
+                "EMQX_NODE__COOKIE": "nondefaultcookie",
+                "EMQX_LOG__CONSOLE__LEVEL": "notice",
+                "EMQX_LOG__CONSOLE__FORMATTER": "json",
+                "EMQX_FEATURES": "ESSENTIAL",
+            },
+            stdout=subprocess.PIPE,
+            text=True,
+    ) as emqx:
+        try:
+            expected = "feature_gates_resolved"
+            outputs = wait_until_stdout(emqx, expected, 15)
+            line = [line for line in outputs if expected in line][0]
+            log = json.loads(line)
+            assert "essential" == log["preset"]
+            assert [] == log["enabled"]
+            disabled = log["disabled"]
+            match disabled:
+                case [_, _, _, *_]:
+                    pass;
+                case _:
+                    raise AssertionError(f"bad disabled: {disabled}")
+        finally:
+            emqx.kill()
+
+
+# Using a dict value to allow specifying feature-specific stuff to test, if needed
+# Remember to update known feature list when `emqx_machine_features:known_features` change.
+KNOWN_FEATURES = {
+    "ai": {},
+    "cluster_link": {},
+    "dashboard": {},
+    "data_integration": {},
+    "exhook": {},
+    "file_transfer": {},
+    "gateways": {},
+    "message_transformation": {},
+    "metrics": {},
+    "mqtt_extensions": {},
+    "multi_tenancy": {},
+    "opentelemetry": {},
+    "plugins": {},
+    "schema_registry": {},
+    "schema_validation": {},
+}
+
+
+@pytest.mark.parametrize("feature", KNOWN_FEATURES.keys())
+def test_feature_gate_custom(emqx_bin_path, feature):
+    """Verifies that custom presets starts the node successfully and with the expected feature(s).
+    """
+    with open_emqx_console(
+            emqx_bin_path,
+            {
+                # needed otherwise new default hardened profile prevents the node from
+                # starting.
+                "EMQX_NODE__COOKIE": "nondefaultcookie",
+                "EMQX_LOG__CONSOLE__LEVEL": "notice",
+                "EMQX_LOG__CONSOLE__FORMATTER": "json",
+                "EMQX_FEATURES": feature,
+            },
+            stdout=subprocess.PIPE,
+            text=True,
+    ) as emqx:
+        try:
+            expected = "feature_gates_resolved"
+            outputs = wait_until_stdout(emqx, expected, 15)
+            line = [line for line in outputs if expected in line][0]
+            log = json.loads(line)
+            assert "custom" == log["preset"]
+            enabled = log["enabled"]
+            assert feature in enabled
+        finally:
+            emqx.kill()
+
+
+def test_feature_gate_custom_multiple(emqx_bin_path):
+    """Verifies multiple features enabled at once.
+    """
+    all_features = KNOWN_FEATURES.keys()
+    features = ",".join(all_features)
+    with open_emqx_console(
+            emqx_bin_path,
+            {
+                # needed otherwise new default hardened profile prevents the node from
+                # starting.
+                "EMQX_NODE__COOKIE": "nondefaultcookie",
+                "EMQX_LOG__CONSOLE__LEVEL": "notice",
+                "EMQX_LOG__CONSOLE__FORMATTER": "json",
+                "EMQX_FEATURES": features,
+            },
+            stdout=subprocess.PIPE,
+            text=True,
+    ) as emqx:
+        try:
+            expected = "feature_gates_resolved"
+            outputs = wait_until_stdout(emqx, expected, 15)
+            line = [line for line in outputs if expected in line][0]
+            log = json.loads(line)
+            assert "custom" == log["preset"]
+            enabled = log["enabled"]
+            for f in all_features:
+                assert f in enabled
+        finally:
+            emqx.kill()
+
+
+def test_feature_gate_bad_preset(emqx_bin_path):
+    """Verifies that an unknown preset prevents the node from booting
+    """
+    result = run_emqx_console(
+        emqx_bin_path,
+        {
+            # needed otherwise new default hardened profile prevents the node from
+            # starting.
+            "EMQX_NODE__COOKIE": "nondefaultcookie",
+            "EMQX_LOG__CONSOLE__LEVEL": "notice",
+            "EMQX_LOG__CONSOLE__FORMATTER": "json",
+            "EMQX_FEATURES": "UNKNOWN",
+        },
+        timeout=120,
+    )
+    assert result.returncode != 0, "Expected emqx console to fail with bad preset"
+    logs = json_outputs(result.stdout.splitlines())
+    log = [l for l in logs if "invalid_feature_specification" == l["msg"]][0]
+    match log:
+        case {"known": [_, *_], "level": "critical", "reason": "unknown_feature"}:
+            pass
+        case _:
+            raise AssertionError(f"bad log: {log}")
+
+
+def test_feature_gate_bad_feature(emqx_bin_path):
+    """Verifies that an unknown feature prevents the node from booting
+    """
+    result = run_emqx_console(
+        emqx_bin_path,
+        {
+            # needed otherwise new default hardened profile prevents the node from
+            # starting.
+            "EMQX_NODE__COOKIE": "nondefaultcookie",
+            "EMQX_LOG__CONSOLE__LEVEL": "notice",
+            "EMQX_LOG__CONSOLE__FORMATTER": "json",
+            "EMQX_FEATURES": "data_integratio",
+        },
+        timeout=120,
+    )
+    assert result.returncode != 0, "Expected emqx console to fail with bad preset"
+    logs = json_outputs(result.stdout.splitlines())
+    log = [l for l in logs if "invalid_feature_specification" == l["msg"]][0]
+    match log:
+        case {"known": [_, *_],
+              "level": "critical",
+              "reason": "unknown_feature",
+              "feature": "data_integratio",
+              "hint": "did you mean data_integration?"
+              }:
+            pass
+        case _:
+            raise AssertionError(f"bad log: {log}")

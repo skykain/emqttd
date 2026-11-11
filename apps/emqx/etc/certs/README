@@ -1,0 +1,39 @@
+This directory is for static, pre-provisioned certificates: files you place
+here yourself before starting EMQX.
+
+EMQX ships no certificates. A TLS listener with no certificate configured
+serves one the node generates for itself on first use.
+
+There are two ways to give a listener your own certificate:
+
+1. Put the files here and name them in the listener's `ssl_options`, using the
+   `${EMQX_ETC_DIR}` variable so the path holds across installations:
+
+       listeners.ssl.default.ssl_options {
+         certfile   = "${EMQX_ETC_DIR}/certs/<name>.pem"
+         keyfile    = "${EMQX_ETC_DIR}/certs/<name>.key"
+         cacertfile = "${EMQX_ETC_DIR}/certs/<ca>.pem"
+       }
+
+2. Use managed certificates instead: upload the files through the Dashboard or
+   the REST API as a named bundle. EMQX stores them under
+   `data/certs2/global/<bundle>/`, replicates them to every node in the
+   cluster, and a listener refers to the bundle by name in `managed_certs`.
+   Nothing needs to be copied to the nodes by hand.
+
+Common file roles, whichever way they are provided:
+
+- `cacertfile`: the CA certificate(s) used to verify the TLS *peer*. For a
+  listener, the CAs that signed trusted clients' certificates. For EMQX acting
+  as a TLS client, the CAs that signed the servers it connects to.
+- `certfile`: the certificate EMQX presents.
+- `keyfile`: the private key for `certfile`.
+
+Configuration examples under `etc/examples/` show these options in context.
+
+`etc/ssl_dist.conf` (used when `cluster.proto_dist` is `inet_tls` or `inet6_tls`)
+names the files it expects under this directory: `cert.pem` is the certificate a
+node presents when it acts as a server and `client-cert.pem` when it acts as a
+client, and every node verifies its peers against `cacert.pem`. Provide all of
+them, issued by one CA, or the nodes will not be able to verify each other.
+

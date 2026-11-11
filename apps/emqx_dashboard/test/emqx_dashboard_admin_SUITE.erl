@@ -1,0 +1,1226 @@
+%%--------------------------------------------------------------------
+%% Copyright (c) 2020-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
+%%--------------------------------------------------------------------
+-module(emqx_dashboard_admin_SUITE).
+
+-compile(nowarn_export_all).
+-compile(export_all).
+
+-include("emqx_dashboard.hrl").
+-include("emqx_dashboard_rbac.hrl").
+-include_lib("eunit/include/eunit.hrl").
+-include_lib("common_test/include/ct.hrl").
+-include_lib("emqx/include/emqx_hooks.hrl").
+-include_lib("emqx_utils/include/emqx_api_key_scopes.hrl").
+
+%%------------------------------------------------------------------------------
+%% Defs
+%%------------------------------------------------------------------------------
+
+-import(emqx_common_test_helpers, [on_exit/1]).
+
+%%------------------------------------------------------------------------------
+%% CT boilerplate
+%%------------------------------------------------------------------------------
+
+all() ->
+    emqx_common_test_helpers:all(?MODULE).
+
+init_per_suite(Config) ->
+    Apps = emqx_cth_suite:start(
+        [
+            emqx_conf,
+            emqx_management,
+            emqx_mgmt_api_test_util:emqx_dashboard()
+        ],
+        #{work_dir => emqx_cth_suite:work_dir(Config)}
+    ),
+    [{apps, Apps} | Config].
+
+end_per_suite(Config) ->
+    Apps = ?config(apps, Config),
+    emqx_cth_suite:stop(Apps),
+    ok.
+
+end_per_testcase(_, _Config) ->
+    All = emqx_dashboard_admin:all_users(),
+    [emqx_dashboard_admin:remove_user(Name) || #{username := Name} <- All],
+    [emqx_mgmt_auth:delete(Name) || #{name := Name} <- emqx_mgmt_auth:list()],
+    ok.
+
+%%------------------------------------------------------------------------------
+%% Helper fns
+%%------------------------------------------------------------------------------
+
+bearer_auth_header(Token) ->
+    {"Authorization", iolist_to_binary(["Bearer ", Token])}.
+
+create_superuser() ->
+    emqx_common_test_http:create_default_app(),
+    Username = <<"superuser">>,
+    Password = <<"secretP@ss1">>,
+    {ok, _} = emqx_dashboard_admin:add_user(Username, Password, ?ROLE_SUPERUSER, <<"desc">>),
+    {200, #{<<"token">> := Token}} = login(#{<<"username">> => Username, <<"password">> => Password}),
+    {"Authorization", iolist_to_binary(["Bearer ", Token])}.
+
+login(Params) ->
+    URL = emqx_mgmt_api_test_util:api_path(["login"]),
+    emqx_mgmt_api_test_util:simple_request(#{
+        auth_header => [{"no", "auth"}],
+        method => post,
+        url => URL,
+        body => Params
+    }).
+
+create_user_api(Params, AuthHeader) ->
+    URL = emqx_mgmt_api_test_util:api_path(["users"]),
+    emqx_mgmt_api_test_util:simple_request(#{
+        auth_header => AuthHeader,
+        method => post,
+        url => URL,
+        body => Params
+    }).
+
+update_user_api(Username, Params, AuthHeader) ->
+    URL = emqx_mgmt_api_test_util:api_path(["users", Username]),
+    emqx_mgmt_api_test_util:simple_request(#{
+        auth_header => AuthHeader,
+        method => put,
+        url => URL,
+        body => Params
+    }).
+
+create_api_key_api(Params, AuthHeader) ->
+    URL = emqx_mgmt_api_test_util:api_path(["api_key"]),
+    emqx_mgmt_api_test_util:simple_request(#{
+        auth_header => AuthHeader,
+        method => post,
+        url => URL,
+        body => Params
+    }).
+
+update_api_key_api(Name, Params, AuthHeader) ->
+    URL = emqx_mgmt_api_test_util:api_path(["api_key", Name]),
+    emqx_mgmt_api_test_util:simple_request(#{
+        auth_header => AuthHeader,
+        method => put,
+        url => URL,
+        body => Params
+    }).
+
+list_api_keys_api(AuthHeader) ->
+    URL = emqx_mgmt_api_test_util:api_path(["api_key"]),
+    emqx_mgmt_api_test_util:simple_request(#{
+        auth_header => AuthHeader,
+        method => get,
+        url => URL
+    }).
+
+get_api_key_api(Name, AuthHeader) ->
+    URL = emqx_mgmt_api_test_util:api_path(["api_key", Name]),
+    emqx_mgmt_api_test_util:simple_request(#{
+        auth_header => AuthHeader,
+        method => get,
+        url => URL
+    }).
+
+delete_api_key_api(Name, AuthHeader) ->
+    URL = emqx_mgmt_api_test_util:api_path(["api_key", Name]),
+    emqx_mgmt_api_test_util:simple_request(#{
+        auth_header => AuthHeader,
+        method => delete,
+        url => URL
+    }).
+
+%% Create a namespaced dashboard administrator and return their bearer auth
+%% header. Used to exercise namespace-scoped API-key management (issue #17728).
+create_namespaced_admin(Namespace, GlobalAdminHeader) ->
+    Username = <<"nsadmin_", Namespace/binary>>,
+    Password = <<"superSecureP@ss1">>,
+    Role = <<"ns:", Namespace/binary, "::", ?ROLE_SUPERUSER/binary>>,
+    {200, _} = create_user_api(
+        #{
+            <<"username">> => Username,
+            <<"password">> => Password,
+            <<"role">> => Role,
+            <<"description">> => <<"namespaced admin">>
+        },
+        GlobalAdminHeader
+    ),
+    {200, #{<<"token">> := Token}} =
+        login(#{<<"username">> => Username, <<"password">> => Password}),
+    bearer_auth_header(Token).
+
+%% Create an API key scoped to `Namespace' (or global when `?global_ns') as the
+%% global administrator, returning the key name.
+create_key_in_namespace(Name, Namespace, GlobalAdminHeader) ->
+    ExpiresAt = to_rfc3339(erlang:system_time(second) + 1_000),
+    Role =
+        case Namespace of
+            global -> ?ROLE_SUPERUSER;
+            _ -> <<"ns:", Namespace/binary, "::", ?ROLE_SUPERUSER/binary>>
+        end,
+    {200, _} = create_api_key_api(
+        #{
+            <<"name">> => Name,
+            <<"expired_at">> => ExpiresAt,
+            <<"desc">> => <<"seed key">>,
+            <<"enable">> => true,
+            <<"role">> => Role
+        },
+        GlobalAdminHeader
+    ),
+    Name.
+
+to_rfc3339(Sec) ->
+    list_to_binary(calendar:system_time_to_rfc3339(Sec)).
+
+bin(X) -> emqx_utils_conv:bin(X).
+
+create_superuser_token() ->
+    emqx_common_test_http:create_default_app(),
+    Username = <<"superuser">>,
+    Password = <<"secretP@ss1">>,
+    {ok, _} = emqx_dashboard_admin:add_user(Username, Password, ?ROLE_SUPERUSER, <<"desc">>),
+    {200, #{<<"token">> := Token}} = login(#{<<"username">> => Username, <<"password">> => Password}),
+    Token.
+
+fake_req(Path, Headers) ->
+    #{path => Path, headers => Headers}.
+
+umbrella_apps() ->
+    [
+        App
+     || {App, _, _} <- application:loaded_applications(),
+        case re:run(atom_to_list(App), "^emqx", [{capture, none}]) of
+            match -> true;
+            nomatch -> false
+        end
+    ].
+
+%% Every authorized handler of the loaded API modules. Routes declared
+%% `security => []' never reach the authorize callback, so they are no
+%% permission surface and are left out. Test-only minirest modules
+%% (`*_SUITE') are left out too: they declare no scopes.
+all_handlers() ->
+    AllMethods = [get, post, put, delete],
+    Mods = [
+        Mod
+     || Mod <- minirest_api:find_api_modules(umbrella_apps()),
+        not lists:suffix("_SUITE", atom_to_list(Mod))
+    ],
+    lists:flatmap(
+        fun(Mod) ->
+            Paths = Mod:paths(),
+            lists:flatmap(
+                fun(Path) ->
+                    #{'operationId' := Fn} = Sc = Mod:schema(Path),
+                    [
+                        #{method => M, module => Mod, function => Fn}
+                     || M <- maps:keys(Sc),
+                        lists:member(M, AllMethods),
+                        maps:get(security, maps:get(M, Sc), undefined) =/= []
+                    ]
+                end,
+                Paths
+            )
+        end,
+        Mods
+    ).
+
+on_user_will_be_created(_UserProps, _Ok) ->
+    {stop, {error, <<"oops">>}}.
+
+%%------------------------------------------------------------------------------
+%% Test cases
+%%------------------------------------------------------------------------------
+
+t_check_user(_) ->
+    Username = <<"admin1">>,
+    Password = <<"public_1">>,
+    BadUsername = <<"admin_bad">>,
+    BadPassword = <<"public_bad">>,
+    EmptyUsername = <<>>,
+    EmptyPassword = <<>>,
+    {ok, _} = emqx_dashboard_admin:add_user(Username, Password, ?ROLE_SUPERUSER, <<"desc">>),
+    {ok, _} = emqx_dashboard_admin:check(Username, Password),
+    {error, <<"password_error">>} = emqx_dashboard_admin:check(Username, BadPassword),
+    {error, <<"username_not_found">>} = emqx_dashboard_admin:check(BadUsername, Password),
+    {error, <<"username_not_found">>} = emqx_dashboard_admin:check(BadUsername, BadPassword),
+    {error, <<"username_not_found">>} = emqx_dashboard_admin:check(EmptyUsername, Password),
+    {error, <<"password_error">>} = emqx_dashboard_admin:check(Username, EmptyPassword),
+    {error, <<"username_not_provided">>} = emqx_dashboard_admin:check(undefined, Password),
+    {error, <<"password_not_provided">>} = emqx_dashboard_admin:check(Username, undefined),
+    ok.
+
+t_add_user(_) ->
+    AddUser = <<"add_user">>,
+    AddPassword = <<"add_password">>,
+    AddDescription = <<"add_description">>,
+
+    BadAddUser = <<"***add_user_bad">>,
+
+    %% add success. not return password
+    {ok, NewUser} = emqx_dashboard_admin:add_user(
+        AddUser, AddPassword, ?ROLE_SUPERUSER, AddDescription
+    ),
+    AddUser = maps:get(username, NewUser),
+    AddDescription = maps:get(description, NewUser),
+    false = maps:is_key(password, NewUser),
+
+    %% add again
+    {error, <<"username_already_exists">>} =
+        emqx_dashboard_admin:add_user(AddUser, AddPassword, ?ROLE_SUPERUSER, AddDescription),
+
+    %% add bad username
+    BadNameError =
+        <<"Bad Username. Only upper and lower case letters, numbers and underscores are supported">>,
+    {error, BadNameError} = emqx_dashboard_admin:add_user(
+        BadAddUser, AddPassword, ?ROLE_SUPERUSER, AddDescription
+    ),
+    ok.
+
+t_lookup_user(_) ->
+    LookupUser = <<"lookup_user">>,
+    LookupPassword = <<"lookup_password">>,
+    LookupDescription = <<"lookup_description">>,
+
+    BadLookupUser = <<"***lookup_user_bad">>,
+
+    {ok, _} =
+        emqx_dashboard_admin:add_user(
+            LookupUser, LookupPassword, ?ROLE_SUPERUSER, LookupDescription
+        ),
+    %% lookup success. not return password
+    [#emqx_admin{username = LookupUser, description = LookupDescription}] =
+        emqx_dashboard_admin:lookup_user(LookupUser),
+
+    [] = emqx_dashboard_admin:lookup_user(BadLookupUser),
+    ok.
+
+t_all_users(_) ->
+    Username = <<"admin_all">>,
+    Password = <<"public_2">>,
+    {ok, _} = emqx_dashboard_admin:add_user(Username, Password, ?ROLE_SUPERUSER, <<"desc">>),
+    All = emqx_dashboard_admin:all_users(),
+    ?assert(erlang:length(All) >= 1),
+    ok.
+
+t_delete_user(_) ->
+    DeleteUser = <<"delete_user">>,
+    DeletePassword = <<"delete_password">>,
+    DeleteDescription = <<"delete_description">>,
+
+    DeleteBadUser = <<"delete_user_bad">>,
+
+    {ok, _NewUser} =
+        emqx_dashboard_admin:add_user(
+            DeleteUser, DeletePassword, ?ROLE_SUPERUSER, DeleteDescription
+        ),
+    {ok, ok} = emqx_dashboard_admin:remove_user(DeleteUser),
+    %% remove again
+    {error, <<"username_not_found">>} = emqx_dashboard_admin:remove_user(DeleteUser),
+    {error, <<"username_not_found">>} = emqx_dashboard_admin:remove_user(DeleteBadUser),
+    ok.
+
+t_update_user(_) ->
+    UpdateUser = <<"update_user">>,
+    UpdatePassword = <<"update_password">>,
+    UpdateDescription = <<"update_description">>,
+
+    NewDesc = <<"new_description">>,
+
+    BadUpdateUser = <<"update_user_bad">>,
+
+    {ok, _} = emqx_dashboard_admin:add_user(
+        UpdateUser, UpdatePassword, ?ROLE_SUPERUSER, UpdateDescription
+    ),
+    {ok, NewUserInfo} =
+        emqx_dashboard_admin:update_user(UpdateUser, ?ROLE_SUPERUSER, NewDesc),
+    UpdateUser = maps:get(username, NewUserInfo),
+    NewDesc = maps:get(description, NewUserInfo),
+
+    {error, <<"username_not_found">>} = emqx_dashboard_admin:update_user(
+        BadUpdateUser, ?ROLE_SUPERUSER, NewDesc
+    ),
+    ok.
+
+t_change_password(_) ->
+    User = <<"change_user">>,
+    OldPassword = <<"change_password">>,
+    Description = <<"change_description">>,
+
+    NewPassword = <<"new_password">>,
+    NewBadPassword = <<"public">>,
+
+    BadChangeUser = <<"change_user_bad">>,
+
+    {ok, _} = emqx_dashboard_admin:add_user(User, OldPassword, ?ROLE_SUPERUSER, Description),
+
+    {ok, ok} = emqx_dashboard_admin:change_password(User, OldPassword, NewPassword),
+    %% change pwd again
+    {error, <<"password_error">>} =
+        emqx_dashboard_admin:change_password(User, OldPassword, NewPassword),
+
+    {error, <<"The range of password length is 8~64">>} =
+        emqx_dashboard_admin:change_password(User, NewPassword, NewBadPassword),
+
+    {error, <<"username_not_found">>} =
+        emqx_dashboard_admin:change_password(BadChangeUser, OldPassword, NewPassword),
+    ok.
+
+t_clean_token(_) ->
+    Username = <<"admin_token">>,
+    Password = <<"public_www1">>,
+    NewPassword = <<"public_www2">>,
+    {ok, _} = emqx_dashboard_admin:add_user(Username, Password, ?ROLE_SUPERUSER, <<"desc">>),
+    {ok, #{token := Token}} = emqx_dashboard_admin:sign_token(Username, Password),
+    FakeReq = #{path => <<"/api/v5/users">>},
+    FakeHandlerInfo = #{method => get, function => any, module => any},
+    {ok, #{actor := Username}} = emqx_dashboard_admin:verify_token(FakeReq, FakeHandlerInfo, Token),
+    %% change password
+    {ok, _} = emqx_dashboard_admin:change_password(Username, Password, NewPassword),
+    timer:sleep(5),
+    {error, not_found} = emqx_dashboard_admin:verify_token(FakeReq, FakeHandlerInfo, Token),
+    %% remove user
+    {ok, #{token := Token2}} = emqx_dashboard_admin:sign_token(Username, NewPassword),
+    {ok, #{actor := Username}} = emqx_dashboard_admin:verify_token(
+        FakeReq, FakeHandlerInfo, Token2
+    ),
+    {ok, _} = emqx_dashboard_admin:remove_user(Username),
+    timer:sleep(5),
+    {error, not_found} = emqx_dashboard_admin:verify_token(FakeReq, FakeHandlerInfo, Token2),
+    ok.
+
+t_password_expired(_) ->
+    Username = <<"t_password_expired">>,
+    Password = <<"public_www1">>,
+    {ok, _} = emqx_dashboard_admin:add_user(Username, Password, ?ROLE_SUPERUSER, <<"desc">>),
+    {ok, #{token := _Token}} = emqx_dashboard_admin:sign_token(Username, Password),
+    [#?ADMIN{extra = #{password_ts := PwdTS}} = User] = emqx_dashboard_admin:lookup_user(Username),
+    PwdTS2 = PwdTS - 86400 * 2,
+    emqx_dashboard_admin:unsafe_update_user(User#?ADMIN{extra = #{password_ts => PwdTS2}}),
+    SignResult = emqx_dashboard_admin:sign_token(Username, Password),
+    ?assertMatch({ok, #{password_expire_in_seconds := X}} when X =< -86400, SignResult),
+    Now = erlang:system_time(second),
+    timer:sleep(1000),
+    emqx_dashboard_admin:change_password_trusted(Username, Password),
+    [#?ADMIN{extra = #{password_ts := PwdTS3}}] = emqx_dashboard_admin:lookup_user(Username),
+    ?assert(PwdTS3 > PwdTS),
+    ?assert(PwdTS3 > Now),
+    ok.
+
+-doc """
+Checks that we can create and use an user that is scoped to a namespace.
+""".
+t_namespaced_user(_TCConfig) ->
+    GlobalAdminHeader = create_superuser(),
+    Username1 = <<"iminans">>,
+    Password1 = <<"superSecureP@ss">>,
+    Namespace1 = <<"ns1">>,
+    AdminRole1 = <<"ns:ns1::administrator">>,
+    %% Unknown role
+    BadRole1 = <<"ns:ns1::blobber">>,
+    ?assertMatch(
+        {400, #{
+            <<"message">> := <<"Role does not exist">>
+        }},
+        create_user_api(
+            #{
+                <<"username">> => Username1,
+                <<"password">> => Password1,
+                <<"role">> => BadRole1,
+                <<"description">> => <<"???">>
+            },
+            GlobalAdminHeader
+        )
+    ),
+    %% Ok
+    ?assertMatch(
+        {200, #{
+            <<"namespace">> := Namespace1,
+            <<"role">> := <<"administrator">>
+        }},
+        create_user_api(
+            #{
+                <<"username">> => Username1,
+                <<"password">> => Password1,
+                <<"role">> => AdminRole1,
+                <<"description">> => <<"namespaced person">>
+            },
+            GlobalAdminHeader
+        )
+    ),
+    %% Unknown role
+    ?assertMatch(
+        {400, #{
+            <<"message">> := <<"Role does not exist">>
+        }},
+        update_user_api(
+            Username1,
+            #{
+                <<"role">> => BadRole1,
+                <<"description">> => <<"???">>
+            },
+            GlobalAdminHeader
+        )
+    ),
+    %% Login
+    {200, #{<<"token">> := Token1, <<"namespace">> := Namespace1}} =
+        login(#{<<"username">> => Username1, <<"password">> => Password1}),
+    %% User updating self to viewer: at the time of writing, this is not yet supported.
+    ViewerRole1 = <<"ns:ns1::viewer">>,
+    ?assertMatch(
+        {403, _},
+        update_user_api(
+            Username1,
+            #{
+                <<"role">> => ViewerRole1,
+                <<"description">> => <<"namespaced viewer person">>
+            },
+            bearer_auth_header(Token1)
+        )
+    ),
+    %% User should not be able to create other users in own namespace (unsupported right
+    %% now)
+    {200, #{<<"token">> := Token2, <<"namespace">> := Namespace1}} =
+        login(#{<<"username">> => Username1, <<"password">> => Password1}),
+    Username1B = <<"iminthesamens">>,
+    Password1B = <<"superSecureP@ss!">>,
+    ?assertMatch(
+        {403, _},
+        create_user_api(
+            #{
+                <<"username">> => Username1B,
+                <<"password">> => Password1B,
+                <<"role">> => ViewerRole1,
+                <<"description">> => <<"just another viewer">>
+            },
+            bearer_auth_header(Token2)
+        )
+    ),
+    %% User should not be able to create other users outside its namespace
+    Username2 = <<"iminanotherns">>,
+    Password2 = <<"superSecureP@ss!!">>,
+    ViewerRole2 = <<"ns:ns2::viewer">>,
+    ?assertMatch(
+        {403, _},
+        create_user_api(
+            #{
+                <<"username">> => Username2,
+                <<"password">> => Password2,
+                <<"role">> => ViewerRole2,
+                <<"description">> => <<"???">>
+            },
+            bearer_auth_header(Token2)
+        )
+    ),
+    %% Global user (without namespace)
+    GlobalUser = <<"imnotinans">>,
+    GlobalViewerRole = <<"viewer">>,
+    ?assertMatch(
+        {200, #{
+            <<"namespace">> := null,
+            <<"role">> := <<"viewer">>
+        }},
+        create_user_api(
+            #{
+                <<"username">> => GlobalUser,
+                <<"password">> => Password1,
+                <<"role">> => GlobalViewerRole,
+                <<"description">> => <<"non-namespaced person">>
+            },
+            GlobalAdminHeader
+        )
+    ),
+    ?assertMatch(
+        {200, #{<<"token">> := _, <<"namespace">> := null}},
+        login(#{<<"username">> => GlobalUser, <<"password">> => Password1})
+    ),
+    ok.
+
+-doc """
+Checks that we can create and use an API key that is scoped to a namespace.
+""".
+t_namespaced_api_key(_TCConfig) ->
+    GlobalAdminHeader = create_superuser(),
+    APIKeyName1 = <<"api1">>,
+    ExpiresAt = to_rfc3339(erlang:system_time(second) + 1_000),
+    Namespace1 = <<"ns1">>,
+    AdminRole1 = <<"ns:ns1::administrator">>,
+    Res1 = create_api_key_api(
+        #{
+            <<"name">> => APIKeyName1,
+            <<"expired_at">> => ExpiresAt,
+            <<"desc">> => <<"namespaced api 1">>,
+            <<"enable">> => true,
+            <<"role">> => AdminRole1
+        },
+        GlobalAdminHeader
+    ),
+    ?assertMatch(
+        {200, #{
+            <<"role">> := <<"administrator">>,
+            <<"namespace">> := Namespace1
+        }},
+        Res1
+    ),
+    {200, #{<<"api_key">> := Key1, <<"api_secret">> := Secret1}} = Res1,
+    %% At this moment, cannot perform any mutations (authorization will be added in the future)
+    ?assertMatch(
+        {403, _},
+        emqx_mgmt_api_test_util:simple_request(#{
+            auth_header => emqx_common_test_http:auth_header(Key1, Secret1),
+            method => post,
+            url => emqx_mgmt_api_test_util:api_path(["banned"]),
+            body => #{<<"as">> => <<"peerhost">>, <<"who">> => <<"127.0.0.1">>}
+        })
+    ),
+    ok.
+
+-doc """
+Simple assertions about namespaced user permissions.
+
+   - Both viewers and admins can `GET` anything, even outside their namespace.  Namespaces
+     are mostly to avoid accidentally mutating the wrong resources rather than hiding
+     information.
+   - Exception: endpoints whose response would expose MQTT payload content (per-client
+     mqueue/inflight, retained, delayed), client-uploaded file content (File Transfer
+     listing and download) or the global plugin configuration are denied for namespaced
+     users by RBAC, because the underlying stores are global and cannot be safely filtered
+     by namespace.  The `text/plain` configuration export (`GET /configs`) is denied too,
+     because it is only available to the global administrator.  Those handlers are kept in
+     a static deny list here so this assertion does not have to reach into RBAC internals.
+""".
+t_namespaced_user_permissions(_TCConfig) ->
+    GlobalAdminHeader = create_superuser(),
+    Username = <<"iminans">>,
+    Password = <<"superSecureP@ss">>,
+    AdminRole = <<"ns:ns1::", ?ROLE_SUPERUSER/binary>>,
+    {200, _} = create_user_api(
+        #{
+            <<"username">> => Username,
+            <<"password">> => Password,
+            <<"role">> => AdminRole,
+            <<"description">> => <<"namespaced person">>
+        },
+        GlobalAdminHeader
+    ),
+    {ok, #{token := Token}} = emqx_dashboard_admin:sign_token(Username, Password),
+    AllHandlers = [_ | _] = all_handlers(),
+    Denied = namespaced_get_denylist(),
+    %% The scope layer is a separate gate on top of RBAC. A namespaced
+    %% administrator holds `?NS_ADMIN_ALLOWED_SCOPES', so handlers
+    %% scoped outside it (gateways, sso_management, ...) are denied
+    %% there by design. Keep the handlers that layer lets through;
+    %% RBAC is what this case checks.
+    GetHandlers =
+        [_ | _] =
+        [
+            FHI
+         || #{method := get} = FHI <- AllHandlers,
+            not lists:member(maps:with([method, module, function], FHI), Denied),
+            held_by_namespaced_admin(FHI)
+        ],
+    FakeReq = #{path => <<"/api/v5/clients">>},
+    Failures =
+        lists:filtermap(
+            fun(FakeHandlerInfo) ->
+                case emqx_dashboard_admin:verify_token(FakeReq, FakeHandlerInfo, Token) of
+                    {ok, _} ->
+                        false;
+                    {error, _} ->
+                        true
+                end
+            end,
+            GetHandlers
+        ),
+    maybe
+        [_ | _] ?= Failures,
+        ct:fail({should_have_been_allowed, Failures})
+    end,
+    ok.
+
+held_by_namespaced_admin(HandlerInfo) ->
+    case emqx_mgmt_api_key_scopes:classify_handler(HandlerInfo) of
+        {scopes, Declared} ->
+            emqx_mgmt_api_key_scopes:any_scope_granted(Declared, ?NS_ADMIN_ALLOWED_SCOPES);
+        public ->
+            true;
+        %% An unmapped handler is denied to a user with an explicit
+        %% scope list. Keep it so the gap shows up here as a failure.
+        not_found ->
+            true
+    end.
+
+%% Keep in sync with the namespaced-deny clauses in
+%% `emqx_dashboard_rbac:do_check_rbac/3' for these modules.  Adding a new
+%% global-only endpoint there means adding it here too.
+namespaced_get_denylist() ->
+    [
+        #{method => get, module => emqx_mgmt_api_clients, function => mqueue_msgs},
+        #{method => get, module => emqx_mgmt_api_clients, function => inflight_msgs},
+        #{method => get, module => emqx_retainer_api, function => '/messages'},
+        #{method => get, module => emqx_retainer_api, function => with_topic_warp},
+        #{method => get, module => emqx_delayed_api, function => delayed_messages},
+        #{method => get, module => emqx_delayed_api, function => delayed_message},
+        #{method => get, module => emqx_ft_api, function => '/file_transfer/files'},
+        #{
+            method => get,
+            module => emqx_ft_api,
+            function => '/file_transfer/files/:clientid/:fileid'
+        },
+        #{
+            method => get,
+            module => emqx_ft_storage_exporter_fs_api,
+            function => '/file_transfer/file'
+        },
+        #{method => get, module => emqx_audit_api, function => audit},
+        #{method => get, module => emqx_mgmt_api_plugins, function => plugin_config},
+        #{method => get, module => emqx_mgmt_api_plugins, function => download_plugin_config},
+        %% Denied for the `text/plain' export, which the fake request negotiates
+        %% because it sends no `Accept' header.
+        #{method => get, module => emqx_mgmt_api_configs, function => configs}
+    ].
+
+-doc """
+Checks the authorization behavior of namespaced publisher API keys.
+
+Currently, they are not authorized even to use the publish HTTP APIs that their
+non-namespaced counterparts are.
+""".
+t_namespaced_api_publisher(TCConfig) when is_list(TCConfig) ->
+    GlobalAdminHeader = create_superuser(),
+    APIKeyName = atom_to_binary(?FUNCTION_NAME),
+    Namespace = <<"ns1">>,
+    APIPublisherRole = <<"ns:ns1::", ?ROLE_API_PUBLISHER/binary>>,
+    ExpiresAt = to_rfc3339(erlang:system_time(second) + 1_000),
+    Res1 = create_api_key_api(
+        #{
+            <<"name">> => APIKeyName,
+            <<"expired_at">> => ExpiresAt,
+            <<"desc">> => <<"namespaced api publisher">>,
+            <<"enable">> => true,
+            <<"role">> => APIPublisherRole
+        },
+        GlobalAdminHeader
+    ),
+    ?assertMatch(
+        {200, #{
+            <<"role">> := ?ROLE_API_PUBLISHER,
+            <<"namespace">> := Namespace
+        }},
+        Res1
+    ),
+    {200, #{<<"api_key">> := Key, <<"api_secret">> := Secret}} = Res1,
+    {_, BasicAuth} = emqx_common_test_http:auth_header(Key, Secret),
+
+    AllHandlers = [_ | _] = all_handlers(),
+    FakeReq = #{
+        path => <<"/api/v5/users">>,
+        headers => #{<<"authorization">> => bin(BasicAuth)}
+    },
+    Failures =
+        lists:filtermap(
+            fun(FakeHandlerInfo) ->
+                case emqx_dashboard:authorize(FakeReq, FakeHandlerInfo) of
+                    {403, _, _} ->
+                        %% Currently, namespaced API publishers can't do anything.
+                        false;
+                    {401, _, _} ->
+                        %% Although a weird status code, it's current state of affairs...
+                        %% Some endpoints can't be called by API keys and return 401.
+                        %% See `emqx_mgmt_auth:authorize/2`.
+                        false;
+                    Unexpected ->
+                        {true, {FakeHandlerInfo, Unexpected}}
+                end
+            end,
+            AllHandlers
+        ),
+    maybe
+        [_ | _] ?= Failures,
+        ct:fail({should_have_been_forbidden, Failures})
+    end,
+    ok.
+
+-doc """
+Verifies that we run hooks before actually creating the user, which allows to plug in
+extra validation.
+""".
+t_namespaced_user_hook(_TCConfig) ->
+    GlobalAdminHeader = create_superuser(),
+    Username = <<"iminans">>,
+    Password = <<"superSecureP@ss">>,
+    AdminRole = <<"ns:ns1::administrator">>,
+    on_exit(fun() ->
+        emqx_hooks:del('api_actor.pre_create', {?MODULE, on_user_will_be_created})
+    end),
+    ok = emqx_hooks:add(
+        'api_actor.pre_create', {?MODULE, on_user_will_be_created, []}, ?HP_LOWEST
+    ),
+    ?assertMatch(
+        {400, #{<<"message">> := <<"oops">>}},
+        create_user_api(
+            #{
+                <<"username">> => Username,
+                <<"password">> => Password,
+                <<"role">> => AdminRole,
+                <<"description">> => <<"namespaced person">>
+            },
+            GlobalAdminHeader
+        )
+    ),
+    ok.
+
+-doc """
+Asserts that we disallow changing the namespace of an user or API key.
+""".
+t_namespace_immutable(_TCConfig) ->
+    GlobalAdminHeader = create_superuser(),
+    NS = <<"ns1">>,
+    AdminRole = <<"ns:", NS/binary, "::", ?ROLE_SUPERUSER/binary>>,
+
+    Username = <<"iminans">>,
+    Password = <<"superSecureP@ss">>,
+    {200, _} = create_user_api(
+        #{
+            <<"username">> => Username,
+            <<"password">> => Password,
+            <<"role">> => AdminRole,
+            <<"description">> => <<"namespaced person">>
+        },
+        GlobalAdminHeader
+    ),
+
+    APIKeyName = <<"someapi">>,
+    ExpiresAt = to_rfc3339(erlang:system_time(second) + 1_000),
+    {200, _} =
+        create_api_key_api(
+            #{
+                <<"name">> => APIKeyName,
+                <<"expired_at">> => ExpiresAt,
+                <<"desc">> => <<"namespaced api publisher">>,
+                <<"enable">> => true,
+                <<"role">> => AdminRole
+            },
+            GlobalAdminHeader
+        ),
+
+    DifferentNS = <<"ns2">>,
+    DifferentAdminRole = <<"ns:", DifferentNS/binary, "::", ?ROLE_SUPERUSER/binary>>,
+    ?assertMatch(
+        {400, #{<<"message">> := <<"changing_namespace_is_forbidden">>}},
+        update_user_api(
+            Username,
+            #{
+                <<"role">> => DifferentAdminRole,
+                <<"description">> => <<"shouldn't work">>
+            },
+            GlobalAdminHeader
+        )
+    ),
+
+    ?assertMatch(
+        {400, #{<<"message">> := <<"changing_namespace_is_forbidden">>}},
+        update_api_key_api(
+            APIKeyName,
+            #{
+                <<"role">> => DifferentAdminRole,
+                <<"description">> => <<"shouldn't work">>
+            },
+            GlobalAdminHeader
+        )
+    ),
+
+    ok.
+
+-doc """
+A bare role plus a top-level `namespace' field is assembled into a namespaced
+API key (issue #17726).
+""".
+t_api_key_namespace_field_assemble(_TCConfig) ->
+    GlobalAdminHeader = create_superuser(),
+    ExpiresAt = to_rfc3339(erlang:system_time(second) + 1_000),
+    ?assertMatch(
+        {200, #{
+            <<"role">> := <<"administrator">>,
+            <<"namespace">> := <<"ns1">>
+        }},
+        create_api_key_api(
+            #{
+                <<"name">> => <<"nsfield1">>,
+                <<"expired_at">> => ExpiresAt,
+                <<"desc">> => <<"bare role + namespace field">>,
+                <<"enable">> => true,
+                <<"role">> => <<"administrator">>,
+                <<"namespace">> => <<"ns1">>
+            },
+            GlobalAdminHeader
+        )
+    ),
+    ok.
+
+-doc """
+A role-encoded namespace and a matching top-level `namespace' field are accepted
+(idempotent) (issue #17726).
+""".
+t_api_key_namespace_field_redundant_match(_TCConfig) ->
+    GlobalAdminHeader = create_superuser(),
+    ExpiresAt = to_rfc3339(erlang:system_time(second) + 1_000),
+    ?assertMatch(
+        {200, #{
+            <<"role">> := <<"administrator">>,
+            <<"namespace">> := <<"ns1">>
+        }},
+        create_api_key_api(
+            #{
+                <<"name">> => <<"nsfield2">>,
+                <<"expired_at">> => ExpiresAt,
+                <<"desc">> => <<"role-encoded + matching namespace field">>,
+                <<"enable">> => true,
+                <<"role">> => <<"ns:ns1::administrator">>,
+                <<"namespace">> => <<"ns1">>
+            },
+            GlobalAdminHeader
+        )
+    ),
+    ok.
+
+-doc """
+A role-encoded namespace that disagrees with the top-level `namespace' field is
+rejected with a clear 400 message (issue #17726).
+""".
+t_api_key_namespace_field_mismatch(_TCConfig) ->
+    GlobalAdminHeader = create_superuser(),
+    ExpiresAt = to_rfc3339(erlang:system_time(second) + 1_000),
+    ?assertMatch(
+        {400, #{<<"message">> := <<"namespace mismatch:", _/binary>>}},
+        create_api_key_api(
+            #{
+                <<"name">> => <<"nsfield3">>,
+                <<"expired_at">> => ExpiresAt,
+                <<"desc">> => <<"mismatching namespace">>,
+                <<"enable">> => true,
+                <<"role">> => <<"ns:ns1::administrator">>,
+                <<"namespace">> => <<"ns2">>
+            },
+            GlobalAdminHeader
+        )
+    ),
+    ok.
+
+-doc """
+Omitting both the role-encoded namespace and the `namespace' field creates a
+global API key, unchanged from previous behaviour (issue #17726).
+""".
+t_api_key_namespace_field_absent(_TCConfig) ->
+    GlobalAdminHeader = create_superuser(),
+    ExpiresAt = to_rfc3339(erlang:system_time(second) + 1_000),
+    ?assertMatch(
+        {200, #{
+            <<"role">> := <<"administrator">>,
+            <<"namespace">> := null
+        }},
+        create_api_key_api(
+            #{
+                <<"name">> => <<"nsfield4">>,
+                <<"expired_at">> => ExpiresAt,
+                <<"desc">> => <<"global key">>,
+                <<"enable">> => true,
+                <<"role">> => <<"administrator">>
+            },
+            GlobalAdminHeader
+        )
+    ),
+    ok.
+
+-doc """
+A namespaced administrator may create an API key within their own namespace
+(issue #17728).
+""".
+t_ns_admin_create_own_namespace(_TCConfig) ->
+    GlobalAdminHeader = create_superuser(),
+    NsAdminHeader = create_namespaced_admin(<<"ns1">>, GlobalAdminHeader),
+    ExpiresAt = to_rfc3339(erlang:system_time(second) + 1_000),
+    ?assertMatch(
+        {200, #{
+            <<"role">> := <<"administrator">>,
+            <<"namespace">> := <<"ns1">>
+        }},
+        create_api_key_api(
+            #{
+                <<"name">> => <<"ownkey">>,
+                <<"expired_at">> => ExpiresAt,
+                <<"desc">> => <<"own namespace key">>,
+                <<"enable">> => true,
+                <<"role">> => <<"administrator">>,
+                <<"namespace">> => <<"ns1">>
+            },
+            NsAdminHeader
+        )
+    ),
+    ok.
+
+-doc """
+A namespaced administrator may not create a global API key (issue #17728).
+""".
+t_ns_admin_create_global_forbidden(_TCConfig) ->
+    GlobalAdminHeader = create_superuser(),
+    NsAdminHeader = create_namespaced_admin(<<"ns1">>, GlobalAdminHeader),
+    ExpiresAt = to_rfc3339(erlang:system_time(second) + 1_000),
+    ?assertMatch(
+        {403, _},
+        create_api_key_api(
+            #{
+                <<"name">> => <<"globalkey">>,
+                <<"expired_at">> => ExpiresAt,
+                <<"desc">> => <<"global key attempt">>,
+                <<"enable">> => true,
+                <<"role">> => <<"administrator">>
+            },
+            NsAdminHeader
+        )
+    ),
+    ok.
+
+-doc """
+A namespaced administrator may not create an API key in another namespace
+(issue #17728).
+""".
+t_ns_admin_create_other_namespace_forbidden(_TCConfig) ->
+    GlobalAdminHeader = create_superuser(),
+    NsAdminHeader = create_namespaced_admin(<<"ns1">>, GlobalAdminHeader),
+    ExpiresAt = to_rfc3339(erlang:system_time(second) + 1_000),
+    ?assertMatch(
+        {403, _},
+        create_api_key_api(
+            #{
+                <<"name">> => <<"otherkey">>,
+                <<"expired_at">> => ExpiresAt,
+                <<"desc">> => <<"other namespace attempt">>,
+                <<"enable">> => true,
+                <<"role">> => <<"administrator">>,
+                <<"namespace">> => <<"ns2">>
+            },
+            NsAdminHeader
+        )
+    ),
+    ok.
+
+-doc """
+A namespaced administrator listing API keys sees only the keys in their own
+namespace -- not global keys nor keys in other namespaces (issue #17728).
+""".
+t_ns_admin_list_scoped(_TCConfig) ->
+    GlobalAdminHeader = create_superuser(),
+    NsAdminHeader = create_namespaced_admin(<<"ns1">>, GlobalAdminHeader),
+    _ = create_key_in_namespace(<<"globalkey">>, global, GlobalAdminHeader),
+    _ = create_key_in_namespace(<<"ns1key">>, <<"ns1">>, GlobalAdminHeader),
+    _ = create_key_in_namespace(<<"ns2key">>, <<"ns2">>, GlobalAdminHeader),
+    %% Global admin sees all three.
+    {200, AllKeys} = list_api_keys_api(GlobalAdminHeader),
+    AllNames = [N || #{<<"name">> := N} <- AllKeys],
+    ?assert(lists:member(<<"globalkey">>, AllNames)),
+    ?assert(lists:member(<<"ns1key">>, AllNames)),
+    ?assert(lists:member(<<"ns2key">>, AllNames)),
+    %% Namespaced admin sees only its own namespace's key.
+    {200, NsKeys} = list_api_keys_api(NsAdminHeader),
+    ?assertEqual(
+        [<<"ns1key">>],
+        [N || #{<<"name">> := N} <- NsKeys]
+    ),
+    ?assertMatch(
+        [#{<<"namespace">> := <<"ns1">>}],
+        NsKeys
+    ),
+    ok.
+
+-doc """
+A namespaced administrator gets 404 (not 403) when reading an API key in another
+namespace, so the key's existence is not leaked (issue #17728).
+""".
+t_ns_admin_get_other_namespace_404(_TCConfig) ->
+    GlobalAdminHeader = create_superuser(),
+    NsAdminHeader = create_namespaced_admin(<<"ns1">>, GlobalAdminHeader),
+    _ = create_key_in_namespace(<<"ns2key">>, <<"ns2">>, GlobalAdminHeader),
+    ?assertMatch({404, _}, get_api_key_api(<<"ns2key">>, NsAdminHeader)),
+    ok.
+
+-doc """
+A namespaced administrator may update an API key in their own namespace, but a
+request that would move it to another namespace is rejected; updating a key in
+another namespace returns 404 (issue #17728).
+""".
+t_ns_admin_put_own_and_change_namespace(_TCConfig) ->
+    GlobalAdminHeader = create_superuser(),
+    NsAdminHeader = create_namespaced_admin(<<"ns1">>, GlobalAdminHeader),
+    _ = create_key_in_namespace(<<"ns1key">>, <<"ns1">>, GlobalAdminHeader),
+    _ = create_key_in_namespace(<<"ns2key">>, <<"ns2">>, GlobalAdminHeader),
+    %% Update own key (keeping the same namespace) is allowed.
+    ?assertMatch(
+        {200, #{<<"namespace">> := <<"ns1">>, <<"desc">> := <<"updated">>}},
+        update_api_key_api(
+            <<"ns1key">>,
+            #{
+                <<"role">> => <<"administrator">>,
+                <<"namespace">> => <<"ns1">>,
+                <<"desc">> => <<"updated">>
+            },
+            NsAdminHeader
+        )
+    ),
+    %% Attempting to move the key to another namespace is rejected with 400 by
+    %% the storage layer (changing a key's namespace is forbidden).
+    ?assertMatch(
+        {400, #{<<"message">> := <<"changing_namespace_is_forbidden">>}},
+        update_api_key_api(
+            <<"ns1key">>,
+            #{
+                <<"role">> => <<"administrator">>,
+                <<"namespace">> => <<"ns2">>,
+                <<"desc">> => <<"shouldn't work">>
+            },
+            NsAdminHeader
+        )
+    ),
+    %% Updating a key in another namespace is hidden as 404.
+    ?assertMatch(
+        {404, _},
+        update_api_key_api(
+            <<"ns2key">>,
+            #{
+                <<"role">> => <<"administrator">>,
+                <<"namespace">> => <<"ns2">>,
+                <<"desc">> => <<"shouldn't work">>
+            },
+            NsAdminHeader
+        )
+    ),
+    ok.
+
+-doc """
+A namespaced administrator gets 404 when deleting an API key in another
+namespace, and the key remains (issue #17728).
+""".
+t_ns_admin_delete_other_namespace_404(_TCConfig) ->
+    GlobalAdminHeader = create_superuser(),
+    NsAdminHeader = create_namespaced_admin(<<"ns1">>, GlobalAdminHeader),
+    _ = create_key_in_namespace(<<"ns2key">>, <<"ns2">>, GlobalAdminHeader),
+    ?assertMatch({404, _}, delete_api_key_api(<<"ns2key">>, NsAdminHeader)),
+    %% The key still exists for the global admin.
+    ?assertMatch({200, _}, get_api_key_api(<<"ns2key">>, GlobalAdminHeader)),
+    ok.
+
+%%------------------------------------------------------------------------------
+%% Cookie auth for plugin API
+%%------------------------------------------------------------------------------
+
+t_cookie_auth_plugin_api(_TCConfig) ->
+    Token = create_superuser_token(),
+    HandlerInfo = #{method => get, module => any, function => any},
+    CookieHeader = <<"emqx_auth=", Token/binary>>,
+    Req = fake_req(<<"/api/v5/plugin_api/my_plugin/foo">>, #{<<"cookie">> => CookieHeader}),
+    ?assertMatch({ok, _}, emqx_dashboard:authorize(Req, HandlerInfo)).
+
+t_cookie_auth_non_plugin_api(_TCConfig) ->
+    Token = create_superuser_token(),
+    HandlerInfo = #{method => get, module => any, function => any},
+    CookieHeader = <<"emqx_auth=", Token/binary>>,
+    Req = fake_req(<<"/api/v5/users">>, #{<<"cookie">> => CookieHeader}),
+    ?assertMatch({401, _, _}, emqx_dashboard:authorize(Req, HandlerInfo)).
+
+t_cookie_auth_no_cookie(_TCConfig) ->
+    _Token = create_superuser_token(),
+    HandlerInfo = #{method => get, module => any, function => any},
+    Req = fake_req(<<"/api/v5/plugin_api/my_plugin/foo">>, #{}),
+    ?assertMatch({401, _, _}, emqx_dashboard:authorize(Req, HandlerInfo)).
+
+t_cookie_auth_empty_token(_TCConfig) ->
+    _Token = create_superuser_token(),
+    HandlerInfo = #{method => get, module => any, function => any},
+    CookieHeader = <<"emqx_auth=">>,
+    Req = fake_req(<<"/api/v5/plugin_api/my_plugin/foo">>, #{<<"cookie">> => CookieHeader}),
+    ?assertMatch({401, _, _}, emqx_dashboard:authorize(Req, HandlerInfo)).
+
+t_cookie_auth_bad_token(_TCConfig) ->
+    _Token = create_superuser_token(),
+    HandlerInfo = #{method => get, module => any, function => any},
+    CookieHeader = <<"emqx_auth=bad_token">>,
+    Req = fake_req(<<"/api/v5/plugin_api/my_plugin/foo">>, #{<<"cookie">> => CookieHeader}),
+    ?assertMatch({401, _, _}, emqx_dashboard:authorize(Req, HandlerInfo)).
+
+%%------------------------------------------------------------------------------
+%% Password hashing (v1 PBKDF2-HMAC-SHA256 with legacy compat)
+%%------------------------------------------------------------------------------
+
+-doc "Hash output uses PHC-style v1 prefix carrying iteration count and base64 fields.".
+t_hash_uses_v1_format(_) ->
+    Hash = emqx_dashboard_admin:hash(<<"hunter2-XYZ">>),
+    ?assertMatch(<<"$1$600000$", _/binary>>, Hash),
+    [<<>>, <<"1">>, <<"600000">>, SaltB64, DKB64] = binary:split(Hash, <<"$">>, [global]),
+    ?assertEqual(16, byte_size(base64:decode(SaltB64, #{padding => false}))),
+    ?assertEqual(32, byte_size(base64:decode(DKB64, #{padding => false}))),
+    ok.
+
+-doc "API-secret hash uses iter=1 (fast) but the same v1 format; verifier accepts it.".
+t_hash_api_secret_uses_iter_1(_) ->
+    Secret = <<"this-is-a-32-byte-test-secret-OK">>,
+    Hash = emqx_dashboard_admin:hash_api_secret(Secret),
+    ?assertMatch(<<"$1$1$", _/binary>>, Hash),
+    ?assertEqual(ok, emqx_dashboard_admin:verify_hash(Secret, Hash)),
+    ?assertEqual(error, emqx_dashboard_admin:verify_hash(<<"wrong">>, Hash)),
+    ok.
+
+-doc "verify_hash accepts the matching password and rejects the wrong one on v1 hashes.".
+t_verify_v1_hash_roundtrip(_) ->
+    Password = <<"correct horse battery staple">>,
+    Hash = emqx_dashboard_admin:hash(Password),
+    ?assertEqual(ok, emqx_dashboard_admin:verify_hash(Password, Hash)),
+    ?assertEqual(error, emqx_dashboard_admin:verify_hash(<<"wrong">>, Hash)),
+    %% Two hashes of the same password must differ (random salt).
+    Hash2 = emqx_dashboard_admin:hash(Password),
+    ?assertNotEqual(Hash, Hash2),
+    ?assertEqual(ok, emqx_dashboard_admin:verify_hash(Password, Hash2)),
+    ok.
+
+-doc "Legacy 36-byte (4-byte ASCII-hex salt + sha256) hash still verifies successfully.".
+t_verify_legacy_hash_succeeds(_) ->
+    Password = <<"hunter2-XYZ">>,
+    LegacyHash = make_legacy_hash(Password),
+    ?assertEqual(36, byte_size(LegacyHash)),
+    ?assertEqual(ok, emqx_dashboard_admin:verify_hash(Password, LegacyHash)),
+    ok.
+
+-doc "Wrong password against a legacy hash returns plain error (no upgrade hint).".
+t_verify_legacy_hash_wrong_password(_) ->
+    Password = <<"hunter2-XYZ">>,
+    LegacyHash = make_legacy_hash(Password),
+    ?assertEqual(error, emqx_dashboard_admin:verify_hash(<<"wrong">>, LegacyHash)),
+    ok.
+
+-doc "Malformed / truncated / unrelated inputs are all rejected.".
+t_verify_rejects_malformed_input(_) ->
+    ?assertEqual(error, emqx_dashboard_admin:verify_hash(<<"x">>, <<>>)),
+    ?assertEqual(error, emqx_dashboard_admin:verify_hash(<<"x">>, <<"random garbage">>)),
+    %% v1 prefix but missing fields.
+    ?assertEqual(error, emqx_dashboard_admin:verify_hash(<<"x">>, <<"$1$">>)),
+    ?assertEqual(error, emqx_dashboard_admin:verify_hash(<<"x">>, <<"$1$600000$">>)),
+    ?assertEqual(error, emqx_dashboard_admin:verify_hash(<<"x">>, <<"$1$abc$AAAA$AAAA">>)),
+    %% 36-byte non-matching binary — same length as legacy but unrelated bytes.
+    Random = crypto:strong_rand_bytes(36),
+    ?assertEqual(error, emqx_dashboard_admin:verify_hash(<<"x">>, Random)),
+    ok.
+
+%%------------------------------------------------------------------------------
+%% Helpers for legacy-hash tests
+%%------------------------------------------------------------------------------
+
+make_legacy_hash(Password) ->
+    SaltAscii = legacy_salt_ascii(),
+    Hash = crypto:hash(sha256, <<SaltAscii/binary, Password/binary>>),
+    <<SaltAscii/binary, Hash/binary>>.
+
+legacy_salt_ascii() ->
+    <<X:16/big-unsigned-integer>> = crypto:strong_rand_bytes(2),
+    iolist_to_binary(io_lib:format("~4.16.0b", [X])).

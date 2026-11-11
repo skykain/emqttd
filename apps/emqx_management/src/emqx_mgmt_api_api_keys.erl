@@ -1,0 +1,798 @@
+%%--------------------------------------------------------------------
+%% Copyright (c) 2020-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
+%%--------------------------------------------------------------------
+-module(emqx_mgmt_api_api_keys).
+
+-behaviour(minirest_api).
+
+-include_lib("typerefl/include/types.hrl").
+-include_lib("hocon/include/hoconsc.hrl").
+-include_lib("emqx_dashboard/include/emqx_dashboard_rbac.hrl").
+-include_lib("emqx_utils/include/emqx_api_key_scopes.hrl").
+-include_lib("emqx/include/emqx_config.hrl").
+
+-export([api_spec/0, fields/1, paths/0, schema/1, namespace/0]).
+-export([api_key/2, api_key_by_name/2, api_key_scopes/2]).
+-export([validate_name/1]).
+
+-export([scopes/0]).
+
+-define(TAGS, [<<"API Keys">>]).
+
+namespace() -> "api_key".
+
+scopes() ->
+    %% API key management endpoints are bearer-auth-only; API keys
+    %% themselves cannot reach these paths. The login user scope
+    %% check consults this map.
+    %%
+    %% /api_key_scopes is marked ?SCOPE_PUBLIC: it returns only the
+    %% static scope catalog (names + i18n descriptions), no tenant
+    %% data, so any authenticated login user may read it. It is a
+    %% top-level path (sibling to /action_types, /source_types)
+    %% chosen to avoid wildcard routing collisions with /api_key/:name.
+    #{
+        "/api_key" => ?SCOPE_API_KEY_MGMT,
+        "/api_key/:name" => ?SCOPE_API_KEY_MGMT,
+        "/api_key_scopes" => ?SCOPE_PUBLIC
+    }.
+
+api_spec() ->
+    emqx_dashboard_swagger:spec(?MODULE, #{check_schema => true, translate_body => true}).
+
+paths() ->
+    ["/api_key", "/api_key/:name", "/api_key_scopes"].
+
+schema("/api_key") ->
+    #{
+        'operationId' => api_key,
+        get => #{
+            description => ?DESC(api_key_list),
+            tags => ?TAGS,
+            security => [#{'bearerAuth' => []}],
+            responses => #{
+                200 => delete([api_secret], fields(app_response))
+            }
+        },
+        post => #{
+            description => ?DESC(create_new_api_key),
+            tags => ?TAGS,
+            security => [#{'bearerAuth' => []}],
+            'requestBody' => delete([created_at, api_key, api_secret], fields(app_create)),
+            responses => #{
+                200 => hoconsc:ref(app_response),
+                400 => emqx_dashboard_swagger:error_codes(['BAD_REQUEST']),
+                403 => emqx_dashboard_swagger:error_codes(['FORBIDDEN'])
+            }
+        }
+    };
+schema("/api_key/:name") ->
+    #{
+        'operationId' => api_key_by_name,
+        get => #{
+            description => ?DESC(get_api_key),
+            tags => ?TAGS,
+            parameters => [hoconsc:ref(name)],
+            responses => #{
+                200 => delete([api_secret], fields(app_response)),
+                404 => emqx_dashboard_swagger:error_codes(['NOT_FOUND'])
+            }
+        },
+        put => #{
+            description => ?DESC(update_api_key),
+            tags => ?TAGS,
+            parameters => [hoconsc:ref(name)],
+            'requestBody' => delete([created_at, api_key, api_secret, name], fields(app)),
+            responses => #{
+                200 => delete([api_secret], fields(app_response)),
+                400 => emqx_dashboard_swagger:error_codes(['BAD_REQUEST']),
+                404 => emqx_dashboard_swagger:error_codes(['NOT_FOUND'])
+            }
+        },
+        delete => #{
+            description => ?DESC(delete_api_key),
+            tags => ?TAGS,
+            parameters => [hoconsc:ref(name)],
+            responses => #{
+                204 => <<"Delete successfully">>,
+                404 => emqx_dashboard_swagger:error_codes(['NOT_FOUND'])
+            }
+        }
+    };
+schema("/api_key_scopes") ->
+    #{
+        'operationId' => api_key_scopes,
+        get => #{
+            description => ?DESC(api_key_scopes_list),
+            tags => ?TAGS,
+            security => [#{'bearerAuth' => []}],
+            responses => #{
+                200 => hoconsc:ref(?MODULE, scopes_response)
+            }
+        }
+    }.
+
+fields(app) ->
+    [
+        {name,
+            hoconsc:mk(
+                binary(),
+                #{
+                    desc => ?DESC("name_format"),
+                    validator => fun ?MODULE:validate_name/1,
+                    example => <<"EMQX-API-KEY-1">>
+                }
+            )},
+        {api_key,
+            hoconsc:mk(
+                binary(),
+                #{
+                    desc => ?DESC("api_key_desc"),
+                    example => <<"a4697a5c75a769f6">>
+                }
+            )},
+        {api_secret,
+            hoconsc:mk(
+                binary(),
+                #{
+                    desc => ?DESC("api_secret_desc"),
+                    example => <<"MzAyMjk3ODMwMDk0NjIzOTUxNjcwNzQ0NzQ3MTE2NDYyMDI">>
+                }
+            )},
+        {expired_at,
+            hoconsc:mk(
+                hoconsc:union([infinity, emqx_utils_calendar:epoch_second()]),
+                #{
+                    desc => ?DESC("expired_at_desc"),
+                    example => <<"2021-12-05T02:01:34.186Z">>,
+                    %% No `default' on purpose, matching `role' below: a schema default is
+                    %% filled into the request body before it reaches the handler, which
+                    %% would make an omitted `expired_at' indistinguishable from an
+                    %% explicit one and let a partial update silently rewrite the key's
+                    %% expiry. A key created without it still never expires; the create
+                    %% path's default is declared by `fields(app_create)'.
+                    required => false
+                }
+            )},
+        {created_at,
+            hoconsc:mk(
+                emqx_utils_calendar:epoch_second(),
+                #{
+                    desc => ?DESC("created_at_desc"),
+                    example => <<"2021-12-01T00:00:00.000Z">>
+                }
+            )},
+        {desc,
+            hoconsc:mk(
+                binary(),
+                #{example => <<"Note">>, required => false}
+            )},
+        {enable, hoconsc:mk(boolean(), #{desc => ?DESC("enable_desc"), required => false})},
+        {expired, hoconsc:mk(boolean(), #{desc => ?DESC("expired_desc"), required => false})},
+        %% Accepts the same shapes the response emits (array or the `unset'
+        %% sentinel) so a read-modify-write can round-trip the value verbatim.
+        {scopes,
+            hoconsc:mk(
+                hoconsc:union([unset, hoconsc:array(binary())]),
+                #{
+                    desc => ?DESC(api_key_scopes_request),
+                    required => false,
+                    example => [<<"clients">>, <<"rules">>]
+                }
+            )}
+    ] ++ app_extend_fields();
+%% The `POST' request body documents the values the create path applies to a field the
+%% caller left out, so `expired_at' and `role' keep their `default' here.
+%%
+%% It must not be shared with the update path: a declared `default' is filled into the
+%% request body *before* the handler sees it, so on an update an omitted field would
+%% overwrite the stored value with the default. That is exactly what used to escalate a
+%% `viewer' key to `administrator' and made an expiring key immortal. `PUT' therefore
+%% uses `fields(app)', which declares no defaults.
+fields(app_create) ->
+    Defaults = create_defaults(),
+    [
+        {Field, maybe_add_default(Schema, maps:find(Field, Defaults))}
+     || {Field, Schema} <- fields(app)
+    ];
+%% Response shape: `scopes' MAY be the binary sentinel <<"unset">> in addition
+%% to the array-of-binaries form, surfaced when the record holds no explicit
+%% `scopes' field (legacy record or unset-equivalent write).
+%%
+%% Listed explicitly (rather than overriding via `lists:keystore') so that the
+%% OpenAPI spec reads as a self-contained response schema and reviewers do not
+%% have to mentally diff `fields(app)' against `fields(app_response)'.
+fields(app_response) ->
+    [
+        {name,
+            hoconsc:mk(
+                binary(),
+                #{
+                    desc => ?DESC("name_format"),
+                    validator => fun ?MODULE:validate_name/1,
+                    example => <<"EMQX-API-KEY-1">>
+                }
+            )},
+        {api_key,
+            hoconsc:mk(
+                binary(),
+                #{
+                    desc => ?DESC("api_key_desc"),
+                    example => <<"a4697a5c75a769f6">>
+                }
+            )},
+        {api_secret,
+            hoconsc:mk(
+                binary(),
+                #{
+                    desc => ?DESC("api_secret_desc"),
+                    example => <<"MzAyMjk3ODMwMDk0NjIzOTUxNjcwNzQ0NzQ3MTE2NDYyMDI">>
+                }
+            )},
+        {expired_at,
+            hoconsc:mk(
+                hoconsc:union([infinity, emqx_utils_calendar:epoch_second()]),
+                #{
+                    desc => ?DESC("expired_at_desc"),
+                    example => <<"2021-12-05T02:01:34.186Z">>,
+                    required => false,
+                    default => infinity
+                }
+            )},
+        {created_at,
+            hoconsc:mk(
+                emqx_utils_calendar:epoch_second(),
+                #{
+                    desc => ?DESC("created_at_desc"),
+                    example => <<"2021-12-01T00:00:00.000Z">>
+                }
+            )},
+        {desc,
+            hoconsc:mk(
+                binary(),
+                #{example => <<"Note">>, required => false}
+            )},
+        {enable, hoconsc:mk(boolean(), #{desc => ?DESC("enable_desc"), required => false})},
+        {expired, hoconsc:mk(boolean(), #{desc => ?DESC("expired_desc"), required => false})},
+        {scopes,
+            hoconsc:mk(
+                hoconsc:union([unset, hoconsc:array(binary())]),
+                #{
+                    desc => ?DESC(api_key_scopes_response),
+                    required => false,
+                    example => [<<"connections">>, <<"monitoring">>]
+                }
+            )}
+    ] ++ app_extend_fields();
+fields(name) ->
+    [
+        {name,
+            hoconsc:mk(
+                binary(),
+                #{
+                    desc => ?DESC("name_pattern"),
+                    example => <<"EMQX-API-KEY-1">>,
+                    in => path,
+                    validator => fun ?MODULE:validate_name/1
+                }
+            )}
+    ];
+fields(scope_info) ->
+    [
+        {name,
+            hoconsc:mk(
+                binary(),
+                #{
+                    desc => ?DESC(scope_info_name),
+                    example => <<"connections">>
+                }
+            )},
+        {desc,
+            hoconsc:mk(
+                binary(),
+                #{
+                    desc => ?DESC(scope_info_desc),
+                    example => <<
+                        "Client connections, subscriptions, topics, banning, "
+                        "retained messages, file transfer, and delayed messages"
+                    >>
+                }
+            )}
+    ];
+fields(scopes_response) ->
+    [
+        {scopes,
+            hoconsc:mk(
+                hoconsc:array(hoconsc:ref(scope_info)),
+                #{
+                    desc => ?DESC(scopes_response_scopes)
+                }
+            )}
+    ].
+
+%% Values the create path applies to a field the caller left out: a key created
+%% without `expired_at' never expires, and one created without `role' gets the
+%% default role. Neither is declared on `fields(app)' because that list is also the
+%% `PUT' request body, where a declared default would overwrite the stored value.
+create_defaults() ->
+    #{expired_at => infinity, role => ?ROLE_API_DEFAULT}.
+
+maybe_add_default(Schema, {ok, Default}) -> Schema#{default => Default};
+maybe_add_default(Schema, error) -> Schema.
+
+-define(NAME_RE, "^[A-Za-z]+[A-Za-z0-9-_]*$").
+
+validate_name(Name) ->
+    NameLen = byte_size(Name),
+    case NameLen > 0 andalso NameLen =< 256 of
+        true ->
+            case re:run(Name, ?NAME_RE) of
+                nomatch -> {error, "Name should be " ?NAME_RE};
+                _ -> ok
+            end;
+        false ->
+            {error, "Name Length must =< 256"}
+    end.
+
+delete(Keys, Fields) ->
+    lists:foldl(fun(Key, Acc) -> lists:keydelete(Key, 1, Acc) end, Fields, Keys).
+
+api_key(get, Req) ->
+    CallerNs = emqx_dashboard:get_namespace(Req),
+    Apps = [App || App <- emqx_mgmt_auth:list(), namespace_accessible(CallerNs, App)],
+    {200, [emqx_mgmt_auth:format(App) || App <- Apps]};
+api_key(post, #{body := App} = Req) ->
+    %% `name' is mandatory in the request schema, `desc' and `enable' are
+    %% optional and are simply absent from the checked body when the client
+    %% omits them, so they must be defaulted here rather than being
+    %% pattern-matched. The Dashboard sends `desc' as `""' and `enable' as `true'.
+    %%
+    %% Note: this request body is a plain field list, so request validation
+    %% drops unknown fields instead of rejecting them: a misspelled field such
+    %% as `description' creates the key with an empty note instead of failing
+    %% with 400. That is the framework-wide behaviour of list-form request
+    %% bodies and is deliberately kept here.
+    #{<<"name">> := Name} = App,
+    ExpiredAt = new_expired_at(App),
+    Desc = unicode:characters_to_binary(maps:get(<<"desc">>, App, <<>>), unicode),
+    Enable = maps:get(<<"enable">>, App, true),
+    Role0 = maps:get(<<"role">>, App, ?ROLE_API_DEFAULT),
+    Namespace = maps:get(<<"namespace">>, App, undefined),
+    CallerNs = emqx_dashboard:get_namespace(Req),
+    maybe
+        {ok, Role} ?= resolve_effective_role(Role0, Namespace),
+        ok ?= authorize_target_namespace(CallerNs, role_namespace(Role)),
+        create_api_key(App, Name, Enable, ExpiredAt, Desc, Role)
+    else
+        {error, forbidden, Msg} ->
+            {403, #{code => 'FORBIDDEN', message => Msg}};
+        {error, Msg} ->
+            {400, #{code => 'BAD_REQUEST', message => Msg}}
+    end.
+
+create_api_key(App, Name, Enable, ExpiredAt, Desc, Role) ->
+    RawScopes = maps:get(<<"scopes">>, App, undefined),
+    case create_scopes(Role, RawScopes) of
+        {ok, Scopes} ->
+            do_create_api_key(Name, Enable, ExpiredAt, Desc, Role, Scopes);
+        {error, Msg} ->
+            {400, #{code => 'BAD_REQUEST', message => Msg}}
+    end.
+
+%% Resolve the `scopes' value to persist on POST: omitted -> materialize
+%% the role default (privilege mutex not applied to that mix);
+%% unset-equivalent -> store no `scopes' field (valid by construction);
+%% explicit list -> validate and store verbatim.
+create_scopes(Role, undefined) ->
+    Scopes = emqx_mgmt_auth:role_default_scopes(Role),
+    case validate_scopes(Role, undefined, Scopes) of
+        ok -> {ok, Scopes};
+        Error -> Error
+    end;
+create_scopes(Role, RawScopes) ->
+    case emqx_mgmt_auth:write_scope_intent(Role, RawScopes) of
+        unset ->
+            {ok, undefined};
+        {set, Scopes} ->
+            case validate_explicit_scopes(Role, Scopes) of
+                ok -> {ok, Scopes};
+                Error -> Error
+            end
+    end.
+
+%% Validation of a newly written explicit scope list — POST, or PUT with
+%% a list that genuinely differs from the persisted one: the shared
+%% four-layer validation plus the namespaced-role scope allowlist.
+validate_explicit_scopes(Role, Scopes) ->
+    case validate_scopes(Role, Scopes, Scopes) of
+        ok -> validate_namespaced_scope_allowlist(Role, Scopes);
+        Error -> Error
+    end.
+
+%% A namespaced API key may only hold scopes in `?NS_ADMIN_ALLOWED_SCOPES',
+%% mirroring the dashboard login-user rule
+%% (`emqx_dashboard_api:validate_role_scope_compat/2'). `publish' is not
+%% in the allowlist, so this subsumes the former publish-only rejection.
+%% Applies to any newly written explicit list; only a verbatim round-trip
+%% of a stored list that predates this rule skips it (see
+%% `validate_update_scopes/3').
+validate_namespaced_scope_allowlist(Role, Scopes) ->
+    case is_binary(role_namespace(Role)) of
+        true ->
+            case [S || S <- Scopes, not lists:member(S, ?NS_ADMIN_ALLOWED_SCOPES)] of
+                [] ->
+                    ok;
+                Forbidden ->
+                    Names = lists:join(<<", ">>, Forbidden),
+                    {error,
+                        iolist_to_binary([
+                            <<"Namespaced API keys cannot hold scopes: ">>, Names
+                        ])}
+            end;
+        false ->
+            ok
+    end.
+
+do_create_api_key(Name, Enable, ExpiredAt, Desc, Role, Scopes) ->
+    case emqx_mgmt_auth:create(Name, Enable, ExpiredAt, Desc, Role, Scopes) of
+        {ok, NewApp} ->
+            {200, emqx_mgmt_auth:format(NewApp)};
+        {error, Reason} when is_map(Reason) ->
+            {400, #{
+                code => 'BAD_REQUEST',
+                message => Reason
+            }};
+        {error, Reason} ->
+            {400, #{
+                code => 'BAD_REQUEST',
+                message => iolist_to_binary(io_lib:format("~p", [Reason]))
+            }}
+    end.
+
+-define(NOT_FOUND_RESPONSE, #{code => 'NOT_FOUND', message => ?DESC("name_not_found")}).
+
+api_key_by_name(get, #{bindings := #{name := Name}} = Req) ->
+    CallerNs = emqx_dashboard:get_namespace(Req),
+    case read_in_namespace(CallerNs, Name) of
+        {ok, App} -> {200, emqx_mgmt_auth:format(App)};
+        {error, not_found} -> {404, ?NOT_FOUND_RESPONSE}
+    end;
+api_key_by_name(delete, #{bindings := #{name := Name}} = Req) ->
+    CallerNs = emqx_dashboard:get_namespace(Req),
+    case read_in_namespace(CallerNs, Name) of
+        {ok, _App} ->
+            case emqx_mgmt_auth:delete(Name) of
+                {ok, _} -> {204};
+                {error, not_found} -> {404, ?NOT_FOUND_RESPONSE}
+            end;
+        {error, not_found} ->
+            {404, ?NOT_FOUND_RESPONSE}
+    end;
+api_key_by_name(put, #{bindings := #{name := Name}, body := Body} = Req) ->
+    CallerNs = emqx_dashboard:get_namespace(Req),
+    Namespace = maps:get(<<"namespace">>, Body, undefined),
+    case read_in_namespace(CallerNs, Name) of
+        {ok, Stored} ->
+            %% `role' deliberately has no schema default: the request body is filled with
+            %% schema defaults before it reaches this handler, which would make "omitted"
+            %% indistinguishable from an explicit value and silently escalate the key.
+            %% An omitted `role' means "keep the stored role", so the effective role is
+            %% read off the stored record — the scope and namespace validation below need
+            %% the key's real role rather than `undefined'.
+            Role0 = maps:get(<<"role">>, Body, stored_role(Stored)),
+            case resolve_effective_role(Role0, Namespace) of
+                {ok, Role} ->
+                    %% A move into another namespace is rejected with 400 by
+                    %% `emqx_mgmt_auth:update/6' (changing_namespace_is_forbidden).
+                    update_api_key(Name, Role, Body);
+                {error, Msg} ->
+                    {400, #{code => 'BAD_REQUEST', message => Msg}}
+            end;
+        {error, not_found} ->
+            %% A key in another namespace is reported as not found so its
+            %% existence is not leaked to a namespaced administrator.
+            {404, ?NOT_FOUND_RESPONSE}
+    end.
+
+update_api_key(Name, Role, Body) ->
+    Enable = maps:get(<<"enable">>, Body, undefined),
+    ExpiredAt = update_expired_at(Body),
+    Desc = maps:get(<<"desc">>, Body, undefined),
+    RawScopes = maps:get(<<"scopes">>, Body, undefined),
+    Intent = emqx_mgmt_auth:write_scope_intent(Role, RawScopes),
+    case validate_update_scopes(Role, Name, Intent) of
+        ok ->
+            Scopes = scopes_update_arg(Intent),
+            case emqx_mgmt_auth:update(Name, Enable, ExpiredAt, Desc, Role, Scopes) of
+                {ok, App} ->
+                    {200, emqx_mgmt_auth:format(App)};
+                {error, not_found} ->
+                    {404, ?NOT_FOUND_RESPONSE};
+                {error, Reason} when is_binary(Reason) ->
+                    {400, #{code => 'BAD_REQUEST', message => Reason}};
+                {error, Reason} ->
+                    {400, #{
+                        code => 'BAD_REQUEST',
+                        message => iolist_to_binary(io_lib:format("~p", [Reason]))
+                    }}
+            end;
+        {error, Msg} ->
+            {400, #{code => 'BAD_REQUEST', message => Msg}}
+    end.
+
+%% Validate the effective scope list for a PUT. `keep' validates the
+%% persisted scopes against the (possibly changed) role, so a role
+%% change to `publisher' cannot keep non-`publish' scopes via a partial
+%% update; `unset' clears to role default (valid by construction);
+%% `{set, L}' validates `L' with the privilege mutex applied and enforces
+%% the namespaced-role scope allowlist — unless `L' merely re-submits the
+%% persisted scope list for the unchanged role/namespace (a
+%% read-modify-write), which is accepted verbatim so a key stored under
+%% an older role default (e.g. a namespaced key whose materialized
+%% default predates the namespace-aware defaults) can always be
+%% round-tripped without being rejected or rewritten. Exception to the
+%% round-trip rule: a namespaced `[publish]'-only list is rejected even
+%% verbatim — such a key can do nothing at all, so the caller is told to
+%% re-create it without a namespace instead.
+validate_update_scopes(_Role, _Name, unset) ->
+    ok;
+validate_update_scopes(Role, Name, keep) ->
+    validate_scopes(Role, undefined, persisted_scopes(Name));
+validate_update_scopes(Role, Name, {set, Scopes}) ->
+    case validate_not_publish_only_namespaced(Role, Scopes) of
+        ok ->
+            case is_unchanged_persisted_scopes(Role, Name, Scopes) of
+                true -> ok;
+                false -> validate_explicit_scopes(Role, Scopes)
+            end;
+        Error ->
+            Error
+    end.
+
+%% A namespaced key whose requested list is exactly `[publish]' cannot be
+%% used for anything: `publish' itself is unusable (the publish APIs are
+%% global-only) and the explicit single-scope list denies every other
+%% scoped endpoint. Reject with a hint at the remedy.
+validate_not_publish_only_namespaced(Role, Scopes) when is_list(Scopes) ->
+    case is_binary(role_namespace(Role)) andalso lists:usort(Scopes) =:= [?SCOPE_PUBLISH] of
+        true ->
+            {error, <<
+                "A namespaced API key with only the 'publish' scope cannot be used "
+                "for anything: the publish API accepts global API keys only. "
+                "Delete this key and re-create it without a namespace"
+            >>};
+        false ->
+            ok
+    end;
+validate_not_publish_only_namespaced(_Role, _Other) ->
+    ok.
+
+%% True iff the PUT re-submits the persisted explicit scope list (order-
+%% insensitive) without changing the key's role or namespace.
+is_unchanged_persisted_scopes(Role, Name, Scopes) when is_list(Scopes) ->
+    case emqx_mgmt_auth:read(Name) of
+        {ok, #{role := PRole, namespace := PNs, scopes := Persisted}} when is_list(Persisted) ->
+            SameRole =
+                {ok, #{?role => PRole, ?namespace => PNs}} =:=
+                    emqx_dashboard_rbac:parse_api_role(Role),
+            SameRole andalso lists:usort(Scopes) =:= lists:usort(Persisted);
+        _ ->
+            false
+    end;
+is_unchanged_persisted_scopes(_Role, _Name, _Other) ->
+    false.
+
+%% Intent -> `Scopes' argument of `emqx_mgmt_auth:update/6'.
+scopes_update_arg(keep) -> undefined;
+scopes_update_arg(unset) -> unset;
+scopes_update_arg({set, Scopes}) -> Scopes.
+
+%% A missing key surfaces as `undefined' so validation passes and the
+%% downstream `emqx_mgmt_auth:update/6' returns the proper 404.
+persisted_scopes(Name) ->
+    case emqx_mgmt_auth:read(Name) of
+        {ok, #{scopes := Persisted}} when is_list(Persisted) -> Persisted;
+        _ -> undefined
+    end.
+
+%% The create path has no previous value to keep, so a key created without `expired_at'
+%% simply never expires.
+new_expired_at(#{<<"expired_at">> := ExpiredAt}) when is_integer(ExpiredAt) -> ExpiredAt;
+new_expired_at(#{<<"expired_at">> := infinity}) -> infinity;
+new_expired_at(_) -> infinity.
+
+%% An update that does not mention `expired_at' must not extend the lifetime of the
+%% key, so an omitted field stays `undefined' and keeps the stored value, just like
+%% `desc', `enable' and `role'. `infinity' is an explicit request to clear the expiry
+%% and must therefore be passed through rather than treated as absent.
+update_expired_at(#{<<"expired_at">> := ExpiredAt}) when
+    is_integer(ExpiredAt); ExpiredAt =:= infinity
+->
+    ExpiredAt;
+update_expired_at(_) ->
+    undefined.
+
+%% The role string that denotes the stored role, used when a `PUT' does not carry one.
+%% A namespaced key keeps its `ns:<namespace>::<role>' form so that an explicit
+%% `namespace' field can still be compared against it.
+stored_role(#{role := Role, namespace := Namespace}) ->
+    emqx_dashboard_rbac:serialize_role(#{?role => Role, ?namespace => Namespace}).
+
+%% Resolve the effective role string from the request `role' field and the
+%% optional top-level `namespace' field.
+%%
+%% A namespace can be specified in two ways: encoded into the role string
+%% (`ns:<namespace>::<role>') or via the standalone `namespace' field. When
+%% both are present they must agree.
+%%
+%%   * neither present                       -> role unchanged (global key)
+%%   * only role-encoded `ns:X::r'           -> role unchanged
+%%   * only `namespace = X' + bare role `r'  -> assemble `ns:X::r'
+%%   * both, encoded X == field X            -> role unchanged (idempotent)
+%%   * both, encoded X /= field Y            -> {error, mismatch}
+resolve_effective_role(Role, undefined) ->
+    {ok, Role};
+resolve_effective_role(_Role, <<>>) ->
+    {error, <<"namespace must not be empty">>};
+resolve_effective_role(Role, Namespace) when is_binary(Namespace) ->
+    case emqx_dashboard_rbac:parse_api_role(Role) of
+        {ok, #{?role := BareRole, ?namespace := ?global_ns}} ->
+            {ok, emqx_dashboard_rbac:serialize_role(#{?role => BareRole, ?namespace => Namespace})};
+        {ok, #{?namespace := Namespace}} ->
+            %% Role-encoded namespace equals the namespace field; idempotent.
+            {ok, Role};
+        {ok, #{?namespace := Other}} ->
+            {error, namespace_mismatch_msg(Other, Namespace)};
+        {error, _} = Error ->
+            Error
+    end.
+
+namespace_mismatch_msg(RoleNs, FieldNs) ->
+    iolist_to_binary([
+        <<"namespace mismatch: role is scoped to namespace '">>,
+        RoleNs,
+        <<"' but the namespace field is '">>,
+        FieldNs,
+        <<"'">>
+    ]).
+
+%% The namespace an effective role string resolves to (`?global_ns' or a binary).
+role_namespace(Role) ->
+    case emqx_dashboard_rbac:parse_api_role(Role) of
+        {ok, #{?namespace := Ns}} -> Ns;
+        _ -> ?global_ns
+    end.
+
+%% A global caller may create keys in any namespace (including global); a
+%% namespaced caller may only create keys in its own namespace.
+authorize_target_namespace(?global_ns, _TargetNs) ->
+    ok;
+authorize_target_namespace(CallerNs, CallerNs) ->
+    ok;
+authorize_target_namespace(_CallerNs, _TargetNs) ->
+    {error, forbidden, <<"You may only manage API keys within your own namespace">>}.
+
+%% A global caller sees every key; a namespaced caller sees only keys in its
+%% own namespace. `KeyApp' is a formatted-or-raw map carrying a `namespace' key.
+namespace_accessible(?global_ns, _KeyApp) ->
+    true;
+namespace_accessible(CallerNs, #{namespace := CallerNs}) ->
+    true;
+namespace_accessible(_CallerNs, _KeyApp) ->
+    false.
+
+%% Read a key only if it is visible to the caller's namespace. A key in a
+%% different namespace is reported as `not_found' so its existence is not
+%% leaked to a namespaced administrator.
+read_in_namespace(CallerNs, Name) ->
+    case emqx_mgmt_auth:read(Name) of
+        {ok, App} ->
+            case namespace_accessible(CallerNs, App) of
+                true -> {ok, App};
+                false -> {error, not_found}
+            end;
+        {error, not_found} ->
+            {error, not_found}
+    end.
+
+api_key_scopes(get, _) ->
+    Scopes = [resolve_scope_desc(S) || S <- emqx_scope_catalog:scope_catalog()],
+    {200, #{
+        scopes => Scopes
+    }}.
+
+resolve_scope_desc(#{desc := Desc} = Scope) ->
+    Scope#{desc => emqx_dashboard_swagger:get_i18n(<<"desc">>, Desc, <<>>, #{})}.
+
+%% Four-layer schema validation, returning the FIRST error encountered.
+%% Layers 1-3 run against `EffectiveScopes' (the materialised list —
+%% request body when supplied, otherwise role default / persisted
+%% scopes). Layer 4 (the privilege-scope mutex) runs against
+%% `RawScopes' — the value the client actually sent — so that an
+%% omitted scope list (which materialises to the administrator role
+%% default, itself a mix of privilege and non-privilege scopes) is
+%% treated as the unrestricted case rather than an explicit mixed list.
+validate_scopes(Role, RawScopes, EffectiveScopes) ->
+    case validate_publisher_scopes(Role, EffectiveScopes) of
+        ok ->
+            case validate_no_login_only_scopes(EffectiveScopes) of
+                ok ->
+                    case validate_scopes_in_catalog(EffectiveScopes) of
+                        ok -> emqx_scope_catalog:check_privilege_scope_mutex(RawScopes);
+                        Error -> Error
+                    end;
+                Error ->
+                    Error
+            end;
+        Error ->
+            Error
+    end.
+
+%% Layer 1: publisher role can only hold the `publish' scope (or an
+%% empty / absent scope list, which falls back to RBAC `?ROLE_API_PUBLISHER'
+%% hardcoded path matching). Defense-in-depth — the runtime path check
+%% in emqx_dashboard_rbac already restricts publishers to /publish and
+%% /publish/bulk; this validator prevents misconfiguration where an
+%% operator assigns a meaningless scope list to a publisher key.
+validate_publisher_scopes(?ROLE_API_PUBLISHER, undefined) ->
+    ok;
+validate_publisher_scopes(?ROLE_API_PUBLISHER, []) ->
+    ok;
+validate_publisher_scopes(?ROLE_API_PUBLISHER, [?SCOPE_PUBLISH]) ->
+    ok;
+validate_publisher_scopes(?ROLE_API_PUBLISHER, _Other) ->
+    {error, <<"Publisher API keys can only hold the 'publish' scope">>};
+validate_publisher_scopes(_OtherRole, _Scopes) ->
+    ok.
+
+%% Layer 2: API keys (regardless of role) must not hold login-only
+%% scopes. These four scopes are reserved for dashboard login users.
+validate_no_login_only_scopes(undefined) ->
+    ok;
+validate_no_login_only_scopes(Scopes) when is_list(Scopes) ->
+    case [S || S <- Scopes, lists:member(S, ?LOGIN_ONLY_SCOPES)] of
+        [] ->
+            ok;
+        Conflicts ->
+            Names = lists:join(<<", ">>, Conflicts),
+            Msg = iolist_to_binary([
+                <<"API keys cannot hold login-only scopes: ">>, Names
+            ]),
+            {error, Msg}
+    end;
+validate_no_login_only_scopes(_) ->
+    ok.
+
+%% Layer 3: scope names must exist in the catalog (unknown name -> 400).
+validate_scopes_in_catalog(undefined) ->
+    ok;
+validate_scopes_in_catalog(Scopes) when is_list(Scopes) ->
+    emqx_mgmt_api_key_scopes:validate_scopes(Scopes);
+validate_scopes_in_catalog(_) ->
+    {error, <<"scopes must be a list of strings">>}.
+
+app_extend_fields() ->
+    [
+        {role,
+            hoconsc:mk(binary(), #{
+                desc => ?DESC(role),
+                %% No `default' on purpose: a declared default is filled into the request
+                %% body before the handler sees it, so an omitted `role' on `PUT' would
+                %% silently reassign (and potentially escalate) the key's role. The
+                %% create path's default is supplied by `fields(app_create)'.
+                required => false,
+                example => ?ROLE_API_DEFAULT,
+                validator => fun(Role) ->
+                    maybe
+                        {ok, _} ?= emqx_dashboard_rbac:parse_api_role(Role),
+                        ok
+                    end
+                end
+            })},
+        {namespace,
+            hoconsc:mk(binary(), #{
+                desc => ?DESC(namespace_field),
+                required => false,
+                example => <<"ns1">>
+            })}
+    ].

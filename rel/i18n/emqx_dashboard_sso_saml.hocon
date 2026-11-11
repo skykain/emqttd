@@ -1,0 +1,43 @@
+emqx_dashboard_sso_saml {
+
+dashboard_addr.desc:
+"""The address of the EMQX Dashboard."""
+dashboard_addr.label:
+"""Dashboard Address"""
+
+idp_metadata_url.desc:
+"""The URL of the IdP metadata."""
+idp_metadata_url.label:
+"""IdP Metadata URL"""
+
+sign_request.desc:
+"""Whether to sign the SAML request."""
+sign_request.label:
+"""Sign SAML Request"""
+
+sp_public_key.desc:
+"""The public key of the SP."""
+sp_public_key.label:
+"""SP Public Key"""
+
+sp_private_key.desc:
+"""The private key of the SP."""
+sp_private_key.label:
+"""SP Private Key"""
+
+idp_signs_envelopes.desc:
+"""Whether to require IDP to sign SAML Response envelopes (outer signature). Defaults to `true` in all security profiles. To disable signature verification entirely, set this and `idp_signs_assertions` both to `false`; this is insecure and should only be used for testing."""
+idp_signs_envelopes.label:
+"""Require Signed Response Envelopes from IDP"""
+
+idp_signs_assertions.desc:
+"""Whether to require IDP to sign SAML Assertions (inner signature). Defaults to `true` in all security profiles. To disable signature verification entirely, set this and `idp_signs_envelopes` both to `false`; this is insecure and should only be used for testing."""
+idp_signs_assertions.label:
+"""Require Signed Assertions from IDP"""
+
+skip_login_cookie_check.desc:
+"""Enable at your own risk. When `true`, EMQX does not check the login cookie at the assertion consumer service, so a login is no longer bound to the browser that started it. Enable it only when browsers cannot keep that cookie and SSO login fails, for example when `dashboard_addr` uses plain HTTP. Defaults to `false`."""
+skip_login_cookie_check.label:
+"""Skip Login Cookie Check (Insecure)"""
+
+}

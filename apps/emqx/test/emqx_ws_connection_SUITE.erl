@@ -1,0 +1,1456 @@
+%%--------------------------------------------------------------------
+%% Copyright (c) 2019-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
+%%--------------------------------------------------------------------
+
+-module(emqx_ws_connection_SUITE).
+
+-include_lib("emqx/include/emqx.hrl").
+-include_lib("emqx/include/emqx_mqtt.hrl").
+-include_lib("emqx/include/asserts.hrl").
+-include_lib("eunit/include/eunit.hrl").
+-include_lib("common_test/include/ct.hrl").
+
+-compile(export_all).
+-compile(nowarn_export_all).
+
+-define(ws_conn, emqx_ws_connection).
+
+-define(SMALL_MAX_PACKET_SIZE, 1024).
+%% The limit cowboy gets when `websocket.max_frame_size' is `infinity'.
+-define(DERIVED_MAX_FRAME_SIZE, 2 * (?SMALL_MAX_PACKET_SIZE + 5)).
+%% Cases that set the default zone's `max_packet_size' to ?SMALL_MAX_PACKET_SIZE
+%% and count the handler calls of real `ws:default' listener connections.
+-define(IS_FRAME_SIZE_CASE(TC),
+    (TC =:= t_ws_max_frame_size_derived orelse
+        TC =:= t_ws_max_frame_size_boundary orelse
+        TC =:= t_ws_max_frame_size_fragmented orelse
+        TC =:= t_ws_max_frame_size_compressed orelse
+        TC =:= t_ws_max_frame_size_compressed_segmented orelse
+        TC =:= t_ws_max_frame_size_compressed_segmented_ok orelse
+        TC =:= t_ws_max_frame_size_explicit orelse
+        TC =:= t_ws_zone_changed_sets_max_frame_size)
+).
+
+all() -> emqx_common_test_helpers:all(?MODULE).
+
+%%--------------------------------------------------------------------
+%% CT callbacks
+%%--------------------------------------------------------------------
+
+init_per_suite(Config) ->
+    Apps = emqx_cth_suite:start(
+        [emqx],
+        #{work_dir => emqx_cth_suite:work_dir(Config)}
+    ),
+    ok = emqx_limiter:create_listener_limiters('ws:default', #{}),
+    [{apps, Apps} | Config].
+
+end_per_suite(Config) ->
+    ok = emqx_cth_suite:stop(?config(apps, Config)).
+
+init_per_testcase(TestCase, Config) when ?IS_FRAME_SIZE_CASE(TestCase) ->
+    {ok, _} = application:ensure_all_started(gun),
+    MaxPacketSize = emqx_config:get_zone_conf(default, [mqtt, max_packet_size]),
+    emqx_config:put_zone_conf(default, [mqtt, max_packet_size], ?SMALL_MAX_PACKET_SIZE),
+    ok = meck:new(?ws_conn, [passthrough, no_link]),
+    [{max_packet_size, MaxPacketSize} | Config];
+init_per_testcase(TestCase, Config) when
+    TestCase =/= t_ws_sub_protocols_mqtt_equivalents,
+    TestCase =/= t_ws_sub_protocols_mqtt,
+    TestCase =/= t_ws_malformed_subprotocol_header,
+    TestCase =/= t_ws_check_origin,
+    TestCase =/= t_ws_pingreq_before_connected,
+    TestCase =/= t_ws_non_check_origin,
+    TestCase =/= t_header,
+    TestCase =/= t_header_source_not_allowed,
+    TestCase =/= t_header_ipv6_source_allowed,
+    TestCase =/= t_header_ipv6_source_ipv4_only_allow,
+    TestCase =/= t_header_ipv6_source_default_allow,
+    TestCase =/= t_header_empty_allow_list,
+    TestCase =/= t_header_multi_hop,
+    TestCase =/= t_header_all_entries_trusted,
+    TestCase =/= t_header_unparseable_entry,
+    TestCase =/= t_header_mixed_family_ipv4_only_allow,
+    TestCase =/= t_header_proxy_disabled_by_empty_name
+->
+    %% Mock cowboy_req
+    ok = meck:new(cowboy_req, [passthrough, no_history, no_link]),
+    ok = meck:expect(cowboy_req, header, fun(_, _, _) -> <<>> end),
+    ok = meck:expect(cowboy_req, peer, fun(_) -> {{127, 0, 0, 1}, 3456} end),
+    ok = meck:expect(cowboy_req, sock, fun(_) -> {{127, 0, 0, 1}, 18083} end),
+    ok = meck:expect(cowboy_req, cert, fun(_) -> undefined end),
+    ok = meck:expect(cowboy_req, parse_cookies, fun(_) -> error(badarg) end),
+    Config;
+init_per_testcase(t_ws_non_check_origin, Config) ->
+    emqx_config:put_listener_conf(ws, default, [websocket, check_origin_enable], false),
+    emqx_config:put_listener_conf(ws, default, [websocket, check_origins], []),
+    Config;
+init_per_testcase(_TestCase, Config) ->
+    Config.
+
+end_per_testcase(TestCase, Config) when ?IS_FRAME_SIZE_CASE(TestCase) ->
+    meck:unload(?ws_conn),
+    MaxPacketSize = ?config(max_packet_size, Config),
+    emqx_config:put_zone_conf(default, [mqtt, max_packet_size], MaxPacketSize),
+    set_ws_opts(max_frame_size, infinity),
+    set_ws_opts(compress, false),
+    ok;
+end_per_testcase(TestCase, _Config) when
+    TestCase =/= t_ws_sub_protocols_mqtt_equivalents,
+    TestCase =/= t_ws_sub_protocols_mqtt,
+    TestCase =/= t_ws_malformed_subprotocol_header,
+    TestCase =/= t_ws_check_origin,
+    TestCase =/= t_ws_non_check_origin,
+    TestCase =/= t_ws_pingreq_before_connected,
+    TestCase =/= t_header,
+    TestCase =/= t_header_source_not_allowed,
+    TestCase =/= t_header_ipv6_source_allowed,
+    TestCase =/= t_header_ipv6_source_ipv4_only_allow,
+    TestCase =/= t_header_ipv6_source_default_allow,
+    TestCase =/= t_header_empty_allow_list,
+    TestCase =/= t_header_multi_hop,
+    TestCase =/= t_header_all_entries_trusted,
+    TestCase =/= t_header_unparseable_entry,
+    TestCase =/= t_header_mixed_family_ipv4_only_allow,
+    TestCase =/= t_header_proxy_disabled_by_empty_name
+->
+    meck:unload([cowboy_req]);
+end_per_testcase(_, Config) ->
+    Config.
+
+%%--------------------------------------------------------------------
+%% Test Cases
+%%--------------------------------------------------------------------
+
+t_info(_) ->
+    WsPid = spawn(fun() ->
+        receive
+            {call, From, info} ->
+                gen_server:reply(From, ?ws_conn:info(st()))
+        end
+    end),
+    #{conninfo := ConnInfo} = ?ws_conn:call(WsPid, info),
+    #{
+        socktype := ws,
+        peername := {{127, 0, 0, 1}, 3456},
+        sockname := {{127, 0, 0, 1}, 18083}
+    } = ConnInfo,
+    %% `sockstate' is not part of the channel info map; it is read from the
+    %% connection state.
+    ?assertEqual(running, ?ws_conn:info(sockstate, st())).
+
+set_ws_opts(Key, Val) ->
+    emqx_config:put_listener_conf(ws, default, [websocket, Key], Val).
+
+set_header_test_ws_opts(ProxyAddressAllow) ->
+    set_ws_opts(fail_if_no_subprotocol, false),
+    set_ws_opts(proxy_address_header, <<"x-forwarded-for">>),
+    set_ws_opts(proxy_port_header, <<"x-forwarded-port">>),
+    set_ws_opts(proxy_address_allow, [
+        esockd_cidr:parse(CIDR, true)
+     || CIDR <- ProxyAddressAllow
+    ]).
+
+%% the schema default of proxy_address_allow
+default_proxy_address_allow() ->
+    [esockd_cidr:parse(CIDR, true) || CIDR <- ["0.0.0.0/0", "::/0"]].
+
+ws_conn_info(Peer, Headers) ->
+    {_Module, _Req, [ConnInfo, _], _ModOpts} = ?ws_conn:init(
+        #{
+            peer => Peer,
+            sock => {{127, 0, 0, 1}, 54321},
+            cert => undefined,
+            headers => Headers
+        },
+        #{
+            zone => default,
+            listener => {ws, default}
+        }
+    ),
+    ConnInfo.
+
+-doc "Under the default allow list, forwarded headers are honored and the leftmost entry is used.".
+t_header(_) ->
+    set_header_test_ws_opts(["0.0.0.0/0", "::/0"]),
+    ConnInfo = ws_conn_info(
+        {{127, 0, 0, 1}, 3456},
+        #{
+            <<"x-forwarded-for">> => <<"100.100.100.100, 99.99.99.99">>,
+            <<"x-forwarded-port">> => <<"1000">>
+        }
+    ),
+    ?assertMatch(
+        #{
+            socktype := ws,
+            peername := {{100, 100, 100, 100}, 1000}
+        },
+        ConnInfo
+    ).
+
+-doc "Forwarded headers are ignored for a source outside the allow list.".
+t_header_source_not_allowed(_) ->
+    set_header_test_ws_opts(["10.0.0.0/8"]),
+    ConnInfo = ws_conn_info(
+        {{127, 0, 0, 1}, 3456},
+        #{
+            <<"x-forwarded-for">> => <<"100.100.100.100">>,
+            <<"x-forwarded-port">> => <<"1000">>
+        }
+    ),
+    ?assertMatch(
+        #{
+            socktype := ws,
+            peername := {{127, 0, 0, 1}, 3456}
+        },
+        ConnInfo
+    ),
+    set_ws_opts(proxy_address_allow, default_proxy_address_allow()).
+
+-doc "Forwarded headers are honored for an IPv6 source within an IPv6 allow range.".
+t_header_ipv6_source_allowed(_) ->
+    set_header_test_ws_opts(["2001:db8::/32"]),
+    ConnInfo = ws_conn_info(
+        {{16#2001, 16#db8, 0, 0, 0, 0, 0, 1}, 3456},
+        #{
+            <<"x-forwarded-for">> => <<"2001:db8::ff">>,
+            <<"x-forwarded-port">> => <<"1000">>
+        }
+    ),
+    ?assertMatch(
+        #{
+            socktype := ws,
+            peername := {{16#2001, 16#db8, 0, 0, 0, 0, 0, 16#ff}, 1000}
+        },
+        ConnInfo
+    ),
+    set_ws_opts(proxy_address_allow, default_proxy_address_allow()).
+
+-doc """
+In a multi-entry header, entries are scanned right to left and entries
+within the allow list (intermediate proxies) are skipped; the first entry
+outside the list is used as the client address.
+""".
+t_header_multi_hop(_) ->
+    set_header_test_ws_opts(["10.0.0.0/8"]),
+    ConnInfo = ws_conn_info(
+        {{10, 0, 0, 1}, 3456},
+        #{
+            <<"x-forwarded-for">> => <<"9.9.9.9, 192.168.1.7, 10.0.0.5">>,
+            <<"x-forwarded-port">> => <<"1000">>
+        }
+    ),
+    ?assertMatch(
+        #{
+            socktype := ws,
+            peername := {{192, 168, 1, 7}, 1000}
+        },
+        ConnInfo
+    ),
+    set_ws_opts(proxy_address_allow, default_proxy_address_allow()).
+
+-doc "When every header entry is within the allow list, the leftmost entry is used.".
+t_header_all_entries_trusted(_) ->
+    set_header_test_ws_opts(["10.0.0.0/8"]),
+    ConnInfo = ws_conn_info(
+        {{10, 0, 0, 1}, 3456},
+        #{
+            <<"x-forwarded-for">> => <<"10.1.1.1, 10.2.2.2">>,
+            <<"x-forwarded-port">> => <<"1000">>
+        }
+    ),
+    ?assertMatch(
+        #{
+            socktype := ws,
+            peername := {{10, 1, 1, 1}, 1000}
+        },
+        ConnInfo
+    ),
+    set_ws_opts(proxy_address_allow, default_proxy_address_allow()).
+
+-doc "A selected header entry that does not parse as an IP address falls back to the socket source address.".
+t_header_unparseable_entry(_) ->
+    set_header_test_ws_opts(["10.0.0.0/8"]),
+    ConnInfo = ws_conn_info(
+        {{10, 0, 0, 1}, 3456},
+        #{<<"x-forwarded-for">> => <<"garbage, 10.0.0.5">>}
+    ),
+    ?assertMatch(
+        #{
+            socktype := ws,
+            peername := {{10, 0, 0, 1}, 3456}
+        },
+        ConnInfo
+    ),
+    set_ws_opts(proxy_address_allow, default_proxy_address_allow()).
+
+-doc """
+Under an IPv4-only allow list, an IPv6 entry in the header is
+outside the list and is therefore selected as the client address.
+""".
+t_header_mixed_family_ipv4_only_allow(_) ->
+    set_header_test_ws_opts(["0.0.0.0/0"]),
+    ConnInfo = ws_conn_info(
+        {{127, 0, 0, 1}, 3456},
+        #{
+            <<"x-forwarded-for">> => <<"100.100.100.100, 2001:db8::1">>,
+            <<"x-forwarded-port">> => <<"1000">>
+        }
+    ),
+    ?assertMatch(
+        #{
+            socktype := ws,
+            peername := {{16#2001, 16#db8, 0, 0, 0, 0, 0, 1}, 1000}
+        },
+        ConnInfo
+    ),
+    set_ws_opts(proxy_address_allow, default_proxy_address_allow()).
+
+-doc "An IPv4-only allow list does not cover IPv6 sources, so forwarded headers are ignored for an IPv6 source.".
+t_header_ipv6_source_ipv4_only_allow(_) ->
+    set_header_test_ws_opts(["0.0.0.0/0"]),
+    ConnInfo = ws_conn_info(
+        {{16#2001, 16#db8, 0, 0, 0, 0, 0, 1}, 3456},
+        #{
+            <<"x-forwarded-for">> => <<"100.100.100.100">>,
+            <<"x-forwarded-port">> => <<"1000">>
+        }
+    ),
+    ?assertMatch(
+        #{
+            socktype := ws,
+            peername := {{16#2001, 16#db8, 0, 0, 0, 0, 0, 1}, 3456}
+        },
+        ConnInfo
+    ),
+    set_ws_opts(proxy_address_allow, default_proxy_address_allow()).
+
+-doc "Under the default allow list, forwarded headers are honored for IPv6 sources as well.".
+t_header_ipv6_source_default_allow(_) ->
+    set_header_test_ws_opts(["0.0.0.0/0", "::/0"]),
+    ConnInfo = ws_conn_info(
+        {{16#2001, 16#db8, 0, 0, 0, 0, 0, 1}, 3456},
+        #{
+            <<"x-forwarded-for">> => <<"100.100.100.100">>,
+            <<"x-forwarded-port">> => <<"1000">>
+        }
+    ),
+    ?assertMatch(
+        #{
+            socktype := ws,
+            peername := {{100, 100, 100, 100}, 1000}
+        },
+        ConnInfo
+    ).
+
+-doc "With an empty allow list, forwarded headers are ignored for every source.".
+t_header_empty_allow_list(_) ->
+    set_header_test_ws_opts([]),
+    Headers = #{
+        <<"x-forwarded-for">> => <<"100.100.100.100">>,
+        <<"x-forwarded-port">> => <<"1000">>
+    },
+    Ipv4Peer = {{127, 0, 0, 1}, 3456},
+    Ipv6Peer = {{16#2001, 16#db8, 0, 0, 0, 0, 0, 1}, 3456},
+    ?assertMatch(
+        #{
+            socktype := ws,
+            peername := Ipv4Peer
+        },
+        ws_conn_info(Ipv4Peer, Headers)
+    ),
+    ?assertMatch(
+        #{
+            socktype := ws,
+            peername := Ipv6Peer
+        },
+        ws_conn_info(Ipv6Peer, Headers)
+    ),
+    set_ws_opts(proxy_address_allow, default_proxy_address_allow()).
+
+-doc """
+Empty `proxy_address_header`/`proxy_port_header` means forwarded headers are
+never consulted; `peername` is the socket peer.
+""".
+t_header_proxy_disabled_by_empty_name(_) ->
+    set_ws_opts(fail_if_no_subprotocol, false),
+    set_ws_opts(proxy_address_header, <<"">>),
+    set_ws_opts(proxy_port_header, <<"">>),
+    ConnInfo = ws_conn_info(
+        {{127, 0, 0, 1}, 3456},
+        #{
+            <<"x-forwarded-for">> => <<"100.100.100.100, 99.99.99.99">>,
+            <<"x-forwarded-port">> => <<"1000">>
+        }
+    ),
+    ?assertMatch(
+        #{
+            socktype := ws,
+            peername := {{127, 0, 0, 1}, 3456}
+        },
+        ConnInfo
+    ).
+
+t_info_channel(_) ->
+    #{conn_state := connected} = ?ws_conn:info(channel, st()).
+
+t_info_gc_state(_) ->
+    GcSt = emqx_gc:init(#{count => 10, bytes => 1000}),
+    GcInfo = ?ws_conn:info(gc_state, st(#{gc_state => GcSt})),
+    ?assertEqual(#{cnt => {10, 10}, oct => {1000, 1000}}, GcInfo).
+
+t_stats(_) ->
+    WsPid = spawn(fun() ->
+        receive
+            {call, From, stats} ->
+                gen_server:reply(From, ?ws_conn:stats(st()))
+        end
+    end),
+    Stats = ?ws_conn:call(WsPid, stats),
+    [
+        ?assert(lists:member(V, Stats))
+     || V <-
+            [
+                {recv_oct, 0},
+                {send_oct, 0},
+                {recv_pkt, 0},
+                {recv_msg, 0},
+                {send_pkt, 0},
+                {send_msg, 0}
+            ]
+    ].
+
+t_call(_) ->
+    Info = ?ws_conn:info(st()),
+    WsPid = spawn(fun() ->
+        receive
+            {call, From, info} -> gen_server:reply(From, Info)
+        end
+    end),
+    ?assertEqual(Info, ?ws_conn:call(WsPid, info)).
+
+t_ws_pingreq_before_connected(_) ->
+    {ok, _} = application:ensure_all_started(gun),
+    {ok, WPID} = gun:open("127.0.0.1", 8083),
+    ws_pingreq(#{}),
+    gun:close(WPID).
+
+ws_pingreq(State) ->
+    receive
+        {gun_up, WPID, _Proto} ->
+            StreamRef = gun:ws_upgrade(WPID, "/mqtt", [], #{
+                protocols => [{<<"mqtt">>, gun_ws_h}]
+            }),
+            ws_pingreq(State#{wref => StreamRef});
+        {gun_down, _WPID, _, Reason, _} ->
+            State#{result => {gun_down, Reason}};
+        {gun_upgrade, WPID, Ref, _Proto, _Data} ->
+            ct:pal("-- gun_upgrade, send ping-req"),
+            PingReq = {binary, <<192, 0>>},
+            ok = gun:ws_send(WPID, Ref, PingReq),
+            gun:flush(WPID),
+            ws_pingreq(State);
+        {gun_ws, _WPID, _Ref, {binary, <<208, 0>>}} ->
+            ct:fail(unexpected_pingresp);
+        {gun_ws, _WPID, _Ref, Frame} ->
+            ct:pal("gun received frame: ~p", [Frame]),
+            ws_pingreq(State);
+        Message ->
+            ct:pal("Received Unknown Message on Gun: ~p~n", [Message]),
+            ws_pingreq(State)
+    after 1000 ->
+        ct:fail(ws_timeout)
+    end.
+
+t_ws_sub_protocols_mqtt(_) ->
+    {ok, _} = application:ensure_all_started(gun),
+    ?assertMatch(
+        {gun_upgrade, _},
+        start_ws_client(#{protocols => [<<"mqtt">>]})
+    ).
+
+t_ws_sub_protocols_mqtt_equivalents(_) ->
+    {ok, _} = application:ensure_all_started(gun),
+    %% also support mqtt-v3, mqtt-v3.1.1, mqtt-v5
+    ?assertMatch(
+        {gun_upgrade, _},
+        start_ws_client(#{protocols => [<<"mqtt-v3">>]})
+    ),
+    ?assertMatch(
+        {gun_upgrade, _},
+        start_ws_client(#{protocols => [<<"mqtt-v3.1.1">>]})
+    ),
+    ?assertMatch(
+        {gun_upgrade, _},
+        start_ws_client(#{protocols => [<<"mqtt-v5">>]})
+    ),
+    ?assertMatch(
+        {gun_response, {_, 400, _}},
+        start_ws_client(#{protocols => [<<"not-mqtt">>]})
+    ).
+
+t_ws_malformed_subprotocol_header(_) ->
+    OldFailIfNoSubprotocol = emqx_config:get_listener_conf(
+        ws,
+        default,
+        [websocket, fail_if_no_subprotocol]
+    ),
+    try
+        set_ws_opts(fail_if_no_subprotocol, true),
+
+        %% A `Sec-WebSocket-Protocol' value Cowboy cannot parse is treated as
+        %% absent: the request is answered with a 400 reply and the request
+        %% process does not crash.
+        Reports = emqx_cth_log_capture:capture(error, fun() ->
+            {ok, Socket} = gen_tcp:connect(
+                "127.0.0.1",
+                8083,
+                [binary, {active, false}]
+            ),
+            try
+                ok = gen_tcp:send(Socket, [
+                    "GET /mqtt HTTP/1.1\r\n"
+                    "Host: 127.0.0.1:8083\r\n"
+                    "Upgrade: websocket\r\n"
+                    "Connection: Upgrade\r\n"
+                    "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+                    "Sec-WebSocket-Version: 13\r\n"
+                    "Sec-WebSocket-Protocol: @@@\r\n"
+                    "\r\n"
+                ]),
+                {ok, StatusLine} = recv_http_status_line(Socket, <<>>),
+                ?assertMatch(<<"HTTP/1.1 400", _/binary>>, StatusLine)
+            after
+                gen_tcp:close(Socket)
+            end
+        end),
+
+        ?assertEqual(
+            [],
+            [R || #{label := {proc_lib, crash}} = R <- Reports],
+            #{expected => no_crash_report}
+        )
+    after
+        set_ws_opts(fail_if_no_subprotocol, OldFailIfNoSubprotocol)
+    end.
+
+recv_http_status_line(Socket, Acc) ->
+    case binary:split(Acc, <<"\r\n">>) of
+        [StatusLine, _Rest] ->
+            {ok, StatusLine};
+        [_] ->
+            case gen_tcp:recv(Socket, 0, 5000) of
+                {ok, Data} ->
+                    recv_http_status_line(
+                        Socket,
+                        <<Acc/binary, Data/binary>>
+                    );
+                Error ->
+                    Error
+            end
+    end.
+
+t_ws_check_origin(_) ->
+    emqx_config:put_listener_conf(ws, default, [websocket, check_origin_enable], true),
+    emqx_config:put_listener_conf(
+        ws,
+        default,
+        [websocket, check_origins],
+        [<<"http://localhost:18083">>]
+    ),
+    {ok, _} = application:ensure_all_started(gun),
+    ?assertMatch(
+        {gun_upgrade, _},
+        start_ws_client(#{
+            protocols => [<<"mqtt">>],
+            headers => [{<<"origin">>, <<"http://localhost:18083">>}]
+        })
+    ),
+    ?assertMatch(
+        {gun_response, {_, 403, _}},
+        start_ws_client(#{
+            protocols => [<<"mqtt">>],
+            headers => [{<<"origin">>, <<"http://localhost:18080">>}]
+        })
+    ).
+
+t_ws_non_check_origin(_) ->
+    {ok, _} = application:ensure_all_started(gun),
+    ?assertMatch(
+        {gun_upgrade, _},
+        start_ws_client(#{
+            protocols => [<<"mqtt">>],
+            headers => [{<<"origin">>, <<"http://localhost:18083">>}]
+        })
+    ),
+    ?assertMatch(
+        {gun_upgrade, _},
+        start_ws_client(#{
+            protocols => [<<"mqtt">>],
+            headers => [{<<"origin">>, <<"http://localhost:18080">>}]
+        })
+    ).
+
+t_websocket_handle_binary(_) ->
+    {ok, _} = ?ws_conn:websocket_handle({binary, <<>>}, st()),
+    {ok, _} = ?ws_conn:websocket_handle({binary, [<<>>]}, st()),
+    {[{binary, Frame}], _} = ?ws_conn:websocket_handle({binary, <<192, 0>>}, st_after_connect()),
+    ?assertEqual(
+        iolist_to_binary(Frame),
+        iolist_to_binary(emqx_frame:serialize(?PACKET(?PINGRESP)))
+    ).
+
+t_websocket_handle_packet_order(_) ->
+    Publishes = [
+        ?PUBLISH_PACKET(?QOS_1, <<"t/q1">>, 1, <<"P1">>),
+        ?PUBLISH_PACKET(?QOS_2, <<"t/q2">>, 2, <<"P2">>)
+    ],
+    <<Frag1:2/bytes, Frag2/bytes>> =
+        iolist_to_binary([emqx_frame:serialize(P, ?MQTT_PROTO_V5) || P <- Publishes]),
+    {ok, St1} = ?ws_conn:websocket_handle({binary, Frag1}, st_after_connect()),
+    {[{binary, Frame1}, {binary, Frame2}], _} = ?ws_conn:websocket_handle({binary, Frag2}, St1),
+    ?assertEqual(
+        iolist_to_binary(Frame1),
+        iolist_to_binary(emqx_frame:serialize(?PUBACK_PACKET(1)))
+    ),
+    ?assertEqual(
+        iolist_to_binary(Frame2),
+        iolist_to_binary(emqx_frame:serialize(?PUBREC_PACKET(2)))
+    ).
+
+%% The first frame marks the connection as active, which arms the hibernate
+%% timer. The frames themselves are ignored, so handling another one leaves the
+%% state as it is.
+t_websocket_handle_ping(_) ->
+    {ok, St} = ?ws_conn:websocket_handle(ping, st()),
+    ?assertEqual({ok, St}, ?ws_conn:websocket_handle({ping, <<>>}, St)).
+
+t_websocket_handle_pong(_) ->
+    {ok, St} = ?ws_conn:websocket_handle(pong, st()),
+    ?assertEqual({ok, St}, ?ws_conn:websocket_handle({pong, <<>>}, St)).
+
+t_websocket_handle_bad_frame(_) ->
+    {[{shutdown, unexpected_ws_frame}], _St} = ?ws_conn:websocket_handle({badframe, <<>>}, st()).
+
+t_websocket_info_call(_) ->
+    From = {make_ref(), self()},
+    Call = {call, From, badreq},
+    {ok, _St} = ?ws_conn:websocket_info(Call, st()).
+
+t_websocket_info_rate_limit(_) ->
+    St0 = st(),
+    {ok, St1} = ?ws_conn:websocket_info({gc, incoming}, St0),
+    {ok, _St} = ?ws_conn:websocket_info({gc, outgoing}, St1).
+
+t_websocket_info_cast(_) ->
+    {ok, _St} = ?ws_conn:websocket_info({cast, msg}, st()).
+
+t_websocket_incoming(_) ->
+    ok = emqx_broker:subscribe(<<"#">>, <<?MODULE_STRING>>),
+    ConnPkt = #mqtt_packet_connect{
+        proto_name = <<"MQTT">>,
+        proto_ver = ?MQTT_PROTO_V5,
+        is_bridge = false,
+        clean_start = true,
+        keepalive = 60,
+        properties = undefined,
+        clientid = <<"clientid">>,
+        username = <<"username">>,
+        password = <<"passwd">>
+    },
+    {[{binary, IoData1}, {close, <<"protocol_error">>}], St1} =
+        ?ws_conn:handle_incoming([?CONNECT_PACKET(ConnPkt)], st()),
+    ?assertEqual(<<224, 2, ?RC_PROTOCOL_ERROR, 0>>, iolist_to_binary(IoData1)),
+    %% PINGREQ
+    {[{binary, IoData2}], St2} =
+        ?ws_conn:handle_incoming([?PACKET(?PINGREQ)], St1),
+    ?assertEqual(<<208, 0>>, iolist_to_binary(IoData2)),
+    %% PUBLISH with property
+    Publish = ?PUBLISH_PACKET(
+        ?QOS_1, <<"t">>, 1, #{'User-Property' => [{<<"k">>, <<"v">>}]}, <<"payload">>
+    ),
+    {[{binary, IoData3}], St3} = ?ws_conn:handle_incoming([Publish], St2),
+    ?assertEqual(<<64, 4, 0, 1, 0, 0>>, iolist_to_binary(IoData3)),
+    %% frame_error
+    FrameError = {frame_error, #{cause => invalid_property_code, property_code => 16#2B}},
+    %% cowboy_websocket's close reason must be an atom to avoid crashing the sender process.
+    %% ensure the cause is atom
+    {[{binary, IoData4}, {close, CauseReq}], _St4} =
+        ?ws_conn:handle_incoming([FrameError], St3),
+    ?assertEqual(<<224, 2, ?RC_MALFORMED_PACKET, 0>>, iolist_to_binary(IoData4)),
+    ?assertEqual(<<"frame_error">>, CauseReq).
+
+-doc """
+The packet counts of the connection trigger the GC: the first packet in and
+out each sends a `gc` message, and after the GC the next trigger waits for
+`active_n` more packets.
+""".
+t_websocket_gc_trigger(_) ->
+    Ping = iolist_to_binary(emqx_frame:serialize(?PACKET(?PINGREQ))),
+    {[{binary, _}], St1} = ?ws_conn:websocket_handle({binary, Ping}, st_after_connect()),
+    ?assertReceive({gc, incoming}),
+    ?assertReceive({gc, outgoing}),
+    {ok, St2} = ?ws_conn:websocket_info({gc, incoming}, St1),
+    {ok, St3} = ?ws_conn:websocket_info({gc, outgoing}, St2),
+    {[{binary, _}], _St4} = ?ws_conn:websocket_handle({binary, Ping}, St3),
+    ?assertNotReceive({gc, _}).
+
+t_websocket_info_check_gc(_) ->
+    Stats = #{cnt => 10, oct => 1000},
+    {ok, _St} = ?ws_conn:websocket_info({check_gc, Stats}, st()).
+
+t_websocket_info_deliver(_) ->
+    Msg0 = emqx_message:make(clientid, ?QOS_0, <<"t">>, <<"">>),
+    Msg1 = emqx_message:make(clientid, ?QOS_1, <<"t">>, <<"">>),
+    self() ! {deliver, <<"#">>, Msg1},
+    {[{binary, _Pub1}, {binary, _Pub2}], _St} =
+        ?ws_conn:websocket_info({deliver, <<"#">>, Msg0}, st()).
+
+-doc """
+The connection calls `emqx_channel:hibernate/1` when it returns `hibernate`,
+and `emqx_channel:wakeup/1` once, from the first callback after it.
+""".
+t_websocket_hibernate_wakeup_channel(_) ->
+    ok = meck:new(emqx_channel, [passthrough, no_link]),
+    try
+        TRef = make_ref(),
+        St0 = st(#{hibernate_timer => TRef}),
+        {ok, St1, hibernate} = ?ws_conn:websocket_info({timeout, TRef, hibernate}, St0),
+        ?assertEqual(1, meck:num_calls(emqx_channel, hibernate, '_')),
+        ?assertEqual(0, meck:num_calls(emqx_channel, wakeup, '_')),
+        {ok, St2} = ?ws_conn:websocket_handle(ping, St1),
+        ?assertEqual(1, meck:num_calls(emqx_channel, wakeup, '_')),
+        {ok, _St3} = ?ws_conn:websocket_handle(ping, St2),
+        ?assertEqual(1, meck:num_calls(emqx_channel, wakeup, '_')),
+        {ok, St4, hibernate} = ?ws_conn:websocket_info({timeout, TRef, hibernate}, St0),
+        {ok, _St5} = ?ws_conn:websocket_info({timeout, make_ref(), keepalive}, St4),
+        ?assertEqual(2, meck:num_calls(emqx_channel, wakeup, '_'))
+    after
+        meck:unload(emqx_channel)
+    end.
+
+t_websocket_info_timeout_keepalive(_) ->
+    {ok, _St} = ?ws_conn:websocket_info({timeout, make_ref(), keepalive}, st()).
+
+t_websocket_info_timeout_emit_stats(_) ->
+    Ref = make_ref(),
+    St = st(#{stats_timer => Ref}),
+    {ok, St1} = ?ws_conn:websocket_info({timeout, Ref, emit_stats}, St),
+    ?assertEqual(undefined, ?ws_conn:info(stats_timer, St1)).
+
+t_websocket_info_timeout_retry(_) ->
+    {ok, _St} = ?ws_conn:websocket_info({timeout, make_ref(), retry_delivery}, st()).
+
+t_websocket_info_close(_) ->
+    {[{shutdown, sock_error}], _St} = ?ws_conn:websocket_info({sock_closed, sock_error}, st()).
+
+t_websocket_info_stop(_) ->
+    {[{shutdown, normal}], _St} = ?ws_conn:websocket_info({stop, normal}, st()).
+
+t_websocket_close(_) ->
+    {[{shutdown, badframe}], _St} = ?ws_conn:websocket_close(badframe, st()).
+
+t_handle_channel_connack(_) ->
+    ConnAck = ?CONNACK_PACKET(?RC_SUCCESS),
+    {[{binary, IoData}], _St} =
+        ?ws_conn:handle_replies({connack, ConnAck}, [], st()),
+    ?assertEqual(<<32, 2, 0, 0>>, iolist_to_binary(IoData)).
+
+t_handle_channel_close(_) ->
+    {[{close, _}], _St} = ?ws_conn:handle_replies({close, protocol_error}, [], st()).
+
+t_handle_info_event(_) ->
+    _ = ?ws_conn:handle_event({event, connected}, st()),
+    _ = ?ws_conn:handle_event({event, disconnected}, st()),
+    _ = ?ws_conn:handle_event({event, updated}, st()).
+
+t_handle_timeout_idle_timeout(_) ->
+    TRef = make_ref(),
+    St = st(#{idle_timer => TRef}),
+    {[{shutdown, idle_timeout}], _St} = ?ws_conn:handle_timeout(TRef, idle_timeout, St).
+
+t_handle_timeout_keepalive(_) ->
+    {ok, _St} = ?ws_conn:handle_timeout(make_ref(), keepalive, st()).
+
+t_handle_timeout_emit_stats(_) ->
+    TRef = make_ref(),
+    {ok, St} = ?ws_conn:handle_timeout(
+        TRef, emit_stats, st(#{stats_timer => TRef})
+    ),
+    ?assertEqual(undefined, ?ws_conn:info(stats_timer, St)).
+
+t_parse_incoming(_) ->
+    {Packets, St} = ?ws_conn:parse_incoming(<<48, 3>>, [], st_after_connect()),
+    {Packets1, _} = ?ws_conn:parse_incoming(<<0, 1, 116>>, Packets, St),
+    Packet = ?PUBLISH_PACKET(?QOS_0, <<"t">>, undefined, <<>>),
+    ?assertEqual([Packet], Packets1).
+
+t_parse_incoming_order(_) ->
+    Packet1 = ?PUBLISH_PACKET(?QOS_0, <<"t1">>, undefined, <<>>),
+    Packet2 = ?PUBLISH_PACKET(?QOS_0, <<"t2">>, undefined, <<>>),
+    Bin1 = emqx_frame:serialize(Packet1),
+    Bin2 = emqx_frame:serialize(Packet2),
+    {Packets1, _} = ?ws_conn:parse_incoming(
+        erlang:iolist_to_binary([Bin1, Bin2]), [], st_after_connect()
+    ),
+    ?assertEqual([Packet1, Packet2], Packets1).
+
+%% Complete packets are handled immediately, in order, without waiting for the
+%% trailing partial packet. Resuming it must not replay the preceding packets.
+t_websocket_handle_packet_order_partial(_) ->
+    Packet1 = ?PUBLISH_PACKET(?QOS_1, <<"t1">>, 1, <<>>),
+    Packet2 = ?PUBLISH_PACKET(?QOS_2, <<"t2">>, 2, <<>>),
+    %% A two-byte remaining length exercises incomplete headers as well as bodies.
+    Packet3 = ?PUBLISH_PACKET(?QOS_1, <<"t3">>, 3, binary:copy(<<"x">>, 128)),
+    Bin3 = iolist_to_binary(emqx_frame:serialize(Packet3)),
+    St0 = st_after_connect(),
+    lists:foreach(
+        fun({Name, Split}) ->
+            <<Prefix:Split/bytes, Rest/binary>> = Bin3,
+            Data = iolist_to_binary([
+                emqx_frame:serialize(Packet1), emqx_frame:serialize(Packet2), Prefix
+            ]),
+            {[{binary, Ack1}, {binary, Ack2}], St} =
+                ?ws_conn:websocket_handle({binary, Data}, St0),
+            ?assertEqual(<<64, 2, 0, 1>>, iolist_to_binary(Ack1), Name),
+            ?assertEqual(<<80, 2, 0, 2>>, iolist_to_binary(Ack2), Name),
+            {[{binary, Ack3}], _} = ?ws_conn:websocket_handle({binary, Rest}, St),
+            ?assertEqual(<<64, 2, 0, 3>>, iolist_to_binary(Ack3), Name)
+        end,
+        [
+            {before_remaining_length, 1},
+            {partial_remaining_length, 2},
+            {before_body, 3},
+            {partial_body, byte_size(Bin3) - 1}
+        ]
+    ).
+
+%% Valid packets preceding an oversized one are handled before the connection closes.
+t_websocket_handle_packets_then_frame_too_large(_) ->
+    Invalid = <<16#30, 16#80, 16#10>>,
+    Reason = <<"frame_too_large">>,
+    Code = ?RC_PACKET_TOO_LARGE,
+    St0 = st_after_connect(#{
+        parse_state => emqx_frame:initial_parse_state(#{max_size => 1024}),
+        serialize => emqx_frame:serialize_opts(?MQTT_PROTO_V5, ?MAX_PACKET_SIZE)
+    }),
+    Packets = [
+        ?PUBLISH_PACKET(?QOS_1, <<"t1">>, 1, <<>>),
+        ?PUBLISH_PACKET(?QOS_1, <<"t2">>, 2, <<>>)
+    ],
+    Data = iolist_to_binary([
+        [emqx_frame:serialize(P) || P <- Packets], Invalid
+    ]),
+    {[{binary, Ack1}, {binary, Ack2}, {binary, Disconnect}, {close, Reason}], _} =
+        ?ws_conn:websocket_handle({binary, Data}, St0),
+    ?assertEqual(
+        iolist_to_binary(
+            emqx_frame:serialize(
+                ?PUBACK_PACKET(1, ?RC_NO_MATCHING_SUBSCRIBERS), ?MQTT_PROTO_V5
+            )
+        ),
+        iolist_to_binary(Ack1)
+    ),
+    ?assertEqual(
+        iolist_to_binary(
+            emqx_frame:serialize(
+                ?PUBACK_PACKET(2, ?RC_NO_MATCHING_SUBSCRIBERS), ?MQTT_PROTO_V5
+            )
+        ),
+        iolist_to_binary(Ack2)
+    ),
+    ?assertEqual(<<224, 2, Code, 0>>, iolist_to_binary(Disconnect)).
+
+t_parse_incoming_frame_error(_) ->
+    %% Strict-mode default rejects the reserved/invalid header outright,
+    %% before per-packet parsing has a chance to surface `malformed_packet`.
+    {Packets, _St} = ?ws_conn:parse_incoming(<<3, 2, 1, 0>>, [], st_after_connect()),
+    ?assertMatch(
+        [{frame_error, bad_frame_header}],
+        Packets
+    ).
+
+-doc """
+A non-CONNECT first packet is rejected from its fixed header, before the
+announced body is buffered.
+""".
+t_parse_incoming_before_connect(_) ->
+    %% PUBLISH fixed header announcing a 268435455 byte body.
+    Publish = <<(?PUBLISH bsl 4), 16#FF, 16#FF, 16#FF, 16#7F>>,
+    St0 = st(#{channel => channel(#{conn_state => idle})}),
+    {Packets, _St} = ?ws_conn:parse_incoming(Publish, [], St0),
+    ?assertMatch(
+        [{frame_error, #{cause := unexpected_packet_before_connect, header_type := 'PUBLISH'}}],
+        Packets
+    ).
+
+t_parse_incoming_fragment_then_bad_subqos_idle(_) ->
+    %% Feed an invalid SUBSCRIBE in two chunks while channel is idle.
+    %% This exercises frame parsing after parser state has already advanced.
+    St0 = st_after_connect(#{channel => channel(#{conn_state => idle})}),
+    Frag1 = <<16#82, 16#06, 16#00>>,
+    Frag2 = <<16#01, 16#00, 16#01, $t, 16#03>>,
+    {Packets1, St1} = ?ws_conn:parse_incoming(Frag1, [], St0),
+    ?assertEqual([], Packets1),
+    {Packets2, St2} = ?ws_conn:parse_incoming(Frag2, Packets1, St1),
+    ?assertMatch([{frame_error, bad_subqos}], Packets2),
+    {[{shutdown, #{shutdown_count := bad_subqos, reason := bad_subqos}}], _St3} =
+        ?ws_conn:handle_incoming(Packets2, St2).
+
+t_handle_incomming_frame_error(_) ->
+    FrameError = {frame_error, bad_qos},
+    Serialize = #{version => 5, max_size => 16#FFFF},
+    {[{binary, IoData}, {close, <<"bad_qos">>}], _St} =
+        ?ws_conn:handle_incoming([FrameError], st(#{serialize => Serialize})),
+    ?assertEqual(<<224, 2, 129, 0>>, iolist_to_binary(IoData)).
+
+t_handle_outgoing(_) ->
+    Packets = [
+        ?PUBLISH_PACKET(?QOS_1, <<"t1">>, 1, <<"payload">>),
+        ?PUBLISH_PACKET(?QOS_2, <<"t2">>, 2, <<"payload">>)
+    ],
+    [{binary, IoData1}, {binary, IoData2}] = ?ws_conn:handle_outgoing(Packets, st()),
+    ?assert(is_binary(iolist_to_binary(IoData1))),
+    ?assert(is_binary(iolist_to_binary(IoData2))).
+
+t_run_gc(_) ->
+    GcSt = emqx_gc:init(#{count => 10, bytes => 100}),
+    WsSt = st(#{gc_state => GcSt}),
+    ?ws_conn:run_gc({100, 10000}, WsSt).
+
+-doc """
+With `websocket.max_frame_size = infinity`, the listener limits a WebSocket
+message to twice the zone's `max_packet_size`. A message of exactly that size
+reaches the connection handler. A message one byte larger closes the
+connection with status code 1009, and the handler never sees it.
+""".
+t_ws_max_frame_size_derived(_) ->
+    Limit = ?DERIVED_MAX_FRAME_SIZE,
+    AtLimit = binary:copy(<<0>>, Limit),
+    Ws1 = ws_open(#{}),
+    ok = ws_send(Ws1, {binary, AtLimit}),
+    ok = meck:wait(?ws_conn, websocket_handle, [{binary, AtLimit}, '_'], 5000),
+    ws_close(Ws1),
+    OverLimit = binary:copy(<<0>>, Limit + 1),
+    Ws2 = ws_open(#{}),
+    ok = ws_send(Ws2, {binary, OverLimit}),
+    ?assertEqual(1009, ws_await_close(Ws2)),
+    ?assertNot(meck:called(?ws_conn, websocket_handle, [{binary, OverLimit}, '_'])),
+    ws_close(Ws2).
+
+-doc """
+A PUBLISH packet whose remaining length equals the zone's `max_packet_size`
+is accepted over WebSocket, as it is over TCP.
+""".
+t_ws_max_frame_size_boundary(_) ->
+    Ws = ws_open(#{}),
+    Connect = ?CONNECT_PACKET(#mqtt_packet_connect{
+        proto_name = <<"MQTT">>,
+        proto_ver = ?MQTT_PROTO_V4,
+        clientid = <<"ws_max_frame_size_boundary">>
+    }),
+    ok = ws_send(Ws, {binary, emqx_frame:serialize(Connect)}),
+    ?assertEqual({binary, <<32, 2, 0, 0>>}, ws_await_frame(Ws)),
+    %% Remaining length: 2-byte topic length, 1-byte topic, 2-byte packet ID, payload.
+    Payload = binary:copy(<<0>>, ?SMALL_MAX_PACKET_SIZE - 5),
+    Publish = iolist_to_binary(emqx_frame:serialize(?PUBLISH_PACKET(?QOS_1, <<"t">>, 1, Payload))),
+    %% Fixed header: 1 byte type and flags, 2 bytes remaining length.
+    ?assertEqual(?SMALL_MAX_PACKET_SIZE + 3, byte_size(Publish)),
+    ok = ws_send(Ws, {binary, Publish}),
+    ?assertEqual({binary, <<64, 2, 0, 1>>}, ws_await_frame(Ws)),
+    ws_close(Ws).
+
+-doc """
+A fragmented message whose fragments each fit the limit, but whose total size
+exceeds it, closes the connection with status code 1009. The handler never
+sees the message.
+""".
+t_ws_max_frame_size_fragmented(_) ->
+    {Sock, _} = raw_ws_open(),
+    Fragment = binary:copy(<<0>>, ?DERIVED_MAX_FRAME_SIZE div 2 + 1),
+    %% Opcode 2 starts a binary message, opcode 0 continues it.
+    ok = gen_tcp:send(Sock, masked_frame(0, 2, Fragment)),
+    ok = gen_tcp:send(Sock, masked_frame(1, 0, Fragment)),
+    %% Unmasked close frame with status code 1009.
+    ?assertEqual({ok, <<1:1, 0:3, 8:4, 0:1, 2:7, 1009:16>>}, gen_tcp:recv(Sock, 4, 5000)),
+    ?assertNot(meck:called(?ws_conn, websocket_handle, [{binary, '_'}, '_'])),
+    gen_tcp:close(Sock).
+
+-doc """
+A compressed message that is small on the wire but inflates past the limit
+closes the connection with status code 1009. The handler never sees the
+inflated message.
+""".
+t_ws_max_frame_size_compressed(_) ->
+    set_ws_opts(compress, true),
+    {_, _, Headers} = Ws = ws_open(#{compress => true}),
+    ?assertMatch(
+        <<"permessage-deflate", _/binary>>,
+        proplists:get_value(<<"sec-websocket-extensions">>, Headers)
+    ),
+    Payload = binary:copy(<<0>>, 64 * 1024),
+    ?assert(byte_size(zlib:compress(Payload)) < ?DERIVED_MAX_FRAME_SIZE),
+    ok = ws_send(Ws, {binary, Payload}),
+    ?assertEqual(1009, ws_await_close(Ws)),
+    ?assertNot(meck:called(?ws_conn, websocket_handle, [{binary, '_'}, '_'])),
+    ws_close(Ws).
+
+-doc """
+A compressed message that the client delivers in several TCP segments and
+that decompresses beyond the listener's limit closes the connection with
+status code 1009. The handler never sees the inflated message.
+""".
+t_ws_max_frame_size_compressed_segmented(_) ->
+    set_ws_opts(compress, true),
+    {Sock, Head} = raw_ws_open("Sec-WebSocket-Extensions: permessage-deflate\r\n"),
+    ?assertMatch(<<"permessage-deflate", _/binary>>, extension(Head)),
+    Mask = 16#11223344,
+    Payloads = [binary:copy(<<0>>, 1000) || _ <- lists:seq(1, 3)],
+    Segments = do_deflate_segments(Payloads),
+    try
+        ok = do_start_inflate_probe(),
+        ok = do_send_segmented(Sock, Mask, Segments, Payloads, false),
+        ?assertEqual(
+            {ok, <<1:1, 0:3, 8:4, 0:1, 2:7, 1009:16>>},
+            gen_tcp:recv(Sock, 4, 5000)
+        ),
+        ?assertNot(meck:called(?ws_conn, websocket_handle, [{binary, '_'}, '_']))
+    after
+        do_stop_inflate_probe(),
+        gen_tcp:close(Sock)
+    end,
+    ok.
+
+-doc """
+A compressed MQTT packet that the client delivers in several TCP segments
+within the listener's limit reaches the connection handler, and the broker
+answers the CONNECT.
+""".
+t_ws_max_frame_size_compressed_segmented_ok(_) ->
+    set_ws_opts(compress, true),
+    {Sock, Head} = raw_ws_open("Sec-WebSocket-Extensions: permessage-deflate\r\n"),
+    ?assertMatch(<<"permessage-deflate", _/binary>>, extension(Head)),
+    Mask = 16#11223344,
+    Connect = iolist_to_binary(
+        emqx_frame:serialize(
+            ?CONNECT_PACKET(#mqtt_packet_connect{
+                proto_name = <<"MQTT">>,
+                proto_ver = ?MQTT_PROTO_V4,
+                clientid = <<"ws_max_frame_size_segmented">>
+            })
+        )
+    ),
+    Payloads = [
+        binary:part(Connect, 0, 8),
+        binary:part(Connect, 8, byte_size(Connect) - 8)
+    ],
+    Segments = do_deflate_segments(Payloads),
+    %% At least one segment boundary must land on a different mask rotation for
+    %% the wire byte count and for the decompressed byte count, otherwise a
+    %% wrong masking offset would not be noticed here.
+    true = lists:any(
+        fun({Wire, Decompressed}) -> Wire rem 4 =/= Decompressed rem 4 end,
+        lists:zip(
+            do_cumulative([byte_size(Segment) || Segment <- Segments]),
+            do_cumulative([byte_size(Payload) || Payload <- Payloads])
+        )
+    ),
+    try
+        ok = do_start_inflate_probe(),
+        ok = do_send_segmented(Sock, Mask, Segments, Payloads, true),
+        ok = meck:wait(?ws_conn, websocket_handle, [{binary, Connect}, '_'], 5000),
+        ?assertEqual(<<32, 2, 0, 0>>, raw_ws_await_connack(Sock))
+    after
+        do_stop_inflate_probe(),
+        gen_tcp:close(Sock)
+    end,
+    ok.
+
+-doc """
+An explicit `websocket.max_frame_size` takes precedence over the limit derived
+from the zone's `max_packet_size`.
+""".
+t_ws_max_frame_size_explicit(_) ->
+    set_ws_opts(max_frame_size, 100),
+    Payload = binary:copy(<<0>>, 101),
+    Ws = ws_open(#{}),
+    ok = ws_send(Ws, {binary, Payload}),
+    ?assertEqual(1009, ws_await_close(Ws)),
+    ?assertNot(meck:called(?ws_conn, websocket_handle, [{binary, Payload}, '_'])),
+    ws_close(Ws).
+
+-doc """
+When the client's zone changes after CONNECT, the connection sends cowboy the
+message size limit for the new zone.
+""".
+t_ws_zone_changed_sets_max_frame_size(_) ->
+    ZoneChanged = [{event, {zone_changed, default}}],
+    ?assertMatch(
+        {[{set_options, #{max_frame_size := ?DERIVED_MAX_FRAME_SIZE}}], _},
+        ?ws_conn:handle_replies(ZoneChanged, [], st())
+    ),
+    set_ws_opts(max_frame_size, 100),
+    ?assertMatch(
+        {[{set_options, #{max_frame_size := 100}}], _},
+        ?ws_conn:handle_replies(ZoneChanged, [], st())
+    ).
+
+ws_open(UpgradeOpts) ->
+    {ok, ConnPid} = gun:open("127.0.0.1", 8083, #{retry => 0}),
+    {ok, _} = gun:await_up(ConnPid, 5000),
+    StreamRef = gun:ws_upgrade(ConnPid, "/mqtt", [], UpgradeOpts#{
+        protocols => [{<<"mqtt">>, gun_ws_h}]
+    }),
+    receive
+        {gun_upgrade, ConnPid, StreamRef, [<<"websocket">>], Headers} ->
+            {ConnPid, StreamRef, Headers};
+        {gun_response, ConnPid, StreamRef, _, Status, _} ->
+            ct:fail({ws_upgrade_rejected, Status})
+    after 5000 ->
+        ct:fail(ws_upgrade_timeout)
+    end.
+
+ws_send({ConnPid, StreamRef, _Headers}, Frame) ->
+    gun:ws_send(ConnPid, StreamRef, Frame).
+
+ws_await_frame({ConnPid, StreamRef, _Headers}) ->
+    receive
+        {gun_ws, ConnPid, StreamRef, Frame} -> Frame
+    after 5000 ->
+        ct:fail(ws_frame_timeout)
+    end.
+
+ws_await_close(Ws) ->
+    case ws_await_frame(Ws) of
+        {close, Code, _} -> Code;
+        Frame -> ct:fail({unexpected_ws_frame, Frame})
+    end.
+
+ws_close({ConnPid, _StreamRef, _Headers}) ->
+    gun:close(ConnPid).
+
+%% Gun cannot send a fragmented message, so this client does the WebSocket
+%% handshake on a plain TCP socket. ExtraHeaders is inserted before the final
+%% empty line, for extensions such as permessage-deflate.
+raw_ws_open() ->
+    raw_ws_open("").
+
+raw_ws_open(ExtraHeaders) ->
+    {ok, Sock} = gen_tcp:connect("127.0.0.1", 8083, [binary, {active, false}]),
+    ok = gen_tcp:send(Sock, [
+        "GET /mqtt HTTP/1.1\r\n",
+        "Host: 127.0.0.1:8083\r\n",
+        "Upgrade: websocket\r\n",
+        "Connection: Upgrade\r\n",
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n",
+        "Sec-WebSocket-Version: 13\r\n",
+        "Sec-WebSocket-Protocol: mqtt\r\n",
+        ExtraHeaders,
+        "\r\n"
+    ]),
+    Head = recv_http_head(Sock, <<>>),
+    ?assertMatch(<<"HTTP/1.1 101 ", _/binary>>, Head),
+    {Sock, Head}.
+
+recv_http_head(Sock, Acc0) ->
+    {ok, Data} = gen_tcp:recv(Sock, 0, 5000),
+    Acc = <<Acc0/binary, Data/binary>>,
+    case binary:match(Acc, <<"\r\n\r\n">>) of
+        nomatch -> recv_http_head(Sock, Acc);
+        _ -> Acc
+    end.
+
+%% A client frame with a zero masking key, so the payload is sent unchanged.
+masked_frame(Fin, Opcode, Payload) ->
+    Header = masked_frame_header(Fin, 0, Opcode, 0, byte_size(Payload)),
+    <<Header/binary, Payload/binary>>.
+
+masked_frame_header(Fin, Rsv, Opcode, MaskKey, Len) when Len =< 16#ffff ->
+    PayloadLen =
+        case Len =< 125 of
+            true -> <<Len:7>>;
+            false -> <<126:7, Len:16>>
+        end,
+    <<Fin:1, Rsv:1, 0:2, Opcode:4, 1:1, PayloadLen/bits, MaskKey:32>>.
+
+do_mask(Data, MaskKey) ->
+    Key = binary:copy(<<MaskKey:32>>, byte_size(Data) div 4 + 1),
+    crypto:exor(Data, binary:part(Key, 0, byte_size(Data))).
+
+%%--------------------------------------------------------------------
+%% Helper functions
+%%--------------------------------------------------------------------
+
+conninfo() ->
+    #{
+        socktype => ws,
+        peername => {{127, 0, 0, 1}, 3456},
+        sockname => {{127, 0, 0, 1}, 18083},
+        sockport => 18083,
+        peercert => undefined,
+        peersni => undefined,
+        conn_mod => ?ws_conn
+    }.
+
+st() -> st(#{}).
+
+%% Connection state whose parser has already accepted a CONNECT, so that the
+%% packets after it are parsed as usual.
+st_after_connect() -> st_after_connect(#{}).
+st_after_connect(InitFields) ->
+    Connect = iolist_to_binary(emqx_frame:serialize(?CONNECT_PACKET(#mqtt_packet_connect{}))),
+    {[_], St} = ?ws_conn:parse_incoming(Connect, [], st(InitFields)),
+    St.
+
+st(InitFields) when is_map(InitFields) ->
+    {ok, St, _} = ?ws_conn:websocket_init([
+        conninfo(),
+        #{
+            zone => default,
+            listener => {ws, default}
+        }
+    ]),
+    maps:fold(
+        fun(N, V, S) -> ?ws_conn:set_field(N, V, S) end,
+        ?ws_conn:set_field(channel, channel(), St),
+        InitFields
+    ).
+
+channel() -> channel(#{}).
+channel(InitFields) ->
+    Listener = 'ws:default',
+    ConnInfo = #{
+        socktype => ws,
+        peername => {{127, 0, 0, 1}, 3456},
+        sockname => {{127, 0, 0, 1}, 18083},
+        conn_mod => emqx_ws_connection,
+        proto_name => <<"MQTT">>,
+        proto_ver => ?MQTT_PROTO_V5,
+        clean_start => true,
+        keepalive => 30,
+        clientid => <<"clientid">>,
+        username => <<"username">>,
+        receive_maximum => 100,
+        expiry_interval => 0
+    },
+    ClientInfo = #{
+        zone => default,
+        listener => Listener,
+        protocol => mqtt,
+        peerhost => {127, 0, 0, 1},
+        clientid => <<"clientid">>,
+        username => <<"username">>,
+        is_superuser => false,
+        mountpoint => undefined
+    },
+    Session = emqx_session:create(
+        ClientInfo,
+        #{receive_maximum => 0, expiry_interval => 0},
+        _WillMsg = undefined
+    ),
+    Limiter = emqx_limiter:create_channel_client_container(default, Listener),
+    maps:fold(
+        fun(Field, Value, Channel) ->
+            emqx_channel:set_field(Field, Value, Channel)
+        end,
+        emqx_channel:init(ConnInfo, #{
+            zone => default,
+            listener => {ws, default},
+            limiter => undefined
+        }),
+        maps:merge(
+            #{
+                clientinfo => ClientInfo,
+                session => Session,
+                quota => Limiter,
+                conn_state => connected
+            },
+            InitFields
+        )
+    ).
+
+start_ws_client(State) ->
+    Host = maps:get(host, State, "127.0.0.1"),
+    Port = maps:get(port, State, 8083),
+    {ok, WPID} = gun:open(Host, Port),
+    #{result := Result} = ws_client(State#{wpid => WPID}),
+    gun:close(WPID),
+    Result.
+
+ws_client(State) ->
+    receive
+        {gun_up, WPID, _Proto} ->
+            #{protocols := Protos} = State,
+            StreamRef = gun:ws_upgrade(
+                WPID,
+                "/mqtt",
+                maps:get(headers, State, []),
+                #{protocols => [{P, gun_ws_h} || P <- Protos]}
+            ),
+            ws_client(State#{wref => StreamRef});
+        {gun_down, _WPID, _, Reason, _} ->
+            State#{result => {gun_down, Reason}};
+        {gun_upgrade, _WPID, _Ref, _Proto, Data} ->
+            ct:pal("-- gun_upgrade: ~p", [Data]),
+            State#{result => {gun_upgrade, Data}};
+        {gun_response, _WPID, _Ref, _Code, _HttpStatusCode, _Headers} ->
+            Rsp = {_Code, _HttpStatusCode, _Headers},
+            ct:pal("-- gun_response: ~p", [Rsp]),
+            State#{result => {gun_response, Rsp}};
+        {gun_error, _WPID, _Ref, _Reason} ->
+            State#{result => {gun_error, _Reason}};
+        {'DOWN', _PID, process, _WPID, _Reason} ->
+            State#{result => {down, _Reason}};
+        {gun_ws, _WPID, Frame} ->
+            case Frame of
+                close ->
+                    self() ! stop;
+                {close, _Code, _Message} ->
+                    self() ! stop;
+                {text, TextData} ->
+                    io:format("Received Text Frame: ~p~n", [TextData]);
+                {binary, BinData} ->
+                    io:format("Received Binary Frame: ~p~n", [BinData]);
+                _ ->
+                    io:format("Received Unhandled Frame: ~p~n", [Frame])
+            end,
+            ws_client(State);
+        stop ->
+            #{wpid := WPID} = State,
+            gun:flush(WPID),
+            gun:shutdown(WPID),
+            State#{result => {stop, normal}};
+        Message ->
+            ct:pal("Received Unknown Message on Gun: ~p~n", [Message]),
+            ws_client(State)
+    after 5000 ->
+        ct:fail(ws_timeout)
+    end.
+
+%%--------------------------------------------------------------------
+%% Segmented compressed message helpers
+%%--------------------------------------------------------------------
+
+extension(Head) ->
+    case
+        re:run(Head, "sec-websocket-extensions: *([^\\r\\n]+)", [caseless, {capture, [1], binary}])
+    of
+        {match, [Value]} -> Value;
+        nomatch -> ct:fail({permessage_deflate_not_negotiated, Head})
+    end.
+
+do_cumulative(Values) ->
+    {_, Reversed} = lists:foldl(
+        fun(Value, {Sum, Acc}) ->
+            Sum2 = Sum + Value,
+            {Sum2, [Sum2 | Acc]}
+        end,
+        {0, []},
+        Values
+    ),
+    lists:reverse(Reversed).
+
+%% Send a binary message whose compressed payload is split in Segments. Each
+%% segment is sent only after the connection has decompressed the previous
+%% ones, which keeps the delivery order deterministic instead of depending on
+%% how TCP groups the writes. When AwaitLast is false the last segment is sent
+%% without waiting for it, for tests that expect the connection to close.
+do_send_segmented(Sock, Mask, Segments, Payloads, AwaitLast) ->
+    ?assertEqual(length(Segments), length(Payloads)),
+    %% The payload is masked as a whole, so that the segments keep the mask
+    %% offset of the frame instead of restarting it.
+    MaskedWhole = do_mask(iolist_to_binary(Segments), Mask),
+    Masked = do_split_lengths(MaskedWhole, [byte_size(Segment) || Segment <- Segments]),
+    Header = masked_frame_header(1, 1, 2, Mask, byte_size(MaskedWhole)),
+    ok = gen_tcp:send(Sock, Header),
+    do_send_segmented_loop(Masked, Payloads, undefined, 0, Sock, AwaitLast).
+
+do_send_segmented_loop([Masked | MaskedTail], [Payload | PayloadTail], Pid0, Acc0, Sock, AwaitLast) ->
+    ok = gen_tcp:send(Sock, Masked),
+    Acc = Acc0 + byte_size(Payload),
+    {Pid, Observed} =
+        case AwaitLast orelse MaskedTail =/= [] of
+            true -> do_await_decompressed(Pid0, Acc0, Acc);
+            false -> {Pid0, Acc0}
+        end,
+    do_send_segmented_loop(MaskedTail, PayloadTail, Pid, Observed, Sock, AwaitLast);
+do_send_segmented_loop([], [], _, _, _, _) ->
+    ok.
+
+do_split_lengths(<<>>, []) ->
+    [];
+do_split_lengths(Bin, [Len | Lengths]) ->
+    <<Part:Len/binary, Rest/binary>> = Bin,
+    [Part | do_split_lengths(Rest, Lengths)].
+
+%% Build permessage-deflate wire data for the given chunks, using one sync
+%% flush per chunk and dropping the trailing sync marker as RFC 7692 requires.
+do_deflate_segments(Chunks) ->
+    Z = zlib:open(),
+    try
+        zlib:deflateInit(Z, default, deflated, -15, 8, default),
+        Encoded = [iolist_to_binary(zlib:deflate(Z, Chunk, sync)) || Chunk <- Chunks],
+        Last = lists:last(Encoded),
+        lists:droplast(Encoded) ++ [binary:part(Last, 0, byte_size(Last) - 4)]
+    after
+        zlib:close(Z)
+    end.
+
+%% The probe observes what the connection decompresses through the public
+%% cow_deflate API and never changes the result. It only provides the delivery
+%% barrier; the assertions stay on the frames the client receives.
+do_start_inflate_probe() ->
+    Tester = self(),
+    ok = meck:new(cow_deflate, [passthrough]),
+    ok = meck:expect(cow_deflate, inflate, fun(Z, Data, Limit) ->
+        Result = meck:passthrough([Z, Data, Limit]),
+        Tester ! {inflate_result, self(), Result},
+        Result
+    end),
+    ok.
+
+do_stop_inflate_probe() ->
+    meck:unload(cow_deflate).
+
+%% Wait until the connection has decompressed at least Target bytes in total.
+do_await_decompressed(Pid0, Acc0, Target) when Acc0 >= Target ->
+    {Pid0, Acc0};
+do_await_decompressed(Pid0, Acc0, Target) ->
+    receive
+        {inflate_result, Pid, {ok, Data}} when Pid0 =:= undefined; Pid =:= Pid0 ->
+            do_await_decompressed(Pid, Acc0 + byte_size(Data), Target);
+        {inflate_result, Pid, {error, Reason}} when Pid0 =:= undefined; Pid =:= Pid0 ->
+            ct:fail({unexpected_inflate_error, Reason})
+    after 6000 ->
+        ct:fail({inflate_progress_timeout, Acc0, Target})
+    end.
+
+raw_ws_await_connack(Sock) ->
+    {ok, <<1:1, Rsv:1, 0:2, 2:4, 0:1, Len:7>>} = gen_tcp:recv(Sock, 2, 5000),
+    PayloadLen =
+        case Len of
+            126 ->
+                {ok, <<L:16>>} = gen_tcp:recv(Sock, 2, 5000),
+                L;
+            127 ->
+                {ok, <<L:64>>} = gen_tcp:recv(Sock, 8, 5000),
+                L;
+            _ ->
+                Len
+        end,
+    {ok, Payload} = gen_tcp:recv(Sock, PayloadLen, 5000),
+    case Rsv of
+        1 -> do_inflate(Payload);
+        0 -> Payload
+    end.
+
+do_inflate(Data) ->
+    Z = zlib:open(),
+    try
+        zlib:inflateInit(Z, -15),
+        Out1 = zlib:inflate(Z, Data),
+        Out2 = zlib:inflate(Z, <<0, 0, 255, 255>>),
+        iolist_to_binary([Out1, Out2])
+    after
+        zlib:close(Z)
+    end.

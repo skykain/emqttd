@@ -1,0 +1,182 @@
+%%--------------------------------------------------------------------
+%% Copyright (c) 2020-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
+%%--------------------------------------------------------------------
+-include("emqx_dashboard_rbac.hrl").
+
+-define(ADMIN, emqx_admin).
+
+-define(BACKEND_LOCAL, local).
+-define(SSO_USERNAME(Backend, Name), {Backend, Name}).
+
+-type dashboard_sso_backend() :: atom().
+-type dashboard_sso_username() :: {dashboard_sso_backend(), binary()}.
+-type dashboard_username() :: binary() | dashboard_sso_username().
+-type dashboard_user_role() :: binary().
+
+-record(?ADMIN, {
+    username :: dashboard_username(),
+    pwdhash :: binary(),
+    description :: binary(),
+    role = ?ROLE_DEFAULT :: dashboard_user_role(),
+    extra = #{} :: map()
+    %% Extensible metadata map. Known keys:
+    %%
+    %%   mfa_state => #{mechanism => totp, secret => binary(), ...}
+    %%              | disabled
+    %%     MFA configuration for this user.
+    %%     - Map with `mechanism` and `secret`: MFA is enabled or pending setup.
+    %%       May also contain `first_verify_ts` after first successful TOTP verify.
+    %%     - `disabled` atom: admin has explicitly exempted this user from MFA.
+    %%     - Key absent: MFA never configured (default).
+    %%
+    %%   mfa_pending => #{type => setup | challenge,
+    %%                    token => binary(),
+    %%                    secret => binary(),        %% setup only
+    %%                    timestamp => integer(),
+    %%                    failed_attempts => non_neg_integer()}
+    %%     Short-lived SSO MFA session token for TOTP setup or verification.
+    %%     Only used when MFA is required after SSO login.
+    %%     For regular (non-SSO) login, no pending state is required.
+    %%
+    %%   sso_code => #{code => binary(),
+    %%                 payload => map(),
+    %%                 exptime => integer()}
+    %%     One-time SSO login code for secure redirect. Created after
+    %%     SAML/OIDC callback; exchanged by frontend via POST /sso/token_exchange.
+    %%     TTL: 60 seconds. Consumed after single use.
+    %%
+    %%   login_lock => integer()
+    %%     Timestamp until which login is locked after too many failed attempts.
+    %%
+}).
+
+-type dashboard_user() :: #?ADMIN{}.
+
+%% admin_override values: admin's explicit decision to override the SSO
+%% backend force_mfa policy for a specific user. undefined / field
+%% absent means "no override — fall back to backend's live force_mfa".
+-define(ADMIN_MFA_REQUIRED, mfa_required).
+-define(ADMIN_MFA_EXEMPTED, mfa_exempted).
+
+-define(ADMIN_JWT, emqx_admin_jwt).
+
+-record(?ADMIN_JWT, {
+    token :: binary(),
+    username :: binary(),
+    exptime :: integer(),
+    extra = #{} :: map()
+}).
+
+-record(emqx_dashboard_scram_challenge, {
+    id :: binary(),
+    username :: dashboard_username(),
+    client_nonce :: binary(),
+    server_nonce :: binary(),
+    salt :: binary(),
+    iterations :: pos_integer(),
+    credential_fingerprint :: binary() | undefined,
+    expires_at :: integer(),
+    extra = #{} :: map()
+}).
+
+-record(emqx_dashboard_scram_meta, {
+    key :: atom(),
+    value :: binary()
+}).
+
+-define(TAB_COLLECT, emqx_collect).
+
+-define(EMPTY_KEY(Key), ((Key == undefined) orelse (Key == <<>>))).
+
+-define(DASHBOARD_SHARD, emqx_dashboard_shard).
+
+-ifdef(TEST).
+%% for test
+-define(DEFAULT_SAMPLE_INTERVAL, 1).
+-define(RPC_TIMEOUT, 50).
+-else.
+%% dashboard monitor do sample interval, default 10s
+-define(DEFAULT_SAMPLE_INTERVAL, 10).
+-define(RPC_TIMEOUT, 5000).
+-endif.
+
+-define(DELTA_SAMPLER_LIST, [
+    received,
+    sent,
+    validation_succeeded,
+    validation_failed,
+    transformation_succeeded,
+    transformation_failed,
+    dropped,
+    persisted,
+    rules_matched,
+    actions_executed,
+    actions_messages
+]).
+
+-define(GAUGE_SAMPLER_LIST, [
+    disconnected_durable_sessions,
+    subscriptions_durable,
+    subscriptions,
+    topics,
+    connections,
+    live_connections
+]).
+
+-define(SAMPLER_LIST, (?GAUGE_SAMPLER_LIST ++ ?DELTA_SAMPLER_LIST)).
+
+-define(DELTA_SAMPLER_RATE_MAP, #{
+    received => received_msg_rate,
+    sent => sent_msg_rate,
+    validation_succeeded => validation_succeeded_rate,
+    validation_failed => validation_failed_rate,
+    transformation_succeeded => transformation_succeeded_rate,
+    transformation_failed => transformation_failed_rate,
+    dropped => dropped_msg_rate,
+    persisted => persisted_rate,
+    rules_matched => rules_matched_rate,
+    actions_executed => actions_executed_rate,
+    actions_messages => actions_messages_rate
+}).
+
+-define(CURRENT_SAMPLE_NON_RATE, [
+    node_uptime,
+    retained_msg_count,
+    shared_subscriptions,
+    cluster_sessions,
+    license_quota
+]).
+
+-define(CLUSTERONLY_SAMPLER_LIST, [
+    subscriptions_durable,
+    disconnected_durable_sessions
+]).
+
+%% record the max value over the history
+-define(WATERMARK_SAMPLER_LIST, [
+    %% sessions history high water mark is only recorded when
+    %% the config broker.session_history_retain > 0s
+    sessions_hist_hwmark
+]).
+
+%% Pick the newer value from the two maps when merging
+%% Keys are from ?WATERMARK_SAMPLER_LIST and ?GAUGE_SAMPLER_LIST
+%% test case is added to ensure no missing key in this macro
+-define(IS_PICK_NEWER(Key),
+    (Key =:= sessions_hist_hwmark orelse
+        Key =:= disconnected_durable_sessions orelse
+        Key =:= subscriptions_durable orelse
+        Key =:= subscriptions orelse
+        Key =:= topics orelse
+        Key =:= connections orelse
+        Key =:= live_connections)
+).
+
+%% use this atom to indicate no value provided from http request
+-define(NO_MFA_TOKEN, no_mfa_token).
+%% use this atom for internal calls where token validation is not required
+%% for example, when handling change_pwd request (which is authenticated
+%% with bearer token).
+-define(TRUSTED_MFA_TOKEN, trusted_mfa_token).
+%% empty bin-string is when the token field exists, but empty
+-define(IS_NO_MFA_TOKEN(X), (X =:= ?NO_MFA_TOKEN orelse X =:= <<>>)).

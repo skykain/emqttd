@@ -1,115 +1,2050 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
-
 -module(emqx_mgmt_api_plugins).
 
--include("emqx_mgmt.hrl").
+-behaviour(minirest_api).
 
--include_lib("emqx/include/emqx.hrl").
+-include_lib("typerefl/include/types.hrl").
+-include_lib("hocon/include/hoconsc.hrl").
+-include_lib("emqx/include/logger.hrl").
+-include_lib("emqx_plugins/include/emqx_plugins.hrl").
+-include_lib("erlavro/include/erlavro.hrl").
+-include_lib("emqx_utils/include/emqx_api_key_scopes.hrl").
+-ifdef(TEST).
+-include_lib("eunit/include/eunit.hrl").
+-endif.
 
--rest_api(#{name   => list_all_plugins,
-            method => 'GET',
-            path   => "/plugins/",
-            func   => list,
-            descr  => "List all plugins in the cluster"}).
+-export([
+    api_spec/0,
+    fields/1,
+    paths/0,
+    schema/1,
+    namespace/0
+]).
 
--rest_api(#{name   => list_node_plugins,
-            method => 'GET',
-            path   => "/nodes/:atom:node/plugins/",
-            func   => list,
-            descr  => "List all plugins on a node"}).
+-export([
+    list_plugins/2,
+    upload_install/2,
+    plugin/2,
+    update_plugin/2,
+    plugin_config/2,
+    upload_plugin_config/2,
+    download_plugin_config/2,
+    plugin_schema/2,
+    update_boot_order/2,
+    sync_plugin/2
+]).
 
--rest_api(#{name   => load_node_plugin,
-            method => 'PUT',
-            path   => "/nodes/:atom:node/plugins/:atom:plugin/load",
-            func   => load,
-            descr  => "Load a plugin"}).
+-export([
+    validate_name/1,
+    validate_file_name/2,
+    get_plugins/0,
+    install_package/2,
+    install_package_v4/2,
+    delete_package/1,
+    delete_package/2,
+    describe_package/1,
+    ensure_action/2,
+    ensure_action/3,
+    do_update_plugin_config/3,
+    do_update_plugin_config_v4/2,
+    ensure_existed/1,
+    sync_plugin_cluster/2,
+    put_plugin_config/2
+]).
+-export([scopes/0]).
 
--rest_api(#{name   => unload_node_plugin,
-            method => 'PUT',
-            path   => "/nodes/:atom:node/plugins/:atom:plugin/unload",
-            func   => unload,
-            descr  => "Unload a plugin"}).
+-define(TAGS, [<<"Plugins">>]).
 
--rest_api(#{name   => reload_node_plugin,
-            method => 'PUT',
-            path   => "/nodes/:atom:node/plugins/:atom:plugin/reload",
-            func   => reload,
-            descr  => "Reload a plugin"}).
+-define(CONTENT_PLUGIN, plugin).
 
--rest_api(#{name   => unload_plugin,
-            method => 'PUT',
-            path   => "/plugins/:atom:plugin/unload",
-            func   => unload,
-            descr  => "Unload a plugin in the cluster"}).
+namespace() ->
+    "plugins".
 
--rest_api(#{name   => reload_plugin,
-            method => 'PUT',
-            path   => "/plugins/:atom:plugin/reload",
-            func   => reload,
-            descr  => "Reload a plugin in the cluster"}).
+api_spec() ->
+    emqx_dashboard_swagger:spec(?MODULE, #{check_schema => true}).
 
--export([ list/2
-        , load/2
-        , unload/2
-        , reload/2
-        ]).
+%% Don't change the path's order
+scopes() -> ?SCOPE_SYSTEM.
 
-list(#{node := Node}, _Params) ->
-    minirest:return({ok, [format(Plugin) || Plugin <- emqx_mgmt:list_plugins(Node)]});
-
-list(_Bindings, _Params) ->
-    minirest:return({ok, [format({Node, Plugins}) || {Node, Plugins} <- emqx_mgmt:list_plugins()]}).
-
-load(#{node := Node, plugin := Plugin}, _Params) ->
-    minirest:return(emqx_mgmt:load_plugin(Node, Plugin)).
-
-unload(#{node := Node, plugin := Plugin}, _Params) ->
-    minirest:return(emqx_mgmt:unload_plugin(Node, Plugin));
-
-unload(#{plugin := Plugin}, _Params) ->
-    Results = [emqx_mgmt:unload_plugin(Node, Plugin) || {Node, _Info} <- emqx_mgmt:list_nodes()],
-    case lists:filter(fun(Item) -> Item =/= ok end, Results) of
-        [] ->
-            minirest:return(ok);
-        Errors ->
-            minirest:return(lists:last(Errors))
+paths() ->
+    %% The plugin framework is a gated feature: when it is not in the active
+    %% `EMQX_FEATURES' preset, `emqx_plugins' is not started and these routes
+    %% must not be registered.
+    case emqx_machine_features:is_umbrella_application_enabled(emqx_plugins) of
+        false ->
+            [];
+        true ->
+            [
+                "/plugins",
+                "/plugins/:name",
+                "/plugins/install",
+                "/plugins/:name/:action",
+                "/plugins/:name/config",
+                "/plugins/:name/config/download",
+                "/plugins/:name/config/upload",
+                "/plugins/:name/schema",
+                "/plugins/:name/move",
+                "/plugins/cluster_sync"
+            ]
     end.
 
-reload(#{node := Node, plugin := Plugin}, _Params) ->
-    minirest:return(emqx_mgmt:reload_plugin(Node, Plugin));
+schema("/plugins") ->
+    #{
+        'operationId' => list_plugins,
+        get => #{
+            description => ?DESC("list_plugins_desc"),
+            tags => ?TAGS,
+            responses => #{
+                200 => hoconsc:array(hoconsc:ref(plugin))
+            }
+        }
+    };
+schema("/plugins/install") ->
+    #{
+        'operationId' => upload_install,
+        filter => fun ?MODULE:validate_file_name/2,
+        post => #{
+            description => ?DESC("install_plugin_desc"),
+            tags => ?TAGS,
+            'requestBody' => #{
+                content => #{
+                    'multipart/form-data' => #{
+                        schema => #{
+                            type => object,
+                            properties => #{
+                                ?CONTENT_PLUGIN => #{type => string, format => binary}
+                            }
+                        },
+                        encoding => #{?CONTENT_PLUGIN => #{'contentType' => 'application/gzip'}}
+                    }
+                }
+            },
+            responses => #{
+                204 => ?DESC("install_success"),
+                400 => emqx_dashboard_swagger:error_codes(
+                    [
+                        'UNEXPECTED_ERROR',
+                        'ALREADY_INSTALLED',
+                        'BAD_PLUGIN_INFO',
+                        'BAD_FORM_DATA',
+                        'FORBIDDEN'
+                    ]
+                ),
+                409 => pinned_error(),
+                500 => emqx_dashboard_swagger:error_codes(
+                    ['INTERNAL_ERROR'], ?DESC("internal_error")
+                )
+            }
+        }
+    };
+schema("/plugins/:name") ->
+    #{
+        'operationId' => plugin,
+        get => #{
+            description => ?DESC("get_plugin_desc"),
+            tags => ?TAGS,
+            parameters => [hoconsc:ref(name)],
+            responses => #{
+                200 => hoconsc:ref(plugin),
+                404 => emqx_dashboard_swagger:error_codes(['NOT_FOUND'], ?DESC("plugin_not_found"))
+            }
+        },
+        delete => #{
+            description => ?DESC("delete_plugin_desc"),
+            tags => ?TAGS,
+            parameters => [hoconsc:ref(name)],
+            responses => #{
+                204 => ?DESC("uninstall_success"),
+                400 => emqx_dashboard_swagger:error_codes(['PARAM_ERROR'], ?DESC("bad_parameter")),
+                404 => emqx_dashboard_swagger:error_codes(['NOT_FOUND'], ?DESC("plugin_not_found")),
+                409 => pinned_error(),
+                500 => emqx_dashboard_swagger:error_codes(
+                    ['INTERNAL_ERROR'], ?DESC("internal_error")
+                )
+            }
+        }
+    };
+schema("/plugins/:name/:action") ->
+    #{
+        'operationId' => update_plugin,
+        put => #{
+            description => ?DESC("trigger_action_desc"),
+            tags => ?TAGS,
+            parameters => [
+                hoconsc:ref(name),
+                {action,
+                    hoconsc:mk(hoconsc:enum([start, stop]), #{desc => ?DESC("action"), in => path})}
+            ],
+            responses => #{
+                204 => ?DESC("trigger_success"),
+                400 => emqx_dashboard_swagger:error_codes(
+                    ['PARAM_ERROR', 'BAD_CONFIG'], ?DESC("bad_parameter")
+                ),
+                404 => emqx_dashboard_swagger:error_codes(['NOT_FOUND'], ?DESC("plugin_not_found")),
+                409 => pinned_error(),
+                500 => emqx_dashboard_swagger:error_codes(
+                    ['INTERNAL_ERROR'], ?DESC("internal_error")
+                )
+            }
+        }
+    };
+schema("/plugins/:name/config") ->
+    #{
+        'operationId' => plugin_config,
+        get => #{
+            description => ?DESC("get_plugin_config_desc"),
+            tags => ?TAGS,
+            parameters => [hoconsc:ref(name)],
+            responses => #{
+                %% avro data, json encoded
+                200 => hoconsc:mk(binary()),
+                400 => emqx_dashboard_swagger:error_codes(
+                    ['BAD_CONFIG'], ?DESC("plugin_config_not_found")
+                ),
+                404 => emqx_dashboard_swagger:error_codes(['NOT_FOUND'], ?DESC("plugin_not_found"))
+            }
+        },
+        put => #{
+            description => ?DESC("update_plugin_config_desc"),
+            tags => ?TAGS,
+            parameters => [hoconsc:ref(name)],
+            'requestBody' => #{
+                content => #{
+                    'application/json' => #{
+                        schema => #{
+                            type => object
+                        }
+                    }
+                }
+            },
+            responses => #{
+                204 => ?DESC("config_updated"),
+                400 => emqx_dashboard_swagger:error_codes(
+                    ['BAD_CONFIG', 'UNEXPECTED_ERROR'], ?DESC("update_config_failed")
+                ),
+                404 => emqx_dashboard_swagger:error_codes(['NOT_FOUND'], ?DESC("plugin_not_found")),
+                500 => emqx_dashboard_swagger:error_codes(
+                    ['INTERNAL_ERROR'], ?DESC("internal_error")
+                )
+            }
+        }
+    };
+schema("/plugins/:name/config/download") ->
+    #{
+        'operationId' => download_plugin_config,
+        get => #{
+            description => ?DESC("download_plugin_config_desc"),
+            tags => ?TAGS,
+            parameters => [hoconsc:ref(name)],
+            responses => #{
+                200 => hoconsc:mk(binary()),
+                400 => emqx_dashboard_swagger:error_codes(
+                    ['BAD_CONFIG'], ?DESC("plugin_config_not_found")
+                ),
+                404 => emqx_dashboard_swagger:error_codes(['NOT_FOUND'], ?DESC("plugin_not_found"))
+            }
+        }
+    };
+schema("/plugins/:name/config/upload") ->
+    #{
+        'operationId' => upload_plugin_config,
+        post => #{
+            description => ?DESC("upload_plugin_config_desc"),
+            tags => ?TAGS,
+            parameters => [hoconsc:ref(name)],
+            'requestBody' => #{
+                content => #{
+                    'multipart/form-data' => #{
+                        schema => #{
+                            type => object,
+                            properties => #{
+                                config => #{type => string, format => binary}
+                            }
+                        },
+                        encoding => #{config => #{'contentType' => 'application/json'}}
+                    }
+                }
+            },
+            responses => #{
+                204 => ?DESC("config_updated"),
+                400 => emqx_dashboard_swagger:error_codes(
+                    ['BAD_CONFIG', 'BAD_FORM_DATA', 'UNEXPECTED_ERROR'],
+                    ?DESC("update_config_failed")
+                ),
+                404 => emqx_dashboard_swagger:error_codes(['NOT_FOUND'], ?DESC("plugin_not_found")),
+                500 => emqx_dashboard_swagger:error_codes(
+                    ['INTERNAL_ERROR'], ?DESC("internal_error")
+                )
+            }
+        }
+    };
+schema("/plugins/:name/schema") ->
+    #{
+        'operationId' => plugin_schema,
+        get => #{
+            description => ?DESC("get_plugin_schema_desc"),
+            tags => ?TAGS,
+            parameters => [hoconsc:ref(name)],
+            responses => #{
+                %% avro schema and i18n json object
+                200 => hoconsc:mk(binary()),
+                404 => emqx_dashboard_swagger:error_codes(
+                    ['NOT_FOUND', 'FILE_NOT_EXISTED'],
+                    ?DESC("plugin_not_found")
+                )
+            }
+        }
+    };
+schema("/plugins/:name/move") ->
+    #{
+        'operationId' => update_boot_order,
+        post => #{
+            description => ?DESC("move_plugin_desc"),
+            tags => ?TAGS,
+            parameters => [hoconsc:ref(name)],
+            'requestBody' => move_request_body(),
+            responses => #{
+                204 => ?DESC("boot_order_changed"),
+                400 => emqx_dashboard_swagger:error_codes(['MOVE_FAILED'], ?DESC("move_failed")),
+                404 => emqx_dashboard_swagger:error_codes(['NOT_FOUND'], ?DESC("plugin_not_found")),
+                409 => pinned_error()
+            }
+        }
+    };
+schema("/plugins/cluster_sync") ->
+    #{
+        'operationId' => sync_plugin,
+        post => #{
+            description => ?DESC("sync_plugin_desc"),
+            tags => ?TAGS,
+            'requestBody' => sync_request_body(),
+            responses => #{
+                204 => ?DESC("sync_success"),
+                400 => emqx_dashboard_swagger:error_codes(
+                    ['BAD_PLUGIN_INFO'], ?DESC("bad_plugin_info")
+                ),
+                404 => emqx_dashboard_swagger:error_codes(
+                    ['NOT_FOUND'], ?DESC("plugin_not_found")
+                ),
+                409 => pinned_error()
+            }
+        }
+    }.
 
-reload(#{plugin := Plugin}, _Params) ->
-    Results = [emqx_mgmt:reload_plugin(Node, Plugin) || {Node, _Info} <- emqx_mgmt:list_nodes()],
-    case lists:filter(fun(Item) -> Item =/= ok end, Results) of
-        [] ->
-            minirest:return(ok);
-        Errors ->
-            minirest:return(lists:last(Errors))
+pinned_error() ->
+    emqx_dashboard_swagger:error_codes(['PLUGIN_PINNED'], ?DESC("plugin_pinned")).
+
+fields(plugin) ->
+    [
+        {name,
+            hoconsc:mk(
+                binary(),
+                #{
+                    desc => ?DESC("plugin_name"),
+                    validator => fun ?MODULE:validate_name/1,
+                    required => true,
+                    example => "emqx_plugin_template-5.0-rc.1"
+                }
+            )},
+        {author,
+            hoconsc:mk(list(string()), #{
+                desc => ?DESC("plugin_author"), example => [<<"EMQX Team">>]
+            })},
+        {builder, hoconsc:ref(?MODULE, builder)},
+        {built_on_otp_release,
+            hoconsc:mk(string(), #{desc => ?DESC("built_on_otp_release"), example => "24"})},
+        {compatibility,
+            hoconsc:mk(map(), #{
+                desc => ?DESC("compatibility"), example => #{<<"emqx">> => <<"~>5.0">>}
+            })},
+        {git_commit_or_build_date,
+            hoconsc:mk(string(), #{
+                example => "2021-12-25",
+                desc => ?DESC("git_commit_or_build_date")
+            })},
+        {functionality,
+            hoconsc:mk(hoconsc:array(string()), #{
+                desc => ?DESC("functionality"), example => [<<"Demo">>]
+            })},
+        {git_ref,
+            hoconsc:mk(string(), #{
+                desc => ?DESC("git_ref"), example => "ddab50fafeed6b1faea70fc9ffd8c700d7e26ec1"
+            })},
+        {metadata_vsn, hoconsc:mk(string(), #{desc => ?DESC("metadata_vsn"), example => "0.1.0"})},
+        {rel_vsn,
+            hoconsc:mk(
+                binary(),
+                #{
+                    desc => ?DESC("rel_vsn"),
+                    required => true,
+                    example => <<"5.0-rc.1">>
+                }
+            )},
+        {rel_apps,
+            hoconsc:mk(
+                hoconsc:array(binary()),
+                #{
+                    desc => ?DESC("rel_apps"),
+                    required => true,
+                    example => [<<"emqx_plugin_template-5.0.0">>, <<"map_sets-1.1.0">>]
+                }
+            )},
+        {repo,
+            hoconsc:mk(string(), #{
+                desc => ?DESC("repo"), example => "https://github.com/emqx/emqx-plugin-template"
+            })},
+        {description,
+            hoconsc:mk(
+                binary(),
+                #{
+                    desc => ?DESC("description"),
+                    required => true,
+                    example => "This is an demo plugin description"
+                }
+            )},
+        {running_status,
+            hoconsc:mk(
+                hoconsc:array(hoconsc:ref(running_status)),
+                #{desc => ?DESC("running_status"), required => true}
+            )},
+        {pinned,
+            hoconsc:mk(boolean(), #{
+                desc => ?DESC("pinned"),
+                required => false,
+                example => false
+            })},
+        {readme,
+            hoconsc:mk(binary(), #{
+                example => "This is an demo plugin.",
+                desc => ?DESC("readme"),
+                required => false
+            })},
+        {health_status, hoconsc:ref(?MODULE, health_status)}
+    ];
+fields(health_status) ->
+    [
+        {status,
+            hoconsc:mk(hoconsc:enum([ok, error]), #{desc => ?DESC("status"), example => error})},
+        {message,
+            hoconsc:mk(binary(), #{
+                desc => ?DESC("message"), example => <<"Port unavailable: 3306">>
+            })}
+    ];
+fields(name) ->
+    [
+        {name,
+            hoconsc:mk(
+                binary(),
+                #{
+                    desc => ?DESC("plugin_name"),
+                    example => "emqx_plugin_template-5.0-rc.1",
+                    in => path,
+                    validator => fun ?MODULE:validate_name/1
+                }
+            )}
+    ];
+fields(builder) ->
+    [
+        {contact,
+            hoconsc:mk(string(), #{
+                desc => ?DESC("plugin_builder"), example => "emqx-support@emqx.io"
+            })},
+        {name, hoconsc:mk(string(), #{desc => ?DESC("plugin_builder"), example => "EMQX Team"})},
+        {website,
+            hoconsc:mk(string(), #{desc => ?DESC("plugin_builder"), example => "www.emqx.com"})}
+    ];
+fields(position) ->
+    [
+        {position,
+            hoconsc:mk(
+                hoconsc:union([front, rear, binary()]),
+                #{
+                    desc => ?DESC("position"),
+                    required => false
+                }
+            )}
+    ];
+fields(sync_request) ->
+    [
+        {name,
+            hoconsc:mk(string(), #{
+                desc => ?DESC("sync_request"),
+                example => "emqx_plugin_demo-5.1-rc.2",
+                required => true
+            })}
+    ];
+fields(running_status) ->
+    [
+        {node, hoconsc:mk(string(), #{desc => ?DESC("node"), example => "emqx@127.0.0.1"})},
+        {status,
+            hoconsc:mk(hoconsc:enum([running, stopped]), #{
+                desc => ?DESC("status")
+            })},
+        {pinned,
+            hoconsc:mk(boolean(), #{
+                desc => ?DESC("node_pinned"),
+                example => false
+            })}
+    ].
+
+move_request_body() ->
+    emqx_dashboard_swagger:schema_with_examples(
+        hoconsc:ref(?MODULE, position),
+        #{
+            move_to_front => #{
+                value => #{position => <<"front">>}
+            },
+            move_to_rear => #{
+                value => #{position => <<"rear">>}
+            },
+            move_to_before => #{
+                value => #{position => <<"before:emqx_plugin_demo-5.1-rc.2">>}
+            },
+            move_to_after => #{
+                value => #{position => <<"after:emqx_plugin_demo-5.1-rc.2">>}
+            }
+        }
+    ).
+
+sync_request_body() ->
+    emqx_dashboard_swagger:schema_with_examples(
+        hoconsc:ref(?MODULE, sync_request),
+        #{
+            sync_from_node => #{
+                value => #{name => <<"emqx_plugin_demo-5.1-rc.2">>}
+            }
+        }
+    ).
+
+validate_name(Name) ->
+    emqx_plugins_utils:validate_name_vsn(Name).
+
+validate_file_name(#{body := #{<<"plugin">> := Plugin}} = Params, _Meta) when is_map(Plugin) ->
+    case maps:to_list(maps:without([type], Plugin)) of
+        [{FileName, Bin}] ->
+            validate_package_file_name(Params, FileName, Bin);
+        _ ->
+            bad_plugin_form_data()
+    end;
+validate_file_name(_Params, _Meta) ->
+    bad_plugin_form_data().
+
+validate_package_file_name(Params, FileName, Bin) ->
+    NameVsn = string:trim(FileName, trailing, ".tar.gz"),
+    case validate_name(NameVsn) of
+        ok ->
+            {ok, Params#{name => NameVsn, bin => Bin}};
+        {error, Reason} ->
+            {400, #{
+                code => 'BAD_PLUGIN_INFO',
+                message => iolist_to_binary(["Bad plugin file name: ", FileName, ". ", Reason])
+            }}
     end.
 
-format({Node, Plugins}) ->
-    #{node => Node, plugins => [format(Plugin) || Plugin <- Plugins]};
+bad_plugin_form_data() ->
+    {400, #{
+        code => 'BAD_FORM_DATA',
+        message =>
+            <<"form-data should be `plugin=@packagename-vsn.tar.gz;type=application/x-gzip`">>
+    }}.
 
-format(#plugin{name = Name,
-               descr = Descr,
-               active = Active,
-               type = Type}) ->
-    #{name => Name,
-      description => iolist_to_binary(Descr),
-      active => Active,
-      type => Type}.
+bad_config_form_data() ->
+    {400, #{
+        code => 'BAD_FORM_DATA',
+        message => <<"form-data should be `config=@config.json;type=application/json`">>
+    }}.
 
+%% API CallBack Begin
+list_plugins(get, _) ->
+    Nodes = emqx:running_nodes(),
+    {Plugins, BadNodes} = emqx_mgmt_api_plugins_proto_v4:get_plugins(Nodes),
+    BadNodes =/= [] andalso
+        ?SLOG(warning, #{msg => "get_plugins_rpc_failed", bad_nodes => BadNodes}),
+    {200, format_plugins(drop_bad_plugin_results(Plugins))}.
+
+get_plugins() ->
+    Plugins = emqx_plugins:list(?normal, #{health_check => true}),
+    {node(), lists:filter(fun api_visible_plugin/1, Plugins)}.
+
+upload_install(post, #{name := NameVsn, bin := Bin}) ->
+    unless_pinned_here(NameVsn, fun() -> do_upload_install(NameVsn, Bin) end);
+upload_install(post, #{}) ->
+    bad_plugin_form_data().
+
+do_upload_install(NameVsn, Bin) ->
+    case classify_installation(NameVsn, Bin) of
+        {installed, IsUploadedPackage} ->
+            %% A complete installation.  An installation that the API does not
+            %% show (installed, but neither configured nor running, or one whose
+            %% metadata became unreadable meanwhile) is (re)installed from the
+            %% upload.
+            case describe_api_plugin(NameVsn, #{}) of
+                {ok, _} when IsUploadedPackage ->
+                    %% The very package which is installed is forwarded: the
+                    %% nodes of the cluster which did not finish the
+                    %% installation -- a peer which held its lock, or a
+                    %% finalization which failed here -- are repaired by
+                    %% uploading it again.  Another package is refused instead
+                    %% of replacing the installation.
+                    install_package_on_nodes(NameVsn, Bin);
+                {ok, _} ->
+                    already_installed(NameVsn);
+                {error, _} ->
+                    install_package_on_nodes(NameVsn, Bin)
+            end;
+        {error, Reason} ->
+            %% The installation could not be classified, so the upload is not
+            %% refused as already installed: the caller can retry.
+            internal_error_response(
+                "plugin_upload_installation_in_progress",
+                #{name_vsn => NameVsn, reason => Reason},
+                <<"another installation of this plugin is in progress, retry later">>
+            );
+        _IncompleteOrAbsent ->
+            %% The plugin is not installed on this node: either nothing is
+            %% there, or the install dir only holds leftovers of a previous
+            %% attempt (an orphan `.tar.gz', a half-unpacked directory, or an
+            %% unreadable `release.json').  None of that is an installation,
+            %% so the upload is treated as a fresh install attempt: it must
+            %% pass the allow gate in `install_package_on_nodes/2', which also
+            %% purges the leftovers before unpacking the uploaded package.
+            install_package_on_nodes(NameVsn, Bin)
+    end.
+
+%% Classify under the installation lock: a tree which another attempt has
+%% published but not validated yet is not an installation.  The package file is
+%% read under the same lock, so that a concurrent installation can not replace
+%% it between the classification and the comparison; `emqx_plugins_fs:get_tar/1'
+%% also creates the file from the installed tree when it is missing, which must
+%% not happen outside the lock either.
+classify_installation(NameVsn, Bin) ->
+    emqx_plugins:with_installation_lock(NameVsn, fun() ->
+        case emqx_plugins:install_state(NameVsn) of
+            installed -> {installed, is_installed_package(NameVsn, Bin)};
+            NotInstalled -> NotInstalled
+        end
+    end).
+
+%% Whether the upload is the package which is installed on this node.
+is_installed_package(NameVsn, Bin) ->
+    case emqx_plugins_fs:get_tar(NameVsn) of
+        {ok, Bin} -> true;
+        _Other -> false
+    end.
+
+already_installed(NameVsn) ->
+    {400, #{
+        code => 'ALREADY_INSTALLED',
+        message => iolist_to_binary([
+            NameVsn,
+            " is already installed. Uninstall it first (`emqx ctl plugins uninstall ",
+            NameVsn,
+            "`) and then upload the package again to replace the installation."
+        ])
+    }}.
+
+install_package_on_nodes(NameVsn, Bin) ->
+    case emqx_plugins:is_allowed_installation(NameVsn, Bin) of
+        ok ->
+            Result = do_install_package_on_nodes(NameVsn, Bin),
+            ok = forget_allow_after_install(NameVsn, Result),
+            Result;
+        {error, not_allowed} ->
+            Msg = iolist_to_binary([
+                <<"Package is not allowed installation;">>,
+                <<" first allow it to be installed by running:">>,
+                <<" `emqx ctl plugins allow ">>,
+                NameVsn,
+                <<"`">>
+            ]),
+            {403, #{code => 'FORBIDDEN', message => Msg}};
+        {error, sha256_mismatch} ->
+            Msg = iolist_to_binary([
+                <<"Package sha256 does not match the value bound by `emqx ctl plugins allow ">>,
+                NameVsn,
+                <<" sha256:...`">>
+            ]),
+            {403, #{code => 'FORBIDDEN', message => Msg}};
+        {error, sha256_required} ->
+            Msg = iolist_to_binary([
+                <<"The hardened security profile requires a sha256-bound grant;">>,
+                <<" allow it to be installed by running:">>,
+                <<" `emqx ctl plugins allow ">>,
+                NameVsn,
+                <<" sha256:<hex>`">>
+            ]),
+            {403, #{code => 'FORBIDDEN', message => Msg}}
+    end.
+
+%% On a successful HTTP install, immediately revoke the cluster-wide allow
+%% entry so the same grant cannot be reused for a subsequent (potentially
+%% different) upload. On failure, leave the entry in place so the operator
+%% can retry without having to re-issue `emqx ctl plugins allow'.
+forget_allow_after_install(NameVsn, {204}) ->
+    Nodes = emqx:running_nodes(),
+    _ = emqx_plugins_proto_v3:disallow_installation(Nodes, NameVsn),
+    ok;
+forget_allow_after_install(_NameVsn, _Other) ->
+    ok.
+
+do_install_package_on_nodes(NameVsn, Bin) ->
+    Nodes = emqx:running_nodes(),
+    {Responses, BadNodes} =
+        emqx_mgmt_api_plugins_proto_v4:install_package(Nodes, NameVsn, Bin),
+    GoodNodes = Nodes -- BadNodes,
+    NodeErrors = [
+        {Node, Response}
+     || {Node, Response} <- lists:zip(GoodNodes, Responses),
+        Response =/= ok
+    ],
+    InstalledNodes = [
+        Node
+     || {Node, ok} <- lists:zip(GoodNodes, Responses)
+    ],
+    case {NodeErrors, BadNodes} of
+        {[], []} ->
+            {204};
+        {NodeErrors, []} when NodeErrors =/= [] ->
+            case lists:any(fun({_Node, Error}) -> is_server_error(Error) end, NodeErrors) of
+                true ->
+                    ?SLOG(error, #{
+                        msg => "plugin_install_failed",
+                        node_errors => NodeErrors,
+                        installed_nodes => InstalledNodes
+                    }),
+                    {500, #{
+                        code => 'INTERNAL_ERROR',
+                        message => install_error_msg(NameVsn, NodeErrors, InstalledNodes)
+                    }};
+                false ->
+                    ?SLOG(warning, #{
+                        msg => "invalid_plugin_package",
+                        node_errors => NodeErrors,
+                        installed_nodes => InstalledNodes
+                    }),
+                    {400, #{
+                        code => 'BAD_PLUGIN_INFO',
+                        message => install_error_msg(NameVsn, NodeErrors, InstalledNodes)
+                    }}
+            end;
+        {NodeErrors, BadNodes} ->
+            ?SLOG(error, #{
+                msg => "plugin_install_failed",
+                node_errors => NodeErrors,
+                bad_nodes => BadNodes,
+                installed_nodes => InstalledNodes
+            }),
+            {500, #{
+                code => 'INTERNAL_ERROR',
+                message => install_error_msg(
+                    NameVsn,
+                    NodeErrors ++ [{Node, {badnode, Node}} || Node <- BadNodes],
+                    InstalledNodes
+                )
+            }}
+    end.
+
+%% The nodes that accepted the package keep it, so the caller is told where it
+%% is and how to remove it.
+install_error_msg(_NameVsn, NodeErrors, []) ->
+    format_node_errors(NodeErrors);
+install_error_msg(NameVsn, NodeErrors, InstalledNodes) ->
+    iolist_to_binary([
+        format_node_errors(NodeErrors),
+        ". The package was installed on node(s) ",
+        lists:join(", ", [atom_to_binary(Node) || Node <- InstalledNodes]),
+        ". To remove it from the cluster, call DELETE /api/v5/plugins/",
+        NameVsn
+    ]).
+
+%% Whether the failure is not the package's fault: the node could not be
+%% reached, another installation of the same plugin held its installation lock,
+%% the installation was published but could not be finished, or the package file,
+%% the tree, the staging directory or the package fetched from another node could
+%% not be written/read.  Those are server errors so the caller retries; anything
+%% else is a package the caller has to fix.  A package which can not be
+%% snapshotted (`failed_to_backup_plugin_package') stays a package error: nothing
+%% has been written yet, and the message points at the permissions of the install
+%% directory.
+is_server_error({badnode, _}) ->
+    true;
+is_server_error({badrpc, _}) ->
+    true;
+is_server_error({error, Errors}) when is_list(Errors) ->
+    lists:any(
+        fun
+            ({_Node, Error}) -> is_server_error(Error);
+            (_Other) -> false
+        end,
+        Errors
+    );
+is_server_error({error, #{reason := installation_in_progress}}) ->
+    true;
+is_server_error({error, #{reason := installation_not_ready}}) ->
+    true;
+is_server_error({error, #{msg := "failed_to_write_plugin_package"}}) ->
+    true;
+is_server_error({error, #{msg := "failed_to_publish_plugin_package"}}) ->
+    true;
+is_server_error({error, #{msg := "failed_to_replace_plugin_package"}}) ->
+    true;
+is_server_error({error, #{msg := "failed_to_create_plugin_staging_dir"}}) ->
+    true;
+is_server_error({error, #{msg := "failed_to_rollback_plugin_install"}}) ->
+    true;
+is_server_error({error, #{msg := "failed_to_purge_plugin_dir"}}) ->
+    true;
+is_server_error({error, #{msg := "failed_to_copy_plugin_from_other_nodes"}}) ->
+    true;
+is_server_error(_) ->
+    false.
+
+plugin(get, #{bindings := #{name := NameVsn}}) ->
+    Nodes = emqx:running_nodes(),
+    {Plugins, _} = emqx_mgmt_api_plugins_proto_v4:describe_package(Nodes, NameVsn),
+    case format_plugins(drop_bad_plugin_results(Plugins)) of
+        [Plugin] -> {200, Plugin};
+        [] -> {404, #{code => 'NOT_FOUND', message => NameVsn}}
+    end;
+plugin(delete, #{bindings := #{name := NameVsn}}) ->
+    unless_pinned_here(NameVsn, fun() ->
+        with_managed_plugin(NameVsn, fun() ->
+            Res = emqx_mgmt_api_plugins_proto_v4:delete_package(NameVsn),
+            operation_response(delete, Res)
+        end)
+    end).
+
+update_plugin(put, #{bindings := #{name := NameVsn, action := Action}}) ->
+    unless_pinned_here(NameVsn, fun() ->
+        with_managed_plugin(NameVsn, fun() ->
+            Res = ensure_cluster_action(NameVsn, Action),
+            operation_response(Action, Res)
+        end)
+    end).
+
+plugin_config(get, #{bindings := #{name := NameVsn}}) ->
+    get_plugin_config(NameVsn);
+plugin_config(put, #{bindings := #{name := NameVsn}, body := Config}) ->
+    return_config_update_result(put_plugin_config(NameVsn, Config)).
+
+upload_plugin_config(post, #{
+    bindings := #{name := NameVsn}, body := #{<<"config">> := #{type := _} = ConfigUpload}
+}) ->
+    case maps:to_list(maps:without([type], ConfigUpload)) of
+        [{_FileName, ConfigBin}] ->
+            return_config_update_result(put_plugin_config(NameVsn, ConfigBin));
+        _ ->
+            bad_config_form_data()
+    end;
+upload_plugin_config(post, _Params) ->
+    bad_config_form_data().
+
+download_plugin_config(get, #{bindings := #{name := NameVsn}}) ->
+    case get_plugin_config(NameVsn) of
+        {200, Headers0, Config} ->
+            Headers = Headers0#{
+                <<"content-disposition">> =>
+                    <<"attachment; filename=\"", NameVsn/binary, ".json\"">>
+            },
+            {200, Headers, Config};
+        FailureResponse ->
+            FailureResponse
+    end.
+
+get_plugin_config(NameVsn) ->
+    case describe_api_plugin(NameVsn, #{}) of
+        {ok, _} ->
+            case emqx_plugins:get_config(NameVsn, ?plugin_conf_not_found) of
+                Config when is_map(Config) ->
+                    {200, #{<<"content-type">> => <<"'application/json'">>}, Config};
+                ?plugin_conf_not_found ->
+                    {400, #{
+                        code => 'BAD_CONFIG',
+                        message => <<"Plugin Config Not Found">>
+                    }}
+            end;
+        _ ->
+            {404, plugin_not_found_msg()}
+    end.
+
+-spec put_plugin_config(name_vsn(), map() | binary()) -> ok | {error, term()}.
+put_plugin_config(NameVsn, Config) ->
+    case describe_api_plugin(NameVsn, #{}) of
+        {ok, _} ->
+            case emqx_plugins:decode_plugin_config_map(NameVsn, Config) of
+                {ok, ?plugin_without_config_schema} ->
+                    %% no plugin avro schema, just put the json map as-is
+                    Res = emqx_mgmt_api_plugins_proto_v4:update_plugin_config(
+                        config_nodes(NameVsn), NameVsn, Config
+                    ),
+                    validate_node_results(Res);
+                {ok, _AvroValue} ->
+                    %% cluster call with config in map (binary key-value)
+                    Res = emqx_mgmt_api_plugins_proto_v4:update_plugin_config(
+                        config_nodes(NameVsn), NameVsn, Config
+                    ),
+                    validate_node_results(Res);
+                {error, _Reason} = Error ->
+                    %% Local config decode/validation failure (e.g. invalid type):
+                    %% surface as a bad_config so the client gets 400 BAD_CONFIG with
+                    %% a readable message rather than 500/UNEXPECTED_ERROR.
+                    {error, {bad_config, [Error]}}
+            end;
+        _ ->
+            {error, ?plugin_not_found}
+    end.
+
+%% The nodes that report the plugin version, plus the nodes whose answer is not a
+%% plugin list (unreachable, or the call crashed), so that the update reports
+%% them as failures. A node that pins another version of the plugin name does
+%% not report this one, and is left out.
+config_nodes(NameVsn) ->
+    Nodes = emqx:running_nodes(),
+    {Results, BadNodes} = emqx_mgmt_api_plugins_proto_v4:describe_package(Nodes, NameVsn),
+    %% `rpc:multicall' returns the results of the reachable nodes in node order.
+    GoodNodes = Nodes -- BadNodes,
+    [
+        Node
+     || {Node, Result} <- lists:zip(GoodNodes, Results),
+        not is_plugin_absent(Node, Result)
+    ] ++ BadNodes.
+
+is_plugin_absent(Node, {Node, []}) -> true;
+is_plugin_absent(_Node, _Result) -> false.
+
+plugin_schema(get, #{bindings := #{name := NameVsn}}) ->
+    case describe_api_plugin(NameVsn, #{}) of
+        {ok, _Plugin} ->
+            {200, format_plugin_avsc_and_i18n(NameVsn)};
+        _ ->
+            {404, plugin_not_found_msg()}
+    end.
+
+update_boot_order(post, #{bindings := #{name := Name}, body := Body}) ->
+    unless_pinned_here(Name, fun() -> do_update_boot_order(Name, Body) end).
+
+do_update_boot_order(Name, Body) ->
+    case describe_api_plugin(Name, #{}) of
+        {ok, _Plugin} ->
+            case parse_position(Body, Name) of
+                {error, Reason} ->
+                    {400, #{code => 'BAD_POSITION', message => Reason}};
+                Position ->
+                    case emqx_plugins:ensure_enabled(Name, Position, global) of
+                        ok ->
+                            {204};
+                        {error, Reason} ->
+                            {400, #{
+                                code => 'MOVE_FAILED',
+                                message => readable_error_msg(Reason)
+                            }}
+                    end
+            end;
+        _ ->
+            {404, plugin_not_found_msg()}
+    end.
+
+sync_plugin(post, #{body := Body}) ->
+    case parse_sync_plugin_name(Body) of
+        {ok, NameVsn} ->
+            ?SLOG(debug, #{
+                msg => "sync_plugin_to_cluster",
+                keep_namevsn => NameVsn
+            }),
+            unless_pinned_here(NameVsn, fun() ->
+                case describe_api_plugin(NameVsn, #{}) of
+                    {ok, _Plugin} ->
+                        do_sync_plugin(NameVsn);
+                    {error, stale_plugin} ->
+                        {404, plugin_not_found_msg()};
+                    _ ->
+                        do_sync_plugin(NameVsn)
+                end
+            end);
+        {error, {plugin_error, Reason}} ->
+            ?SLOG(warning, #{msg => "invalid_plugin_sync_name", reason => Reason}),
+            {400, #{
+                code => 'BAD_PLUGIN_INFO',
+                message => Reason
+            }}
+    end.
+
+do_sync_plugin(NameVsn) ->
+    case ensure_existed(NameVsn) of
+        ok ->
+            Nodes = emqx:running_nodes(),
+            {Responses, BadNodes} =
+                emqx_mgmt_api_plugins_proto_v4:sync_plugin_cluster(Nodes, node(), NameVsn),
+            case sync_node_errors(Nodes, Responses, BadNodes) of
+                [] -> {204};
+                NodeErrors -> sync_error_response(NameVsn, NodeErrors)
+            end;
+        {error, #{reason := installation_in_progress} = Reason} ->
+            %% The installation state could not be read, so this is not a
+            %% missing plugin: report the transient failure as a server error.
+            internal_error_response(
+                "plugin_sync_installation_in_progress",
+                #{name_vsn => NameVsn, reason => Reason},
+                <<"another installation of this plugin is in progress, retry later">>
+            );
+        {error, {plugin_error, _Reason}} ->
+            {404, plugin_not_found_msg()}
+    end.
+
+%% The results of the sync callback on the nodes.  A node which is still
+%% installing this plugin holds its installation lock, so it can neither purge
+%% its other versions nor fetch the package: that is a transient failure which
+%% the caller retries.  Peers which predate the installation lock answer with
+%% the package they fetched, which is a success.
+sync_node_errors(Nodes, Responses, BadNodes) ->
+    GoodNodes = Nodes -- BadNodes,
+    [{Node, {badnode, Node}} || Node <- BadNodes] ++
+        [
+            {Node, Response}
+         || {Node, Response} <- lists:zip(GoodNodes, Responses),
+            not is_sync_ok(Response)
+        ].
+
+is_sync_ok(ok) -> true;
+is_sync_ok({ok, _FetchedPackage}) -> true;
+is_sync_ok(_Other) -> false.
+
+sync_error_response(NameVsn, NodeErrors) ->
+    case lists:any(fun({_Node, Error}) -> is_server_error(Error) end, NodeErrors) of
+        true ->
+            internal_error_response(
+                "plugin_sync_failed",
+                #{name_vsn => NameVsn, node_errors => NodeErrors},
+                sync_server_error_message(NodeErrors)
+            );
+        false ->
+            {400, #{
+                code => 'BAD_PLUGIN_INFO',
+                message => format_node_errors(NodeErrors)
+            }}
+    end.
+
+%% Only a node which is installing this plugin reports a reason the caller can
+%% fix by retrying; an unreachable node or a package fetch failure needs a
+%% neutral message.
+sync_server_error_message(NodeErrors) ->
+    case lists:all(fun({_Node, Error}) -> is_installation_in_progress(Error) end, NodeErrors) of
+        true -> <<"another installation of this plugin is in progress, retry later">>;
+        false -> <<"the plugin synchronization failed on some nodes, retry later">>
+    end.
+
+is_installation_in_progress({error, #{reason := installation_in_progress}}) ->
+    true;
+is_installation_in_progress({error, Errors}) when is_list(Errors) ->
+    lists:all(
+        fun
+            ({_Node, Error}) -> is_installation_in_progress(Error);
+            (_Other) -> false
+        end,
+        Errors
+    );
+is_installation_in_progress(_) ->
+    false.
+
+%% API CallBack End
+
+%% For RPC upload_install/2
+install_package(FileName, Bin) ->
+    NameVsn = string:trim(FileName, trailing, ".tar.gz"),
+    install_package_v4(NameVsn, Bin).
+
+%% Classifying the installation, snapshotting the package which is replaced and
+%% unpacking the upload are all done by `emqx_plugins:install_package/2', which
+%% runs them under the installation lock of the plugin.
+install_package_v4(NameVsn, Bin) ->
+    emqx_plugins:install_package(NameVsn, Bin).
+
+%% For RPC plugin get
+describe_package(NameVsn) ->
+    Node = node(),
+    case describe_api_plugin(NameVsn) of
+        {ok, Plugin} -> {Node, [Plugin]};
+        _ -> {Node, []}
+    end.
+
+%% Tip: Don't delete delete_package/1, use before v571 cluster_rpc
+delete_package(NameVsn) ->
+    delete_package(NameVsn, #{}).
+
+%% For RPC plugin delete.
+%% On a node that pins the plugin name, only the `plugins.states' entry is
+%% removed, and the pinned plugin is not touched.
+delete_package(NameVsn, _Opts) ->
+    unless_pinned(
+        NameVsn,
+        fun() -> emqx_plugins:delete_state(NameVsn) end,
+        fun() -> emqx_plugins:safe_delete_package(NameVsn) end
+    ).
+
+%% Tip: Don't delete ensure_action/2, use before v571 cluster_rpc
+ensure_action(Name, Action) ->
+    ensure_action(Name, Action, #{}).
+
+%% On a node that pins the plugin name, only the `plugins.states' change is
+%% applied, and the pinned plugin is not touched.
+ensure_action(Name, Action, _Opts) ->
+    unless_pinned(
+        Name,
+        fun() -> emqx_plugins:mirror_cluster_state(Name, Action =/= stop) end,
+        fun() -> do_ensure_action(Name, Action) end
+    ).
+
+do_ensure_action(Name, start) ->
+    case emqx_plugins:ensure_started(Name) of
+        ok -> emqx_plugins:ensure_enabled(Name);
+        {error, _} = Error -> Error
+    end;
+do_ensure_action(Name, stop) ->
+    case emqx_plugins:ensure_stopped(Name) of
+        ok -> emqx_plugins:ensure_disabled(Name);
+        {error, _} = Error -> Error
+    end;
+do_ensure_action(Name, restart) ->
+    case emqx_plugins:restart(Name) of
+        ok -> emqx_plugins:ensure_enabled(Name);
+        {error, _} = Error -> Error
+    end.
+
+ensure_cluster_action(Name, stop) ->
+    emqx_mgmt_api_plugins_proto_v4:ensure_action(Name, stop);
+ensure_cluster_action(Name, start) ->
+    Nodes = emqx:running_nodes(),
+    ensure_start_packages_on_nodes(Nodes, Name).
+
+ensure_start_packages_on_nodes(Nodes, Name) ->
+    {Responses, BadNodes} =
+        emqx_mgmt_api_plugins_proto_v5:ensure_start_package(Nodes, Name),
+    GoodNodes = Nodes -- BadNodes,
+    NodeErrors = [
+        {Node, Response}
+     || {Node, Response} <- lists:zip(GoodNodes, Responses),
+        Response =/= ok
+    ],
+    case {lists:any(fun is_node_rpc_error/1, NodeErrors), BadNodes, NodeErrors} of
+        {false, [], []} ->
+            validate_and_start_on_nodes(Nodes, Name);
+        {false, [], _} ->
+            {error, {plugin_start_failed, NodeErrors}};
+        _ ->
+            {error, {plugin_start_unavailable, package, NodeErrors, BadNodes}}
+    end.
+
+%% Start validation is deliberately side-effect free, but it is not an atomic
+%% transaction with the following starts.  Each node revalidates in
+%% `emqx_plugins:ensure_started/1', and rollback is best effort if concurrent
+%% lifecycle or configuration operations make these status hints stale.
+validate_and_start_on_nodes(Nodes, Name) ->
+    {Responses, BadNodes} = emqx_mgmt_api_plugins_proto_v5:validate_start(Nodes, Name),
+    GoodNodes = Nodes -- BadNodes,
+    NodeResponses = lists:zip(GoodNodes, Responses),
+    NodeErrors = [
+        {Node, Response}
+     || {Node, Response} <- NodeResponses,
+        not is_start_validation_result(Response)
+    ],
+    case {lists:any(fun is_node_rpc_error/1, NodeErrors), BadNodes, NodeErrors} of
+        {false, [], []} ->
+            NodeStates = [
+                {Node, RunningStatus}
+             || {Node, {ok, RunningStatus}} <- NodeResponses
+            ],
+            start_on_nodes(Name, NodeStates);
+        {false, [], _} ->
+            {error, {plugin_start_preflight_failed, NodeErrors}};
+        _ ->
+            {error, {plugin_start_unavailable, validation, NodeErrors, BadNodes}}
+    end.
+
+start_on_nodes(Name, NodeStates) ->
+    Nodes = [Node || {Node, _RunningStatus} <- NodeStates],
+    {Responses, BadNodes} = emqx_mgmt_api_plugins_proto_v5:ensure_started(Nodes, Name),
+    GoodNodes = Nodes -- BadNodes,
+    Errors = [
+        {Node, Response}
+     || {Node, Response} <- lists:zip(GoodNodes, Responses),
+        Response =/= ok
+    ],
+    case {lists:any(fun is_node_rpc_error/1, Errors), BadNodes, Errors} of
+        {false, [], []} ->
+            enable_if_membership_unchanged(Name, NodeStates);
+        {false, [], _} ->
+            rollback_after_start_error(Name, NodeStates, {plugin_start_failed, Errors});
+        _ ->
+            rollback_after_start_error(
+                Name,
+                NodeStates,
+                {plugin_start_unavailable, start, Errors, BadNodes}
+            )
+    end.
+
+enable_if_membership_unchanged(Name, NodeStates) ->
+    ValidatedNodes = lists:sort([Node || {Node, _} <- NodeStates]),
+    CurrentNodes = lists:sort(emqx:running_nodes()),
+    case CurrentNodes =:= ValidatedNodes of
+        true ->
+            case emqx_plugins:ensure_enabled(Name, no_move, global) of
+                ok ->
+                    ok;
+                {error, Reason} ->
+                    rollback_after_start_error(
+                        Name,
+                        NodeStates,
+                        {plugin_start_enable_failed, Reason}
+                    )
+            end;
+        false ->
+            rollback_after_start_error(
+                Name,
+                NodeStates,
+                {plugin_start_membership_changed, ValidatedNodes, CurrentNodes}
+            )
+    end.
+
+rollback_after_start_error(Name, NodeStates, Cause) ->
+    case rollback_starts(Name, NodeStates) of
+        ok ->
+            {error, Cause};
+        {error, RollbackErrors} ->
+            {error, {plugin_start_rollback_failed, Cause, RollbackErrors}}
+    end.
+
+rollback_starts(Name, NodeStates) ->
+    Nodes = [Node || {Node, not_running} <- NodeStates],
+    {Responses, BadNodes} = emqx_mgmt_api_plugins_proto_v5:ensure_stopped(Nodes, Name),
+    GoodNodes = Nodes -- BadNodes,
+    Errors =
+        [
+            {Node, Response}
+         || {Node, Response} <- lists:zip(GoodNodes, Responses),
+            Response =/= ok
+        ] ++
+            [{Node, {badnode, Node}} || Node <- BadNodes],
+    case Errors of
+        [] -> ok;
+        [_ | _] -> {error, Errors}
+    end.
+
+is_start_validation_result({ok, RunningStatus}) when
+    RunningStatus =:= running; RunningStatus =:= not_running
+->
+    true;
+is_start_validation_result(_) ->
+    false.
+
+is_node_rpc_error({_Node, {badrpc, _}}) -> true;
+is_node_rpc_error({_Node, _}) -> false.
+
+%% for RPC plugin avro encoded config update
+-spec do_update_plugin_config(name_vsn(), map() | binary(), any()) ->
+    ok.
+do_update_plugin_config(NameVsn, AvroJsonMap, _AvroValue) ->
+    case do_update_plugin_config_v4(NameVsn, AvroJsonMap) of
+        ok -> ok;
+        {error, Reason} -> error(Reason)
+    end.
+
+-spec do_update_plugin_config_v4(name_vsn(), map() | binary()) ->
+    ok | {error, term()}.
+do_update_plugin_config_v4(NameVsn, AvroJsonMap) when is_binary(AvroJsonMap) ->
+    do_update_plugin_config_v4(NameVsn, emqx_utils_json:decode(AvroJsonMap));
+do_update_plugin_config_v4(NameVsn, AvroJsonMap) ->
+    %% A node that pins another version of the plugin name skips the update: the
+    %% config file is per plugin name, so it would overwrite the pinned config.
+    case
+        emqx_plugins_utils:validate_name_vsn(NameVsn) =:= ok andalso
+            emqx_plugins_pinned:is_other_version(NameVsn)
+    of
+        true -> ok;
+        false -> emqx_plugins:update_config(NameVsn, AvroJsonMap)
+    end.
+
+%% for RPC plugin ensure existed
+-spec ensure_existed(name_vsn()) -> ok | {error, term()}.
+ensure_existed(NameVsn) ->
+    case emqx_plugins:ensure_installed(NameVsn) of
+        ok ->
+            _ = emqx_plugins:publish_state(NameVsn),
+            ok;
+        {error, #{reason := installation_in_progress}} = Busy ->
+            %% The installation could not be classified, so this does not say
+            %% that the plugin is missing.
+            Busy;
+        {error, _} ->
+            {error, {plugin_error, <<"Plugin Not Found">>}}
+    end.
+
+%% for RPC plugin sync
+%%
+%% The refusal of the installation lock is returned to the caller: a node which
+%% is installing this plugin must not report that the synchronization succeeded.
+-spec sync_plugin_cluster(node(), name_vsn()) ->
+    ok | {ok, binary()} | {error, term()}.
+sync_plugin_cluster(Node, NameVsn) ->
+    unless_pinned(NameVsn, ok, fun() -> do_sync_plugin_cluster(Node, NameVsn) end).
+
+do_sync_plugin_cluster(Node, NameVsn) when Node =:= node() ->
+    emqx_plugins:purge_other_versions(NameVsn);
+do_sync_plugin_cluster(Node, NameVsn) ->
+    maybe
+        ok ?= emqx_plugins:purge_other_versions(NameVsn),
+        emqx_plugins:get_package_from_node(Node, NameVsn)
+    end.
+
+%%--------------------------------------------------------------------
+%% Helper functions
+%%--------------------------------------------------------------------
+
+operation_response(_Operation, ok) ->
+    {204};
+operation_response(start, {error, {plugin_start_preflight_failed, NodeErrors}}) ->
+    case classify_start_preflight_errors(NodeErrors) of
+        invalid_config ->
+            {400, #{
+                code => 'BAD_CONFIG',
+                message => format_node_errors(NodeErrors)
+            }};
+        conflicting_version ->
+            {400, #{
+                code => 'PARAM_ERROR',
+                message => format_node_errors(NodeErrors)
+            }};
+        mixed_client_errors ->
+            {400, #{
+                code => 'PARAM_ERROR',
+                message => format_node_errors(NodeErrors)
+            }};
+        internal_error ->
+            internal_error_response(
+                "plugin_start_preflight_failed",
+                #{node_errors => NodeErrors},
+                format_node_errors(NodeErrors)
+            )
+    end;
+operation_response(
+    start,
+    {error, {plugin_start_unavailable, Phase, NodeErrors, BadNodes}}
+) ->
+    internal_error_response(
+        "plugin_start_unavailable",
+        #{phase => Phase, node_errors => NodeErrors, bad_nodes => BadNodes},
+        format_node_errors(NodeErrors ++ [{Node, {badnode, Node}} || Node <- BadNodes])
+    );
+operation_response(
+    start,
+    {error, {plugin_start_membership_changed, ValidatedNodes, CurrentNodes}}
+) ->
+    internal_error_response(
+        "plugin_start_membership_changed",
+        #{validated_nodes => ValidatedNodes, current_nodes => CurrentNodes},
+        <<"Cluster membership changed during plugin start. Retry when the cluster is stable.">>
+    );
+operation_response(start, {error, {plugin_start_rollback_failed, Cause, RollbackErrors}}) ->
+    internal_error_response(
+        "plugin_start_rollback_failed",
+        #{cause => Cause, rollback_errors => RollbackErrors},
+        <<
+            "Plugin start failed and rollback was incomplete. "
+            "Check server logs and plugin status on all nodes."
+        >>
+    );
+operation_response(start, {error, {plugin_start_enable_failed, Reason}}) ->
+    internal_error_response(
+        "plugin_start_enable_failed",
+        #{reason => Reason},
+        <<
+            "Plugin start was rolled back because enabling it in the cluster configuration failed. "
+            "Check server logs for details."
+        >>
+    );
+operation_response(start, {error, {plugin_start_failed, NodeErrors}}) ->
+    internal_error_response(
+        "plugin_start_failed",
+        #{node_errors => NodeErrors},
+        format_node_errors(NodeErrors)
+    );
+operation_response(Operation, {error, #{reason := {enoent, Path} = Reason} = Error}) ->
+    ?SLOG(warning, #{
+        msg => "plugin_resource_not_found",
+        operation => Operation,
+        path => Path,
+        reason => Reason,
+        error => Error
+    }),
+    {404, #{
+        code => 'NOT_FOUND',
+        message =>
+            <<
+                "plugin_resource_not_found: A required plugin resource was not found. "
+                "Check server logs for details."
+            >>
+    }};
+operation_response(Operation, {error, Reason}) ->
+    internal_error_response(
+        operation_error_keyword(Operation),
+        #{operation => Operation, reason => Reason},
+        <<"Plugin operation failed. Check server logs for details.">>
+    ).
+
+internal_error_response(Keyword, LogFields, Details) ->
+    ?SLOG(error, LogFields#{msg => Keyword}),
+    {500, #{
+        code => 'INTERNAL_ERROR',
+        message => iolist_to_binary([Keyword, ": ", Details])
+    }}.
+
+operation_error_keyword(start) -> "plugin_start_failed";
+operation_error_keyword(stop) -> "plugin_stop_failed";
+operation_error_keyword(delete) -> "plugin_delete_failed".
+
+validate_node_results({Responses, BadNodes}) ->
+    ResponseErrors = lists:filter(fun(Response) -> Response =/= ok end, Responses),
+    NodeErrors = [{badnode, Node} || Node <- BadNodes],
+    case {ResponseErrors, NodeErrors} of
+        {[], []} ->
+            ok;
+        {ResponseErrors, []} ->
+            {error, {bad_config, ResponseErrors}};
+        {ResponseErrors, NodeErrors} ->
+            {error, {internal_error, ResponseErrors ++ NodeErrors}}
+    end.
+
+return_config_update_result(ok) ->
+    {204};
+return_config_update_result({error, {bad_config, ResponseErrors}}) ->
+    {400, #{code => 'BAD_CONFIG', message => format_errors(ResponseErrors)}};
+return_config_update_result({error, {internal_error, ResponseErrorsAndNodeErrors}}) ->
+    {500, #{
+        code => 'INTERNAL_ERROR',
+        message => format_errors(ResponseErrorsAndNodeErrors)
+    }};
+return_config_update_result({error, ?plugin_not_found}) ->
+    {404, plugin_not_found_msg()}.
+
+plugin_not_found_msg() ->
+    #{
+        code => 'NOT_FOUND',
+        message => <<"Plugin Not Found">>
+    }.
+
+format_errors(Errors) ->
+    Msgs = lists:map(fun format_error/1, Errors),
+    iolist_to_binary(lists:join("; ", Msgs)).
+
+format_error({error, Msg}) ->
+    readable_error_msg(Msg);
+format_error({badnode, Node}) ->
+    iolist_to_binary(io_lib:format("node ~ts unavailable", [Node]));
+format_error(Other) ->
+    readable_error_msg(Other).
+
+format_node_errors(NodeErrors) ->
+    iolist_to_binary(
+        lists:join("; ", [format_node_error(Node, Error) || {Node, Error} <- NodeErrors])
+    ).
+
+format_node_error(Node, {badnode, Node}) ->
+    iolist_to_binary(["node ", atom_to_binary(Node), " unavailable"]);
+format_node_error(Node, Error) ->
+    iolist_to_binary([
+        "node ",
+        atom_to_binary(Node),
+        ": ",
+        format_error(Error)
+    ]).
+
+classify_start_preflight_errors(NodeErrors) ->
+    Errors = [Error || {_Node, Error} <- NodeErrors],
+    Kinds = lists:filtermap(fun validation_error_kind/1, Errors),
+    case length(Kinds) =:= length(Errors) of
+        false ->
+            internal_error;
+        true ->
+            case lists:usort(Kinds) of
+                [] -> internal_error;
+                [invalid_config] -> invalid_config;
+                [conflicting_version] -> conflicting_version;
+                [_ | _] -> mixed_client_errors
+            end
+    end.
+
+validation_error_kind({error, #{kind := Kind}}) when
+    Kind =:= invalid_config;
+    Kind =:= invalid_package;
+    Kind =:= conflicting_version
+->
+    {true, Kind};
+validation_error_kind(_) ->
+    false.
+
+readable_error_msg(#{
+    msg := "invalid_plugin_config",
+    name_vsn := NameVsn,
+    reason := #{
+        reason := invalid_type,
+        path := Path,
+        expected := Expected,
+        actual := Actual
+    }
+}) ->
+    iolist_to_binary([
+        "invalid_plugin_config: Plugin ",
+        NameVsn,
+        " configuration is invalid at '",
+        Path,
+        "': expected ",
+        Expected,
+        ", got ",
+        Actual,
+        ". Fix or remove ",
+        emqx_plugins_fs:config_file_path(NameVsn),
+        " on this node and retry."
+    ]);
+readable_error_msg(#{
+    msg := "invalid_plugin_config",
+    name_vsn := NameVsn,
+    reason := _Reason
+}) ->
+    iolist_to_binary([
+        "invalid_plugin_config: Plugin ",
+        NameVsn,
+        " configuration is invalid. Fix or remove ",
+        emqx_plugins_fs:config_file_path(NameVsn),
+        " on this node and retry."
+    ]);
+readable_error_msg(#{
+    msg := "invalid_plugin_config_schema",
+    name_vsn := NameVsn,
+    reason := _Reason
+}) ->
+    iolist_to_binary([
+        "invalid_plugin_config_schema: Plugin ",
+        NameVsn,
+        " contains an invalid configuration schema. Rebuild or reinstall a corrected plugin "
+        "package and retry."
+    ]);
+readable_error_msg(#{
+    msg := "bad_plugin_app_file",
+    path := _Path,
+    reason := _Reason
+}) ->
+    <<
+        "bad_plugin_app_file: Plugin package metadata is invalid or unreadable. "
+        "Rebuild or reinstall a corrected plugin package and retry."
+    >>;
+readable_error_msg(#{
+    msg := "plugin_app_version_mismatch",
+    path := _Path,
+    expected_vsn := ExpectedVsn,
+    actual_vsn := ActualVsn
+}) ->
+    iolist_to_binary([
+        "plugin_app_version_mismatch: Plugin package metadata declares application version ",
+        emqx_utils:readable_error_msg(ActualVsn),
+        ", but ",
+        ExpectedVsn,
+        " is required. Rebuild or reinstall the correct plugin package and retry."
+    ]);
+readable_error_msg(#{
+    msg := "plugin_app_loaded_outside_package",
+    name := AppName,
+    expected_ebin := ExpectedEbin,
+    loaded_ebin := LoadedEbin
+}) ->
+    case other_plugin_version(ExpectedEbin, LoadedEbin) of
+        {ok, OtherNameVsn} ->
+            iolist_to_binary([
+                "plugin_app_loaded_outside_package: Plugin ",
+                OtherNameVsn,
+                " is loaded. Uninstall it or restart the node, then retry."
+            ]);
+        error ->
+            iolist_to_binary([
+                "plugin_app_loaded_outside_package: Plugin application ",
+                atom_to_binary(AppName),
+                " is already loaded outside this plugin package. A package can bundle an "
+                "application that another plugin has loaded only when the two .app files are "
+                "identical. Rebuild the plugin with the loaded version, or remove the conflicting "
+                "code path and restart the node, then retry."
+            ])
+    end;
+readable_error_msg(#{
+    msg := "bad_default_hocon_file",
+    reason := _Reason
+}) ->
+    <<
+        "bad_default_hocon_file: Plugin package default configuration is invalid or "
+        "unreadable. Rebuild or reinstall a corrected plugin package and retry."
+    >>;
+readable_error_msg(#{
+    reason := bad_schema,
+    details := _Details
+}) ->
+    <<
+        "invalid_plugin_config_schema: Plugin package configuration schema is invalid. "
+        "Rebuild or reinstall a corrected plugin package and retry."
+    >>;
+readable_error_msg(#{
+    msg := "plugin_installed_but_not_ready",
+    name_vsn := NameVsn,
+    cause := Cause
+}) ->
+    iolist_to_binary([
+        "plugin_installed_but_not_ready: The uploaded package of plugin ",
+        NameVsn,
+        " is installed, but the plugin could not be loaded or configured (",
+        readable_error_msg(Cause),
+        "). Fix the cause and retry: the retry keeps the installed files and does not unpack the "
+        "package again. To replace the installation with this package, uninstall the plugin "
+        "(`emqx ctl plugins uninstall ",
+        NameVsn,
+        "`) and upload the package again."
+    ]);
+readable_error_msg(#{
+    msg := "plugin_is_in_use",
+    name_vsn := NameVsn
+}) ->
+    iolist_to_binary([
+        "plugin_is_in_use: Plugin ",
+        NameVsn,
+        " is still running from the installation that can not be replaced. "
+        "Stop the plugin (`emqx ctl plugins stop ",
+        NameVsn,
+        "`) and retry the upload."
+    ]);
+readable_error_msg(#{
+    msg := "failed_to_unload_plugin_apps",
+    name_vsn := NameVsn
+}) ->
+    iolist_to_binary([
+        "failed_to_unload_plugin_apps: The applications of plugin ",
+        NameVsn,
+        " could not be unloaded from the installation that can not be replaced. "
+        "Stop the plugin (`emqx ctl plugins stop ",
+        NameVsn,
+        "`) and retry the upload."
+    ]);
+readable_error_msg(#{
+    msg := "incomplete_plugin_package",
+    name_vsn := NameVsn,
+    missing_apps := MissingApps
+}) ->
+    iolist_to_binary([
+        "incomplete_plugin_package: The package of plugin ",
+        NameVsn,
+        " does not contain the applications declared by its release.json (",
+        lists:join(", ", MissingApps),
+        "). Rebuild or reinstall a corrected plugin package and retry."
+    ]);
+readable_error_msg(#{
+    msg := "conflicting_plugin_version_running",
+    active_versions := ActiveVersions
+}) ->
+    iolist_to_binary([
+        "conflicting_plugin_version_running: Another version of this plugin is running: ",
+        lists:join(", ", ActiveVersions),
+        ". Stop the active version and retry."
+    ]);
+readable_error_msg(#{
+    reason := invalid_type,
+    path := Path,
+    expected := Expected,
+    actual := Actual
+}) ->
+    iolist_to_binary([
+        "invalid_type: Invalid type for field '",
+        Path,
+        "': expected ",
+        Expected,
+        ", got ",
+        Actual
+    ]);
+readable_error_msg(#{
+    reason := invalid_union_member,
+    path := Path,
+    expected := Expected,
+    actual := Actual
+}) ->
+    iolist_to_binary([
+        "invalid_union_member: Invalid union member for field '",
+        Path,
+        "': expected ",
+        Expected,
+        ", got ",
+        Actual
+    ]);
+readable_error_msg(Msg) ->
+    emqx_utils:readable_error_msg(Msg).
+
+%% The name-vsn of the plugin that loaded the application, when it is another
+%% version of the plugin that is being installed.  `LoadedEbin' is
+%% `{error, bad_name}' when the loaded application has no directory in the
+%% code path.
+other_plugin_version(ExpectedEbin, LoadedEbin) when is_list(LoadedEbin) ->
+    maybe
+        {ok, NameVsn} ?= emqx_plugins_fs:name_vsn_of_path(ExpectedEbin),
+        {ok, LoadedNameVsn} ?= emqx_plugins_fs:name_vsn_of_path(LoadedEbin),
+        true ?= LoadedNameVsn =/= NameVsn,
+        true ?= plugin_name(LoadedNameVsn) =:= plugin_name(NameVsn),
+        {ok, LoadedNameVsn}
+    else
+        _ -> error
+    end;
+other_plugin_version(_ExpectedEbin, _LoadedEbin) ->
+    error.
+
+plugin_name(NameVsn) ->
+    case string:split(NameVsn, "-") of
+        [Name, _Vsn] -> Name;
+        _ -> NameVsn
+    end.
+
+-ifdef(TEST).
+
+update_plugin_schema_exposes_param_error_test() ->
+    #{
+        put := #{
+            responses := #{
+                400 := _
+            }
+        }
+    } = schema("/plugins/:name/:action").
+
+paths_gated_by_feature_test_() ->
+    {foreach, fun setup_feature_env/0, fun clear_feature_env/1, [
+        {"enabled when plugins feature is on", fun() ->
+            os:putenv("EMQX_FEATURES", "plugins"),
+            emqx_machine_features:clear_features(),
+            ?assertMatch([_ | _], paths())
+        end},
+        {"empty when plugins feature is off", fun() ->
+            os:putenv("EMQX_FEATURES", "dashboard"),
+            emqx_machine_features:clear_features(),
+            ?assertEqual([], paths())
+        end}
+    ]}.
+
+setup_feature_env() ->
+    os:getenv("EMQX_FEATURES").
+
+clear_feature_env(Prev) ->
+    case Prev of
+        false -> os:unsetenv("EMQX_FEATURES");
+        _ -> os:putenv("EMQX_FEATURES", Prev)
+    end,
+    emqx_machine_features:clear_features().
+
+%% A node which could not be reached, or which could not fetch the package for
+%% the synchronization, is a server-side failure, not a package the caller has to
+%% fix.
+is_server_error_test_() ->
+    [
+        ?_assert(is_server_error({badnode, 'peer@127.0.0.1'})),
+        ?_assert(is_server_error({badrpc, {'EXIT', boom}})),
+        ?_assert(is_server_error({error, #{reason => installation_in_progress}})),
+        ?_assert(is_server_error({error, [{node(), {badrpc, timeout}}]})),
+        ?_assertNot(is_server_error({error, [{node(), {error, #{msg => "bad_rel_apps"}}}]})),
+        ?_assertNot(is_server_error({error, [node(), node()]})),
+        ?_assertNot(is_server_error({error, "package is not valid"})),
+        ?_assert(is_server_error({error, #{msg => "failed_to_create_plugin_staging_dir"}})),
+        ?_assertNot(is_server_error({error, #{msg => "failed_to_backup_plugin_package"}})),
+        ?_assert(is_server_error({error, #{msg => "failed_to_rollback_plugin_install"}})),
+        ?_assert(is_server_error({error, #{msg => "failed_to_purge_plugin_dir"}})),
+        ?_assert(is_server_error({error, #{msg => "failed_to_copy_plugin_from_other_nodes"}})),
+        ?_assertNot(is_server_error({error, #{msg => "bad_plugin_package_name"}}))
+    ].
+
+is_installation_in_progress_test_() ->
+    [
+        ?_assert(is_installation_in_progress({error, #{reason => installation_in_progress}})),
+        ?_assert(
+            is_installation_in_progress(
+                {error, [{node(), {error, #{reason => installation_in_progress}}}]}
+            )
+        ),
+        ?_assertNot(is_installation_in_progress({error, [{node(), {badrpc, timeout}}]})),
+        ?_assertNot(
+            is_installation_in_progress({error, [{node(), {badrpc, timeout}}, oops]})
+        ),
+        ?_assertNot(is_installation_in_progress({error, "package is not valid"}))
+    ].
+
+-endif.
+
+describe_api_plugin(NameVsn) ->
+    describe_api_plugin(NameVsn, #{fill_readme => true, health_check => true}).
+
+describe_api_plugin(NameVsn, Options) ->
+    case emqx_plugins:describe(NameVsn, Options) of
+        {ok, Plugin} ->
+            case api_visible_plugin(Plugin) of
+                true -> {ok, Plugin};
+                false -> {error, stale_plugin}
+            end;
+        Error ->
+            Error
+    end.
+
+api_visible_plugin(#{name := Name, rel_vsn := Vsn} = Plugin) when not is_map_key(pinned, Plugin) ->
+    %% This node never runs another version of a plugin name that it pins.
+    case emqx_plugins_pinned:is_pinned(emqx_plugins_utils:make_name_vsn_binary(Name, Vsn)) of
+        true -> false;
+        false -> api_visible_configured_plugin(Plugin)
+    end;
+api_visible_plugin(Plugin) ->
+    api_visible_configured_plugin(Plugin).
+
+api_visible_configured_plugin(
+    #{config_status := not_configured, running_status := RunningStatus} = Plugin
+) ->
+    case RunningStatus of
+        running ->
+            true;
+        _ ->
+            emqx_plugins:log_unconfigured_plugin(Plugin),
+            false
+    end;
+api_visible_configured_plugin(_) ->
+    true.
+
+%% Run `Fun' when at least one node manages the plugin through the cluster.
+%% A plugin that only nodes pinning it report is managed on those nodes only.
+with_managed_plugin(NameVsn, Fun) ->
+    Nodes = emqx:running_nodes(),
+    {Plugins, _} = emqx_mgmt_api_plugins_proto_v4:describe_package(Nodes, NameVsn),
+    case format_plugins(drop_bad_plugin_results(Plugins)) of
+        [] ->
+            {404, plugin_not_found_msg()};
+        [#{pinned := true, running_status := Status} | _] ->
+            PinnedNodes = [Node || #{node := Node} <- Status],
+            {409, #{
+                code => 'PLUGIN_PINNED',
+                message => iolist_to_binary([
+                    "Plugin ",
+                    NameVsn,
+                    " is only on nodes that list it in node.pinned_plugins: ",
+                    lists:join(", ", [atom_to_binary(N) || N <- PinnedNodes]),
+                    ". Use the CLI on that node to start or stop it."
+                ])
+            }};
+        [_ | _] ->
+            Fun()
+    end.
+
+%% Refuse a request for a plugin name that this node pins.
+unless_pinned_here(NameVsn, Fun) ->
+    case emqx_plugins_pinned:is_pinned(NameVsn) of
+        true ->
+            #{pinned := Pinned} = emqx_plugins_pinned:refusal(NameVsn),
+            {409, #{
+                code => 'PLUGIN_PINNED',
+                message => iolist_to_binary([
+                    "Plugin name of ",
+                    NameVsn,
+                    " is pinned on node ",
+                    atom_to_binary(node()),
+                    " as ",
+                    Pinned,
+                    ". Use the CLI on that node to start or stop it,"
+                    " or edit node.pinned_plugins and restart the node."
+                ])
+            }};
+        false ->
+            Fun()
+    end.
+
+%% On a node that pins the plugin name, an RPC from a peer returns `Skip'
+%% instead of acting on the pinned plugin.
+unless_pinned(NameVsn, Skip, Fun) ->
+    case
+        emqx_plugins_utils:validate_name_vsn(NameVsn) =:= ok andalso
+            emqx_plugins_pinned:is_pinned(NameVsn)
+    of
+        true when is_function(Skip, 0) -> Skip();
+        true -> Skip;
+        false -> Fun()
+    end.
+
+%% A remote crash surfaces in the rpc:multicall result list as {badrpc, {'EXIT', _}}.
+drop_bad_plugin_results(Results) ->
+    {Good, Bad} = lists:partition(
+        fun
+            ({Node, Plugins}) when is_atom(Node), is_list(Plugins) -> true;
+            (_) -> false
+        end,
+        Results
+    ),
+    Bad =/= [] andalso
+        ?SLOG(warning, #{msg => "get_plugins_rpc_bad_results", results => Bad}),
+    Good.
+
+parse_position(#{<<"position">> := <<"front">>}, _) ->
+    front;
+parse_position(#{<<"position">> := <<"rear">>}, _) ->
+    rear;
+parse_position(#{<<"position">> := <<"before:", Name/binary>>}, Name) ->
+    {error, <<"Invalid parameter. Cannot be placed before itself">>};
+parse_position(#{<<"position">> := <<"after:", Name/binary>>}, Name) ->
+    {error, <<"Invalid parameter. Cannot be placed after itself">>};
+parse_position(#{<<"position">> := <<"before:">>}, _Name) ->
+    {error, <<"Invalid parameter. Cannot be placed before an empty target">>};
+parse_position(#{<<"position">> := <<"after:">>}, _Name) ->
+    {error, <<"Invalid parameter. Cannot be placed after an empty target">>};
+parse_position(#{<<"position">> := <<"before:", Before/binary>>}, _Name) ->
+    {before, binary_to_list(Before)};
+parse_position(#{<<"position">> := <<"after:", After/binary>>}, _Name) ->
+    {behind, binary_to_list(After)};
+parse_position(Position, _) ->
+    {error, iolist_to_binary(io_lib:format("~p", [Position]))}.
+
+-spec parse_sync_plugin_name(map()) -> {ok, string()} | {error, term()}.
+parse_sync_plugin_name(#{<<"name">> := Name}) ->
+    parse_sync_plugin_name(Name);
+parse_sync_plugin_name(Name) when is_binary(Name) ->
+    case validate_name(Name) of
+        ok ->
+            {ok, binary_to_list(Name)};
+        {error, _} ->
+            {error, {plugin_error, <<"Bad Plugin Name Vsn">>}}
+    end;
+parse_sync_plugin_name(_) ->
+    {error, {plugin_error, <<"Bad Plugin Name Vsn">>}}.
+
+format_plugins(List) ->
+    StatusMap = aggregate_status(List),
+    SortFun = fun({_N1, P1}, {_N2, P2}) -> length(P1) > length(P2) end,
+    SortList = lists:sort(SortFun, List),
+    pack_status_in_order(SortList, StatusMap).
+
+pack_status_in_order(List, StatusMap) ->
+    {Plugins, _} =
+        lists:foldl(
+            fun({_Node, PluginList}, {Acc, StatusAcc}) ->
+                pack_plugin_in_order(PluginList, Acc, StatusAcc)
+            end,
+            {[], StatusMap},
+            List
+        ),
+    lists:reverse(Plugins).
+
+pack_plugin_in_order([], Acc, StatusAcc) ->
+    {Acc, StatusAcc};
+pack_plugin_in_order(_, Acc, StatusAcc) when map_size(StatusAcc) =:= 0 -> {Acc, StatusAcc};
+pack_plugin_in_order([Plugin0 | Plugins], Acc, StatusAcc) ->
+    #{name := Name, rel_vsn := Vsn} = Plugin0,
+    case maps:find({Name, Vsn}, StatusAcc) of
+        {ok, Status} ->
+            Plugin1 = maps:without([running_status, config_status, pinned], Plugin0),
+            Plugins2 = Plugin1#{
+                running_status => Status,
+                pinned => lists:all(fun(#{pinned := Pinned}) -> Pinned end, Status)
+            },
+            NewStatusAcc = maps:remove({Name, Vsn}, StatusAcc),
+            pack_plugin_in_order(Plugins, [Plugins2 | Acc], NewStatusAcc);
+        error ->
+            pack_plugin_in_order(Plugins, Acc, StatusAcc)
+    end.
+
+aggregate_status(List) -> aggregate_status(List, #{}).
+
+aggregate_status([], Acc) ->
+    Acc;
+aggregate_status([{Node, Plugins} | List], Acc) ->
+    NewAcc =
+        lists:foldl(
+            fun(Plugin, SubAcc) ->
+                #{name := Name, rel_vsn := Vsn} = Plugin,
+                Key = {Name, Vsn},
+                Value0 = #{
+                    node => Node,
+                    status => plugin_status(Plugin),
+                    pinned => maps:get(pinned, Plugin, false)
+                },
+                Value = add_health_status(Value0, Plugin),
+                SubAcc#{Key => [Value | maps:get(Key, Acc, [])]}
+            end,
+            Acc,
+            Plugins
+        ),
+    aggregate_status(List, NewAcc).
+
+-dialyzer({nowarn_function, format_plugin_avsc_and_i18n/1}).
+format_plugin_avsc_and_i18n(NameVsn) ->
+    case emqx_release:edition() of
+        ee ->
+            #{
+                avsc => or_null(emqx_plugins:plugin_schema(NameVsn)),
+                i18n => or_null(emqx_plugins:plugin_i18n(NameVsn))
+            };
+        ce ->
+            #{avsc => null, i18n => null}
+    end.
+
+or_null({ok, Value}) -> Value;
+or_null(_) -> null.
+
+% running_status: running loaded, stopped
+%% config_status: not_configured disable enable
+plugin_status(#{running_status := running}) -> running;
+plugin_status(_) -> stopped.
+
+add_health_status(StatusInfo, #{health_status := HealthStatus}) ->
+    StatusInfo#{health_status => HealthStatus};
+add_health_status(StatusInfo, _) ->
+    StatusInfo.
+
+-ifdef(TEST).
+
+ensure_action_test_() ->
+    {setup,
+        fun() ->
+            meck:new(emqx_plugins, [passthrough]),
+            ok
+        end,
+        fun(_) ->
+            meck:unload(emqx_plugins)
+        end,
+        [
+            fun ensure_action_start_propagates_error_case/0,
+            fun ensure_action_stop_propagates_error_case/0,
+            fun ensure_action_restart_propagates_restart_error_case/0,
+            fun ensure_action_restart_propagates_enable_error_case/0,
+            fun ensure_action_success_case/0
+        ]}.
+
+ensure_action_start_propagates_error_case() ->
+    meck:expect(emqx_plugins, ensure_started, fun(_Name) -> {error, start_failed} end),
+    ?assertEqual({error, start_failed}, ensure_action(<<"demo-1.0.0">>, start, #{})).
+
+ensure_action_stop_propagates_error_case() ->
+    meck:expect(emqx_plugins, ensure_stopped, fun(_Name) -> {error, stop_failed} end),
+    ?assertEqual({error, stop_failed}, ensure_action(<<"demo-1.0.0">>, stop, #{})).
+
+ensure_action_restart_propagates_restart_error_case() ->
+    meck:expect(emqx_plugins, restart, fun(_Name) -> {error, restart_failed} end),
+    meck:expect(emqx_plugins, ensure_enabled, fun(_Name) -> ok end),
+    ?assertEqual({error, restart_failed}, ensure_action(<<"demo-1.0.0">>, restart, #{})),
+    ?assertNot(meck:called(emqx_plugins, ensure_enabled, ['_'])).
+
+ensure_action_restart_propagates_enable_error_case() ->
+    meck:expect(emqx_plugins, restart, fun(_Name) -> ok end),
+    meck:expect(emqx_plugins, ensure_enabled, fun(_Name) -> {error, enable_failed} end),
+    ?assertEqual({error, enable_failed}, ensure_action(<<"demo-1.0.0">>, restart, #{})).
+
+ensure_action_success_case() ->
+    meck:expect(emqx_plugins, ensure_started, fun(_Name) -> ok end),
+    meck:expect(emqx_plugins, ensure_enabled, fun(_Name) -> ok end),
+    meck:expect(emqx_plugins, ensure_stopped, fun(_Name) -> ok end),
+    meck:expect(emqx_plugins, ensure_disabled, fun(_Name) -> ok end),
+    meck:expect(emqx_plugins, restart, fun(_Name) -> ok end),
+    ?assertEqual(ok, ensure_action(<<"demo-1.0.0">>, start, #{})),
+    ?assertEqual(ok, ensure_action(<<"demo-1.0.0">>, stop, #{})),
+    ?assertEqual(ok, ensure_action(<<"demo-1.0.0">>, restart, #{})).
+
+-endif.

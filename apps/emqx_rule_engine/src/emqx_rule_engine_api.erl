@@ -1,554 +1,1041 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_rule_engine_api).
 
 -include("rule_engine.hrl").
+-include("emqx_rule_engine_internal.hrl").
 -include_lib("emqx/include/logger.hrl").
+-include_lib("hocon/include/hoconsc.hrl").
+-include_lib("typerefl/include/types.hrl").
+-include_lib("emqx_utils/include/emqx_http_api.hrl").
+-include_lib("emqx/include/emqx_config.hrl").
+-include_lib("emqx_utils/include/emqx_api_key_scopes.hrl").
 
--logger_header("[RuleEngineAPI]").
+-behaviour(minirest_api).
 
--import(minirest,  [return/1]).
+-import(hoconsc, [mk/2, ref/2, array/1]).
 
--rest_api(#{name   => create_rule,
-            method => 'POST',
-            path   => "/rules/",
-            func   => create_rule,
-            descr  => "Create a rule"
-           }).
+-export([printable_function_name/2]).
 
--rest_api(#{name   => update_rule,
-            method => 'PUT',
-            path   => "/rules/:bin:id",
-            func   => update_rule,
-            descr  => "Update a rule"
-           }).
+%% Swagger specs from hocon schema
+-export([api_spec/0, paths/0, schema/1, namespace/0]).
 
--rest_api(#{name   => list_rules,
-            method => 'GET',
-            path   => "/rules/",
-            func   => list_rules,
-            descr  => "A list of all rules"
-           }).
+%% API callbacks
+-export([
+    '/rule_engine'/2,
+    '/rule_events'/2,
+    '/rule_test'/2,
+    '/rules'/2,
+    '/rules/:id'/2,
+    '/rules/:id/test'/2,
+    '/rules/:id/metrics'/2,
+    '/rules/:id/metrics/reset'/2
+]).
 
--rest_api(#{name   => show_rule,
-            method => 'GET',
-            path   => "/rules/:bin:id",
-            func   => show_rule,
-            descr  => "Show a rule"
-           }).
+%% minirest filter callback
+-export([filter/2]).
 
--rest_api(#{name   => delete_rule,
-            method => 'DELETE',
-            path   => "/rules/:bin:id",
-            func   => delete_rule,
-            descr  => "Delete a rule"
-           }).
+%% query callback
+-export([run_fuzzy_match/2, format_rule_info_resp/2]).
+-export([scopes/0]).
 
--rest_api(#{name   => list_actions,
-            method => 'GET',
-            path   => "/actions/",
-            func   => list_actions,
-            descr  => "A list of all actions"
-           }).
+%%------------------------------------------------------------------------------
+%% Type declarations
+%%------------------------------------------------------------------------------
 
--rest_api(#{name   => show_action,
-            method => 'GET',
-            path   => "/actions/:atom:name",
-            func   => show_action,
-            descr  => "Show an action"
-           }).
+-define(RPC_GET_METRICS_TIMEOUT, 5_000).
 
--rest_api(#{name   => list_resources,
-            method => 'GET',
-            path   => "/resources/",
-            func   => list_resources,
-            descr  => "A list of all resources"
-           }).
+-define(ERR_BADARGS(REASON), begin
+    R0 = err_msg(REASON),
+    <<"Bad Arguments: ", R0/binary>>
+end).
 
--rest_api(#{name   => create_resource,
-            method => 'POST',
-            path   => "/resources/",
-            func   => create_resource,
-            descr  => "Create a resource"
-           }).
+-define(CHECK_PARAMS(PARAMS, TAG, EXPR),
+    case emqx_rule_api_schema:check_params(PARAMS, TAG) of
+        {ok, CheckedParams} ->
+            EXPR;
+        {error, REASON} ->
+            {400, #{code => 'BAD_REQUEST', message => ?ERR_BADARGS(REASON)}}
+    end
+).
 
--rest_api(#{name   => update_resource,
-            method => 'PUT',
-            path   => "/resources/:bin:id",
-            func   => update_resource,
-            descr  => "Update a resource"
-           }).
+%% Metrics map value
+-define(METRICS_VAL(
+    MATCH,
+    PASS,
+    FAIL,
+    FAIL_EX,
+    FAIL_NORES,
+    O_TOTAL,
+    O_FAIL,
+    O_FAIL_OOS,
+    O_FAIL_UNKNOWN,
+    O_SUCC,
+    O_DISCARDED,
+    RATE,
+    RATE_MAX,
+    RATE_5
+),
+    #{
+        'matched' => MATCH,
+        'passed' => PASS,
+        'failed' => FAIL,
+        'failed.exception' => FAIL_EX,
+        'failed.no_result' => FAIL_NORES,
+        'actions.total' => O_TOTAL,
+        'actions.failed' => O_FAIL,
+        'actions.failed.out_of_service' => O_FAIL_OOS,
+        'actions.failed.unknown' => O_FAIL_UNKNOWN,
+        'actions.success' => O_SUCC,
+        'actions.discarded' => O_DISCARDED,
+        'matched.rate' => RATE,
+        'matched.rate.max' => RATE_MAX,
+        'matched.rate.last5m' => RATE_5
+    }
+).
 
--rest_api(#{name   => show_resource,
-            method => 'GET',
-            path   => "/resources/:bin:id",
-            func   => show_resource,
-            descr  => "Show a resource"
-           }).
+-define(METRICS_VAL_ZERO, ?METRICS_VAL(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)).
 
--rest_api(#{name   => get_resource_status,
-            method => 'GET',
-            path   => "/resource_status/:bin:id",
-            func   => get_resource_status,
-            descr  => "Get status of a resource"
-           }).
+%% Metrics map match pattern
+-define(METRICS_PAT(
+    MATCH,
+    PASS,
+    FAIL,
+    FAIL_EX,
+    FAIL_NORES,
+    O_TOTAL,
+    O_FAIL,
+    O_FAIL_OOS,
+    O_FAIL_UNKNOWN,
+    O_SUCC,
+    O_DISCARDED,
+    RATE,
+    RATE_MAX,
+    RATE_5
+),
+    #{
+        'matched' := MATCH,
+        'passed' := PASS,
+        'failed' := FAIL,
+        'failed.exception' := FAIL_EX,
+        'failed.no_result' := FAIL_NORES,
+        'actions.total' := O_TOTAL,
+        'actions.failed' := O_FAIL,
+        'actions.failed.out_of_service' := O_FAIL_OOS,
+        'actions.failed.unknown' := O_FAIL_UNKNOWN,
+        'actions.success' := O_SUCC,
+        'actions.discarded' := O_DISCARDED,
+        'matched.rate' := RATE,
+        'matched.rate.max' := RATE_MAX,
+        'matched.rate.last5m' := RATE_5
+    }
+).
 
--rest_api(#{name   => start_resource,
-            method => 'POST',
-            path   => "/resources/:bin:id",
-            func   => start_resource,
-            descr  => "Start a resource"
-           }).
+-define(RULE_QS_SCHEMA, [
+    {<<"enable">>, atom},
+    {<<"from">>, binary},
+    {<<"like_id">>, binary},
+    {<<"like_from">>, binary},
+    {<<"match_from">>, binary},
+    {<<"action">>, binary},
+    {<<"source">>, binary},
+    {<<"like_description">>, binary}
+]).
 
--rest_api(#{name   => delete_resource,
-            method => 'DELETE',
-            path   => "/resources/:bin:id",
-            func   => delete_resource,
-            descr  => "Delete a resource"
-           }).
+-type maybe_namespace() :: ?global_ns | binary().
 
--rest_api(#{name   => list_resource_types,
-            method => 'GET',
-            path   => "/resource_types/",
-            func   => list_resource_types,
-            descr  => "List all resource types"
-           }).
+%%-------------------------------------------------------------------------------------------------
+%% `minirest' and `minirest_trails' API
+%%-------------------------------------------------------------------------------------------------
 
--rest_api(#{name   => show_resource_type,
-            method => 'GET',
-            path   => "/resource_types/:atom:name",
-            func   => show_resource_type,
-            descr  => "Show a resource type"
-           }).
+namespace() -> "rule".
 
--rest_api(#{name   => list_resources_by_type,
-            method => 'GET',
-            path   => "/resource_types/:atom:type/resources",
-            func   => list_resources_by_type,
-            descr  => "List all resources of a resource type"
-           }).
+api_spec() ->
+    emqx_dashboard_swagger:spec(?MODULE, #{
+        check_schema => fun emqx_dashboard_swagger:validate_content_type_json/2
+    }).
 
--rest_api(#{name   => list_events,
-            method => 'GET',
-            path   => "/rule_events/",
-            func   => list_events,
-            descr  => "List all events with detailed info"
-           }).
+scopes() -> ?SCOPE_DATA_INTEGRATION.
 
--export([ create_rule/2
-        , update_rule/2
-        , list_rules/2
-        , show_rule/2
-        , delete_rule/2
-        ]).
+paths() ->
+    [
+        "/rule_engine",
+        "/rule_events",
+        "/rule_test",
+        "/rules",
+        "/rules/:id",
+        "/rules/:id/test",
+        "/rules/:id/metrics",
+        "/rules/:id/metrics/reset"
+    ].
 
--export([ list_actions/2
-        , show_action/2
-        ]).
+error_schema(Code, Message) when is_atom(Code) ->
+    emqx_dashboard_swagger:error_codes([Code], Message).
 
--export([ create_resource/2
-        , list_resources/2
-        , show_resource/2
-        , get_resource_status/2
-        , start_resource/2
-        , delete_resource/2
-        , update_resource/2
-        ]).
+rule_engine_schema() ->
+    ref(emqx_rule_api_schema, "rule_engine").
 
--export([ list_resource_types/2
-        , list_resources_by_type/2
-        , show_resource_type/2
-        ]).
+rule_creation_schema() ->
+    ref(emqx_rule_api_schema, "rule_creation").
 
--export([list_events/2]).
+rule_test_schema() ->
+    ref(emqx_rule_api_schema, "rule_test").
 
--define(ERR_NO_RULE(ID), list_to_binary(io_lib:format("Rule ~s Not Found", [(ID)]))).
--define(ERR_NO_ACTION(NAME), list_to_binary(io_lib:format("Action ~s Not Found", [(NAME)]))).
--define(ERR_NO_RESOURCE(RESID), list_to_binary(io_lib:format("Resource ~s Not Found", [(RESID)]))).
--define(ERR_NO_RESOURCE_TYPE(TYPE), list_to_binary(io_lib:format("Resource Type ~s Not Found", [(TYPE)]))).
--define(ERR_BADARGS(REASON),
-        begin
-            R0 = list_to_binary(io_lib:format("~0p", [REASON])),
-            <<"Bad Arguments: ", R0/binary>>
-        end).
+rule_apply_test_schema() ->
+    ref(emqx_rule_api_schema, "rule_apply_test").
 
--dialyzer({nowarn_function, [create_rule/2,
-                             test_rule_sql/1,
-                             do_create_rule/1,
-                             update_rule/2
-                             ]}).
+rule_info_schema() ->
+    ref(emqx_rule_api_schema, "rule_info").
+
+rule_metrics_schema() ->
+    ref(emqx_rule_api_schema, "rule_metrics").
+
+schema("/rules") ->
+    #{
+        'operationId' => '/rules',
+        filter => fun ?MODULE:filter/2,
+        get => #{
+            tags => [<<"rules">>],
+            description => ?DESC("api1"),
+            parameters => [
+                ns_qs_param(),
+                only_global_qs_param(),
+                {enable,
+                    mk(boolean(), #{desc => ?DESC("api1_enable"), in => query, required => false})},
+                {from, mk(binary(), #{desc => ?DESC("api1_from"), in => query, required => false})},
+                {like_id,
+                    mk(binary(), #{desc => ?DESC("api1_like_id"), in => query, required => false})},
+                {like_from,
+                    mk(binary(), #{desc => ?DESC("api1_like_from"), in => query, required => false})},
+                {like_description,
+                    mk(binary(), #{
+                        desc => ?DESC("api1_like_description"), in => query, required => false
+                    })},
+                {match_from,
+                    mk(binary(), #{desc => ?DESC("api1_match_from"), in => query, required => false})},
+                {action,
+                    mk(hoconsc:array(binary()), #{in => query, desc => ?DESC("api1_qs_action")})},
+                {source,
+                    mk(hoconsc:array(binary()), #{in => query, desc => ?DESC("api1_qs_source")})},
+                ref(emqx_dashboard_swagger, page),
+                ref(emqx_dashboard_swagger, limit)
+            ],
+            responses => #{
+                200 =>
+                    [
+                        {data, mk(array(rule_info_schema()), #{desc => ?DESC("api1_resp")})},
+                        {meta, mk(ref(emqx_dashboard_swagger, meta), #{})}
+                    ],
+                400 => error_schema('BAD_REQUEST', ?DESC("invalid_parameters"))
+            }
+        },
+        post => #{
+            tags => [<<"rules">>],
+            description => ?DESC("api2"),
+            parameters => [ns_qs_param()],
+            'requestBody' => rule_creation_schema(),
+            responses => #{
+                400 => error_schema('BAD_REQUEST', ?DESC("invalid_parameters")),
+                201 => rule_info_schema()
+            }
+        }
+    };
+schema("/rule_events") ->
+    #{
+        'operationId' => '/rule_events',
+        get => #{
+            tags => [<<"rules">>],
+            description => ?DESC("api3"),
+            responses => #{
+                200 => mk(ref(emqx_rule_api_schema, "rule_events"), #{})
+            }
+        }
+    };
+schema("/rules/:id") ->
+    #{
+        'operationId' => '/rules/:id',
+        filter => fun ?MODULE:filter/2,
+        get => #{
+            tags => [<<"rules">>],
+            description => ?DESC("api4"),
+            parameters => [param_path_id(), ns_qs_param()],
+            responses => #{
+                404 => error_schema('NOT_FOUND', ?DESC("rule_not_found")),
+                200 => rule_info_schema()
+            }
+        },
+        put => #{
+            tags => [<<"rules">>],
+            description => ?DESC("api5"),
+            parameters => [param_path_id(), ns_qs_param()],
+            'requestBody' => rule_creation_schema(),
+            responses => #{
+                400 => error_schema('BAD_REQUEST', ?DESC("invalid_parameters")),
+                404 => error_schema('NOT_FOUND', ?DESC("rule_not_found")),
+                200 => rule_info_schema()
+            }
+        },
+        delete => #{
+            tags => [<<"rules">>],
+            description => ?DESC("api6"),
+            parameters => [param_path_id(), ns_qs_param()],
+            responses => #{
+                404 => error_schema('NOT_FOUND', ?DESC("rule_not_found")),
+                204 => ?DESC("delete_rule_successfully")
+            }
+        }
+    };
+schema("/rules/:id/test") ->
+    #{
+        'operationId' => '/rules/:id/test',
+        filter => fun ?MODULE:filter/2,
+        post => #{
+            tags => [<<"rules">>],
+            description => ?DESC("api11"),
+            parameters => [param_path_id(), ns_qs_param()],
+            'requestBody' => rule_apply_test_schema(),
+            responses => #{
+                400 => error_schema('BAD_REQUEST', ?DESC("invalid_parameters")),
+                412 => error_schema('NOT_MATCH', ?DESC("sql_not_match")),
+                404 => error_schema('RULE_NOT_FOUND', ?DESC("rule_could_not_be_found")),
+                200 => ?DESC("rule_applied")
+            }
+        }
+    };
+schema("/rules/:id/metrics") ->
+    #{
+        'operationId' => '/rules/:id/metrics',
+        filter => fun ?MODULE:filter/2,
+        get => #{
+            tags => [<<"rules">>],
+            description => ?DESC("api4_1"),
+            parameters => [param_path_id(), ns_qs_param()],
+            responses => #{
+                404 => error_schema('NOT_FOUND', ?DESC("rule_not_found")),
+                200 => rule_metrics_schema()
+            }
+        }
+    };
+schema("/rules/:id/metrics/reset") ->
+    #{
+        'operationId' => '/rules/:id/metrics/reset',
+        filter => fun ?MODULE:filter/2,
+        put => #{
+            tags => [<<"rules">>],
+            description => ?DESC("api7"),
+            parameters => [param_path_id(), ns_qs_param()],
+            responses => #{
+                404 => error_schema('NOT_FOUND', ?DESC("rule_not_found")),
+                204 => ?DESC("reset_success")
+            }
+        }
+    };
+schema("/rule_test") ->
+    #{
+        'operationId' => '/rule_test',
+        filter => fun ?MODULE:filter/2,
+        post => #{
+            tags => [<<"rules">>],
+            description => ?DESC("api8"),
+            parameters => [ns_qs_param()],
+            'requestBody' => rule_test_schema(),
+            responses => #{
+                400 => error_schema('BAD_REQUEST', ?DESC("invalid_parameters")),
+                412 => error_schema('NOT_MATCH', ?DESC("sql_not_match")),
+                200 => ?DESC("rule_test_pass")
+            }
+        }
+    };
+schema("/rule_engine") ->
+    #{
+        'operationId' => '/rule_engine',
+        filter => fun ?MODULE:filter/2,
+        get => #{
+            tags => [<<"rules">>],
+            description => ?DESC("api9"),
+            parameters => [ns_qs_param()],
+            responses => #{
+                200 => rule_engine_schema()
+            }
+        },
+        put => #{
+            tags => [<<"rules">>],
+            description => ?DESC("api10"),
+            parameters => [ns_qs_param()],
+            'requestBody' => rule_engine_schema(),
+            responses => #{
+                200 => rule_engine_schema(),
+                400 => error_schema('BAD_REQUEST', ?DESC("invalid_request"))
+            }
+        }
+    }.
+
+param_path_id() ->
+    {id, mk(binary(), #{in => path, example => <<"my_rule_id">>})}.
+
+ns_qs_param() ->
+    {ns, mk(binary(), #{in => query, required => false})}.
+
+only_global_qs_param() ->
+    {only_global, mk(boolean(), #{in => query, required => false, default => false})}.
 
 %%------------------------------------------------------------------------------
 %% Rules API
 %%------------------------------------------------------------------------------
-create_rule(_Bindings, Params) ->
-    if_test(fun() -> test_rule_sql(Params) end,
-            fun() -> do_create_rule(Params) end,
-            Params).
 
-test_rule_sql(Params) ->
-    case emqx_rule_sqltester:test(emqx_json:decode(emqx_json:encode(Params), [return_maps])) of
-        {ok, Result} -> return({ok, Result});
-        {error, nomatch} -> return({error, 404, <<"SQL Not Match">>});
-        {error, Reason} ->
-            ?LOG(error, "~p failed: ~0p", [?FUNCTION_NAME, Reason]),
-            return({error, 400, ?ERR_BADARGS(Reason)})
+'/rule_events'(get, _Params) ->
+    {200, emqx_rule_events:event_info()}.
+
+'/rules'(get, #{query_string := QueryString} = Req) ->
+    Namespace0 = get_namespace(Req),
+    Namespace =
+        case maps:get(<<"only_global">>, QueryString, false) of
+            false when Namespace0 == ?global_ns -> all;
+            _ -> Namespace0
+        end,
+    case
+        emqx_mgmt_api:node_query(
+            node(),
+            ?RULE_TAB,
+            QueryString,
+            ?RULE_QS_SCHEMA,
+            mk_qs2ms_fn(Namespace),
+            mk_format_fn(Namespace)
+        )
+    of
+        {error, page_limit_invalid} ->
+            {400, #{code => 'BAD_REQUEST', message => <<"page_limit_invalid">>}};
+        {error, Node, Error} ->
+            Message = list_to_binary(io_lib:format("bad rpc call ~p, Reason ~p", [Node, Error])),
+            {500, #{code => <<"NODE_DOWN">>, message => Message}};
+        Result ->
+            {200, Result}
+    end;
+'/rules'(post, #{body := Params0} = Req) ->
+    Namespace = get_namespace(Req),
+    case maps:get(<<"id">>, Params0, list_to_binary(emqx_utils:gen_id(8))) of
+        <<>> ->
+            {400, #{code => 'BAD_REQUEST', message => <<"empty rule id is not allowed">>}};
+        Id when is_binary(Id) ->
+            Params = filter_out_request_body(add_metadata(Params0)),
+            case emqx_rule_engine:get_rule(Namespace, Id) of
+                {ok, _Rule} ->
+                    ?BAD_REQUEST(<<"rule id already exists">>);
+                not_found ->
+                    UpdateRes = emqx_rule_engine_config:create_or_update_rule(
+                        Namespace,
+                        Id,
+                        Params
+                    ),
+                    case UpdateRes of
+                        {ok, #{post_config_update := #{emqx_rule_engine_config := Rule}}} ->
+                            FormatFn = mk_format_fn(Namespace),
+                            ?CREATED(FormatFn(Rule));
+                        {error, Reason} ->
+                            ?SLOG(
+                                info,
+                                #{
+                                    msg => "create_rule_failed",
+                                    namespace => Namespace,
+                                    rule_id => Id,
+                                    reason => Reason
+                                },
+                                #{tag => ?TAG}
+                            ),
+                            ?BAD_REQUEST(?ERR_BADARGS(Reason))
+                    end
+            end;
+        _BadId ->
+            ?BAD_REQUEST(<<"rule id must be a string">>)
     end.
 
-do_create_rule(Params) ->
-    case emqx_rule_engine:create_rule(parse_rule_params(Params)) of
-        {ok, Rule} -> return({ok, record_to_map(Rule)});
-        {error, {action_not_found, ActionName}} ->
-            return({error, 400, ?ERR_NO_ACTION(ActionName)});
-        {error, Reason} ->
-            ?LOG(error, "~p failed: ~0p", [?FUNCTION_NAME, Reason]),
-            return({error, 400, ?ERR_BADARGS(Reason)})
-    end.
+'/rule_test'(post, #{body := Params} = Req) ->
+    Namespace = emqx_dashboard:get_namespace(Req),
+    ?CHECK_PARAMS(
+        Params,
+        rule_test,
+        case emqx_rule_sqltester:test(Namespace, CheckedParams) of
+            {ok, Result} ->
+                {200, Result};
+            {error, {parse_error, Reason}} ->
+                {400, #{code => 'BAD_REQUEST', message => err_msg(Reason)}};
+            {error, nomatch} ->
+                {412, #{code => 'NOT_MATCH', message => <<"SQL Not Match">>}};
+            {error, Reason} ->
+                {400, #{code => 'BAD_REQUEST', message => err_msg(Reason)}}
+        end
+    ).
 
-update_rule(#{id := Id}, Params) ->
-    case emqx_rule_engine:update_rule(parse_rule_params(Params, #{id => Id})) of
-        {ok, Rule} -> return({ok, record_to_map(Rule)});
-        {error, {not_found, RuleId}} ->
-            return({error, 400, ?ERR_NO_RULE(RuleId)});
-        {error, Reason} ->
-            ?LOG(error, "~p failed: ~0p", [?FUNCTION_NAME, Reason]),
-            return({error, 400, ?ERR_BADARGS(Reason)})
-    end.
+'/rules/:id/test'(post, #{body := Params, bindings := #{id := RuleId}} = Req) ->
+    Namespace = get_namespace(Req),
+    ?CHECK_PARAMS(
+        Params,
+        rule_apply_test,
+        case emqx_rule_sqltester:apply_rule(Namespace, RuleId, CheckedParams) of
+            {ok, Result} ->
+                {200, emqx_utils_json:best_effort_json_obj(Result)};
+            {error, {parse_error, Reason}} ->
+                {400, #{code => 'BAD_REQUEST', message => err_msg(Reason)}};
+            {error, nomatch} ->
+                {412, #{code => 'NOT_MATCH', message => <<"SQL Not Match">>}};
+            {error, rule_not_found} ->
+                {404, #{code => 'RULE_NOT_FOUND', message => <<"The rule could not be found">>}};
+            {error, Reason} ->
+                {400, #{code => 'BAD_REQUEST', message => err_msg(Reason)}}
+        end
+    ).
 
-list_rules(_Bindings, _Params) ->
-    return_all(emqx_rule_registry:get_rules_ordered_by_ts()).
-
-show_rule(#{id := Id}, _Params) ->
-    reply_with(fun emqx_rule_registry:get_rule/1, Id).
-
-delete_rule(#{id := Id}, _Params) ->
-    ok = emqx_rule_engine:delete_rule(Id),
-    return(ok).
-
-%%------------------------------------------------------------------------------
-%% Actions API
-%%------------------------------------------------------------------------------
-
-list_actions(#{}, _Params) ->
-    return_all(
-        sort_by_title(action,
-            emqx_rule_registry:get_actions())).
-
-show_action(#{name := Name}, _Params) ->
-    reply_with(fun emqx_rule_registry:find_action/1, Name).
-
-%%------------------------------------------------------------------------------
-%% Resources API
-%%------------------------------------------------------------------------------
-create_resource(#{}, Params) ->
-    case parse_resource_params(Params) of
-        {ok, ParsedParams} ->
-            if_test(fun() -> do_create_resource(test_resource, ParsedParams) end,
-                    fun() -> do_create_resource(create_resource, ParsedParams) end,
-                    Params);
-        {error, Reason} ->
-            ?LOG(error, "~p failed: ~0p", [?FUNCTION_NAME, Reason]),
-            return({error, 400, ?ERR_BADARGS(Reason)})
-    end.
-
-do_create_resource(Create, ParsedParams) ->
-    case emqx_rule_engine:Create(ParsedParams) of
-        ok ->
-            return(ok);
-        {ok, Resource} ->
-            return({ok, record_to_map(Resource)});
-        {error, {resource_type_not_found, Type}} ->
-            return({error, 400, ?ERR_NO_RESOURCE_TYPE(Type)});
-        {error, {init_resource, _}} ->
-            return({error, 500, <<"Init resource failure!">>});
-        {error, Reason} ->
-            ?LOG(error, "~p failed: ~0p", [?FUNCTION_NAME, Reason]),
-            return({error, 400, ?ERR_BADARGS(Reason)})
-    end.
-
-list_resources(#{}, _Params) ->
-    Data0 = lists:foldr(fun maybe_record_to_map/2, [], emqx_rule_registry:get_resources()),
-    Data = lists:map(fun(Res = #{id := Id}) ->
-               Status = lists:all(fun(Node) ->
-                            case rpc:call(Node, emqx_rule_registry, find_resource_params, [Id]) of
-                                {ok, #resource_params{status = #{is_alive := true}}} -> true;
-                                _ -> false
-                            end
-                        end, ekka_mnesia:running_nodes()),
-               maps:put(status, Status, Res)
-           end, Data0),
-    return({ok, Data}).
-
-list_resources_by_type(#{type := Type}, _Params) ->
-    return_all(emqx_rule_registry:get_resources_by_type(Type)).
-
-show_resource(#{id := Id}, _Params) ->
-    case emqx_rule_registry:find_resource(Id) of
-        {ok, R} ->
-            Status =
-                [begin
-                    {ok, St} = rpc:call(Node, emqx_rule_engine, get_resource_status, [Id]),
-                    maps:put(node, Node, St)
-                end || Node <- ekka_mnesia:running_nodes()],
-            return({ok, maps:put(status, Status, record_to_map(R))});
+'/rules/:id'(get, #{bindings := #{id := Id}} = Req) ->
+    Namespace = get_namespace(Req),
+    case emqx_rule_engine:get_rule(Namespace, Id) of
+        {ok, Rule} ->
+            FormatFn = mk_format_fn(Namespace),
+            {200, FormatFn(Rule)};
         not_found ->
-            return({error, 404, <<"Not Found">>})
-    end.
-
-get_resource_status(#{id := Id}, _Params) ->
-    case emqx_rule_engine:get_resource_status(Id) of
-        {ok, Status} ->
-            return({ok, Status});
-        {error, {resource_not_found, ResId}} ->
-            return({error, 400, ?ERR_NO_RESOURCE(ResId)})
-    end.
-
-start_resource(#{id := Id}, _Params) ->
-    case emqx_rule_engine:start_resource(Id) of
-        ok ->
-            return(ok);
-        {error, {resource_not_found, ResId}} ->
-            return({error, 400, ?ERR_NO_RESOURCE(ResId)});
-        {error, Reason} ->
-            ?LOG(error, "~p failed: ~0p", [?FUNCTION_NAME, Reason]),
-            return({error, 400, ?ERR_BADARGS(Reason)})
-    end.
-
-update_resource(#{id := Id}, NewParams) ->
-    P1 = case proplists:get_value(<<"description">>, NewParams) of
-        undefined -> #{};
-        Value -> #{<<"description">> => Value}
-    end,
-    P2 = case proplists:get_value(<<"config">>, NewParams) of
-        undefined -> #{};
-        [{}] -> #{};
-        Config -> #{<<"config">> => ?RAISE(json_term_to_map(Config), {invalid_config, Config})}
-    end,
-    case emqx_rule_engine:update_resource(Id, maps:merge(P1, P2)) of
-        ok ->
-            return(ok);
+            {404, #{code => 'NOT_FOUND', message => <<"Rule Id Not Found">>}}
+    end;
+'/rules/:id'(put, #{bindings := #{id := Id}, body := Params0} = Req) ->
+    Namespace = get_namespace(Req),
+    Params1 = filter_out_request_body(Params0),
+    Params2 = ensure_last_modified_at(Params1),
+    case emqx_rule_engine_config:get_raw_rule(Namespace, Id) of
+        {ok, RawRule0} ->
+            Params = maps:merge(RawRule0, Params2),
+            UpdateRes = emqx_rule_engine_config:create_or_update_rule(
+                Namespace,
+                Id,
+                Params
+            ),
+            case UpdateRes of
+                {ok, #{post_config_update := #{emqx_rule_engine_config := Rule}}} ->
+                    FormatFn = mk_format_fn(Namespace),
+                    {200, FormatFn(Rule)};
+                {error, Reason} ->
+                    ?SLOG(
+                        info,
+                        #{
+                            msg => "update_rule_failed",
+                            namespace => Namespace,
+                            rule_id => Id,
+                            reason => Reason
+                        },
+                        #{tag => ?TAG}
+                    ),
+                    {400, #{code => 'BAD_REQUEST', message => ?ERR_BADARGS(Reason)}}
+            end;
         {error, not_found} ->
-            ?LOG(error, "Resource not found: ~0p", [Id]),
-            return({error, 400, <<"Resource not found:", Id/binary>>});
-        {error, {init_resource, _}} ->
-            ?LOG(error, "Init resource failure: ~0p", [Id]),
-            return({error, 500, <<"Init resource failure:", Id/binary>>});
-        {error, {dependency_exists, RuleId}} ->
-            ?LOG(error, "Dependency exists: ~0p", [RuleId]),
-            return({error, 500, <<"Dependency exists:", RuleId/binary>>});
-        {error, Reason} ->
-            ?LOG(error, "Resource update failed: ~0p", [Reason]),
-            return({error, 500, <<"Resource update failed!">>})
+            {404, #{code => 'NOT_FOUND', message => <<"Rule Id Not Found">>}}
+    end;
+'/rules/:id'(delete, #{bindings := #{id := Id}} = Req) ->
+    Namespace = get_namespace(Req),
+    case emqx_rule_engine:get_rule(Namespace, Id) of
+        {ok, _Rule} ->
+            UpdateRes = emqx_rule_engine_config:delete_rule(
+                Namespace,
+                Id
+            ),
+            case UpdateRes of
+                {ok, _} ->
+                    {204};
+                {error, Reason} ->
+                    ?SLOG(
+                        error,
+                        #{
+                            msg => "delete_rule_failed",
+                            namespace => Namespace,
+                            rule_id => Id,
+                            reason => Reason
+                        },
+                        #{tag => ?TAG}
+                    ),
+                    {500, #{code => 'INTERNAL_ERROR', message => ?ERR_BADARGS(Reason)}}
+            end;
+        not_found ->
+            {404, #{code => 'NOT_FOUND', message => <<"Rule Id Not Found">>}}
     end.
 
-delete_resource(#{id := Id}, _Params) ->
-    case emqx_rule_engine:delete_resource(Id) of
-        ok -> return(ok);
-        {error, not_found} -> return(ok);
-        {error, Reason} ->
-            return({error, 400, ?ERR_BADARGS(Reason)})
+'/rules/:id/metrics'(get, #{bindings := #{id := Id}} = Req) ->
+    Namespace = get_namespace(Req),
+    case emqx_rule_engine:get_rule(Namespace, Id) of
+        {ok, Rule} ->
+            RuleResId = emqx_rule_engine:rule_resource_id(Rule),
+            NodeMetrics = get_rule_metrics(RuleResId),
+            MetricsResp =
+                #{
+                    id => Id,
+                    metrics => aggregate_metrics(NodeMetrics),
+                    node_metrics => NodeMetrics
+                },
+            {200, MetricsResp};
+        not_found ->
+            {404, #{code => 'NOT_FOUND', message => <<"Rule Id Not Found">>}}
     end.
 
-%%------------------------------------------------------------------------------
-%% Resource Types API
-%%------------------------------------------------------------------------------
+'/rules/:id/metrics/reset'(put, #{bindings := #{id := Id}} = Req) ->
+    Namespace = get_namespace(Req),
+    case emqx_rule_engine:get_rule(Namespace, Id) of
+        {ok, Rule} ->
+            RuleResId = emqx_rule_engine:rule_resource_id(Rule),
+            ok = emqx_rule_engine_proto_v1:reset_metrics(RuleResId),
+            {204};
+        not_found ->
+            {404, #{code => 'NOT_FOUND', message => <<"Rule Id Not Found">>}}
+    end.
 
-list_resource_types(#{}, _Params) ->
-    return_all(
-        sort_by_title(resource_type,
-            emqx_rule_registry:get_resource_types())).
-
-show_resource_type(#{name := Name}, _Params) ->
-    reply_with(fun emqx_rule_registry:find_resource_type/1, Name).
-
-
-%%------------------------------------------------------------------------------
-%% Events API
-%%------------------------------------------------------------------------------
-
-list_events(#{}, _Params) ->
-    return({ok, emqx_rule_events:event_info()}).
+'/rule_engine'(get, Req) ->
+    Namespace = get_namespace(Req),
+    {200, format_rule_engine_resp(get_config(Namespace, [rule_engine], #{}))};
+'/rule_engine'(put, #{body := Params} = Req) ->
+    Namespace = get_namespace(Req),
+    case rule_engine_update(Namespace, Params) of
+        {ok, Config} ->
+            {200, format_rule_engine_resp(Config)};
+        {error, Reason} ->
+            {400, #{code => 'BAD_REQUEST', message => ?ERR_BADARGS(Reason)}}
+    end.
 
 %%------------------------------------------------------------------------------
 %% Internal functions
 %%------------------------------------------------------------------------------
 
-if_test(True, False, Params) ->
-    case proplists:get_value(<<"test">>, Params) of
-        Test when Test =:= true; Test =:= <<"true">> ->
-            True();
+err_msg({RuleError, {_E, Reason, _S}}) ->
+    emqx_utils:readable_error_msg(encode_nested_error(RuleError, Reason));
+err_msg({Reason, _Details}) ->
+    emqx_utils:readable_error_msg(Reason);
+err_msg(Msg) ->
+    emqx_utils:readable_error_msg(Msg).
+
+encode_nested_error(RuleError, Reason) when is_tuple(Reason) ->
+    encode_nested_error(RuleError, element(1, Reason));
+encode_nested_error(RuleError, Reason) ->
+    case emqx_utils_json:safe_encode(#{RuleError => Reason}) of
+        {ok, Json} ->
+            Json;
         _ ->
-            False()
+            {RuleError, Reason}
     end.
 
-return_all(Records) ->
-    Data = lists:foldr(fun maybe_record_to_map/2, [], Records),
-    return({ok, Data}).
-
-maybe_record_to_map(Rec, Acc) ->
-    case record_to_map(Rec) of
-        ignore -> Acc;
-        Map -> [Map | Acc]
+mk_format_fn(Namespace) ->
+    SummaryIndex =
+        maybe
+            {ok, Summary} ?= emqx_bridge_v2_api:do_handle_summary(Namespace, actions),
+            lists:foldl(
+                fun(#{name := N, type := T, status := S}, Acc) ->
+                    Acc#{{T, N} => S}
+                end,
+                #{},
+                Summary
+            )
+        else
+            {error, Reason} ->
+                ?SLOG(warning, #{
+                    msg => "failed_to_fetch_action_summary_for_rules", reason => Reason
+                }),
+                #{}
+        end,
+    fun(Row) ->
+        ?MODULE:format_rule_info_resp(Row, #{action_summary_index => SummaryIndex})
     end.
 
-reply_with(Find, Key) ->
-    case Find(Key) of
-        {ok, R} ->
-            return({ok, record_to_map(R)});
-        not_found ->
-            return({error, 404, <<"Not Found">>})
-    end.
+format_rule_info_resp({?KEY(Namespace, Id), Rule}, Context) ->
+    format_rule_info_resp(Rule#{namespace => Namespace, id => Id}, Context);
+format_rule_info_resp(
+    #{
+        namespace := Namespace,
+        id := Id,
+        name := Name,
+        created_at := CreatedAt,
+        updated_at := LastModifiedAt,
+        from := Topics,
+        actions := Actions,
+        sql := SQL,
+        enable := Enable,
+        description := Descr
+    },
+    Context
+) ->
+    #{
+        namespace => namespace_out(Namespace),
+        id => Id,
+        name => Name,
+        from => Topics,
+        actions => format_action(Actions),
+        action_details => format_action_details(Actions, Context),
+        sql => SQL,
+        enable => Enable,
+        created_at => format_datetime(CreatedAt, millisecond),
+        last_modified_at => format_datetime(LastModifiedAt, millisecond),
+        description => Descr
+    }.
 
-record_to_map(#rule{id = Id,
-                    for = Hook,
-                    rawsql = RawSQL,
-                    actions = Actions,
-                    on_action_failed = OnFailed,
-                    enabled = Enabled,
-                    description = Descr}) ->
-    #{id => Id,
-      for => Hook,
-      rawsql => RawSQL,
-      actions => printable_actions(Actions),
-      on_action_failed => OnFailed,
-      metrics => get_rule_metrics(Id),
-      enabled => Enabled,
-      description => Descr
-     };
+format_rule_engine_resp(Config) ->
+    maps:remove(rules, Config).
 
-record_to_map(#action{hidden = true}) ->
-    ignore;
-record_to_map(#action{name = Name,
-                      category = Category,
-                      app = App,
-                      for = Hook,
-                      types = Types,
-                      params_spec = Params,
-                      title = Title,
-                      description = Descr}) ->
-    #{name => Name,
-      category => Category,
-      app => App,
-      for => Hook,
-      types => Types,
-      params => Params,
-      title => Title,
-      description => Descr
-     };
+format_datetime(Timestamp, Unit) ->
+    emqx_utils_calendar:epoch_to_rfc3339(Timestamp, Unit).
 
-record_to_map(#resource{id = Id,
-                        type = Type,
-                        config = Config,
-                        description = Descr}) ->
-    #{id => Id,
-      type => Type,
-      config => Config,
-      description => Descr
-     };
+format_action(Actions) ->
+    [do_format_action(Act) || Act <- Actions].
 
-record_to_map(#resource_type{name = Name,
-                             provider = Provider,
-                             params_spec = Params,
-                             title = Title,
-                             description = Descr}) ->
-    #{name => Name,
-      provider => Provider,
-      params => Params,
-      title => Title,
-      description => Descr
-     }.
+do_format_action({bridge, BridgeType, BridgeName, _ResId}) ->
+    emqx_bridge_resource:bridge_id(BridgeType, BridgeName);
+do_format_action({bridge_v2, BridgeType, BridgeName}) ->
+    emqx_bridge_resource:bridge_id(BridgeType, BridgeName);
+do_format_action(#{mod := Mod, func := Func, args := Args}) ->
+    #{
+        function => printable_function_name(Mod, Func),
+        args => maps:remove(preprocessed_tmpl, Args)
+    };
+do_format_action(#{mod := Mod, func := Func}) ->
+    #{
+        function => printable_function_name(Mod, Func)
+    }.
 
-printable_actions(Actions) ->
-    [#{id => Id, name => Name, params => Args,
-       metrics => get_action_metrics(Id),
-       fallbacks => printable_actions(Fallbacks)}
-     || #action_instance{id = Id, name = Name, args = Args, fallbacks = Fallbacks} <- Actions].
+format_action_details(RuleActions, Context) ->
+    #{action_summary_index := SummaryIndex} = Context,
+    Actions0 =
+        lists:filtermap(
+            fun
+                ({bridge, Type, Name}) ->
+                    {true, {bin(Type), bin(Name)}};
+                ({bridge_v2, Type, Name}) ->
+                    {true, {bin(Type), bin(Name)}};
+                (_) ->
+                    false
+            end,
+            RuleActions
+        ),
+    Actions = lists:sort(Actions0),
+    lists:foldl(
+        fun({T, N}, Acc) ->
+            case SummaryIndex of
+                #{{T, N} := S} ->
+                    [#{type => T, name => N, status => S} | Acc];
+                _ ->
+                    [#{type => T, name => N, status => not_found} | Acc]
+            end
+        end,
+        [],
+        Actions
+    ).
 
-parse_rule_params(Params) ->
-    parse_rule_params(Params, #{description => <<"">>}).
-parse_rule_params([], Rule) ->
-    Rule;
-parse_rule_params([{<<"id">>, Id} | Params], Rule) ->
-    parse_rule_params(Params, Rule#{id => Id});
-parse_rule_params([{<<"rawsql">>, RawSQL} | Params], Rule) ->
-    parse_rule_params(Params, Rule#{rawsql => RawSQL});
-parse_rule_params([{<<"enabled">>, Enabled} | Params], Rule) ->
-    parse_rule_params(Params, Rule#{enabled => enabled(Enabled)});
-parse_rule_params([{<<"on_action_failed">>, OnFailed} | Params], Rule) ->
-    parse_rule_params(Params, Rule#{on_action_failed => on_failed(OnFailed)});
-parse_rule_params([{<<"actions">>, Actions} | Params], Rule) ->
-    parse_rule_params(Params, Rule#{actions => parse_actions(Actions)});
-parse_rule_params([{<<"description">>, Descr} | Params], Rule) ->
-    parse_rule_params(Params, Rule#{description => Descr});
-parse_rule_params([_ | Params], Rule) ->
-    parse_rule_params(Params, Rule).
-
-on_failed(<<"continue">>) -> continue;
-on_failed(<<"stop">>) -> stop;
-on_failed(OnFailed) -> error({invalid_on_failed, OnFailed}).
-
-enabled(Enabled) when is_boolean(Enabled) -> Enabled;
-enabled(Enabled) -> error({invalid_enabled, Enabled}).
-
-parse_actions(Actions) ->
-    [parse_action(json_term_to_map(A)) || A <- Actions].
-
-parse_action(Action) ->
-    #{name => binary_to_existing_atom(maps:get(<<"name">>, Action), utf8),
-      args => maps:get(<<"params">>, Action, #{}),
-      fallbacks => parse_actions(maps:get(<<"fallbacks">>, Action, []))}.
-
-parse_resource_params(Params) ->
-    parse_resource_params(Params, #{config => #{}, description => <<"">>}).
-parse_resource_params([], Res) ->
-    {ok, Res};
-parse_resource_params([{<<"id">>, Id} | Params], Res) ->
-    parse_resource_params(Params, Res#{id => Id});
-parse_resource_params([{<<"type">>, ResourceType} | Params], Res) ->
-    try parse_resource_params(Params, Res#{type => binary_to_existing_atom(ResourceType, utf8)})
-    catch error:badarg ->
-        {error, {resource_type_not_found, ResourceType}}
-    end;
-parse_resource_params([{<<"config">>, Config} | Params], Res) ->
-    parse_resource_params(Params, Res#{config => json_term_to_map(Config)});
-parse_resource_params([{<<"description">>, Descr} | Params], Res) ->
-    parse_resource_params(Params, Res#{description => Descr});
-parse_resource_params([_ | Params], Res) ->
-    parse_resource_params(Params, Res).
-
-json_term_to_map(List) ->
-    emqx_json:decode(emqx_json:encode(List), [return_maps]).
-
-sort_by_title(action, Actions) ->
-    sort_by(#action.title, Actions);
-sort_by_title(resource_type, ResourceTypes) ->
-    sort_by(#resource_type.title, ResourceTypes).
-
-sort_by(Pos, TplList) ->
-    lists:sort(
-        fun(RecA, RecB) ->
-            maps:get(en, element(Pos, RecA), 0)
-            =< maps:get(en, element(Pos, RecB), 0)
-        end, TplList).
+printable_function_name(emqx_rule_actions, Func) ->
+    Func;
+printable_function_name(Mod, Func) ->
+    list_to_binary(lists:concat([Mod, ":", Func])).
 
 get_rule_metrics(Id) ->
-    [maps:put(node, Node, rpc:call(Node, emqx_rule_metrics, get_rule_metrics, [Id]))
-     || Node <- ekka_mnesia:running_nodes()].
+    Nodes = emqx:running_nodes(),
+    Results = emqx_metrics_proto_v2:get_metrics(Nodes, rule_metrics, Id, ?RPC_GET_METRICS_TIMEOUT),
+    NodeResults = lists:zip(Nodes, Results),
+    NodeMetrics = [format_metrics(Node, Metrics) || {Node, {ok, Metrics}} <- NodeResults],
+    NodeErrors = [Result || Result = {_Node, {NOk, _}} <- NodeResults, NOk =/= ok],
+    NodeErrors == [] orelse
+        ?SLOG(
+            warning,
+            #{
+                msg => "rpc_get_rule_metrics_errors",
+                rule_id => Id,
+                errors => NodeErrors
+            },
+            #{tag => ?TAG}
+        ),
+    NodeMetrics.
 
-get_action_metrics(Id) ->
-    [maps:put(node, Node, rpc:call(Node, emqx_rule_metrics, get_action_metrics, [Id]))
-     || Node <- ekka_mnesia:running_nodes()].
+format_metrics(Node, #{
+    counters :=
+        #{
+            'matched' := Matched,
+            'passed' := Passed,
+            'failed' := Failed,
+            'failed.exception' := FailedEx,
+            'failed.no_result' := FailedNoRes,
+            'actions.total' := OTotal,
+            'actions.failed' := OFailed,
+            'actions.failed.out_of_service' := OFailedOOS,
+            'actions.failed.unknown' := OFailedUnknown,
+            'actions.success' := OSucc,
+            'actions.discarded' := ODiscard
+        },
+    rate :=
+        #{
+            'matched' :=
+                #{current := Current, max := Max, last5m := Last5M}
+        }
+}) ->
+    #{
+        metrics => ?METRICS_VAL(
+            Matched,
+            Passed,
+            Failed,
+            FailedEx,
+            FailedNoRes,
+            OTotal,
+            OFailed,
+            OFailedOOS,
+            OFailedUnknown,
+            OSucc,
+            ODiscard,
+            Current,
+            Max,
+            Last5M
+        ),
+        node => Node
+    };
+format_metrics(Node, _Metrics) ->
+    %% Empty metrics: can happen when a node joins another and a bridge is not yet
+    %% replicated to it, so the counters map is empty.
+    #{
+        metrics => ?METRICS_VAL_ZERO,
+        node => Node
+    }.
+
+aggregate_metrics(AllMetrics) ->
+    InitMetrics = ?METRICS_VAL_ZERO,
+    lists:foldl(fun do_aggregate_metrics/2, InitMetrics, AllMetrics).
+
+do_aggregate_metrics(#{metrics := Mt1}, Mt0) when map_size(Mt1) =:= map_size(Mt0) ->
+    ?METRICS_PAT(A1, B1, C1, D1, E1, F1, G1, H1, I1, J1, K1, L1, M1, N1) = Mt1,
+    ?METRICS_PAT(A0, B0, C0, D0, E0, F0, G0, H0, I0, J0, K0, L0, M0, N0) = Mt0,
+    ?METRICS_VAL(
+        A0 + A1,
+        B0 + B1,
+        C0 + C1,
+        D0 + D1,
+        E0 + E1,
+        F0 + F1,
+        G0 + G1,
+        H0 + H1,
+        I0 + I1,
+        J0 + J1,
+        K0 + K1,
+        L0 + L1,
+        M0 + M1,
+        N0 + N1
+    );
+do_aggregate_metrics(#{metrics := M1}, M0) ->
+    %% this happens during rolling upgrade
+    %% fallback to per-map-key iteration
+    maps:fold(
+        fun(Name, V1, Acc) ->
+            case maps:get(Name, Acc, false) of
+                false ->
+                    %% this is an unknown metric name for this node
+                    %% discard
+                    Acc;
+                V0 ->
+                    Acc#{Name => V0 + V1}
+            end
+        end,
+        M0,
+        M1
+    ).
+
+add_metadata(Params) ->
+    NowMS = emqx_rule_engine:now_ms(),
+    Params#{
+        <<"metadata">> => #{
+            <<"created_at">> => NowMS,
+            <<"last_modified_at">> => NowMS
+        }
+    }.
+
+filter_out_request_body(Conf) ->
+    ExtraConfs = [
+        <<"id">>,
+        <<"status">>,
+        <<"node_status">>,
+        <<"node_metrics">>,
+        <<"metrics">>,
+        <<"node">>
+    ],
+    maps:without(ExtraConfs, Conf).
+
+-spec mk_qs2ms_fn(maybe_namespace()) ->
+    fun((atom(), {list(), list()}) -> emqx_mgmt_api:match_spec_and_filter()).
+mk_qs2ms_fn(Namespace) ->
+    fun(_Tab, {Qs0, Fuzzy0}) ->
+        {Qs1, Fuzzy} = adapt_custom_filters(Qs0, Fuzzy0),
+        case lists:keytake(from, 1, Qs1) of
+            false ->
+                #{
+                    match_spec => generate_match_spec(Namespace, Qs1),
+                    fuzzy_fun => fuzzy_match_fun(Fuzzy)
+                };
+            {value, {from, '=:=', From}, Qs2} ->
+                #{
+                    match_spec => generate_match_spec(Namespace, Qs2),
+                    fuzzy_fun => fuzzy_match_fun([{from, '=:=', From} | Fuzzy])
+                }
+        end
+    end.
+
+%% Some filters are run as fuzzy filters because they cannot be expressed as simple ETS
+%% match specs.
+-spec adapt_custom_filters(Qs, Fuzzy) -> {Qs, Fuzzy}.
+adapt_custom_filters(Qs, Fuzzy) ->
+    lists:foldl(
+        fun
+            ({action, '=:=', X}, {QsAcc, FuzzyAcc}) ->
+                ActionIds = wrap(X),
+                Parsed = lists:map(fun emqx_rule_actions:parse_action/1, ActionIds),
+                {QsAcc, [{action, in, Parsed} | FuzzyAcc]};
+            ({source, '=:=', X}, {QsAcc, FuzzyAcc}) ->
+                SourceIds = wrap(X),
+                Parsed = lists:flatmap(
+                    fun(SourceId) ->
+                        [
+                            emqx_bridge_resource:bridge_hookpoint(SourceId),
+                            emqx_bridge_v2:source_hookpoint(SourceId)
+                        ]
+                    end,
+                    SourceIds
+                ),
+                {QsAcc, [{source, in, Parsed} | FuzzyAcc]};
+            (Clause, {QsAcc, FuzzyAcc}) ->
+                {[Clause | QsAcc], FuzzyAcc}
+        end,
+        {[], Fuzzy},
+        Qs
+    ).
+
+wrap(Xs) when is_list(Xs) -> Xs;
+wrap(X) -> [X].
+
+generate_match_spec(Namespace, Qs) ->
+    {MatchHead, Conds} = generate_match_spec(Qs, 2, {#{}, []}),
+    NsSpec =
+        case Namespace of
+            all -> '_';
+            _ -> Namespace
+        end,
+    [{{?KEY(NsSpec, '_'), MatchHead}, Conds, ['$_']}].
+
+generate_match_spec([], _, {MatchHead, Conds}) ->
+    {MatchHead, lists:reverse(Conds)};
+generate_match_spec([Qs | Rest], N, {MatchHead, Conds}) ->
+    Holder = list_to_atom([$$ | integer_to_list(N)]),
+    NMatchHead = emqx_mgmt_util:merge_maps(MatchHead, ms(element(1, Qs), Holder)),
+    NConds = put_conds(Qs, Holder, Conds),
+    generate_match_spec(Rest, N + 1, {NMatchHead, NConds}).
+
+put_conds({_, Op, V}, Holder, Conds) ->
+    [{Op, Holder, V} | Conds].
+
+ms(enable, X) ->
+    #{enable => X}.
+
+fuzzy_match_fun([]) ->
+    undefined;
+fuzzy_match_fun(Fuzzy) ->
+    {fun ?MODULE:run_fuzzy_match/2, [Fuzzy]}.
+
+run_fuzzy_match(_, []) ->
+    true;
+run_fuzzy_match(E = {?KEY(_, Id), _}, [{id, like, Pattern} | Fuzzy]) ->
+    binary:match(Id, Pattern) /= nomatch andalso run_fuzzy_match(E, Fuzzy);
+run_fuzzy_match(E = {_, #{description := Desc}}, [{description, like, Pattern} | Fuzzy]) ->
+    binary:match(Desc, Pattern) /= nomatch andalso run_fuzzy_match(E, Fuzzy);
+run_fuzzy_match(E = {_, #{from := Topics}}, [{from, '=:=', Pattern} | Fuzzy]) ->
+    lists:member(Pattern, Topics) /= false andalso run_fuzzy_match(E, Fuzzy);
+run_fuzzy_match(E = {_, #{from := Topics}}, [{from, match, Pattern} | Fuzzy]) ->
+    lists:any(fun(For) -> emqx_topic:match(For, Pattern) end, Topics) andalso
+        run_fuzzy_match(E, Fuzzy);
+run_fuzzy_match(E = {_, #{from := Topics}}, [{from, like, Pattern} | Fuzzy]) ->
+    lists:any(fun(For) -> binary:match(For, Pattern) /= nomatch end, Topics) andalso
+        run_fuzzy_match(E, Fuzzy);
+run_fuzzy_match(E = {_, #{actions := Actions}}, [{action, in, ActionIds} | Fuzzy]) ->
+    lists:any(fun(AId) -> lists:member(AId, Actions) end, ActionIds) andalso
+        run_fuzzy_match(E, Fuzzy);
+run_fuzzy_match(E = {_, #{from := Froms}}, [{source, in, SourceIds} | Fuzzy]) ->
+    lists:any(fun(SId) -> lists:member(SId, Froms) end, SourceIds) andalso
+        run_fuzzy_match(E, Fuzzy);
+run_fuzzy_match(E, [_ | Fuzzy]) ->
+    run_fuzzy_match(E, Fuzzy).
+
+rule_engine_update(Namespace, Params0) ->
+    case emqx_rule_api_schema:check_params(Params0, rule_engine) of
+        {ok, _CheckedParams} ->
+            Rules = emqx_rule_engine_config:list_raw_rules(Namespace),
+            Params = Params0#{<<"rules">> => Rules},
+            {ok, #{config := Config}} = emqx_conf:update(
+                [?ROOT_KEY],
+                Params,
+                with_namespace(#{override_to => cluster}, Namespace)
+            ),
+            {ok, Config};
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+ensure_last_modified_at(RawConfig) ->
+    emqx_utils_maps:deep_merge(
+        RawConfig,
+        #{<<"metadata">> => #{<<"last_modified_at">> => emqx_rule_engine:now_ms()}}
+    ).
+
+bin(X) -> emqx_utils_conv:bin(X).
+
+with_namespace(UpdateOpts, ?global_ns) ->
+    UpdateOpts;
+with_namespace(UpdateOpts, Namespace) when is_binary(Namespace) ->
+    UpdateOpts#{namespace => Namespace}.
+
+get_config(Namespace, KeyPath, Default) when is_binary(Namespace) ->
+    emqx:get_namespaced_config(Namespace, KeyPath, Default);
+get_config(?global_ns, KeyPath, Default) ->
+    emqx:get_config(KeyPath, Default).
+
+namespace_out(?global_ns) ->
+    null;
+namespace_out(Namespace) when is_binary(Namespace) ->
+    Namespace.
+
+get_namespace(#{resolved_ns := Namespace}) ->
+    Namespace.
+
+parse_namespace(#{query_string := QueryString} = Req) ->
+    ActorNamespace = emqx_dashboard:get_namespace(Req),
+    case maps:get(<<"ns">>, QueryString, ActorNamespace) of
+        QSNamespace when QSNamespace /= ActorNamespace andalso ActorNamespace /= ?global_ns ->
+            {error, not_authorized};
+        QSNamespace ->
+            {ok, QSNamespace}
+    end.
+
+resolve_namespace(Req, _Meta) ->
+    case parse_namespace(Req) of
+        {ok, Namespace} ->
+            ok = log_ns(Namespace),
+            {ok, Req#{resolved_ns => Namespace}};
+        {error, not_authorized} ->
+            ?FORBIDDEN(<<"User not authorized to operate on requested namespace">>)
+    end.
+
+log_ns(?global_ns) ->
+    _ = minirest_handler:update_log_meta(#{namespace => <<"global">>}),
+    ok;
+log_ns(NS) when is_binary(NS) ->
+    _ = minirest_handler:update_log_meta(#{namespace => NS}),
+    ok.
+
+validate_managed_namespace(#{resolved_ns := ?global_ns} = Req, _Meta) ->
+    {ok, Req};
+validate_managed_namespace(#{resolved_ns := Namespace} = Req, _Meta) ->
+    Res = emqx_hooks:run_fold('namespace.resource_pre_create', [#{namespace => Namespace}], #{
+        exists => false
+    }),
+    case Res of
+        #{exists := false} ->
+            ?BAD_REQUEST(<<"Managed namespace not found">>);
+        #{exists := true} ->
+            {ok, Req}
+    end.
+
+filter(Req0, Meta) ->
+    maybe
+        {ok, Req1} ?= resolve_namespace(Req0, Meta),
+        validate_managed_namespace(Req1, Meta)
+    end.

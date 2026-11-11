@@ -1,0 +1,374 @@
+%%--------------------------------------------------------------------
+%% Copyright (c) 2020-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
+%%--------------------------------------------------------------------
+-module(emqx_mgmt_api_topics_SUITE).
+
+-compile(export_all).
+-compile(nowarn_export_all).
+
+-include_lib("eunit/include/eunit.hrl").
+-include_lib("common_test/include/ct.hrl").
+
+all() ->
+    emqx_common_test_helpers:all(?MODULE).
+
+init_per_suite(Config0) ->
+    DurableSessionsOpts = #{<<"enable">> => true},
+    Opts = #{durable_sessions_opts => DurableSessionsOpts},
+    ExtraApps = [emqx_management, emqx_mgmt_api_test_util:emqx_dashboard()],
+    Config = emqx_common_test_helpers:start_apps_ds(
+        Config0,
+        ExtraApps,
+        Opts
+    ),
+    [Peer] = emqx_cth_cluster:start(
+        [{node1, #{apps => [emqx]}}],
+        #{work_dir => emqx_cth_suite:work_dir(node1, Config)}
+    ),
+    [{peer, Peer} | Config].
+
+end_per_suite(Config) ->
+    ok = emqx_cth_cluster:stop([?config(peer, Config)]),
+    emqx_common_test_helpers:run_cleanups(Config).
+
+t_nodes_api(_Config) ->
+    Node = atom_to_binary(node(), utf8),
+    Topic = <<"test_topic">>,
+    Client = client(?FUNCTION_NAME),
+    {ok, _, _} = emqtt:subscribe(Client, Topic),
+
+    %% list all
+    RoutesData = request_json(get, ["topics"]),
+    Meta = maps:get(<<"meta">>, RoutesData),
+    ?assertEqual(1, maps:get(<<"page">>, Meta)),
+    ?assertEqual(emqx_mgmt:default_row_limit(), maps:get(<<"limit">>, Meta)),
+    ?assertEqual(1, maps:get(<<"count">>, Meta)),
+    [Route | _] = maps:get(<<"data">>, RoutesData),
+    ?assertEqual(Topic, maps:get(<<"topic">>, Route)),
+    ?assertEqual(Node, maps:get(<<"node">>, Route)),
+
+    %% exact match
+    Topic2 = <<"test_topic_2">>,
+    {ok, _, _} = emqtt:subscribe(Client, Topic2),
+    MatchData = request_json(get, ["topics"], [
+        {"topic", Topic2},
+        {"node", atom_to_list(node())}
+    ]),
+    ?assertMatch(
+        #{
+            <<"data">> := [#{<<"topic">> := Topic2, <<"node">> := Node}],
+            <<"meta">> := #{<<"page">> := 1, <<"limit">> := 100, <<"count">> := 1}
+        },
+        MatchData
+    ),
+
+    %% get topics/:topic
+    RouteResponse = request_json(get, ["topics", Topic]),
+    ?assertEqual(
+        [#{<<"topic">> => Topic, <<"node">> => Node}],
+        RouteResponse
+    ),
+    ok = emqtt:stop(Client).
+
+t_paging(_Config) ->
+    Node = atom_to_list(node()),
+    Client1 = client(c_paging_1),
+    Client2 = client(c_paging_2),
+    Topics1 = [
+        <<"t/+">>,
+        <<"test/client/#">>,
+        <<"test/1">>,
+        <<"test/2">>,
+        <<"test/3">>
+    ],
+    Topics2 = [
+        <<"t/+">>,
+        <<"test/client/#">>,
+        <<"test/4">>,
+        <<"test/5">>,
+        <<"test/6">>
+    ],
+    ok = lists:foreach(fun(T) -> {ok, _, _} = emqtt:subscribe(Client1, T) end, Topics1),
+    ok = lists:foreach(fun(T) -> {ok, _, _} = emqtt:subscribe(Client2, T) end, Topics2),
+    Matched = request_json(get, ["topics"]),
+    ?assertEqual(
+        Matched,
+        request_json(get, ["topics"], [{"node", Node}])
+    ),
+    ?assertEqual(
+        %% NOTE: No `count` in this case.
+        #{<<"hasnext">> => true, <<"page">> => 1, <<"limit">> => 3},
+        maps:get(<<"meta">>, request_json(get, ["topics"], [{"node", Node}, {"limit", "3"}]))
+    ),
+    R1 = #{<<"data">> := Data1} = request_json(get, ["topics"], [{"page", "1"}, {"limit", "5"}]),
+    R2 = #{<<"data">> := Data2} = request_json(get, ["topics"], [{"page", "2"}, {"limit", "5"}]),
+    ?assertMatch(
+        #{
+            <<"meta">> := #{<<"hasnext">> := true, <<"page">> := 1, <<"count">> := 8},
+            <<"data">> := [_1, _2, _3, _4, _5]
+        },
+        R1
+    ),
+    ?assertMatch(
+        #{
+            <<"meta">> := #{<<"hasnext">> := false, <<"page">> := 2, <<"count">> := 8},
+            <<"data">> := [_6, _7, _8]
+        },
+        R2
+    ),
+    ?assertEqual(
+        lists:usort(Topics1 ++ Topics2),
+        lists:sort([T || #{<<"topic">> := T} <- Data1 ++ Data2])
+    ),
+
+    ok = emqtt:stop(Client1),
+    ok = emqtt:stop(Client2).
+
+t_percent_topics(_Config) ->
+    Node = atom_to_binary(node(), utf8),
+    Topic = <<"test_%%1">>,
+    Client = client(?FUNCTION_NAME),
+    {ok, _, _} = emqtt:subscribe(Client, Topic),
+
+    %% exact match with percent encoded topic
+    MatchData = request_json(get, ["topics"], [
+        {"topic", Topic},
+        {"node", atom_to_list(node())}
+    ]),
+    ?assertMatch(
+        #{
+            <<"data">> := [#{<<"topic">> := Topic, <<"node">> := Node}],
+            <<"meta">> := #{<<"page">> := 1, <<"limit">> := 100, <<"count">> := 1}
+        },
+        MatchData
+    ),
+
+    ok = emqtt:stop(Client).
+
+t_shared_topics(_Configs) ->
+    Node = atom_to_binary(node(), utf8),
+    RealTopic = <<"t/+">>,
+    Topic = <<"$share/g1/", RealTopic/binary>>,
+
+    Client = client(?FUNCTION_NAME),
+    {ok, _, _} = emqtt:subscribe(Client, Topic),
+    {ok, _, _} = emqtt:subscribe(Client, RealTopic),
+
+    %% exact match with shared topic
+    MatchData = request_json(get, ["topics"], [
+        {"topic", Topic},
+        {"node", atom_to_list(node())}
+    ]),
+    ?assertMatch(
+        #{
+            <<"data">> := [#{<<"topic">> := Topic, <<"node">> := Node}],
+            <<"meta">> := #{<<"page">> := 1, <<"limit">> := 100, <<"count">> := 1}
+        },
+        MatchData
+    ),
+
+    ok = emqtt:stop(Client).
+
+t_queue_topics(_Configs) ->
+    Node = atom_to_binary(node(), utf8),
+    RealTopic = <<"t/+">>,
+    Topic = <<"$queue/", RealTopic/binary>>,
+
+    Client = client(?FUNCTION_NAME),
+    {ok, _, _} = emqtt:subscribe(Client, Topic),
+    {ok, _, _} = emqtt:subscribe(Client, RealTopic),
+
+    %% exact match with shared topic
+    MatchData = request_json(get, ["topics"], [
+        {"topic", Topic},
+        {"node", atom_to_list(node())}
+    ]),
+    ?assertMatch(
+        #{
+            <<"data">> := [#{<<"topic">> := Topic, <<"node">> := Node}],
+            <<"meta">> := #{<<"page">> := 1, <<"limit">> := 100, <<"count">> := 1}
+        },
+        MatchData
+    ),
+
+    ok = emqtt:stop(Client).
+
+t_shared_topics_invalid(_Config) ->
+    %% no real topic
+    InvalidShareTopicFilter = <<"$share/group">>,
+    Path = emqx_mgmt_api_test_util:api_path(["topics"]),
+    QS = uri_string:compose_query([
+        {"topic", InvalidShareTopicFilter},
+        {"node", atom_to_list(node())}
+    ]),
+    Headers = emqx_mgmt_api_test_util:auth_header_(),
+    {error, {{_, 400, _}, _RespHeaders, Body}} = emqx_mgmt_api_test_util:request_api(
+        get, Path, QS, Headers, [], #{return_all => true}
+    ),
+    ?assertMatch(
+        #{<<"code">> := <<"INVALID_PARAMTER">>, <<"message">> := <<"topic_filter_invalid">>},
+        emqx_utils_json:decode(Body)
+    ).
+
+t_persistent_topics(_Config) ->
+    PersistentOpts = #{
+        proto_ver => v5,
+        properties => #{'Session-Expiry-Interval' => 300}
+    },
+    Client1 = client(t_persistent_topics_m1),
+    Client2 = client(t_persistent_topics_m2),
+    SessionId1 = <<"t_persistent_topics_p1">>,
+    SessionId2 = <<"t_persistent_topics_p2">>,
+    ClientPersistent1 = client(SessionId1, PersistentOpts),
+    ClientPersistent2 = client(SessionId2, PersistentOpts),
+    _ = [
+        ?assertMatch({ok, _, [1]}, emqtt:subscribe(Client, Topic, qos1))
+     || {Client, Topics} <- [
+            {Client1, [<<"t/client/mem">>, <<"t/+">>]},
+            {Client2, [<<"t/client/mem">>, <<"t/+">>]},
+            {ClientPersistent1, [<<"t/persistent/#">>, <<"t/client/ps">>, <<"t/+">>]},
+            {ClientPersistent2, [<<"t/persistent/#">>, <<"t/client/ps">>, <<"t/+">>]}
+        ],
+        Topic <- Topics
+    ],
+    Matched = request_json(get, ["topics"]),
+    ?assertMatch(
+        #{<<"page">> := 1, <<"limit">> := 100, <<"count">> := 8},
+        maps:get(<<"meta">>, Matched)
+    ),
+    %% Get back both topics for both persistent and in-memory subscriptions.
+    Expected = [
+        #{<<"topic">> => <<"t/+">>, <<"node">> => atom_to_binary(node())},
+        #{<<"topic">> => <<"t/+">>, <<"session">> => SessionId1},
+        #{<<"topic">> => <<"t/+">>, <<"session">> => SessionId2},
+        #{<<"topic">> => <<"t/client/mem">>, <<"node">> => atom_to_binary(node())},
+        #{<<"topic">> => <<"t/client/ps">>, <<"session">> => SessionId1},
+        #{<<"topic">> => <<"t/client/ps">>, <<"session">> => SessionId2},
+        #{<<"topic">> => <<"t/persistent/#">>, <<"session">> => SessionId1},
+        #{<<"topic">> => <<"t/persistent/#">>, <<"session">> => SessionId2}
+    ],
+    ?assertEqual(
+        lists:sort(Expected),
+        lists:sort(maps:get(<<"data">>, Matched))
+    ),
+    %% Are results the same when paginating?
+    #{<<"data">> := Page1} = R1 = request_json(get, ["topics"], [{"page", "1"}, {"limit", "3"}]),
+    #{<<"data">> := Page2} = request_json(get, ["topics"], [{"page", "2"}, {"limit", "3"}]),
+    #{<<"data">> := Page3} = request_json(get, ["topics"], [{"page", "3"}, {"limit", "3"}]),
+    ?assertEqual(
+        lists:sort(Expected),
+        lists:sort(Page1 ++ Page2 ++ Page3)
+    ),
+    %% Count respects persistent sessions.
+    ?assertMatch(
+        #{
+            <<"meta">> := #{<<"page">> := 1, <<"limit">> := 3, <<"count">> := 8},
+            <<"data">> := [_, _, _]
+        },
+        R1
+    ),
+    %% Filtering by node makes no sense for persistent sessions.
+    ?assertMatch(
+        #{
+            <<"data">> := [
+                #{<<"topic">> := <<"t/client/mem">>, <<"node">> := _},
+                #{<<"topic">> := <<"t/+">>, <<"node">> := _}
+            ],
+            <<"meta">> := #{<<"page">> := 1, <<"limit">> := 100, <<"count">> := 2}
+        },
+        request_json(get, ["topics"], [{"node", atom_to_list(node())}])
+    ).
+
+-doc """
+A durable shared subscription must be distinguishable from a normal durable
+subscription to the same underlying topic: its `topic` must carry the
+`$share/<group>/` prefix, same as an in-memory shared subscription already does.
+Regression test for https://github.com/emqx/emqx/issues/18648.
+""".
+t_persistent_shared_topics(_Config) ->
+    PersistentOpts = #{
+        proto_ver => v5,
+        properties => #{'Session-Expiry-Interval' => 300}
+    },
+    Group = <<"g1">>,
+    RealTopic = <<"t_persistent_shared_topics/a">>,
+    ShareTopic = <<"$share/", Group/binary, "/", RealTopic/binary>>,
+    SessionIdPlain = <<"t_persistent_shared_topics_plain">>,
+    ClientShared = client(<<"t_persistent_shared_topics_shared">>, PersistentOpts),
+    ClientPlain = client(SessionIdPlain, PersistentOpts),
+    {ok, _, [1]} = emqtt:subscribe(ClientShared, ShareTopic, qos1),
+    {ok, _, [1]} = emqtt:subscribe(ClientPlain, RealTopic, qos1),
+
+    %% NOTE: `topic`/`node` filters exclude persistent routes entirely (see
+    %% `mk_topic_stream/1`), so list unfiltered and pick out this test's rows.
+    #{<<"data">> := Data} = request_json(get, ["topics"], [{"limit", "1000"}]),
+    Matching = [Row || Row = #{<<"topic">> := T} <- Data, T =:= RealTopic orelse T =:= ShareTopic],
+    ?assertEqual(
+        lists:sort([
+            #{<<"topic">> => ShareTopic},
+            #{<<"topic">> => RealTopic, <<"session">> => SessionIdPlain}
+        ]),
+        lists:sort(Matching)
+    ),
+
+    {ok, _, _} = emqtt:unsubscribe(ClientShared, ShareTopic),
+    {ok, _, _} = emqtt:unsubscribe(ClientPlain, RealTopic),
+    ok = emqtt:stop(ClientShared),
+    ok = emqtt:stop(ClientPlain),
+    %% Unsubscribing only detaches the borrower; the durable queue backing a
+    %% shared subscription (and its route) outlives it until explicitly destroyed.
+    _ = emqx_ds_shared_sub:destroy(Group, RealTopic).
+
+-doc """
+A durable route written in the pre-fix shape (a bare opaque binary `dest`,
+group not carried) must still be listed without crashing the API, e.g. when
+read from a node that has not yet been upgraded during a rolling upgrade.
+""".
+t_persistent_shared_topics_legacy_dest(_Config) ->
+    Topic = <<"t_persistent_shared_topics_legacy_dest/a">>,
+    LegacyDest = <<"legacy-opaque-shared-sub-id">>,
+    ok = emqx_persistent_session_ds_router:do_add_route(Topic, LegacyDest),
+    #{<<"data">> := Data} = request_json(get, ["topics"], [{"limit", "1000"}]),
+    ?assertEqual(
+        [#{<<"topic">> => Topic, <<"session">> => LegacyDest}],
+        [Row || Row = #{<<"topic">> := T} <- Data, T =:= Topic]
+    ),
+    ok = emqx_persistent_session_ds_router:do_delete_route(Topic, LegacyDest).
+
+%% Utilities
+
+client(Name) ->
+    client(Name, #{}).
+
+client(Name, Overrides) ->
+    {ok, Client} = emqtt:start_link(
+        maps:merge(
+            #{
+                username => emqx_utils_conv:bin(Name),
+                clientid => emqx_utils_conv:bin(Name)
+            },
+            Overrides
+        )
+    ),
+    {ok, _} = emqtt:connect(Client),
+    Client.
+
+request_json(Method, Path) ->
+    decode_response(request_api(Method, Path)).
+
+request_json(Method, Path, QS) ->
+    decode_response(request_api(Method, Path, QS)).
+
+decode_response({ok, Response}) ->
+    emqx_utils_json:decode(Response);
+decode_response({error, Reason}) ->
+    error({request_api_error, Reason}).
+
+request_api(Method, API) ->
+    Path = emqx_mgmt_api_test_util:api_path(API),
+    emqx_mgmt_api_test_util:request_api(Method, Path).
+
+request_api(Method, API, QS) ->
+    Path = emqx_mgmt_api_test_util:api_path(API),
+    Auth = emqx_mgmt_api_test_util:auth_header_(),
+    emqx_mgmt_api_test_util:request_api(Method, Path, uri_string:compose_query(QS), Auth).

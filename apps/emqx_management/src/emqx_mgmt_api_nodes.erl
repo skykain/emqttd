@@ -1,46 +1,337 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
-
 -module(emqx_mgmt_api_nodes).
 
--rest_api(#{name   => list_nodes,
-            method => 'GET',
-            path   => "/nodes/",
-            func   => list,
-            descr  => "A list of nodes in the cluster"}).
+-behaviour(minirest_api).
 
--rest_api(#{name   => get_node,
-            method => 'GET',
-            path   => "/nodes/:atom:node",
-            func   => get,
-            descr  => "Lookup a node in the cluster"}).
+-include_lib("typerefl/include/types.hrl").
+-include_lib("hocon/include/hoconsc.hrl").
+-include_lib("emqx_utils/include/emqx_api_key_scopes.hrl").
 
--export([ list/2
-        , get/2
-        ]).
+-import(hoconsc, [mk/2, ref/1, ref/2, enum/1, array/1]).
 
-list(_Bindings, _Params) ->
-    minirest:return({ok, [format(Node, Info) || {Node, Info} <- emqx_mgmt:list_nodes()]}).
+-define(NODE_METRICS_MODULE, emqx_mgmt_api_metrics).
+-define(NODE_STATS_MODULE, emqx_mgmt_api_stats).
 
-get(#{node := Node}, _Params) ->
-    minirest:return({ok, emqx_mgmt:lookup_node(Node)}).
+%% Swagger specs from hocon schema
+-export([
+    api_spec/0,
+    schema/1,
+    paths/0,
+    fields/1,
+    namespace/0
+]).
 
-format(Node, {error, Reason}) -> #{node => Node, error => Reason};
+%% API callbacks
+-export([
+    nodes/2,
+    node/2,
+    node_metrics/2,
+    node_stats/2
+]).
+-export([scopes/0]).
 
-format(_Node, Info = #{memory_total := Total, memory_used := Used}) ->
-    Info#{memory_total := emqx_mgmt_util:kmg(Total),
-          memory_used  := emqx_mgmt_util:kmg(Used)}.
+%%--------------------------------------------------------------------
+%% API spec funcs
+%%--------------------------------------------------------------------
 
+namespace() -> undefined.
+
+api_spec() ->
+    emqx_dashboard_swagger:spec(?MODULE, #{check_schema => true}).
+
+scopes() -> ?SCOPE_CLUSTER_OPERATIONS.
+
+paths() ->
+    [
+        "/nodes",
+        "/nodes/:node",
+        "/nodes/:node/metrics",
+        "/nodes/:node/stats"
+    ].
+
+schema("/nodes") ->
+    #{
+        'operationId' => nodes,
+        get =>
+            #{
+                description => ?DESC(list_nodes),
+                tags => [<<"Nodes">>],
+                responses =>
+                    #{
+                        200 => mk(
+                            array(ref(node_info)),
+                            #{desc => ?DESC("list_nodes")}
+                        )
+                    }
+            }
+    };
+schema("/nodes/:node") ->
+    #{
+        'operationId' => node,
+        get =>
+            #{
+                description => ?DESC(get_node_info),
+                tags => [<<"Nodes">>],
+                parameters => [ref(node_name)],
+                responses =>
+                    #{
+                        200 => mk(
+                            ref(node_info),
+                            #{desc => ?DESC("get_node_info_success")}
+                        ),
+                        404 => not_found()
+                    }
+            }
+    };
+schema("/nodes/:node/metrics") ->
+    #{
+        'operationId' => node_metrics,
+        get =>
+            #{
+                description => ?DESC(get_node_metrics),
+                tags => [<<"Nodes">>],
+                parameters => [ref(node_name)],
+                responses =>
+                    #{
+                        200 => mk(
+                            ref(?NODE_METRICS_MODULE, node_metrics),
+                            #{desc => ?DESC("get_node_metrics_success")}
+                        ),
+                        404 => not_found()
+                    }
+            }
+    };
+schema("/nodes/:node/stats") ->
+    #{
+        'operationId' => node_stats,
+        get =>
+            #{
+                description => ?DESC(get_node_stats),
+                tags => [<<"Nodes">>],
+                parameters => [ref(node_name)],
+                responses =>
+                    #{
+                        200 => mk(
+                            ref(?NODE_STATS_MODULE, aggregated_data),
+                            #{desc => ?DESC("get_node_stats_success")}
+                        ),
+                        404 => not_found()
+                    }
+            }
+    }.
+
+%%--------------------------------------------------------------------
+%% Fields
+
+fields(node_name) ->
+    [
+        {node,
+            mk(
+                binary(),
+                #{
+                    in => path,
+                    description => ?DESC("node_name"),
+                    required => true,
+                    example => <<"emqx@127.0.0.1">>
+                }
+            )}
+    ];
+fields(node_info) ->
+    [
+        {node,
+            mk(
+                atom(),
+                #{desc => ?DESC("node_name"), example => <<"emqx@127.0.0.1">>}
+            )},
+        {connections,
+            mk(
+                non_neg_integer(),
+                #{desc => ?DESC("clients_session_count"), example => 0}
+            )},
+        {live_connections,
+            mk(
+                non_neg_integer(),
+                #{desc => ?DESC("live_connections_count"), example => 0}
+            )},
+        {cluster_sessions,
+            mk(
+                non_neg_integer(),
+                #{
+                    desc => ?DESC("cluster_sessions_desc"),
+                    example => 0
+                }
+            )},
+        {load1,
+            mk(
+                float(),
+                #{desc => ?DESC("cpu_load_1min"), example => 2.66}
+            )},
+        {load5,
+            mk(
+                float(),
+                #{desc => ?DESC("cpu_load_5min"), example => 2.66}
+            )},
+        {load15,
+            mk(
+                float(),
+                #{desc => ?DESC("cpu_load_15min"), example => 2.66}
+            )},
+        {max_fds,
+            mk(
+                non_neg_integer(),
+                #{desc => ?DESC("file_descriptors_limit"), example => 1024}
+            )},
+        {memory_total,
+            mk(
+                emqx_schema:bytesize(),
+                #{desc => ?DESC("allocated_memory"), example => "512.00M"}
+            )},
+        {memory_used,
+            mk(
+                emqx_schema:bytesize(),
+                #{desc => ?DESC("used_memory"), example => "256.00M"}
+            )},
+        {node_status,
+            mk(
+                enum(['running', 'stopped', 'unreachable']),
+                #{desc => ?DESC("node_status"), example => "running"}
+            )},
+        {otp_release,
+            mk(
+                string(),
+                #{desc => ?DESC("erlang_otp_version"), example => "24.2/12.2"}
+            )},
+        {process_available,
+            mk(
+                non_neg_integer(),
+                #{desc => ?DESC("erlang_processes_limit"), example => 2097152}
+            )},
+        {process_used,
+            mk(
+                non_neg_integer(),
+                #{desc => ?DESC("running_erlang_processes"), example => 1024}
+            )},
+        {uptime,
+            mk(
+                non_neg_integer(),
+                #{desc => ?DESC("system_uptime"), example => 5120000}
+            )},
+        {version,
+            mk(
+                string(),
+                #{desc => ?DESC("release_version"), example => "5.0.0"}
+            )},
+        {edition,
+            mk(
+                enum(['Opensource', 'Enterprise']),
+                #{desc => ?DESC("release_edition"), example => "Opensource"}
+            )},
+        {sys_path,
+            mk(
+                string(),
+                #{desc => ?DESC("system_files_path"), example => "path/to/emqx"}
+            )},
+        {log_path,
+            mk(
+                string(),
+                #{
+                    desc => ?DESC("log_files_path"),
+                    example => "path/to/log | The log path is not yet set"
+                }
+            )},
+        {role,
+            mk(
+                enum([core, replicant]),
+                #{desc => ?DESC("node_role"), example => "core"}
+            )},
+        {security_profile,
+            mk(
+                enum([legacy, hardened]),
+                #{desc => ?DESC("security_profile"), example => "legacy"}
+            )},
+        {feature_preset,
+            mk(
+                enum([full, essential, custom]),
+                #{desc => ?DESC("feature_preset"), example => "full"}
+            )}
+    ].
+
+%%--------------------------------------------------------------------
+%% API Handler funcs
+%%--------------------------------------------------------------------
+
+nodes(get, _Params) ->
+    list_nodes(#{}).
+
+node(get, #{bindings := #{node := NodeName}}) ->
+    with_node(NodeName, to_ok_result_fun(fun get_node/1)).
+
+node_metrics(get, #{bindings := #{node := NodeName}}) ->
+    with_node(NodeName, to_ok_result_fun(fun emqx_mgmt:get_metrics/1)).
+
+node_stats(get, #{bindings := #{node := NodeName}}) ->
+    with_node(NodeName, to_ok_result_fun(fun emqx_mgmt:get_stats/1)).
+
+%%--------------------------------------------------------------------
+%% api apply
+
+list_nodes(#{}) ->
+    NodesInfo = [format(NodeInfo) || {_Node, NodeInfo} <- emqx_mgmt:list_nodes()],
+    {200, NodesInfo}.
+
+%% `emqx_mgmt:lookup_node/1` answers `{error, Reason}` for a node that passed
+%% the membership check but did not report. `format/1` takes a map only, so that
+%% reached the client as a 500. Report it the way `GET /nodes` does instead.
+get_node(Node) ->
+    case emqx_mgmt:lookup_node(Node) of
+        Info when is_map(Info) -> format(Info);
+        {error, _Reason} -> format(emqx_mgmt:unreachable_node_info(Node))
+    end.
+
+%%--------------------------------------------------------------------
+%% internal function
+
+%% The last clause is unreachable for the success typing that OTP 28.5 infers
+%% for `emqx_mgmt:node_info/1', and reachable for the one OTP 28.4 infers. Keep
+%% the clause: it answers a real reply, and dropping it would turn that reply
+%% into a `function_clause' crash.
+-dialyzer({nowarn_function, format/1}).
+format(Info = #{memory_total := Total, memory_used := Used}) ->
+    format_version(Info#{
+        memory_total := emqx_mgmt_util:kmg(Total),
+        memory_used := emqx_mgmt_util:kmg(Used)
+    });
+format(Info) when is_map(Info) ->
+    format_version(Info);
+%% `emqx_mgmt:lookup_node/1` reaches this as `Info` when the target node
+%% becomes unreachable between the caller's liveness check and the RPC,
+%% e.g. a concurrent `cluster leave`.
+format({error, _} = Error) ->
+    Error.
+
+%% `emqx_mgmt:node_info/0` keeps the real version: the data backup import
+%% compares it across the cluster.
+format_version(#{version := Vsn} = Info) ->
+    Info#{version := emqx_dashboard:reported_version(Vsn)};
+format_version(Info) ->
+    Info.
+
+to_ok_result({error, _} = Error) ->
+    Error;
+to_ok_result({ok, _} = Ok) ->
+    Ok;
+to_ok_result(Result) ->
+    {ok, Result}.
+
+to_ok_result_fun(Fun) when is_function(Fun) ->
+    fun(Arg) ->
+        to_ok_result(Fun(Arg))
+    end.
+
+not_found() ->
+    emqx_dashboard_swagger:error_codes(['NOT_FOUND'], ?DESC("node_not_found")).
+
+with_node(Name, Fn) ->
+    emqx_mgmt_api_lib:with_node(Name, Fn).

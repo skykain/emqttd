@@ -1,0 +1,64 @@
+name: Cluster tests
+
+concurrency:
+  group: cluster-tests-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  cluster-smoke-test:
+    runs-on: ${{ github.repository_owner == 'emqx' && 'aws-ubuntu22.04-amd64' || 'ubuntu-22.04' }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      EMQX_NAME: emqx-enterprise
+
+    strategy:
+      fail-fast: false
+      matrix:
+        # Presets the two-node cluster boots with. Both must form a cluster and
+        # route MQTT messages across nodes; ESSENTIAL is the minimal feature set.
+        features:
+          - FULL
+          - ESSENTIAL
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ env.EMQX_NAME }}-docker-amd64
+      - name: load docker image
+        run: |
+          EMQX_TAG=$(docker load < ${EMQX_NAME}-docker-*.tar.gz 2>/dev/null | sed 's/Loaded image: //g')
+          echo "CI_EMQX_DOCKER_IMAGE_TAG=$EMQX_TAG" | tee -a $GITHUB_ENV
+
+      - name: start two-node cluster (features=${{ matrix.features }})
+        timeout-minutes: 5
+        env:
+          # The smoke test is about clustering, not authorization: make authz
+          # permissive so an anonymous client can publish/subscribe freely.
+          EMQX_FEATURES: ${{ matrix.features }}
+          EMQX_AUTHORIZATION__NO_MATCH: allow
+          EMQX_AUTHORIZATION__SOURCES: "[]"
+        run: ./scripts/test/start-two-nodes-in-docker.sh "$CI_EMQX_DOCKER_IMAGE_TAG"
+
+      - name: cluster mqtt smoke test
+        timeout-minutes: 5
+        run: ./scripts/test/cluster-smoke/run.sh
+
+      - name: dump logs on failure
+        if: failure()
+        run: |
+          echo "==============  node1  =============="; docker logs node1.emqx.io || true
+          echo "==============  node2  =============="; docker logs node2.emqx.io || true
+          echo "============== haproxy =============="; docker logs haproxy || true
+
+      - name: cleanup
+        if: always()
+        run: ./scripts/test/start-two-nodes-in-docker.sh -c

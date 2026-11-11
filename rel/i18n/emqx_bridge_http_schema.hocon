@@ -1,0 +1,141 @@
+emqx_bridge_http_schema {
+
+active_health_check.desc:
+"""Optional active HTTP health check. When enabled, each probe must receive a complete 2xx response.
+The existing pool connection checks also run.
+Redirects are not followed. The check uses the Connector's TLS, OAuth2 and static request headers.
+Headers with variables in the name or value are omitted.
+Use <code>resource_opts.health_check_interval</code> and a finite
+<code>resource_opts.health_check_timeout</code> to control the check. The timeout covers token acquisition,
+connection establishment, the response, and one OAuth2 retry after a 401.
+A timeout of at least 5 seconds is recommended.
+Probes use a separate connection pool, independent of the business request queue.
+Use HEAD or an endpoint with a small response body.
+Stopping, disabling or updating the Connector closes the probe pool.
+A successful probe does not guarantee that every business connection can complete requests.
+When disabled, only the existing connection and OAuth2 checks run."""
+
+active_health_check.label:
+"""Active HTTP Health Check"""
+
+active_health_check_enable.desc:
+"""Enable active HTTP health checks. A failed check marks this Connector and its Actions as unavailable."""
+
+active_health_check_enable.label:
+"""Enable Active HTTP Health Check"""
+
+active_health_check_method.desc:
+"""HTTP method for the health check request. GET and HEAD are supported. No request body is sent."""
+
+active_health_check_method.label:
+"""Health Check Method"""
+
+active_health_check_path.desc:
+"""Path of the health check endpoint, relative to the server root. For example, <code>/health?full=1</code>.
+This path replaces the path in the Connector URL. It must start with <code>/</code> and must not contain
+template variables, a host or a fragment. Required when the health check is enabled."""
+
+active_health_check_path.label:
+"""Health Check Path"""
+
+config_body.desc:
+"""The body of the HTTP request.<br/>
+If not provided, the body will be a JSON object of all the available fields.<br/>
+There, 'all the available fields' means the context of a MQTT message when
+this action is triggered by receiving a MQTT message,
+or the context of the event when this webhook is triggered by a rule (i.e. this
+action is used as an action of a rule).<br/>
+Template with variables is allowed."""
+
+config_body.label:
+"""HTTP Body"""
+
+config_enable_bridge.desc:
+"""Enable or disable this action."""
+
+config_enable_bridge.label:
+"""Enable Or Disable Bridge"""
+
+config_headers.desc:
+"""The headers of the HTTP request.<br/>
+Template with variables is allowed."""
+
+config_headers.label:
+"""HTTP Header"""
+
+config_max_retries.desc:
+"""Maximum number of retries for failed HTTP requests within a single action query.
+Retries for normal connection shutdown races do not consume this budget.
+The action buffer may retry recoverable errors independently until the request TTL expires."""
+
+config_max_retries.label:
+"""HTTP Request Max Retries"""
+
+config_method.desc:
+"""The method of the HTTP request. All the available methods are: post, put, get, delete.<br/>
+Template with variables is allowed."""
+
+config_method.label:
+"""HTTP Method"""
+
+config_request_timeout.desc:
+"""HTTP request timeout."""
+
+config_request_timeout.label:
+"""HTTP Request Timeout"""
+
+config_url.desc:
+"""The URL of the HTTP action.<br/>
+Template with variables is allowed in the path, but variables cannot be used in the scheme, host,
+or port part.<br/>
+For example, <code> http://localhost:9901/${topic} </code> is allowed, but
+<code> http://${host}:9901/message </code> or <code> http://localhost:${port}/message </code>
+is not allowed."""
+
+config_url.label:
+"""URL"""
+
+config_path.desc:
+"""The URL path for this Action.<br/>
+This path will be appended to the Connector's <code>url</code> configuration to form the full
+URL address.
+Template with variables is allowed in this option. For example, <code>/room/${room_no}</code>"""
+
+config_path.label:
+"""URL Path"""
+
+config_parameters_opts.desc:
+"""The parameters for HTTP action."""
+
+config_parameters_opts.label:
+"""Parameters"""
+
+desc_config.desc:
+"""Configuration for an HTTP action."""
+
+desc_config.label:
+"""HTTP Action Configuration"""
+
+desc_name.desc:
+"""Action name, used as a human-readable identifier."""
+
+desc_name.label:
+"""Action Name"""
+
+desc_type.desc:
+"""The action type."""
+
+desc_type.label:
+"""Action Type"""
+
+http_action_config.desc:
+"""HTTP Action Config."""
+http_action_config.label:
+"""HTTP Action Config"""
+
+webhook_config_method.desc:
+"""Configuration for WebHook using the specified method."""
+webhook_config_method.label:
+"""WebHook Configuration Method"""
+
+}

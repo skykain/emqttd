@@ -1,0 +1,217 @@
+#!/usr/bin/env bash
+# Print the next-to-be-released EMQX version on the current branch and every
+# downstream branch in the forward-sync chain, on a single comma-separated line.
+#
+# Example: if HEAD is on a v6.0 topic branch (last reachable GA tag is 6.0.3),
+# this prints
+#
+#     6.0.4, 6.1.4, 6.2.3, 6.3.0, 7.0.0
+#
+# A downstream line that has no GA tag yet (e.g. dev-70 before 7.0.0 ships)
+# contributes its first GA version, M.N.0 (7.0.0 above).
+#
+# computed by running `git describe <remote>/dev-XX --tags --match 'X.Y.*'
+# --exclude '*-*'` against the matching dev-XX branch (so the answers reflect
+# what is actually in upstream right now, not what is on disk locally).
+#
+# The pre-release tag forms (6.2.2-rc.1, 6.0.0-alpha.1, ...) are excluded
+# from the lookup; the script computes "next patch after the most recent GA".
+#
+# A version in code freeze is skipped. Once rel-X.Y.Z is cut, that branch takes
+# only what is merged into it, so work landing on dev-X.Y afterwards misses the
+# release and ships in the next patch. With rel-6.0.4 cut, a pull request
+# against dev-60 is released in 6.0.5, not 6.0.4. Work built on the release
+# branch itself is the exception and still reports X.Y.Z.
+#
+# Branches in the forward-sync chain. The 6.x line ends at dev-63; there is no
+# 6.4 release, so dev-63 syncs forward into dev-70:
+#   dev-60 -> dev-61 -> dev-62 -> dev-63 -> dev-70
+#
+# The script auto-detects the remote pointing at github.com:emqx/emqx from
+# `git remote -v` -- it doesn't assume the remote is called `origin`.
+
+set -euo pipefail
+
+usage() {
+    cat <<EOF
+Usage: $0
+
+Prints, on a single comma-separated line, the next release version on the
+current branch's release line and every downstream branch it would forward-sync
+to. A line with no GA tag yet contributes its first release, M.N.0.
+
+No arguments. The starting point is determined by the most recent GA tag
+reachable from HEAD (e.g. 6.0.3 -> start from the v6.0 line).
+
+A version whose release branch (rel-X.Y.Z) is already cut is skipped, because a
+change merged into dev-X.Y after the cut ships in the next patch instead.
+EOF
+}
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+    usage
+    exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# Detect the canonical emqx/emqx remote name.
+# Accept both SSH (git@github.com:emqx/emqx.git) and HTTPS
+# (https://github.com/emqx/emqx.git, with or without the .git suffix).
+# ---------------------------------------------------------------------------
+detect_remote() {
+    local name url first=""
+    while read -r name url _; do
+        # filter to fetch entries only
+        case "$url" in
+            *github.com[:/]emqx/emqx*)
+                # Strip optional trailing .git, accept the path matching exactly.
+                if [[ "$url" =~ github\.com[:/]emqx/emqx(\.git)?$ ]]; then
+                    if [[ "$name" == "origin" ]]; then
+                        echo "$name"
+                        return 0
+                    fi
+                    first="${first:-$name}"
+                fi
+                ;;
+        esac
+    done < <(git remote -v | awk '$3 == "(fetch)"')
+    if [[ -n "$first" ]]; then
+        echo "$first"
+        return 0
+    fi
+    return 1
+}
+
+REMOTE=$(detect_remote || true)
+if [[ -z "${REMOTE:-}" ]]; then
+    echo "error: no git remote points at github.com:emqx/emqx" >&2
+    exit 1
+fi
+
+git fetch "$REMOTE" --tags --quiet
+
+# ---------------------------------------------------------------------------
+# Resolve the starting minor from the most recent GA tag reachable from HEAD.
+# ---------------------------------------------------------------------------
+prev_tag=$(git describe --tags --match '[0-9]*.*' --exclude '*-*' --abbrev=0 2>/dev/null || true)
+if [[ -z "$prev_tag" ]]; then
+    echo "error: no GA tag (X.Y.Z) reachable from HEAD" >&2
+    exit 1
+fi
+if [[ ! "$prev_tag" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+    echo "error: cannot parse tag '$prev_tag'" >&2
+    exit 1
+fi
+start_major="${BASH_REMATCH[1]}"
+start_minor="${BASH_REMATCH[2]}"
+
+# ---------------------------------------------------------------------------
+# Forward-sync chain. It spans major versions: the 6.x line ends at dev-63,
+# which syncs forward into dev-70, because 6.4 is not released.
+# ---------------------------------------------------------------------------
+chain=(60 61 62 63 70)
+
+case "$start_major" in
+    6 | 7) ;;
+    *)
+        echo "error: unsupported major version $start_major" >&2
+        exit 1
+        ;;
+esac
+
+# Encode the starting minor the same way the chain entries are encoded:
+# chain entries are e.g. 60, 61, 62, 63, 70 (concatenation of major+minor).
+start_key="${start_major}${start_minor}"
+
+# ---------------------------------------------------------------------------
+# For each step in the chain >= start, look up dev-<N>'s latest GA tag and
+# collect the next patch version. A line with no GA tag yet (e.g. dev-63
+# before 6.3.0 ships) contributes its first GA version, M.N.0.
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Versions in code freeze.
+#
+# A rel-X.Y.Z branch means X.Y.Z is cut: from then on it takes only what is
+# merged into that branch, so a change that lands on dev-X.Y afterwards is not
+# in it and ships in the next patch.
+#
+# A change built on the release branch itself does ship in X.Y.Z. That case is
+# recognised by HEAD already containing the tip of rel-X.Y.Z.
+#
+# Kept as newline separated "version<TAB>sha" records rather than an
+# associative array, so the script still runs under bash 3.2.
+# ---------------------------------------------------------------------------
+frozen_refs=$(
+    git ls-remote --heads "$REMOTE" 'refs/heads/rel-*' 2>/dev/null |
+        sed -n 's|^\([0-9a-f]*\)[[:space:]]*refs/heads/rel-\(.*\)$|\2\t\1|p' ||
+        true
+)
+
+# next_unfrozen MAJOR MINOR PATCH
+# Prints the first version at or after MAJOR.MINOR.PATCH that is not frozen.
+next_unfrozen() {
+    local major="$1" minor="$2" patch="$3"
+    local version sha line_version line_sha
+    while :; do
+        version="${major}.${minor}.${patch}"
+        sha=""
+        while IFS=$'\t' read -r line_version line_sha; do
+            if [[ "$line_version" == "$version" ]]; then
+                sha="$line_sha"
+                break
+            fi
+        done <<< "$frozen_refs"
+
+        if [[ -z "$sha" ]]; then
+            echo "$version"
+            return 0
+        fi
+        # HEAD contains the release branch, so this work is part of that release.
+        if git merge-base --is-ancestor "$sha" HEAD 2>/dev/null; then
+            echo "$version"
+            return 0
+        fi
+        patch=$((patch + 1))
+    done
+}
+
+versions=()
+seen_start=0
+for step in "${chain[@]}"; do
+    if [[ "$step" != "$start_key" && "$seen_start" -eq 0 ]]; then
+        continue
+    fi
+    seen_start=1
+
+    # Extract minor from the chain key (e.g. 60 -> major=6 minor=0).
+    if [[ "$step" =~ ^([0-9])([0-9]+)$ ]]; then
+        major="${BASH_REMATCH[1]}"
+        minor="${BASH_REMATCH[2]}"
+    else
+        echo "error: cannot parse chain entry '$step'" >&2
+        exit 1
+    fi
+
+    branch="${REMOTE}/dev-${step}"
+    desc=$(git describe "$branch" --tags --match "${major}.${minor}.*" --exclude '*-*' --abbrev=0 2>/dev/null || true)
+    if [[ -z "$desc" ]]; then
+        # No GA tag on this line yet -> the first release will be M.N.0.
+        versions+=("$(next_unfrozen "$major" "$minor" 0)")
+        continue
+    fi
+
+    # desc is the GA tag itself (e.g. 6.0.3) because of --abbrev=0.
+    if [[ ! "$desc" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+        echo "warning: cannot parse tag '$desc' on ${branch} -- skipping" >&2
+        continue
+    fi
+    patch="${BASH_REMATCH[3]}"
+    versions+=("$(next_unfrozen "$major" "$minor" $((patch + 1)))")
+done
+
+# Print all collected versions on a single comma-separated line.
+out=""
+for v in "${versions[@]}"; do
+    out="${out:+$out, }$v"
+done
+echo "$out"

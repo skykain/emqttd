@@ -1,0 +1,114 @@
+%%--------------------------------------------------------------------
+%% Copyright (c) 2022-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
+%%--------------------------------------------------------------------
+
+%% Kafka connection configuration
+-module(emqx_bridge_kafka_impl).
+
+-export([
+    hosts/1,
+    sasl/1,
+    sasl/2,
+    socket_opts/1,
+    client_opts/1
+]).
+
+-include_lib("emqx/include/logger.hrl").
+
+%% Options passed down to the Kafka client library that are only present when
+%% the user explicitly configured them.
+-spec client_opts(map()) -> map().
+client_opts(Config) ->
+    maps:filter(
+        fun(_, Value) -> Value =/= undefined end,
+        #{
+            client_id => kafka_client_id_opt(Config)
+        }
+    ).
+
+kafka_client_id_opt(Config) ->
+    case maps:get(kafka_client_id, Config, <<>>) of
+        <<>> -> undefined;
+        ClientId -> ClientId
+    end.
+
+%% Parse comma separated host:port list into a [{Host,Port}] list
+hosts(Hosts) when is_binary(Hosts) ->
+    hosts(binary_to_list(Hosts));
+hosts([#{hostname := _, port := _} | _] = Servers) ->
+    %% already parsed
+    [{Hostname, Port} || #{hostname := Hostname, port := Port} <- Servers];
+hosts(Hosts) when is_list(Hosts) ->
+    kpro:parse_endpoints(Hosts).
+
+sasl(none) ->
+    undefined;
+sasl(msk_iam) ->
+    {callback, brod_oauth, #{
+        token_callback => fun emqx_bridge_kafka_msk_iam_authn:token_callback/1
+    }};
+sasl(#{type := msk_iam_roles_anywhere} = Opts) ->
+    #{region := _Region, endpoint := _Endpoint} = Opts,
+    {callback, brod_oauth, #{
+        token_callback => emqx_bridge_kafka_msk_iam_authn:mk_token_callback(Opts)
+    }};
+sasl(#{mechanism := Mechanism, username := Username, password := Secret}) ->
+    {Mechanism, Username, Secret};
+sasl(#{
+    kerberos_principal := Principal,
+    kerberos_keytab_file := KeyTabFile
+}) ->
+    {callback, brod_gssapi, {gssapi, KeyTabFile, Principal}}.
+
+sasl(#{mechanism := oauth, grant_type := client_credentials} = Opts, OAuth2ResourceId) ->
+    Extensions = emqx_utils_maps:binary_key_map(maps:get(extensions, Opts, #{})),
+    {callback, brod_oauth, #{
+        token_callback => emqx_bridge_kafka_oauth_authn:mk_token_callback(OAuth2ResourceId),
+        extensions => Extensions
+    }};
+sasl(Auth, _OAuth2ResourceId) ->
+    sasl(Auth).
+
+%% Extra socket options, such as sndbuf size etc.
+socket_opts(Opts) when is_map(Opts) ->
+    socket_opts(maps:to_list(Opts));
+socket_opts(Opts) when is_list(Opts) ->
+    socket_opts_loop(Opts, []).
+
+socket_opts_loop([], Acc) ->
+    lists:reverse(Acc);
+socket_opts_loop([{tcp_keepalive, KeepAlive} | Rest], Acc) ->
+    Acc1 = tcp_keepalive(KeepAlive) ++ Acc,
+    socket_opts_loop(Rest, Acc1);
+socket_opts_loop([{ip_family, IpFamily} | Rest], Acc) ->
+    %% kafka_protocol connects with one address family only when the
+    %% options include `inet' or `inet6'. Otherwise, it tries IPv4 first
+    %% and falls back to IPv6 for hostnames.
+    Acc1 =
+        case IpFamily of
+            auto -> Acc;
+            ipv4 -> [inet | Acc];
+            ipv6 -> [inet6 | Acc]
+        end,
+    socket_opts_loop(Rest, Acc1);
+socket_opts_loop([{T, Bytes} | Rest], Acc) when
+    T =:= sndbuf orelse T =:= recbuf orelse T =:= buffer
+->
+    Acc1 = [{T, Bytes} | adjust_socket_buffer(Bytes, Acc)],
+    socket_opts_loop(Rest, Acc1);
+socket_opts_loop([Other | Rest], Acc) ->
+    socket_opts_loop(Rest, [Other | Acc]).
+
+%% https://www.erlang.org/doc/man/inet.html
+%% For TCP it is recommended to have val(buffer) >= val(recbuf)
+%% to avoid performance issues because of unnecessary copying.
+adjust_socket_buffer(Bytes, Opts) ->
+    case lists:keytake(buffer, 1, Opts) of
+        false ->
+            [{buffer, Bytes} | Opts];
+        {value, {buffer, Bytes1}, Acc1} ->
+            [{buffer, max(Bytes1, Bytes)} | Acc1]
+    end.
+
+tcp_keepalive(String) ->
+    emqx_schema:tcp_keepalive_opts(String).

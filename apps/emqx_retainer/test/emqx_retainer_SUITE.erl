@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_retainer_SUITE).
@@ -19,177 +7,1891 @@
 -compile(export_all).
 -compile(nowarn_export_all).
 
--define(APP, emqx).
+-include("emqx_retainer.hrl").
 
+-include_lib("emqx/include/asserts.hrl").
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("common_test/include/ct.hrl").
+-include_lib("snabbkaffe/include/snabbkaffe.hrl").
+-include_lib("emqx/src/emqx_tracepoints.hrl").
+-include("../../emqx_extsub/src/emqx_extsub_internal.hrl").
 
-all() -> emqx_ct:all(?MODULE).
+all() ->
+    [
+        {group, mnesia_without_indices},
+        {group, mnesia_with_indices},
+        {group, mnesia_reindex},
+        {group, index_agnostic},
+        {group, index_agnostic_ds}
+    ].
+
+groups() ->
+    [
+        {mnesia_without_indices, [sequence], index_related_tests()},
+        {mnesia_with_indices, [sequence], index_related_tests()},
+        {mnesia_reindex, [sequence], [t_reindex]},
+        {index_agnostic, [sequence], [
+            t_disable_then_start,
+            t_start_stop_on_setting_change,
+            %% N.B. `disabled__t_takeover` and `disabled__t_resume` are skipped until
+            %% iteration resumption is implemented as an improvement.  See the docs for
+            %% `t_resume_and_resubscribe`.
+            %% disabled__t_takeover,
+            %% disabled__t_resume,
+            t_resume_and_resubscribe,
+            t_read_ignore_non_mqtt,
+            t_read_no_wildcard_empty,
+            t_read_no_wildcard_retained,
+            t_read_wildcard_empty,
+            t_extsub_no_leak_wildcard_multi_batch,
+            t_extsub_no_leak_wildcard_single_batch,
+            t_extsub_no_leak_wildcard_empty,
+            t_extsub_no_leak_no_wildcard,
+            t_extsub_no_leak_no_wildcard_empty,
+            t_extsub_no_leak_subscribe_unsubscribe,
+            t_retain_available_does_not_control_retainer_lifecycle,
+            t_retain_available_true_honors_retainer_enable
+        ]},
+        {index_agnostic_ds, [sequence], [
+            %% N.B. `disabled__t_takeover` and `disabled__t_resume` are skipped until
+            %% iteration resumption is implemented as an improvement.  See the docs for
+            %% `t_resume_and_resubscribe`.
+            %% disabled__t_takeover,
+            %% disabled__t_resume,
+            t_resume_and_resubscribe
+        ]}
+    ].
+
+index_related_tests() ->
+    emqx_common_test_helpers:all(?MODULE) --
+        [
+            t_reindex,
+            t_disable_then_start,
+            t_disabled,
+            t_start_stop_on_setting_change,
+            t_read_ignore_non_mqtt,
+            t_read_no_wildcard_empty,
+            t_read_no_wildcard_retained,
+            t_read_wildcard_empty,
+            t_extsub_no_leak_wildcard_multi_batch,
+            t_extsub_no_leak_wildcard_single_batch,
+            t_extsub_no_leak_wildcard_empty,
+            t_extsub_no_leak_no_wildcard,
+            t_extsub_no_leak_no_wildcard_empty,
+            t_extsub_no_leak_subscribe_unsubscribe,
+            t_retain_available_does_not_control_retainer_lifecycle,
+            t_retain_available_true_honors_retainer_enable
+        ].
+
+%% erlfmt-ignore
+-define(BASE_CONF, ~'
+retainer {
+  enable = true
+  msg_clear_interval = 0s
+  msg_expiry_interval = 0s
+  max_payload_size = 1MB
+  delivery_rate = "1000/s"
+  max_publish_rate = "100000/s"
+  flow_control {
+    batch_read_number = 1000
+  }
+  backend {
+    type = built_in_database
+    storage_type = ram
+    max_retained_messages = 0
+  }
+}
+').
+
+%% erlfmt-ignore
+-define(DISABLED_CONF, ~b'
+retainer {
+  enable = false
+}
+').
 
 %%--------------------------------------------------------------------
 %% Setups
 %%--------------------------------------------------------------------
 
-init_per_suite(Config) ->
-    emqx_ct_helpers:start_apps([emqx_retainer]),
-    Config.
+init_per_group(mnesia_without_indices = Group, Config) ->
+    start_apps(Group, [{index, false} | Config]);
+init_per_group(Group, Config) ->
+    start_apps(Group, Config).
 
-end_per_suite(_Config) ->
-    emqx_ct_helpers:stop_apps([emqx_retainer]).
+end_per_group(Group, Config) ->
+    emqx_retainer_mnesia:populate_index_meta(),
+    stop_apps(Group, Config),
+    ok.
 
-init_per_testcase(TestCase, Config) ->
-    emqx_retainer:clean(<<"#">>),
-    case TestCase of
-        t_message_expiry_2 ->
-            application:set_env(emqx_retainer, expiry_interval, 2000);
+init_per_testcase(t_disabled, Config) ->
+    snabbkaffe:start_trace(),
+    Config;
+init_per_testcase(_TestCase, Config) ->
+    snabbkaffe:start_trace(),
+    case ?config(index, Config) of
+        false ->
+            mria:clear_table(?TAB_INDEX_META);
         _ ->
-            application:set_env(emqx_retainer, expiry_interval, 0)
+            emqx_retainer_mnesia:populate_index_meta()
     end,
-    application:stop(emqx_retainer),
-    application:ensure_all_started(emqx_retainer),
+    emqx_retainer:clean(),
+    reset_rates_to_default(),
     Config.
+
+end_per_testcase(t_disabled, _Config) ->
+    snabbkaffe:stop(),
+    ok;
+end_per_testcase(_TestCase, _Config) ->
+    emqx_common_test_helpers:call_janitor(),
+    snabbkaffe:stop(),
+    reset_rates_to_default(),
+    ok.
+
+emqx_retainer_app_spec(disabled) ->
+    {emqx_retainer, ?DISABLED_CONF};
+emqx_retainer_app_spec(_) ->
+    {emqx_retainer, ?BASE_CONF}.
+
+emqx_retainer_app_spec() ->
+    emqx_retainer_app_spec(default).
+
+emqx_conf_app_spec(_) ->
+    emqx_conf.
+
+start_apps(index_agnostic_ds = _Group, Config) ->
+    ExtraApps = [emqx_retainer_app_spec()],
+    emqx_common_test_helpers:start_apps_ds(Config, ExtraApps, #{});
+start_apps(Group, Config) ->
+    Apps = emqx_cth_suite:start(
+        [
+            mria,
+            emqx,
+            emqx_conf_app_spec(Group),
+            emqx_retainer_app_spec(Group)
+        ],
+        #{work_dir => emqx_cth_suite:work_dir(Config)}
+    ),
+    [{suite_apps, Apps} | Config].
+
+stop_apps(index_agnostic_ds, Config) ->
+    emqx_common_test_helpers:run_cleanups(Config);
+stop_apps(_Group, Config) ->
+    emqx_cth_suite:stop(?config(suite_apps, Config)).
 
 %%--------------------------------------------------------------------
 %% Test Cases
 %%--------------------------------------------------------------------
-
 t_store_and_clean(_) ->
     {ok, C1} = emqtt:start_link([{clean_start, true}, {proto_ver, v5}]),
     {ok, _} = emqtt:connect(C1),
 
-    emqtt:publish(C1, <<"retained">>, <<"this is a retained message">>, [{qos, 0}, {retain, true}]),
-    timer:sleep(100),
+    Retained0 = emqx_metrics:val_global('messages.retained'),
+    emqtt:publish(
+        C1,
+        <<"retained">>,
+        <<"this is a retained message">>,
+        [{qos, 0}, {retain, true}]
+    ),
+    %% The retainer stores the message asynchronously.
+    %% Wait until the store is visible before reading.
+    ?retry(
+        100,
+        20,
+        ?assertMatch(
+            {ok, [#message{payload = <<"this is a retained message">>}]},
+            emqx_retainer:read_message(<<"retained">>)
+        )
+    ),
+    %% The counter increments asynchronously relative to store visibility.
+    ?retry(100, 20, ?assertEqual(Retained0 + 1, emqx_metrics:val_global('messages.retained'))),
+
+    {ok, _, List} = emqx_retainer:page_read(<<"retained">>, 1, 10),
+    ?assertEqual(1, length(List)),
+    ?assertMatch(
+        {ok, [#message{payload = <<"this is a retained message">>}]},
+        emqx_retainer:read_message(<<"retained">>)
+    ),
+
     {ok, #{}, [0]} = emqtt:subscribe(C1, <<"retained">>, [{qos, 0}, {rh, 0}]),
     ?assertEqual(1, length(receive_messages(1))),
+    ?assertMatch(
+        {ok, [#message{payload = <<"this is a retained message">>}]},
+        emqx_retainer:read_message(<<"retained">>)
+    ),
 
     {ok, #{}, [0]} = emqtt:unsubscribe(C1, <<"retained">>),
+    %% The broker removes the subscriber entry asynchronously after UNSUBACK.
+    %% Wait until the topic has no subscribers before publishing the clear.
+    %% Otherwise the broker delivers the empty-payload publish to this client
+    %% as a normal message.
+    ?retry(100, 20, ?assertEqual([], emqx_broker:subscribers(<<"retained">>))),
 
     emqtt:publish(C1, <<"retained">>, <<"">>, [{qos, 0}, {retain, true}]),
-    timer:sleep(100),
+    %% Wait until the empty-payload publish has cleared the retained message.
+    ?retry(100, 20, ?assertMatch({ok, []}, emqx_retainer:read_message(<<"retained">>))),
+    %% The counter increments asynchronously relative to store visibility.
+    ?retry(100, 20, ?assertEqual(Retained0 + 1, emqx_metrics:val_global('messages.retained'))),
+
     {ok, #{}, [0]} = emqtt:subscribe(C1, <<"retained">>, [{qos, 0}, {rh, 0}]),
     ?assertEqual(0, length(receive_messages(1))),
+    ?assertMatch(
+        {ok, []},
+        emqx_retainer:read_message(<<"retained">>)
+    ),
+
+    ok = emqx_retainer:clean(),
+    {ok, _, List2} = emqx_retainer:page_read(<<"retained">>, 1, 10),
+    ?assertEqual(0, length(List2)),
+    ?assertMatch(
+        {ok, []},
+        emqx_retainer:read_message(<<"retained">>)
+    ),
 
     ok = emqtt:disconnect(C1).
 
-t_retain_handling(_) ->
+t_retain_handling(Config) ->
     {ok, C1} = emqtt:start_link([{clean_start, true}, {proto_ver, v5}]),
     {ok, _} = emqtt:connect(C1),
 
-    emqtt:publish(C1, <<"retained">>, <<"this is a retained message">>, [{qos, 0}, {retain, true}]),
+    ok = emqx_retainer:clean(),
+
+    %% rh = 0, no wildcard, and with empty retained message
+    {ok, #{}, [0]} = emqtt:subscribe(C1, <<"retained">>, [{qos, 0}, {rh, 0}]),
+    ?assertEqual(0, length(receive_messages(1))),
+    {ok, #{}, [0]} = emqtt:unsubscribe(C1, <<"retained">>),
+
+    %% rh = 0, has wildcard, and with empty retained message
+    {ok, #{}, [0]} = emqtt:subscribe(C1, <<"retained/#">>, [{qos, 0}, {rh, 0}]),
+    ?assertEqual(0, length(receive_messages(1))),
+    {ok, #{}, [0]} = emqtt:unsubscribe(C1, <<"retained/#">>),
+
+    %% The broker removes the subscriber entries asynchronously after UNSUBACK.
+    %% Wait until both topic filters have no subscribers before the publish.
+    %% Otherwise the broker delivers the publish to this client as a normal
+    %% message, and every later receive_messages/1 call consumes a delivery
+    %% that belongs to an earlier assertion.
+    ?retry(100, 20, ?assertEqual([], emqx_broker:subscribers(<<"retained">>))),
+    ?retry(100, 20, ?assertEqual([], emqx_broker:subscribers(<<"retained/#">>))),
+
+    publish(
+        C1,
+        <<"retained">>,
+        <<"this is a retained message">>,
+        [{qos, 0}, {retain, true}],
+        Config
+    ),
 
     {ok, #{}, [0]} = emqtt:subscribe(C1, <<"retained">>, [{qos, 0}, {rh, 0}]),
     ?assertEqual(1, length(receive_messages(1))),
+
     {ok, #{}, [0]} = emqtt:subscribe(C1, <<"retained">>, [{qos, 0}, {rh, 0}]),
     ?assertEqual(1, length(receive_messages(1))),
+
+    {ok, #{}, [0]} = emqtt:subscribe(C1, <<"retained/#">>, [{qos, 0}, {rh, 0}]),
+    ?assertEqual(1, length(receive_messages(1))),
+
     {ok, #{}, [0]} = emqtt:unsubscribe(C1, <<"retained">>),
 
     {ok, #{}, [0]} = emqtt:subscribe(C1, <<"retained">>, [{qos, 0}, {rh, 1}]),
     ?assertEqual(1, length(receive_messages(1))),
+
     {ok, #{}, [0]} = emqtt:subscribe(C1, <<"retained">>, [{qos, 0}, {rh, 1}]),
     ?assertEqual(0, length(receive_messages(1))),
+
     {ok, #{}, [0]} = emqtt:unsubscribe(C1, <<"retained">>),
 
     {ok, #{}, [0]} = emqtt:subscribe(C1, <<"retained">>, [{qos, 0}, {rh, 2}]),
     ?assertEqual(0, length(receive_messages(1))),
 
     emqtt:publish(C1, <<"retained">>, <<"">>, [{qos, 0}, {retain, true}]),
+    %% Wait until the clear is applied so it cannot leak into the next case.
+    ?retry(100, 20, ?assertMatch({ok, []}, emqx_retainer:read_message(<<"retained">>))),
     ok = emqtt:disconnect(C1).
 
-t_wildcard_subscription(_) ->
+t_wildcard_subscription(Config) ->
     {ok, C1} = emqtt:start_link([{clean_start, true}, {proto_ver, v5}]),
     {ok, _} = emqtt:connect(C1),
-    emqtt:publish(C1, <<"retained/0">>, <<"this is a retained message 0">>, [{qos, 0}, {retain, true}]),
-    emqtt:publish(C1, <<"retained/1">>, <<"this is a retained message 1">>, [{qos, 0}, {retain, true}]),
-    emqtt:publish(C1, <<"retained/a/b/c">>, <<"this is a retained message 2">>, [{qos, 0}, {retain, true}]),
+    emqtt:publish(
+        C1,
+        <<"retained/0">>,
+        <<"this is a retained message 0">>,
+        [{qos, 0}, {retain, true}]
+    ),
+    emqtt:publish(
+        C1,
+        <<"retained/1">>,
+        <<"this is a retained message 1">>,
+        [{qos, 0}, {retain, true}]
+    ),
+    emqtt:publish(
+        C1,
+        <<"retained/a/b/c">>,
+        <<"this is a retained message 2">>,
+        [{qos, 0}, {retain, true}]
+    ),
+    publish(
+        C1,
+        <<"/x/y/z">>,
+        <<"this is a retained message 3">>,
+        [{qos, 0}, {retain, true}],
+        Config
+    ),
 
-    {ok, #{}, [0]} = emqtt:subscribe(C1,  <<"retained/+">>, 0),
-    {ok, #{}, [0]} = emqtt:subscribe(C1,  <<"retained/+/b/#">>, 0),
-    ?assertEqual(3, length(receive_messages(3))),
+    {ok, #{}, [0]} = emqtt:subscribe(C1, <<"retained/+">>, 0),
+    {ok, #{}, [0]} = emqtt:subscribe(C1, <<"retained/+/b/#">>, 0),
+    {ok, #{}, [0]} = emqtt:subscribe(C1, <<"/+/y/#">>, 0),
+    Msgs = receive_messages(4),
+    ?assertEqual(4, length(Msgs), #{msgs => Msgs}),
 
     emqtt:publish(C1, <<"retained/0">>, <<"">>, [{qos, 0}, {retain, true}]),
     emqtt:publish(C1, <<"retained/1">>, <<"">>, [{qos, 0}, {retain, true}]),
     emqtt:publish(C1, <<"retained/a/b/c">>, <<"">>, [{qos, 0}, {retain, true}]),
+    emqtt:publish(C1, <<"/x/y/z">>, <<"">>, [{qos, 0}, {retain, true}]),
     ok = emqtt:disconnect(C1).
 
-t_message_expiry(_) ->
+t_wildcard_no_dollar_sign_prefix(_Config) ->
+    {ok, C0} = emqtt:start_link([{clean_start, true}, {proto_ver, v5}]),
+    {ok, _} = emqtt:connect(C0),
+    emqtt:publish(
+        C0,
+        <<"$test/t/0">>,
+        <<"this is a retained message with $ prefix in topic">>,
+        [{qos, 1}, {retain, true}]
+    ),
+    emqtt:publish(
+        C0,
+        <<"$test/test/1">>,
+        <<"this is another retained message with $ prefix in topic">>,
+        [{qos, 1}, {retain, true}]
+    ),
+
+    emqtt:publish(
+        C0,
+        <<"t/1">>,
+        <<"this is a retained message 1">>,
+        [{qos, 1}, {retain, true}]
+    ),
+    emqtt:publish(
+        C0,
+        <<"t/2">>,
+        <<"this is a retained message 2">>,
+        [{qos, 1}, {retain, true}]
+    ),
+    emqtt:publish(
+        C0,
+        <<"/t/3">>,
+        <<"this is a retained message 3">>,
+        [{qos, 1}, {retain, true}]
+    ),
+
+    %%%%%%%%%%
+    %% C1 subscribes to `#'
     {ok, C1} = emqtt:start_link([{clean_start, true}, {proto_ver, v5}]),
     {ok, _} = emqtt:connect(C1),
+    {ok, #{}, [0]} = emqtt:subscribe(C1, <<"#">>, 0),
+    %% Matched 5 msgs but only receive 3 msgs, 2 ignored
+    %% (`$test/t/0` and `$test/test/1` with `$` prefix in topic are ignored)
+    Msgs1 = receive_messages(5),
+    ?assertMatch(
+        %% The order in which messages are received is not always the same as the order in which they are published.
+        %% The received order follows the order in which the indexes match.
+        %% i.e.
+        %%   The first level of the topic `/t/3` is empty.
+        %%   So it will be the first message that be matched and be sent.
+        [
+            #{topic := <<"/t/3">>},
+            #{topic := <<"t/1">>},
+            #{topic := <<"t/2">>}
+        ],
+        Msgs1
+    ),
+    ok = emqtt:disconnect(C1),
 
-    emqtt:publish(C1, <<"retained/0">>, #{'Message-Expiry-Interval' => 0}, <<"don't expire">>, [{qos, 0}, {retain, true}]),
-    emqtt:publish(C1, <<"retained/1">>, #{'Message-Expiry-Interval' => 2}, <<"expire">>, [{qos, 0}, {retain, true}]),
-    emqtt:publish(C1, <<"retained/2">>, #{'Message-Expiry-Interval' => 5}, <<"don't expire">>, [{qos, 0}, {retain, true}]),
-    emqtt:publish(C1, <<"retained/3">>, <<"don't expire">>, [{qos, 0}, {retain, true}]),
-    emqtt:publish(C1, <<"$SYS/retained/4">>, <<"don't expire">>, [{qos, 0}, {retain, true}]),
+    %%%%%%%%%%
+    %% C2 subscribes to `$test/#'
+    {ok, C2} = emqtt:start_link([{clean_start, true}, {proto_ver, v5}]),
+    {ok, _} = emqtt:connect(C2),
+    {ok, #{}, [0]} = emqtt:subscribe(C2, <<"$test/#">>, 0),
+    %% Matched 2 msgs and receive them all, no ignored
+    Msgs2 = receive_messages(2),
+    ?assertMatch(
+        [
+            #{topic := <<"$test/t/0">>},
+            #{topic := <<"$test/test/1">>}
+        ],
+        Msgs2
+    ),
+    ok = emqtt:disconnect(C2),
 
-    {ok, #{}, [0]} = emqtt:subscribe(C1, <<"retained/+">>, 0),
-    {ok, #{}, [0]} = emqtt:subscribe(C1, <<"$SYS/retained/+">>, 0),
-    ?assertEqual(5, length(receive_messages(5))),
-    {ok, #{}, [0]} = emqtt:unsubscribe(C1, <<"retained/+">>),
-    {ok, #{}, [0]} = emqtt:unsubscribe(C1, <<"$SYS/retained/+">>),
+    %%%%%%%%%%
+    %% C3 subscribes to `+/+'
+    {ok, C3} = emqtt:start_link([{clean_start, true}, {proto_ver, v5}]),
+    {ok, _} = emqtt:connect(C3),
+    {ok, #{}, [0]} = emqtt:subscribe(C3, <<"+/+">>, 0),
+    %% Matched 2 msgs and receive them all, no ignored
+    Msgs3 = receive_messages(2),
+    ?assertMatch(
+        [
+            #{topic := <<"t/1">>},
+            #{topic := <<"t/2">>}
+        ],
+        Msgs3
+    ),
+    ok = emqtt:disconnect(C3),
 
-    timer:sleep(3000),
-    {ok, #{}, [0]} = emqtt:subscribe(C1, <<"retained/+">>, 0),
-    {ok, #{}, [0]} = emqtt:subscribe(C1, <<"$SYS/retained/+">>, 0),
-    ?assertEqual(4, length(receive_messages(5))),
+    %%%%%%%%%%
+    %% C4 subscribes to `+/t/#'
+    {ok, C4} = emqtt:start_link([{clean_start, true}, {proto_ver, v5}]),
+    {ok, _} = emqtt:connect(C4),
+    {ok, #{}, [0]} = emqtt:subscribe(C4, <<"+/t/#">>, 0),
+    %% Matched 2 msgs but only receive 1 msgs, 1 ignored
+    %% (`$test/t/0` with `$` prefix in topic are ignored)
+    Msgs4 = receive_messages(1),
+    ?assertMatch(
+        [
+            #{topic := <<"/t/3">>}
+        ],
+        Msgs4
+    ),
+    ok = emqtt:disconnect(C4),
 
-    emqtt:publish(C1, <<"retained/0">>, <<"">>, [{qos, 0}, {retain, true}]),
-    emqtt:publish(C1, <<"retained/1">>, <<"">>, [{qos, 0}, {retain, true}]),
-    emqtt:publish(C1, <<"retained/2">>, <<"">>, [{qos, 0}, {retain, true}]),
-    emqtt:publish(C1, <<"retained/3">>, <<"">>, [{qos, 0}, {retain, true}]),
-    emqtt:publish(C1, <<"$SYS/retained/4">>, <<"">>, [{qos, 0}, {retain, true}]),
+    ?assertNotReceive(_),
 
-    ok = emqtt:disconnect(C1).
+    ok.
 
-t_message_expiry_2(_) ->
+t_message_expiry(Config) ->
+    ConfMod = fun(Conf) ->
+        Conf#{<<"delivery_rate">> := <<"infinity">>}
+    end,
+    Case = fun() ->
+        ExpireSoon = 10,
+        ExpireLater = 60,
+        {ok, C1} = emqtt:start_link([{clean_start, true}, {proto_ver, v5}]),
+        {ok, _} = emqtt:connect(C1),
+
+        emqtt:publish(C1, <<"retained/0">>, <<"don't expire">>, [{qos, 0}, {retain, true}]),
+        emqtt:publish(
+            C1,
+            <<"retained/1">>,
+            #{'Message-Expiry-Interval' => ExpireSoon},
+            <<"expire">>,
+            [{qos, 0}, {retain, true}]
+        ),
+        emqtt:publish(
+            C1,
+            <<"retained/2">>,
+            #{'Message-Expiry-Interval' => ExpireLater},
+            <<"don't expire">>,
+            [{qos, 0}, {retain, true}]
+        ),
+        emqtt:publish(
+            C1,
+            <<"retained/3">>,
+            <<"don't expire">>,
+            [{qos, 0}, {retain, true}]
+        ),
+        publish(
+            C1,
+            <<"$SYS/retained/4">>,
+            <<"don't expire">>,
+            [{qos, 0}, {retain, true}],
+            Config
+        ),
+
+        {ok, #{}, [0]} = emqtt:subscribe(C1, <<"retained/+">>, 0),
+        {ok, #{}, [0]} = emqtt:subscribe(C1, <<"$SYS/retained/+">>, 0),
+        ?assertEqual(5, length(receive_messages(5))),
+        {ok, #{}, [0]} = emqtt:unsubscribe(C1, <<"retained/+">>),
+        {ok, #{}, [0]} = emqtt:unsubscribe(C1, <<"$SYS/retained/+">>),
+
+        timer:sleep(timer:seconds(ExpireSoon + 1)),
+        {ok, #{}, [0]} = emqtt:subscribe(C1, <<"retained/+">>, 0),
+        {ok, #{}, [0]} = emqtt:subscribe(C1, <<"$SYS/retained/+">>, 0),
+        ?assertEqual(4, length(receive_messages(5))),
+
+        emqtt:publish(C1, <<"retained/0">>, <<"">>, [{qos, 0}, {retain, true}]),
+        emqtt:publish(C1, <<"retained/1">>, <<"">>, [{qos, 0}, {retain, true}]),
+        emqtt:publish(C1, <<"retained/2">>, <<"">>, [{qos, 0}, {retain, true}]),
+        emqtt:publish(C1, <<"retained/3">>, <<"">>, [{qos, 0}, {retain, true}]),
+        emqtt:publish(C1, <<"$SYS/retained/4">>, <<"">>, [{qos, 0}, {retain, true}]),
+
+        ok = emqtt:disconnect(C1)
+    end,
+    with_conf(Config, ConfMod, Case).
+
+t_message_expiry_2(Config) ->
+    ConfMod = fun(Conf) ->
+        Conf#{<<"msg_expiry_interval">> := <<"2s">>}
+    end,
+    Case = fun() ->
+        {ok, C1} = emqtt:start_link([{clean_start, true}, {proto_ver, v5}]),
+        {ok, _} = emqtt:connect(C1),
+        publish(C1, <<"retained">>, <<"expire">>, [{qos, 0}, {retain, true}], Config),
+
+        {ok, #{}, [0]} = emqtt:subscribe(C1, <<"retained">>, [{qos, 0}, {rh, 0}]),
+        ?assertEqual(1, length(receive_messages(1))),
+        timer:sleep(4000),
+        {ok, #{}, [0]} = emqtt:subscribe(C1, <<"retained">>, [{qos, 0}, {rh, 0}]),
+        ?assertEqual(0, length(receive_messages(1))),
+        {ok, #{}, [0]} = emqtt:unsubscribe(C1, <<"retained">>),
+
+        emqtt:publish(C1, <<"retained">>, <<"">>, [{qos, 0}, {retain, true}]),
+
+        ok = emqtt:disconnect(C1)
+    end,
+    with_conf(Config, ConfMod, Case).
+
+t_table_full(Config) ->
+    ConfMod = fun(Conf) ->
+        Conf#{<<"backend">> => #{<<"max_retained_messages">> => <<"1">>}}
+    end,
+    Case = fun() ->
+        {ok, C1} = emqtt:start_link([{clean_start, true}, {proto_ver, v5}]),
+        {ok, _} = emqtt:connect(C1),
+        emqtt:publish(C1, <<"retained/t/1">>, <<"a">>, [{qos, 0}, {retain, true}]),
+        emqtt:publish(C1, <<"retained/t/2">>, <<"b">>, [{qos, 0}, {retain, true}]),
+        ct:sleep(100),
+        {ok, #{}, [0]} = emqtt:subscribe(C1, <<"retained/t/1">>, [{qos, 0}, {rh, 0}]),
+        ?assertEqual(1, length(receive_messages(1))),
+        {ok, #{}, [0]} = emqtt:subscribe(C1, <<"retained/t/2">>, [{qos, 0}, {rh, 0}]),
+        ?assertEqual(0, length(receive_messages(1))),
+
+        ok = emqtt:disconnect(C1)
+    end,
+    with_conf(Config, ConfMod, Case).
+
+t_clean(Config) ->
     {ok, C1} = emqtt:start_link([{clean_start, true}, {proto_ver, v5}]),
     {ok, _} = emqtt:connect(C1),
-    emqtt:publish(C1, <<"retained">>, <<"expire">>, [{qos, 0}, {retain, true}]),
-
-    {ok, #{}, [0]} = emqtt:subscribe(C1, <<"retained">>, [{qos, 0}, {rh, 0}]),
-    ?assertEqual(1, length(receive_messages(1))),
-    timer:sleep(3000),
-    {ok, #{}, [0]} = emqtt:subscribe(C1, <<"retained">>, [{qos, 0}, {rh, 0}]),
-    ?assertEqual(0, length(receive_messages(1))),
-    {ok, #{}, [0]} = emqtt:unsubscribe(C1, <<"retained">>),
-
-    emqtt:publish(C1, <<"retained">>, <<"">>, [{qos, 0}, {retain, true}]),
-
-    ok = emqtt:disconnect(C1).
-
-t_clean(_) ->
-    {ok, C1} = emqtt:start_link([{clean_start, true}, {proto_ver, v5}]),
-    {ok, _} = emqtt:connect(C1),
-    emqtt:publish(C1, <<"retained/0">>, <<"this is a retained message 0">>, [{qos, 0}, {retain, true}]),
-    emqtt:publish(C1, <<"retained/1">>, <<"this is a retained message 1">>, [{qos, 0}, {retain, true}]),
-    emqtt:publish(C1, <<"retained/test/0">>, <<"this is a retained message 2">>, [{qos, 0}, {retain, true}]),
-
+    emqtt:publish(
+        C1,
+        <<"retained/0">>,
+        <<"this is a retained message 0">>,
+        [{qos, 0}, {retain, true}]
+    ),
+    emqtt:publish(
+        C1,
+        <<"retained/1">>,
+        <<"this is a retained message 1">>,
+        [{qos, 0}, {retain, true}]
+    ),
+    publish(
+        C1,
+        <<"retained/test/0">>,
+        <<"this is a retained message 2">>,
+        [{qos, 0}, {retain, true}],
+        Config
+    ),
+    ct:sleep(100),
     {ok, #{}, [0]} = emqtt:subscribe(C1, <<"retained/#">>, [{qos, 0}, {rh, 0}]),
     ?assertEqual(3, length(receive_messages(3))),
 
-    1 = emqx_retainer:clean(<<"retained/test/0">>),
-    2 = emqx_retainer:clean(<<"retained/+">>),
+    ok = emqx_retainer:delete(<<"retained/test/0">>),
+    ok = emqx_retainer:delete(<<"retained/+">>),
     {ok, #{}, [0]} = emqtt:subscribe(C1, <<"retained/#">>, [{qos, 0}, {rh, 0}]),
     ?assertEqual(0, length(receive_messages(3))),
 
     ok = emqtt:disconnect(C1).
 
+t_stop_publish_clear_msg(_) ->
+    update_retainer_config(#{<<"stop_publish_clear_msg">> => true}),
+    {ok, C1} = emqtt:start_link([{clean_start, true}, {proto_ver, v5}]),
+    {ok, _} = emqtt:connect(C1),
+    emqtt:publish(
+        C1,
+        <<"retained/0">>,
+        <<"this is a retained message 0">>,
+        [{qos, 0}, {retain, true}]
+    ),
+
+    {ok, #{}, [0]} = emqtt:subscribe(C1, <<"retained/#">>, [{qos, 0}, {rh, 0}]),
+    ?assertEqual(1, length(receive_messages(1))),
+
+    emqtt:publish(C1, <<"retained/0">>, <<"">>, [{qos, 0}, {retain, true}]),
+    ?assertEqual(0, length(receive_messages(1))),
+
+    update_retainer_config(#{<<"stop_publish_clear_msg">> => false}),
+    ok = emqtt:disconnect(C1).
+
+t_flow_control(_) ->
+    %% Setup slow delivery
+    update_retainer_config(#{
+        <<"delivery_rate">> => <<"1/1s">>
+    }),
+    {ok, C1} = emqtt:start_link([{clean_start, true}, {proto_ver, v5}]),
+    {ok, _} = emqtt:connect(C1),
+    emqtt:publish(
+        C1,
+        <<"retained/0">>,
+        <<"this is a retained message 0">>,
+        [{qos, 0}, {retain, true}]
+    ),
+    emqtt:publish(
+        C1,
+        <<"retained/1">>,
+        <<"this is a retained message 1">>,
+        [{qos, 0}, {retain, true}]
+    ),
+    emqtt:publish(
+        C1,
+        <<"retained/2">>,
+        <<"this is a retained message 2">>,
+        [{qos, 0}, {retain, true}]
+    ),
+    ct:sleep(100),
+    {ok, #{}, [0]} = emqtt:subscribe(C1, <<"retained/#">>, [{qos, 0}, {rh, 0}]),
+    ?assertEqual(3, length(receive_messages(3))),
+    ok.
+
+t_publish_rate_limit(_) ->
+    %% Setup tight publish rates
+    update_retainer_config(#{
+        <<"max_publish_rate">> => <<"1/1s">>
+    }),
+    %% Connect client
+    {ok, C1} = emqtt:start_link([{clean_start, true}, {proto_ver, v5}]),
+    {ok, _} = emqtt:connect(C1),
+    snabbkaffe:start_trace(),
+
+    %% Should see failure after the first message
+    {_, {ok, _}} = ?wait_async_action(
+        publish_messages(C1, 2),
+        #{?snk_kind := retain_failed_for_rate_exceeded_limit, topic := <<"t/2">>},
+        5000
+    ),
+
+    %% Wait for the refill timer to refill the tokens
+    ct:sleep(1100),
+
+    %% Should see success after the first message
+    {_, {ok, _}} = ?wait_async_action(
+        publish_messages(C1, 1),
+        #{?snk_kind := retain_within_limit, topic := <<"t/1">>},
+        5000
+    ),
+    %% And a failure again since we have 1 token per second
+    {_, {ok, _}} = ?wait_async_action(
+        publish_messages(C1, 1),
+        #{?snk_kind := retain_failed_for_rate_exceeded_limit, topic := <<"t/1">>},
+        5000
+    ),
+    snabbkaffe:stop(),
+
+    %% No more failures after setting the rate limit to infinity
+    update_retainer_config(#{<<"max_publish_rate">> => <<"infinity">>}),
+    ?check_trace(
+        ?wait_async_action(
+            publish_messages(C1, 100),
+            #{?snk_kind := retain_within_limit, topic := <<"t/100">>},
+            5000
+        ),
+        fun(Trace) ->
+            ?assertEqual(
+                [],
+                ?of_kind(retain_failed_for_rate_exceeded_limit, Trace)
+            )
+        end
+    ),
+
+    %% Check that the rate limit is still working after restarting the app
+    ok = application:stop(emqx_retainer),
+    ok = application:ensure_started(emqx_retainer),
+    ?check_trace(
+        ?wait_async_action(
+            publish_messages(C1, 100),
+            #{?snk_kind := retain_within_limit, topic := <<"t/100">>},
+            5000
+        ),
+        fun(Trace) ->
+            ?assertEqual(
+                [],
+                ?of_kind(retain_failed_for_rate_exceeded_limit, Trace)
+            )
+        end
+    ),
+
+    %% Start with tight rate limit
+    update_retainer_config(#{<<"max_publish_rate">> => <<"1/1s">>}),
+    ok = application:stop(emqx_retainer),
+    ok = application:ensure_started(emqx_retainer),
+
+    %% Check that the rate limit is still working
+    snabbkaffe:start_trace(),
+    {_, {ok, _}} = ?wait_async_action(
+        publish_messages(C1, 2),
+        #{?snk_kind := retain_failed_for_rate_exceeded_limit, topic := <<"t/2">>},
+        5000
+    ),
+
+    %% Check that the tokens do not accumulate, still only 1 token
+    ct:sleep(2200),
+    {_, {ok, _}} = ?wait_async_action(
+        publish_messages(C1, 1),
+        #{?snk_kind := retain_within_limit, topic := <<"t/1">>},
+        5000
+    ),
+    {_, {ok, _}} = ?wait_async_action(
+        publish_messages(C1, 1),
+        #{?snk_kind := retain_failed_for_rate_exceeded_limit, topic := <<"t/1">>},
+        5000
+    ),
+
+    ok = emqtt:disconnect(C1),
+    ok.
+
+t_delete_rate_limit(_) ->
+    %% Setup tight publish rates
+    update_retainer_config(#{
+        <<"max_publish_rate">> => <<"1/1s">>
+    }),
+    {ok, C1} = emqtt:start_link([{clean_start, true}, {proto_ver, v5}]),
+    {ok, _} = emqtt:connect(C1),
+
+    ?check_trace(
+        begin
+            {_, {ok, _}} = ?wait_async_action(
+                lists:foreach(
+                    fun(_) ->
+                        emqtt:publish(C1, <<"retained/topic">>, <<"">>, [{qos, 0}, {retain, true}])
+                    end,
+                    lists:seq(1, 2)
+                ),
+                #{
+                    ?snk_kind := retained_delete_failed_for_rate_exceeded_limit,
+                    topic := <<"retained/topic">>
+                },
+                5000
+            )
+        end,
+        []
+    ),
+
+    ok = emqtt:disconnect(C1),
+    ok.
+
+-doc """
+Checks that non-wildcard subscriptions receive their retained messages at once, also when the
+dispatch rate limit is exhausted.
+""".
+t_dispatch_rate_limit_non_wildcard(_) ->
+    %% Setup tight dispatch rates
+    update_retainer_config(#{<<"delivery_rate">> => <<"1/2s">>}),
+
+    %% Prepare retained messages
+    QoS = 1,
+    lists:foreach(
+        fun(Topic) ->
+            Msg = emqx_message:make(<<"sender">>, QoS, Topic, Topic, #{retain => true}, #{}),
+            emqx:publish2(Msg)
+        end,
+        [<<"t/a">>, <<"t/b">>]
+    ),
+    %% Sanity check
+    ?assertEqual(2, emqx_retainer:retained_count()),
+
+    %% Exhaust the global retainer limit, then subscribe to both topics
+    hit_delivery_rate_limit(),
+    snabbkaffe:start_trace(),
+    {ok, C1} = emqtt:start_link(#{clean_start => true, proto_ver => v5}),
+    {ok, _} = emqtt:connect(C1),
+    {ok, _, _} = emqtt:subscribe(C1, <<"t/a">>, 1),
+    {ok, _, _} = emqtt:subscribe(C1, <<"t/b">>, 1),
+
+    %% Both messages arrive without waiting for the limit
+    ?assertMatch([_, _], receive_messages(2, 1_000)),
+    ?assertEqual([], ?of_kind(retained_fetch_rate_limit_exceeded, snabbkaffe:collect_trace())),
+    ok = emqtt:stop(C1),
+
+    update_retainer_config(#{<<"delivery_rate">> => <<"1000/1s">>}),
+
+    ok.
+
+-doc """
+Checks that, even if we hit the dispatch rate limit while subscribing to a wildcard topic.
+""".
+t_dispatch_rate_limit_wildcard(_) ->
+    %% Setup tight dispatch rates
+    update_retainer_config(#{
+        <<"delivery_rate">> => <<"10/1s">>,
+        <<"flow_control">> => #{<<"batch_read_number">> => 1}
+    }),
+
+    %% Prepare a bunch of retained messages to hit dispatch limit.
+    NumMsgs = 20,
+    lists:foreach(
+        fun(N) ->
+            QoS = 1,
+            Payload = integer_to_binary(N),
+            Topic = <<"t/", Payload/binary>>,
+            Msg = emqx_message:make(<<"sender">>, QoS, Topic, Payload, #{retain => true}, #{}),
+            emqx:publish2(Msg)
+        end,
+        lists:seq(1, NumMsgs)
+    ),
+    %% Sanity check
+    ?assertEqual(NumMsgs, emqx_retainer:retained_count()),
+
+    snabbkaffe:start_trace(),
+
+    %% Now we connect and subscribe; should hit delivery rate limit, and yet eventually
+    %% consume all messages.
+    {ok, C1} = emqtt:start_link(#{clean_start => true, proto_ver => v5}),
+    {ok, _} = emqtt:connect(C1),
+    {_, {ok, _}} =
+        ?wait_async_action(
+            emqtt:subscribe(C1, <<"t/+">>, 1),
+            #{?snk_kind := retained_fetch_rate_limit_exceeded},
+            5_000
+        ),
+    Msgs1 = receive_messages(NumMsgs),
+    ?assertEqual(NumMsgs, length(Msgs1), #{received => Msgs1}),
+    ok = emqtt:stop(C1),
+
+    update_retainer_config(#{
+        <<"delivery_rate">> => <<"1000/1s">>,
+        <<"flow_control">> => #{<<"batch_read_number">> => 1_000}
+    }),
+    emqx_retainer:clean(),
+
+    ok.
+
+-doc """
+Smoke test for subscribing to a topic containing a retained message using shared
+subscriptions:
+
+> No Retained Messages are sent to the Session when it first subscribes. It will be sent
+  other matching messages as they are published.
+""".
+t_shared_subscription(_TCConfig) ->
+    QoS = 1,
+    Payload = <<"I shouldn't be delivered...">>,
+    Topic = <<"smoke/shared_sub">>,
+    Msg = emqx_message:make(<<"sender">>, QoS, Topic, Payload, #{retain => true}, #{}),
+    emqx:publish2(Msg),
+
+    {ok, C} = emqtt:start_link(#{clean_start => true, proto_ver => v5}),
+    {ok, _} = emqtt:connect(C),
+
+    %% Non-wildcard subscription
+    {ok, _, _} = emqtt:subscribe(C, <<"$share/g_retained/", Topic/binary>>),
+    ?assertNotReceive({publish, _}),
+
+    %% Using wildcard
+    {ok, _, _} = emqtt:subscribe(C, <<"$share/g_retained/+/shared_sub">>),
+    ?assertNotReceive({publish, _}),
+
+    %% Queue topics (special shared subs)
+    {ok, _, _} = emqtt:subscribe(C, <<"$queue/", Topic/binary>>),
+    ?assertNotReceive({publish, _}),
+
+    {ok, _, _} = emqtt:subscribe(C, <<"$queue/+/shared_sub">>),
+    ?assertNotReceive({publish, _}),
+
+    emqtt:stop(C),
+    ok.
+
+t_clear_expired(Config) ->
+    ConfMod = fun(Conf) ->
+        Conf#{
+            <<"msg_clear_interval">> := <<"1s">>,
+            <<"msg_expiry_interval">> := <<"3s">>
+        }
+    end,
+
+    Case = fun() ->
+        {ok, C1} = emqtt:start_link([{clean_start, true}, {proto_ver, v5}]),
+        {ok, _} = emqtt:connect(C1),
+
+        lists:foreach(
+            fun(I) ->
+                emqtt:publish(
+                    C1,
+                    <<"retained/", (I + 60):8/unsigned-integer>>,
+                    #{'Message-Expiry-Interval' => 3},
+                    <<"retained">>,
+                    [{qos, 0}, {retain, true}]
+                )
+            end,
+            lists:seq(1, 5)
+        ),
+        timer:sleep(1000),
+
+        {ok, _, List} = emqx_retainer:page_read(<<"retained/+">>, _Deadline = 0, 1, 10),
+        ?assertEqual(5, erlang:length(List)),
+
+        timer:sleep(4500),
+
+        {ok, _, List2} = emqx_retainer:page_read(<<"retained/+">>, _Deadline = 0, 1, 10),
+        ?assertEqual(0, erlang:length(List2)),
+
+        ok = emqtt:disconnect(C1)
+    end,
+    with_conf(Config, ConfMod, Case).
+
+t_max_payload_size(Config) ->
+    ConfMod = fun(Conf) -> Conf#{<<"max_payload_size">> := <<"1kb">>} end,
+    Case = fun() ->
+        emqx_retainer:clean(),
+        timer:sleep(500),
+        {ok, C1} = emqtt:start_link([{clean_start, true}, {proto_ver, v5}]),
+        {ok, _} = emqtt:connect(C1),
+        Payload = iolist_to_binary(lists:duplicate(1024, <<"0">>)),
+        emqtt:publish(
+            C1,
+            <<"retained/1">>,
+            #{},
+            Payload,
+            [{qos, 0}, {retain, true}]
+        ),
+        emqtt:publish(
+            C1,
+            <<"retained/2">>,
+            #{},
+            <<"1", Payload/binary>>,
+            [{qos, 0}, {retain, true}]
+        ),
+
+        timer:sleep(500),
+        {ok, _, List} = emqx_retainer:page_read(<<"retained/+">>, 1, 10),
+        ?assertEqual(1, erlang:length(List)),
+
+        ok = emqtt:disconnect(C1)
+    end,
+    with_conf(Config, ConfMod, Case).
+
+t_page_read(_) ->
+    {ok, C1} = emqtt:start_link([{clean_start, true}, {proto_ver, v5}]),
+    {ok, _} = emqtt:connect(C1),
+    ok = emqx_retainer:clean(),
+    timer:sleep(500),
+
+    Fun = fun(I) ->
+        emqtt:publish(
+            C1,
+            <<"retained/", (I + 60)>>,
+            <<"this is a retained message">>,
+            [{qos, 0}, {retain, true}]
+        )
+    end,
+    lists:foreach(Fun, lists:seq(1, 9)),
+    timer:sleep(200),
+
+    {ok, _, List} = emqx_retainer:page_read(<<"retained/+">>, 1, 5),
+    ?assertEqual(5, length(List)),
+
+    {ok, _, List2} = emqx_retainer:page_read(<<"retained/+">>, 2, 5),
+    ?assertEqual(4, length(List2)),
+
+    ok = emqtt:disconnect(C1).
+
+t_only_for_coverage(_) ->
+    ?assertEqual(retainer, emqx_retainer_schema:namespace()),
+    ignored = gen_server:call(emqx_retainer, unexpected),
+    ok = gen_server:cast(emqx_retainer, unexpected),
+    unexpected = erlang:send(erlang:whereis(emqx_retainer), unexpected),
+
+    Dispatcher = emqx_retainer_dispatcher:worker(),
+    ignored = gen_server:call(Dispatcher, unexpected),
+    ok = gen_server:cast(Dispatcher, unexpected),
+    unexpected = erlang:send(Dispatcher, unexpected),
+    true = erlang:exit(Dispatcher, normal),
+    ok.
+
+t_reindex(_) ->
+    remove_delivery_rate(),
+    {ok, C} = emqtt:start_link([{clean_start, true}, {proto_ver, v5}]),
+    {ok, _} = emqtt:connect(C),
+
+    ok = emqx_retainer:clean(),
+    ok = emqx_retainer_mnesia:reindex([[1, 3]], false, fun(_Done) -> ok end),
+
+    %% Prepare retained messages for "retained/N1/N2" topics
+    ?check_trace(
+        ?wait_async_action(
+            lists:foreach(
+                fun(N1) ->
+                    lists:foreach(
+                        fun(N2) ->
+                            emqtt:publish(
+                                C,
+                                erlang:iolist_to_binary(
+                                    io_lib:format("retained/~5..0w/~5..0w", [N1, N2])
+                                ),
+                                <<"this is a retained message">>,
+                                [{qos, 0}, {retain, true}]
+                            )
+                        end,
+                        lists:seq(1, 10)
+                    )
+                end,
+                lists:seq(1, 1000)
+            ),
+            #{?snk_kind := message_retained, topic := <<"retained/01000/00010">>},
+            5000
+        ),
+        []
+    ),
+
+    ?check_trace(
+        ?wait_async_action(
+            begin
+                %% Spawn reindexing in the background
+                spawn_link(
+                    fun() ->
+                        timer:sleep(1000),
+                        emqx_retainer_mnesia:reindex(
+                            [[1, 4]],
+                            false,
+                            fun(Done) ->
+                                ?tp(
+                                    info,
+                                    reindexing_progress,
+                                    #{done => Done}
+                                )
+                            end
+                        )
+                    end
+                ),
+
+                %% Subscribe to "retained/N/+" for some time, while reindexing is in progress
+                T = erlang:monotonic_time(millisecond),
+                ok = test_retain_while_reindexing(C, T + 3000)
+            end,
+            #{?snk_kind := reindexing_progress, done := 10000},
+            10000
+        ),
+        fun(Trace) ->
+            ?assertMatch(
+                [_ | _],
+                lists:filter(
+                    fun
+                        (#{done := 10000}) -> true;
+                        (_) -> false
+                    end,
+                    ?of_kind(reindexing_progress, Trace)
+                )
+            )
+        end
+    ),
+    reset_delivery_rate_to_default(),
+    ok.
+
+t_get_basic_usage_info(_Config) ->
+    ?assertEqual(#{retained_messages => 0}, emqx_retainer:get_basic_usage_info()),
+    lists:foreach(
+        fun(N) ->
+            Num = integer_to_binary(N),
+            Message = emqx_message:make(<<"retained/", Num/binary>>, <<"payload">>),
+            ok = emqx_retainer_publisher:store_retained(Message)
+        end,
+        lists:seq(1, 5)
+    ),
+    ct:sleep(100),
+    ?assertEqual(#{retained_messages => 5}, emqx_retainer:get_basic_usage_info()),
+    ok.
+
+%% test whether the app can start normally after disabling emqx_retainer
+%% fix: https://github.com/emqx/emqx/pull/8911
+%%
+%% stop/start in enable/disable state
+t_disable_then_start(_Config) ->
+    {ok, _} = emqx_retainer:update_config(#{<<"enable">> => false}),
+    ?assertNot(is_retainer_started()),
+    ok = application:stop(emqx_retainer),
+    ?assertNot(is_retainer_started()),
+    ok = application:ensure_started(emqx_retainer),
+    ?assertNot(is_retainer_started()),
+    {ok, _} = emqx_retainer:update_config(#{<<"enable">> => true}),
+    ?assert(is_retainer_started()),
+    ok = application:stop(emqx_retainer),
+    ?assertNot(is_retainer_started()),
+    ok = application:ensure_started(emqx_retainer),
+    ?assert(is_retainer_started()),
+    ok.
+
+t_retain_available_does_not_control_retainer_lifecycle(_Config) ->
+    %% `mqtt.retain_available` no longer controls whether retainer is started.
+    ?assert(is_retainer_started()),
+    {ok, _} = set_retain_available(false),
+    ?assert(is_retainer_started()),
+    {ok, _} = set_retain_available_for_zone(default, false),
+    ?assert(is_retainer_started()),
+
+    {ok, _} = emqx_retainer:update_config(#{<<"enable">> => false}),
+    ?assertNot(is_retainer_started()),
+
+    {ok, _} = set_retain_available(true),
+    {ok, _} = set_retain_available_for_zone(default, true),
+    ?assertNot(is_retainer_started()),
+    {ok, _} = emqx_retainer:update_config(#{<<"enable">> => true}),
+    ?assert(is_retainer_started()),
+    ok.
+
+t_retain_available_true_honors_retainer_enable(_Config) ->
+    TopicEnabled = <<"retained/enable/on">>,
+    TopicDisabled = <<"retained/enable/off">>,
+    TopicReenabled = <<"retained/enable/re-on">>,
+    {ok, _} = set_retain_available(true),
+    {ok, _} = set_retain_available_for_zone(default, true),
+    {ok, _} = emqx_retainer:update_config(#{<<"enable">> => true}),
+    ?assert(is_retainer_started()),
+    {ok, Client} = emqtt:start_link([{clean_start, true}, {proto_ver, v5}]),
+    {ok, _} = emqtt:connect(Client),
+
+    ok = emqtt:publish(Client, TopicEnabled, <<"enabled">>, [{qos, 0}, {retain, true}]),
+    ct:sleep(100),
+    ?assertMatch(
+        {ok, [#message{payload = <<"enabled">>}]}, emqx_retainer:read_message(TopicEnabled)
+    ),
+
+    {ok, _} = emqx_retainer:update_config(#{<<"enable">> => false}),
+    ok = emqtt:publish(Client, TopicDisabled, <<"disabled">>, [{qos, 0}, {retain, true}]),
+    ct:sleep(100),
+    ?assertEqual({ok, []}, emqx_retainer:read_message(TopicDisabled)),
+
+    {ok, _} = emqx_retainer:update_config(#{<<"enable">> => true}),
+    ok = emqtt:publish(Client, TopicReenabled, <<"re-enabled">>, [{qos, 0}, {retain, true}]),
+    ct:sleep(100),
+    ?assertMatch(
+        {ok, [#message{payload = <<"re-enabled">>}]},
+        emqx_retainer:read_message(TopicReenabled)
+    ),
+
+    ok = emqtt:disconnect(Client),
+    ok.
+
+t_start_stop_on_setting_change(_Config) ->
+    try
+        ?assert(is_retainer_started()),
+
+        {ok, _} = emqx_retainer:update_config(#{<<"enable">> => false}),
+        ?assertNot(is_retainer_started()),
+
+        {ok, _} = set_retain_available(true),
+        {ok, _} = set_retain_available_for_zone(default, true),
+        ?assertNot(is_retainer_started()),
+
+        {ok, _} = emqx_retainer:update_config(#{<<"enable">> => true}),
+        ?assert(is_retainer_started())
+    after
+        {ok, _} = set_retain_available(true),
+        {ok, _} = set_retain_available_for_zone(default, true),
+        {ok, _} = emqx_retainer:update_config(#{<<"enable">> => true})
+    end,
+    ok.
+
+t_deliver_when_banned(_) ->
+    Client1 = <<"c1">>,
+    Client2 = <<"c2">>,
+
+    {ok, C1} = emqtt:start_link([{clientid, Client1}, {clean_start, true}, {proto_ver, v5}]),
+    {ok, _} = emqtt:connect(C1),
+
+    lists:foreach(
+        fun(I) ->
+            Topic = erlang:list_to_binary(io_lib:format("retained/~p", [I])),
+            Msg = emqx_message:make(Client2, 0, Topic, <<"this is a retained message">>),
+            Msg2 = emqx_message:set_flag(retain, Msg),
+            emqx:publish2(Msg2)
+        end,
+        lists:seq(1, 3)
+    ),
+
+    Now = erlang:system_time(second),
+    Who = emqx_banned:who(clientid, Client2),
+
+    emqx_banned:create(#{
+        who => Who,
+        by => <<"test">>,
+        reason => <<"test">>,
+        at => Now,
+        until => Now + 120
+    }),
+
+    timer:sleep(100),
+
+    snabbkaffe:start_trace(),
+    {ok, SubRef} =
+        snabbkaffe:subscribe(
+            ?match_event(#{?snk_kind := ignore_retained_message_due_to_banned}),
+            _NEvents = 3,
+            _Timeout = 10000,
+            0
+        ),
+
+    {ok, #{}, [0]} = emqtt:subscribe(C1, <<"retained/+">>, [{qos, 0}, {rh, 0}]),
+
+    {ok, Trace} = snabbkaffe:receive_events(SubRef),
+    ?assertEqual(3, length(?of_kind(ignore_retained_message_due_to_banned, Trace))),
+    snabbkaffe:stop(),
+    emqx_banned:delete(Who),
+    {ok, #{}, [0]} = emqtt:unsubscribe(C1, <<"retained/+">>),
+    ok = emqtt:disconnect(C1).
+
+t_compatibility_for_deliver_rate(_) ->
+    Parser = fun(Conf) ->
+        {ok, RawConf} = hocon:binary(Conf, #{format => map}),
+        hocon_tconf:check_plain(emqx_retainer_schema, RawConf, #{
+            required => false, atom_key => false
+        })
+    end,
+    Infinity = <<"retainer.deliver_rate = \"infinity\"">>,
+    ?assertMatch(
+        #{
+            <<"retainer">> :=
+                #{
+                    <<"flow_control">> := #{
+                        <<"batch_read_number">> := 0,
+                        <<"batch_deliver_limiter">> := infinity
+                    }
+                }
+        },
+        Parser(Infinity)
+    ),
+
+    R1 = <<"retainer.deliver_rate = \"1000/s\"">>,
+    ?assertMatch(
+        #{
+            <<"retainer">> :=
+                #{
+                    <<"flow_control">> := #{
+                        <<"batch_read_number">> := 1000,
+                        <<"batch_deliver_limiter">> := {1000, 1000}
+                    }
+                }
+        },
+        Parser(R1)
+    ),
+
+    DeliveryInf = <<"retainer.delivery_rate = \"infinity\"">>,
+    ?assertMatch(
+        #{
+            <<"retainer">> :=
+                #{
+                    <<"flow_control">> := #{
+                        <<"batch_read_number">> := 0,
+                        <<"batch_deliver_limiter">> := infinity
+                    }
+                }
+        },
+        Parser(DeliveryInf)
+    ).
+
+t_update_config(_) ->
+    OldConf = emqx_config:get_raw([retainer]),
+    NewConf = emqx_utils_maps:deep_put([<<"backend">>, <<"storage_type">>], OldConf, <<"disc">>),
+    update_retainer_config(NewConf).
+
+disabled__t_takeover(TCConfig) ->
+    test_takeover_or_resume(takeover, TCConfig).
+
+disabled__t_resume(TCConfig) ->
+    test_takeover_or_resume(resume, TCConfig).
+
+%% Note: current implementation (and the implementation prior to using `emqx_extsub`) does
+%% **not** resume iteration of retained messages when resuming a session.  The previous
+%% implementation without `extsub` did not hook into `session.resumed`, hence iteration
+%% stopped when resuming/taking over.  For now, we adopt the same behavior.  Resuming
+%% iteration would thus be an improvement.
+test_takeover_or_resume(Kind, TCConfig) ->
+    update_retainer_config(#{
+        <<"delivery_rate">> => <<"5/1s">>,
+        <<"flow_control">> => #{<<"batch_read_number">> => 1}
+    }),
+    NumRetained = 15,
+    lists:foreach(
+        fun(N) ->
+            Topic = iolist_to_binary(io_lib:format("retained/~2..0w", [N])),
+            Message = emqx_message:make(Topic, <<"payload">>),
+            ok = emqx_retainer_publisher:store_retained(Message)
+        end,
+        lists:seq(1, NumRetained)
+    ),
+    ?check_trace(
+        begin
+            ClientId = <<"takeover">>,
+            Opts = #{
+                clientid => ClientId,
+                clean_start => false,
+                proto_ver => v5,
+                properties => #{'Session-Expiry-Interval' => 30}
+            },
+            {ok, C0} = emqtt:start_link(Opts#{clean_start := true}),
+            {ok, _} = emqtt:connect(C0),
+
+            {ok, C1} = emqtt:start_link(Opts),
+
+            %% Receive messages until rate limit is hit.
+            {ok, _, _} = emqtt:subscribe(C0, <<"retained/+">>, 1),
+            Msgs0 = receive_messages(5),
+
+            %% Now take over/resume
+            case Kind of
+                takeover ->
+                    unlink(C0);
+                resume ->
+                    emqtt:stop(C0)
+            end,
+            {ok, _} = emqtt:connect(C1),
+            Msgs1 = receive_messages(10),
+
+            %% Should have received everything without duplication.
+            Msgs = Msgs0 ++ Msgs1,
+            NumReceived = length(Msgs),
+            Duplicated0 = maps:groups_from_list(fun(#{topic := T}) -> T end, Msgs),
+            Duplicated = maps:filter(fun(_T, Ms) -> length(Ms) > 1 end, Duplicated0),
+            Ctx = #{
+                received_so_far => Msgs,
+                num_received => NumReceived,
+                duplicated => Duplicated,
+                old_client => C0,
+                new_client => C1
+            },
+
+            ?assertNotReceive({publish, _}, 1_000, Ctx),
+            ?assertEqual(NumRetained, NumReceived, Ctx),
+            ?assertEqual(#{}, Duplicated, Ctx),
+
+            case is_ds(TCConfig) of
+                true ->
+                    {ok, {ok, _}} =
+                        ?wait_async_action(
+                            emqtt:stop(C1),
+                            #{?snk_kind := ?sessds_terminate},
+                            1_000
+                        ),
+                    %% Ensure the sub state is cleared of extsub state.
+                    SSs = emqx_utils_maps:deep_get(
+                        [s, subscription_states],
+                        emqx_persistent_session_ds:print_session(ClientId)
+                    ),
+                    ?assertMatch(
+                        [{_, #{subopts := SubOpts}}] when not is_map_key(emqx_extsub, SubOpts),
+                        maps:to_list(SSs)
+                    ),
+                    ok;
+                false ->
+                    ok = emqtt:stop(C1),
+                    ok
+            end,
+
+            ok
+        end,
+        []
+    ),
+    ok.
+
+-doc """
+Verifies that if a session first subscribes to a retained topic with a single message,
+completes that iteration, disconnects, reconnects and re-subscribes, it'll receive only
+one message.
+
+This matches the previous retainer implementation (pre-6.1.0), which did not hook into
+`session.resumed`, which `extsub` does.
+
+When resuming iteration during resume/takeover is implemented as an improvement, this test
+case will become invalid and can be dropped. Then `disabled__t_resume` and
+`disabled__t_takeover` can be renamed and enabled.
+""".
+t_resume_and_resubscribe(_TCConfig) ->
+    Topic = <<"t/1">>,
+    Message = emqx_message:make(Topic, <<"payload">>),
+    ok = emqx_retainer_publisher:store_retained(Message),
+    ?check_trace(
+        begin
+            ClientId = <<"takeover">>,
+            Opts = #{
+                clientid => ClientId,
+                clean_start => false,
+                proto_ver => v5,
+                properties => #{'Session-Expiry-Interval' => 30}
+            },
+            {ok, C0} = emqtt:start_link(Opts#{clean_start := true}),
+            {ok, _} = emqtt:connect(C0),
+
+            %% Receive the single message
+            {ok, _, _} = emqtt:subscribe(C0, Topic, 1),
+            ?assertMatch([_], receive_messages(1)),
+            emqtt:disconnect(C0),
+
+            %% Now take resume
+            {ok, C1} = emqtt:start_link(Opts),
+            {ok, _} = emqtt:connect(C1),
+            %% Resubscribe; should receive it again, only once.
+            {ok, _, _} = emqtt:subscribe(C1, Topic, 1),
+
+            %% We expect one more to ensure it's not duplicated.
+            ?assertMatch([_], receive_messages(2)),
+
+            emqtt:stop(C1),
+
+            ok
+        end,
+        []
+    ),
+    ok.
+
+-doc "Non-MQTT subscriptions start no retained read.".
+t_read_ignore_non_mqtt(_Config) ->
+    ok = channel_subscribe(#{protocol => lwm2m}, <<"retained/test">>),
+    ?assertNotReceive(#retained_batch{}, 100).
+
+-doc "An unlimited exact-topic subscription without a retained message sends no batch.".
+t_read_no_wildcard_empty(_Config) ->
+    update_retainer_config(#{<<"delivery_rate">> => <<"infinity">>}),
+    ok = channel_subscribe(#{protocol => mqtt}, <<"skip_empty/none">>),
+    ?assertNotReceive(#retained_batch{}, 100).
+
+-doc """
+An unlimited exact-topic subscription that has a retained message reads the backend once in the
+channel and sends the message to the channel itself.
+""".
+t_read_no_wildcard_retained(_Config) ->
+    update_retainer_config(#{<<"delivery_rate">> => <<"infinity">>}),
+    Topic = <<"skip_empty/retained">>,
+    ok = emqx_retainer_publisher:store_retained(emqx_message:make(Topic, <<"payload">>)),
+    ok = meck:new(emqx_retainer_mnesia, [passthrough, no_link]),
+    try
+        ok = channel_subscribe(#{protocol => mqtt}, Topic),
+        ?assertReceive(
+            #retained_batch{
+                topic_filter = Topic,
+                messages = [#message{topic = Topic, payload = <<"payload">>}],
+                cursor = done
+            },
+            1000
+        ),
+        ?assertEqual(1, meck:num_calls(emqx_retainer_mnesia, read_message, '_'))
+    after
+        meck:unload(emqx_retainer_mnesia),
+        ok = emqx_retainer_publisher:delete_message(Topic)
+    end.
+
+-doc "A wildcard subscription requests a batch from the dispatcher also when no message matches.".
+t_read_wildcard_empty(_Config) ->
+    ok = channel_subscribe(#{protocol => mqtt}, <<"skip_empty/none/+">>),
+    ?assertReceive(#retained_batch{messages = [], cursor = done}, 1000).
+
+%% Run the subscribe hook of `emqx_retainer_channel' in the test process.
+channel_subscribe(ClientInfo, TopicFilter) ->
+    emqx_common_test_helpers:on_exit(fun() ->
+        emqx_retainer_channel:on_session_disconnected(ClientInfo, #{})
+    end),
+    emqx_retainer_channel:on_session_subscribed(ClientInfo, TopicFilter, #{rh => 0}).
+
+-doc """
+Checks that the extsub handler removes itself after it finishes iterating over wildcard
+subscription.
+
+This test uses a batch read number of 1, so it requires a nudge that returns no results
+and does not have a corresponding `handle_delivered` call.
+""".
+t_extsub_no_leak_wildcard_multi_batch(TCConfig) ->
+    Opts = #{
+        batch_read_number => 1,
+        expected_retained => 5,
+        topic_filter => <<"retained/+">>
+    },
+    test_extsub_no_leak(TCConfig, Opts).
+
+-doc """
+Checks that the extsub handler removes itself after it finishes iterating over wildcard
+subscription.
+
+This test uses a batch read number of 10, so it retrieves all results in a single batch.
+""".
+t_extsub_no_leak_wildcard_single_batch(TCConfig) ->
+    Opts = #{
+        batch_read_number => 10,
+        expected_retained => 5,
+        topic_filter => <<"retained/+">>
+    },
+    test_extsub_no_leak(TCConfig, Opts).
+
+-doc """
+Checks that the extsub handler removes itself after it finishes iterating over wildcard
+subscription.
+
+This test uses a topic filter that has no results.
+""".
+t_extsub_no_leak_wildcard_empty(TCConfig) ->
+    Opts = #{
+        batch_read_number => 10,
+        expected_retained => 0,
+        topic_filter => <<"not_retained/+">>
+    },
+    test_extsub_no_leak(TCConfig, Opts).
+
+-doc """
+Checks that the extsub handler removes itself after it finishes iterating over wildcard
+subscription.
+
+This test uses a topic filter that has a returned message.
+""".
+t_extsub_no_leak_no_wildcard(TCConfig) ->
+    Opts = #{
+        batch_read_number => 10,
+        expected_retained => 1,
+        topic_filter => <<"retained/01">>
+    },
+    test_extsub_no_leak(TCConfig, Opts).
+
+-doc """
+Checks that the extsub handler removes itself after it finishes iterating over wildcard
+subscription.
+
+This test uses a topic filter that has no results.
+""".
+t_extsub_no_leak_no_wildcard_empty(TCConfig) ->
+    Opts = #{
+        batch_read_number => 10,
+        expected_retained => 0,
+        topic_filter => <<"not_retained/01">>
+    },
+    test_extsub_no_leak(TCConfig, Opts).
+
+test_extsub_no_leak(_TCConfig, Opts) ->
+    #{
+        batch_read_number := BatchReadNumber,
+        expected_retained := ExpectedRetained,
+        topic_filter := TopicFilter
+    } = Opts,
+    update_retainer_config(#{
+        <<"flow_control">> => #{<<"batch_read_number">> => BatchReadNumber}
+    }),
+    NumRetained = 5,
+    lists:foreach(
+        fun(N) ->
+            Topic = iolist_to_binary(io_lib:format("retained/~2..0w", [N])),
+            Message = emqx_message:make(Topic, <<"payload">>),
+            ok = emqx_retainer_publisher:store_retained(Message)
+        end,
+        lists:seq(1, NumRetained)
+    ),
+    ClientId = <<"no_leak">>,
+    ClientOpts = #{
+        clientid => ClientId,
+        clean_start => true,
+        proto_ver => v5,
+        properties => #{'Session-Expiry-Interval' => 30}
+    },
+    {ok, C0} = emqtt:start_link(ClientOpts#{clean_start := true}),
+    {ok, _} = emqtt:connect(C0),
+    [ChanPid] = emqx_cm:lookup_channels(ClientId),
+
+    %% Sanity check
+    EmptyMap = #{},
+    ?assertMatch(
+        {ok, #{
+            registry := #{
+                buffer := #{
+                    message_buffer_size := 0,
+                    delivering := EmptyMap
+                },
+                by_ref := [],
+                by_topic_cbm := EmptyMap
+            }
+        }},
+        emqx_extsub:inspect(ChanPid)
+    ),
+
+    {ok, _, _} = emqtt:subscribe(C0, TopicFilter, 1),
+    Msgs = receive_messages(ExpectedRetained),
+
+    ?retry(
+        20,
+        100,
+        ?assertMatch(
+            {ok, #{
+                registry := #{
+                    buffer := #{
+                        message_buffer_size := 0,
+                        delivering := EmptyMap
+                    },
+                    by_ref := [],
+                    by_topic_cbm := EmptyMap
+                }
+            }},
+            emqx_extsub:inspect(ChanPid)
+        )
+    ),
+    ?assertEqual(ExpectedRetained, length(Msgs)),
+    ?assertNotReceive({publish, _}),
+
+    emqtt:stop(C0),
+
+    ok.
+
+-doc """
+Checks that the extsub handler removes itself after we unsubscribe.
+""".
+t_extsub_no_leak_subscribe_unsubscribe(_TCConfig) ->
+    update_retainer_config(#{
+        <<"delivery_rate">> => <<"1/1s">>,
+        <<"flow_control">> => #{<<"batch_read_number">> => 1}
+    }),
+    NumRetained = 5,
+    lists:foreach(
+        fun(N) ->
+            Topic = iolist_to_binary(io_lib:format("retained/~2..0w", [N])),
+            Message = emqx_message:make(Topic, <<"payload">>),
+            ok = emqx_retainer_publisher:store_retained(Message)
+        end,
+        lists:seq(1, NumRetained)
+    ),
+    ClientId = <<"no_leak">>,
+    ClientOpts = #{
+        clientid => ClientId,
+        clean_start => true,
+        proto_ver => v5,
+        properties => #{'Session-Expiry-Interval' => 30}
+    },
+    {ok, C0} = emqtt:start_link(ClientOpts#{clean_start := true}),
+    {ok, _} = emqtt:connect(C0),
+    [ChanPid] = emqx_cm:lookup_channels(ClientId),
+
+    %% Sanity check
+    EmptyMap = #{},
+    ?assertMatch(
+        {ok, #{
+            registry := #{
+                buffer := #{
+                    message_buffer_size := 0,
+                    delivering := EmptyMap
+                },
+                by_ref := [],
+                by_topic_cbm := EmptyMap
+            }
+        }},
+        emqx_extsub:inspect(ChanPid)
+    ),
+
+    TopicFilter = <<"retained/+">>,
+    {ok, _, _} = emqtt:subscribe(C0, TopicFilter, 1),
+    %% Receive a message and hit rate limit
+    [_] = receive_messages(1),
+
+    %% Unsubscribe
+    {ok, _, _} = emqtt:unsubscribe(C0, TopicFilter),
+
+    ?assertMatch(
+        {ok, #{
+            registry := #{
+                buffer := #{
+                    message_buffer_size := 0,
+                    delivering := EmptyMap
+                },
+                by_ref := [],
+                by_topic_cbm := EmptyMap
+            }
+        }},
+        emqx_extsub:inspect(ChanPid)
+    ),
+
+    emqtt:stop(C0),
+
+    ok.
+
+-doc """
+A runtime change of `delivery_rate` sets the dispatcher limiter to the new rate
+at once, also for two changes in a row and for `infinity`.
+""".
+t_delivery_rate_update(_) ->
+    check_rate_update(<<"delivery_rate">>, ?DISPATCHER_LIMITER_NAME).
+
+-doc """
+A runtime change of `max_publish_rate` sets the publisher limiter to the new rate
+at once, also for two changes in a row and for `infinity`.
+""".
+t_max_publish_rate_update(_) ->
+    check_rate_update(<<"max_publish_rate">>, ?PUBLISHER_LIMITER_NAME).
+
 %%--------------------------------------------------------------------
 %% Helper functions
 %%--------------------------------------------------------------------
 
-receive_messages(Count) ->
-    receive_messages(Count, []).
-receive_messages(0, Msgs) ->
-    Msgs;
-receive_messages(Count, Msgs) ->
-    receive
-        {publish, Msg} ->
-            ct:log("Msg: ~p ~n", [Msg]),
-            receive_messages(Count-1, [Msg|Msgs]);
-        Other ->
-            ct:log("Other Msg: ~p~n",[Other]),
-            receive_messages(Count, Msgs)
-    after 2000 ->
-            Msgs
+is_ds(TCConfig) ->
+    case emqx_common_test_helpers:get_matrix_prop(TCConfig, [index_agnostic_ds], false) of
+        index_agnostic_ds ->
+            true;
+        _ ->
+            false
     end.
 
+test_retain_while_reindexing(C, Deadline) ->
+    case erlang:monotonic_time(millisecond) > Deadline of
+        true ->
+            ok;
+        false ->
+            N = rand:uniform(1000),
+            Topic = iolist_to_binary([
+                <<"retained/">>,
+                io_lib:format("~5..0w", [N]),
+                <<"/+">>
+            ]),
+            {ok, #{}, [0]} = emqtt:subscribe(C, Topic, [{qos, 0}, {rh, 0}]),
+            Messages = receive_messages(10),
+            ?assertEqual(10, length(Messages), #{topic => Topic}),
+            {ok, #{}, [0]} = emqtt:unsubscribe(C, Topic),
+            test_retain_while_reindexing(C, Deadline)
+    end.
+
+receive_messages(Count) ->
+    receive_messages(Count, _Timeout = 2_000).
+
+receive_messages(Count, Timeout) ->
+    lists:reverse(
+        do_receive_messages(Count, Timeout, [])
+    ).
+
+do_receive_messages(0, _Timeout, Msgs) ->
+    Msgs;
+do_receive_messages(Count, Timeout, Msgs) ->
+    receive
+        {publish, Msg} ->
+            ct:pal("Msg:\n  ~p", [Msg]),
+            do_receive_messages(Count - 1, Timeout, [Msg | Msgs])
+    after Timeout ->
+        Msgs
+    end.
+
+with_conf(CTConfig, ConfMod, Case) ->
+    Conf = emqx:get_raw_config([retainer]),
+    NewConf = ConfMod(Conf),
+    update_retainer_config(NewConf),
+    ?config(index, CTConfig) =:= false andalso mria:clear_table(?TAB_INDEX_META),
+    try
+        Case(),
+        update_retainer_config(Conf)
+    catch
+        Type:Error:Strace ->
+            update_retainer_config(Conf),
+            erlang:raise(Type, Error, Strace)
+    end.
+
+publish(Client, Topic, Payload, Opts, TCConfig) ->
+    PublishOpts = publish_opts(TCConfig),
+    do_publish(Client, Topic, Payload, Opts, PublishOpts).
+
+publish_opts(TCConfig) ->
+    Timeout = proplists:get_value(publish_wait_timeout, TCConfig, undefined),
+    Predicate =
+        case proplists:get_value(publish_wait_predicate, TCConfig, undefined) of
+            undefined -> undefined;
+            {NEvents, Pred} -> {predicate, {NEvents, Pred, Timeout}};
+            Pred -> {predicate, {1, Pred, Timeout}}
+        end,
+    Sleep =
+        case proplists:get_value(sleep_after_publish, TCConfig, undefined) of
+            undefined -> undefined;
+            Time -> {sleep, Time}
+        end,
+    emqx_maybe:define(Predicate, Sleep).
+
+do_publish(Client, Topic, Payload, Opts, undefined) ->
+    emqtt:publish(Client, Topic, Payload, Opts);
+do_publish(Client, Topic, Payload, Opts, {predicate, {NEvents, Predicate, Timeout}}) ->
+    %% Do not delete this clause: it's used by other retainer implementation tests
+    {ok, SRef0} = snabbkaffe:subscribe(Predicate, NEvents, Timeout),
+    Res = emqtt:publish(Client, Topic, Payload, Opts),
+    {ok, _} = snabbkaffe:receive_events(SRef0),
+    Res;
+do_publish(Client, Topic, Payload, Opts, {sleep, Time}) ->
+    %% Do not delete this clause: it's used by other retainer implementation tests
+    Res = emqtt:publish(Client, Topic, Payload, Opts),
+    ct:sleep(Time),
+    Res.
+
+reset_rates_to_default() ->
+    update_retainer_config(#{
+        <<"delivery_rate">> => <<"1000/s">>,
+        <<"max_publish_rate">> => <<"100000/s">>,
+        <<"flow_control">> =>
+            #{
+                <<"batch_read_number">> => 1_000
+            }
+    }).
+
+publish_messages(C1, Count) ->
+    lists:foreach(
+        fun(I) ->
+            emqtt:publish(
+                C1,
+                iolist_to_binary(io_lib:format("t/~p", [I])),
+                <<"this is a retained message">>,
+                [{qos, 0}, {retain, true}]
+            )
+        end,
+        lists:seq(1, Count)
+    ).
+
+set_retain_available(Enabled) ->
+    RawConf0 = emqx_config:get_raw([mqtt]),
+    RawConf = maps:put(<<"retain_available">>, Enabled, RawConf0),
+    emqx_conf:update([mqtt], RawConf, #{override_to => cluster}).
+
+set_retain_available_for_zone(Zone, Enabled) ->
+    RawZoneConf0 = emqx_config:get_raw([zones]),
+    RawZoneConf = emqx_utils_maps:deep_put(
+        [atom_to_binary(Zone), <<"mqtt">>, <<"retain_available">>],
+        RawZoneConf0,
+        Enabled
+    ),
+    emqx_conf:update([zones], RawZoneConf, #{override_to => cluster}).
+
+is_retainer_started() ->
+    %% We indirectly check the actual state of the retainer by checking
+    %% if the dispatcher has any active workers.
+    gproc_pool:active_workers(emqx_retainer_dispatcher) /= [].
+
+remove_delivery_rate() ->
+    update_retainer_config(#{
+        <<"delivery_rate">> => <<"infinity">>
+    }).
+
+reset_delivery_rate_to_default() ->
+    update_retainer_config(#{
+        <<"delivery_rate">> => <<"1000/s">>
+    }).
+
+restart_retainer_limiter() ->
+    ok = emqx_retainer_limiter:delete(),
+    ok = emqx_retainer_limiter:create().
+
+%% Update with `emqx_retainer:update_config/1' only: the limiter must follow
+%% the config update without a restart.
+check_rate_update(RateKey, LimiterName) ->
+    LimiterId = {?RETAINER_LIMITER_GROUP, LimiterName},
+    lists:foreach(
+        fun({Rate, Expected}) ->
+            {ok, _} = emqx_retainer:update_config(#{RateKey => Rate}),
+            ?assertEqual(
+                Expected,
+                emqx_limiter_registry:get_limiter_options(LimiterId),
+                #{rate => Rate}
+            )
+        end,
+        [
+            {<<"10/s">>, #{capacity => 10, interval => 1000, burst_capacity => 0}},
+            {<<"20/s">>, #{capacity => 20, interval => 1000, burst_capacity => 0}},
+            {<<"infinity">>, #{capacity => infinity}}
+        ]
+    ).
+
+update_retainer_config(Conf) ->
+    {ok, _} = emqx_retainer:update_config(Conf),
+    ok = restart_retainer_limiter().
+
+hit_delivery_rate_limit() ->
+    LimiterId = {?RETAINER_LIMITER_GROUP, ?DISPATCHER_LIMITER_NAME},
+    Limiter = emqx_limiter:connect(LimiterId),
+    hit_delivery_rate_limit(Limiter).
+
+hit_delivery_rate_limit(Limiter0) ->
+    case emqx_limiter_client:try_consume(Limiter0, 1) of
+        {true, Limiter} ->
+            hit_delivery_rate_limit(Limiter);
+        {false, _, _} ->
+            ok
+    end.

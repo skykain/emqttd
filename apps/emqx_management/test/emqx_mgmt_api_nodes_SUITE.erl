@@ -1,0 +1,286 @@
+%%--------------------------------------------------------------------
+%% Copyright (c) 2020-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
+%%--------------------------------------------------------------------
+-module(emqx_mgmt_api_nodes_SUITE).
+
+-compile(export_all).
+-compile(nowarn_export_all).
+
+-include_lib("eunit/include/eunit.hrl").
+-include_lib("common_test/include/ct.hrl").
+-include_lib("snabbkaffe/include/snabbkaffe.hrl").
+
+all() ->
+    emqx_common_test_helpers:all(?MODULE).
+
+init_per_suite(Config) ->
+    Apps = emqx_cth_suite:start(
+        [
+            emqx_conf,
+            emqx_management,
+            emqx_mgmt_api_test_util:emqx_dashboard()
+        ],
+        #{work_dir => emqx_cth_suite:work_dir(Config)}
+    ),
+    [{suite_apps, Apps} | Config].
+
+end_per_suite(Config) ->
+    ok = emqx_cth_suite:stop(?config(suite_apps, Config)).
+
+init_per_testcase(t_log_path, Config) ->
+    emqx_config_logger:add_handler(),
+    Log = emqx_conf:get_raw([log], #{}),
+    File = "log/emqx-test.log",
+    Log1 = emqx_utils_maps:deep_put([<<"file">>, <<"default">>, <<"enable">>], Log, true),
+    Log2 = emqx_utils_maps:deep_put([<<"file">>, <<"default">>, <<"path">>], Log1, File),
+    {ok, #{}} = emqx_conf:update([log], Log2, #{rawconf_with_defaults => true}),
+    Config;
+init_per_testcase(TC, Config) when
+    TC =:= t_preview_version_shown;
+    TC =:= t_preview_version_hidden;
+    TC =:= t_preview_version_hidden_no_suffix
+->
+    meck:new(emqx_release, [passthrough, no_history, no_link]),
+    Config;
+init_per_testcase(_, Config) ->
+    Config.
+
+end_per_testcase(t_log_path, Config) ->
+    Log = emqx_conf:get_raw([log], #{}),
+    Log1 = emqx_utils_maps:deep_put([<<"file">>, <<"default">>, <<"enable">>], Log, false),
+    {ok, #{}} = emqx_conf:update([log], Log1, #{rawconf_with_defaults => true}),
+    emqx_config_logger:remove_handler(),
+    Config;
+end_per_testcase(TC, Config) when
+    TC =:= t_preview_version_shown;
+    TC =:= t_preview_version_hidden;
+    TC =:= t_preview_version_hidden_no_suffix
+->
+    meck:unload(emqx_release),
+    {ok, _} = emqx_conf:update([dashboard], #{<<"show_preview_version">> => true}, #{}),
+    Config;
+end_per_testcase(_, Config) ->
+    Config.
+
+t_nodes_api(_) ->
+    NodesPath = emqx_mgmt_api_test_util:api_path(["nodes"]),
+    {ok, Nodes} = emqx_mgmt_api_test_util:request_api(get, NodesPath),
+    NodesResponse = emqx_utils_json:decode(Nodes),
+    LocalNodeInfo = hd(NodesResponse),
+    Node = binary_to_atom(maps:get(<<"node">>, LocalNodeInfo), utf8),
+    ?assertEqual(Node, node()),
+    Edition = maps:get(<<"edition">>, LocalNodeInfo),
+    ?assertEqual(emqx_release:edition_longstr(), Edition),
+    assert_profile_and_preset(LocalNodeInfo),
+
+    Conns = maps:get(<<"connections">>, LocalNodeInfo),
+    ?assertEqual(0, Conns),
+    LiveConns = maps:get(<<"live_connections">>, LocalNodeInfo),
+    ?assertEqual(0, LiveConns),
+
+    NodePath = emqx_mgmt_api_test_util:api_path(["nodes", atom_to_list(node())]),
+    {ok, NodeInfo} = emqx_mgmt_api_test_util:request_api(get, NodePath),
+    NodeInfoMap = emqx_utils_json:decode(NodeInfo),
+    NodeNameResponse = binary_to_atom(maps:get(<<"node">>, NodeInfoMap), utf8),
+    ?assertEqual(node(), NodeNameResponse),
+    assert_profile_and_preset(NodeInfoMap),
+
+    BadNodePath = emqx_mgmt_api_test_util:api_path(["nodes", "badnode"]),
+    ?assertMatch(
+        {error, {_, 404, _}},
+        emqx_mgmt_api_test_util:request_api(get, BadNodePath)
+    ).
+
+-doc """
+A node can pass the running-nodes liveness check and still fail the RPC right
+after, e.g. a concurrent `cluster leave`. `emqx_mgmt:lookup_node/1` then
+returns `{error, _}`, and the API reports the node as unreachable instead of
+failing the request.
+""".
+t_node_api_unreachable_node(_) ->
+    meck:new(emqx_mgmt, [passthrough, no_history]),
+    meck:expect(emqx_mgmt, lookup_node, fun(_Node) -> {error, badarg} end),
+    try
+        NodePath = emqx_mgmt_api_test_util:api_path(["nodes", atom_to_list(node())]),
+        {ok, NodeInfo} = emqx_mgmt_api_test_util:request_api(get, NodePath),
+        ?assertMatch(
+            #{<<"node">> := _, <<"node_status">> := <<"unreachable">>},
+            emqx_utils_json:decode(NodeInfo)
+        )
+    after
+        meck:unload(emqx_mgmt)
+    end.
+
+-doc """
+With the default `dashboard.show_preview_version = true`, the nodes API
+reports a preview release version unchanged.
+""".
+t_preview_version_shown(_) ->
+    meck:expect(emqx_release, version, 0, "6.1.5-preview.1"),
+    ?assertEqual(true, emqx:get_config([dashboard, show_preview_version])),
+    ?assertEqual([<<"6.1.5-preview.1">>], api_node_versions()).
+
+-doc """
+With `dashboard.show_preview_version = false`, the nodes API cuts the
+`-preview.N` suffix. The node info that the data backup import reads keeps the
+real version.
+""".
+t_preview_version_hidden(_) ->
+    meck:expect(emqx_release, version, 0, "6.1.5-preview.1"),
+    {ok, _} = emqx_conf:update([dashboard], #{<<"show_preview_version">> => false}, #{}),
+    ?assertEqual([<<"6.1.5">>], api_node_versions()),
+    ?assertMatch(#{version := <<"6.1.5-preview.1">>}, emqx_mgmt:node_info()).
+
+-doc """
+With `dashboard.show_preview_version = false`, a version without the
+`-preview.N` suffix is reported unchanged.
+""".
+t_preview_version_hidden_no_suffix(_) ->
+    meck:expect(emqx_release, version, 0, "6.1.5-rc.1"),
+    {ok, _} = emqx_conf:update([dashboard], #{<<"show_preview_version">> => false}, #{}),
+    ?assertEqual([<<"6.1.5-rc.1">>], api_node_versions()).
+
+%% The versions that GET /nodes and GET /nodes/:node report for this node.
+api_node_versions() ->
+    NodesPath = emqx_mgmt_api_test_util:api_path(["nodes"]),
+    {ok, Nodes} = emqx_mgmt_api_test_util:request_api(get, NodesPath),
+    [#{<<"version">> := V1}] = emqx_utils_json:decode(Nodes),
+    NodePath = emqx_mgmt_api_test_util:api_path(["nodes", atom_to_list(node())]),
+    {ok, Node} = emqx_mgmt_api_test_util:request_api(get, NodePath),
+    #{<<"version">> := V2} = emqx_utils_json:decode(Node),
+    lists:usort([V1, V2]).
+
+t_log_path(_) ->
+    NodePath = emqx_mgmt_api_test_util:api_path(["nodes", atom_to_list(node())]),
+    {ok, NodeInfo} = emqx_mgmt_api_test_util:request_api(get, NodePath),
+    #{<<"log_path">> := Path} = emqx_utils_json:decode(NodeInfo),
+    ?assertEqual(
+        <<"log">>,
+        filename:basename(Path)
+    ).
+
+-doc """
+`security_profile` and `feature_preset` reflect non-default settings.
+""".
+t_node_info_non_default_profile_and_preset(_) ->
+    NodePath = emqx_mgmt_api_test_util:api_path(["nodes", atom_to_list(node())]),
+    os:putenv("EMQX_FEATURES", "ESSENTIAL"),
+    emqx_machine_features:clear_features(),
+    try
+        emqx_common_test_helpers:with_security_profile(legacy, fun() ->
+            {ok, NodeInfo} = emqx_mgmt_api_test_util:request_api(get, NodePath),
+            ?assertMatch(
+                #{
+                    <<"security_profile">> := <<"legacy">>,
+                    <<"feature_preset">> := <<"essential">>
+                },
+                emqx_utils_json:decode(NodeInfo)
+            )
+        end)
+    after
+        os:unsetenv("EMQX_FEATURES"),
+        emqx_machine_features:clear_features()
+    end,
+    {ok, NodeInfo1} = emqx_mgmt_api_test_util:request_api(get, NodePath),
+    ?assertMatch(
+        #{<<"security_profile">> := <<"hardened">>, <<"feature_preset">> := <<"full">>},
+        emqx_utils_json:decode(NodeInfo1)
+    ).
+
+t_node_stats_api(_) ->
+    StatsPath = emqx_mgmt_api_test_util:api_path(["nodes", atom_to_binary(node(), utf8), "stats"]),
+    SystemStats = emqx_mgmt:get_stats(),
+    {ok, StatsResponse} = emqx_mgmt_api_test_util:request_api(get, StatsPath),
+    Stats = emqx_utils_json:decode(StatsResponse),
+    Fun =
+        fun(Key) ->
+            ?assertEqual(maps:get(Key, SystemStats), maps:get(atom_to_binary(Key, utf8), Stats))
+        end,
+    lists:foreach(Fun, maps:keys(SystemStats)),
+
+    BadNodePath = emqx_mgmt_api_test_util:api_path(["nodes", "badnode", "stats"]),
+    ?assertMatch(
+        {error, {_, 404, _}},
+        emqx_mgmt_api_test_util:request_api(get, BadNodePath)
+    ).
+
+t_node_metrics_api(_) ->
+    MetricsPath =
+        emqx_mgmt_api_test_util:api_path(["nodes", atom_to_binary(node(), utf8), "metrics"]),
+    SystemMetrics = emqx_mgmt:get_metrics(),
+    {ok, MetricsResponse} = emqx_mgmt_api_test_util:request_api(get, MetricsPath),
+    Metrics = emqx_utils_json:decode(MetricsResponse),
+    Fun =
+        fun(Key) ->
+            ?assertEqual(maps:get(Key, SystemMetrics), maps:get(atom_to_binary(Key, utf8), Metrics))
+        end,
+    lists:foreach(Fun, maps:keys(SystemMetrics)),
+
+    BadNodePath = emqx_mgmt_api_test_util:api_path(["nodes", "badnode", "metrics"]),
+    ?assertMatch(
+        {error, {_, 404, _}},
+        emqx_mgmt_api_test_util:request_api(get, BadNodePath)
+    ).
+
+t_multiple_nodes_api(Config) ->
+    ct:timetrap({seconds, 120}),
+    Nodes =
+        [Node1, Node2] = emqx_cth_cluster:start(
+            [
+                {t_multiple_nodes_api1, #{role => core, apps => [emqx_conf, emqx_management]}},
+                {t_multiple_nodes_api2, #{role => core, apps => [emqx_conf, emqx_management]}}
+            ],
+            #{work_dir => emqx_cth_suite:work_dir(?FUNCTION_NAME, Config)}
+        ),
+    try
+        {200, NodesList} = rpc:call(Node1, emqx_mgmt_api_nodes, nodes, [get, #{}]),
+        All = [Node1, Node2],
+        lists:map(
+            fun(N) ->
+                N1 = maps:get(node, N),
+                ?assertEqual(true, lists:member(N1, All))
+            end,
+            NodesList
+        ),
+        ?assertEqual(2, length(NodesList)),
+
+        {200, Node11} = rpc:call(Node1, emqx_mgmt_api_nodes, node, [
+            get, #{bindings => #{node => Node1}}
+        ]),
+        ?assertMatch(
+            #{node := Node1, security_profile := hardened, feature_preset := full}, Node11
+        ),
+        %% A stopped node never reports its profile or preset.
+        ok = emqx_cth_cluster:stop_node(Node2),
+        {200, [RunningInfo, StoppedInfo]} = ?retry(
+            _Interval = 200,
+            _Attempts = 50,
+            begin
+                {200, [_, #{node_status := stopped}]} =
+                    rpc:call(Node1, emqx_mgmt_api_nodes, nodes, [get, #{}])
+            end
+        ),
+        ?assertMatch(
+            #{node := Node1, security_profile := hardened, feature_preset := full},
+            RunningInfo
+        ),
+        ?assertMatch(#{node := Node2, node_status := stopped}, StoppedInfo),
+        ?assertNot(is_map_key(security_profile, StoppedInfo)),
+        ?assertNot(is_map_key(feature_preset, StoppedInfo))
+    after
+        emqx_cth_cluster:stop(Nodes)
+    end,
+    ok.
+
+%%--------------------------------------------------------------------
+%% Helpers
+
+assert_profile_and_preset(Info) ->
+    ?assertEqual(
+        atom_to_binary(emqx_security_profile:profile()),
+        maps:get(<<"security_profile">>, Info)
+    ),
+    ?assertEqual(
+        atom_to_binary(maps:get(preset, emqx_machine_features:info())),
+        maps:get(<<"feature_preset">>, Info)
+    ).

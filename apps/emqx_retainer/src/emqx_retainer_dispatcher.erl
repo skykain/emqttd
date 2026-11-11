@@ -1,0 +1,312 @@
+%%--------------------------------------------------------------------
+%% Copyright (c) 2020-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
+%%--------------------------------------------------------------------
+
+-module(emqx_retainer_dispatcher).
+
+-behaviour(gen_server).
+
+-include("emqx_retainer.hrl").
+-include_lib("emqx/include/logger.hrl").
+-include_lib("snabbkaffe/include/snabbkaffe.hrl").
+
+%% API
+-export([
+    start_link/2,
+    %% RPC target (`emqx_retainer_proto_v2:wait_dispatch_complete/2`)
+    wait_dispatch_complete/1,
+    worker/0,
+    fetch/6
+]).
+
+%% gen_server callbacks
+-export([
+    init/1,
+    handle_call/3,
+    handle_cast/2,
+    handle_info/2,
+    terminate/2
+]).
+
+-elvis([{elvis_style, no_invalid_dynamic_calls, disable}]).
+
+-record(fetch, {target, request_ref, topic, words, cursor}).
+-record(wait_dispatch_complete, {}).
+-record(dispatch, {}).
+
+-define(DEFAULT_BATCH_SIZE, 1000).
+-define(MIN_BATCH_SIZE, 10).
+-define(MAX_REQUESTS_PER_DISPATCH, 100).
+-define(LIMITER_RETRY_INTERVAL_MS, 100).
+
+-type target() :: pid() | emqx_extsub_handler:message_target().
+
+%%------------------------------------------------------------------------------
+%% API
+%%------------------------------------------------------------------------------
+
+%% RPC target (`emqx_retainer_proto_v2:wait_dispatch_complete/2`).
+-spec wait_dispatch_complete(timeout()) -> ok.
+wait_dispatch_complete(Timeout) ->
+    lists:foreach(
+        fun({_, Pid}) -> ok = gen_server:call(Pid, #wait_dispatch_complete{}, Timeout) end,
+        gproc_pool:active_workers(?DISPATCHER_POOL)
+    ).
+
+-spec worker() -> pid() | false.
+worker() ->
+    gproc_pool:pick_worker(?DISPATCHER_POOL, self()).
+
+-doc """
+Queue one retained-message batch for a channel or an ExtSub handler.
+`Words` is `Topic` split with `emqx_topic:words/1`.
+The worker replies with a `#retained_batch{}` message: directly to a channel pid, and with
+`emqx_extsub_handler:send/2` to a handler.
+When the worker drops the request from its full queue, it replies with `#retained_dropped{}`.
+""".
+-spec fetch(
+    pid(),
+    target(),
+    reference(),
+    emqx_types:topic(),
+    emqx_types:words(),
+    term()
+) -> ok.
+fetch(Worker, Target, RequestRef, Topic, Words, Cursor) ->
+    gen_server:cast(Worker, #fetch{
+        target = Target,
+        request_ref = RequestRef,
+        topic = Topic,
+        words = Words,
+        cursor = Cursor
+    }).
+
+-spec start_link(atom(), pos_integer()) -> {ok, pid()}.
+start_link(Pool, Id) ->
+    gen_server:start_link(
+        {local, emqx_utils:proc_name(?MODULE, Id)},
+        ?MODULE,
+        [Pool, Id],
+        [{hibernate_after, 1000}]
+    ).
+
+%%------------------------------------------------------------------------------
+%% gen_server callbacks
+%%------------------------------------------------------------------------------
+
+init([Pool, Id]) ->
+    erlang:process_flag(trap_exit, true),
+    true = gproc_pool:connect_worker(Pool, {Pool, Id}),
+    Limiter = emqx_limiter:connect({?RETAINER_LIMITER_GROUP, ?DISPATCHER_LIMITER_NAME}),
+    {ok, #{
+        pool => Pool,
+        id => Id,
+        queue => queue:new(),
+        %% `queue:len/1' walks the whole queue, so the length is kept here
+        queue_len => 0,
+        scheduled => false,
+        limiter => Limiter,
+        next_demand => 0
+    }}.
+
+handle_call(#wait_dispatch_complete{}, _From, State) ->
+    {reply, ok, State};
+handle_call(Req, _From, State) ->
+    ?SLOG(error, #{msg => "unexpected_call", call => Req}),
+    {reply, ignored, State}.
+
+handle_cast(#fetch{} = Request, State) ->
+    {noreply, schedule(enqueue(Request, State))};
+handle_cast(Msg, State) ->
+    ?SLOG(error, #{msg => "unexpected_cast", cast => Msg}),
+    {noreply, State}.
+
+handle_info(#dispatch{}, State) ->
+    {noreply, dispatch(State#{scheduled := false}, ?MAX_REQUESTS_PER_DISPATCH)};
+handle_info(Info, State) ->
+    ?SLOG(error, #{msg => "unexpected_info", info => Info}),
+    {noreply, State}.
+
+terminate(_Reason, #{pool := Pool, id := Id}) ->
+    gproc_pool:disconnect_worker(Pool, {Pool, Id}).
+
+%%------------------------------------------------------------------------------
+%% Private
+%%------------------------------------------------------------------------------
+
+schedule(#{scheduled := true} = State) ->
+    State;
+schedule(#{queue := Queue} = State) ->
+    case queue:is_empty(Queue) of
+        true ->
+            State;
+        false ->
+            self() ! #dispatch{},
+            State#{scheduled := true}
+    end.
+
+%% Drop a new request when the queue is full.
+enqueue(Request, #{queue := Queue, queue_len := Len} = State) ->
+    case Len >= emqx_config:get([retainer, max_dispatcher_queue_length]) of
+        true ->
+            ok = drop(Request),
+            State;
+        false ->
+            State#{queue := queue:in(Request, Queue), queue_len := Len + 1}
+    end.
+
+drop(#fetch{target = Target, request_ref = RequestRef, topic = Topic}) ->
+    ok = send(Target, #retained_dropped{topic_filter = Topic, request_ref = RequestRef}),
+    ?tp(retainer_dispatcher_dropped, #{topic => Topic}),
+    ?SLOG_THROTTLE(
+        warning,
+        #{msg => retained_read_dropped, reason => queue_full, topic => Topic},
+        #{tag => "RETAINER"}
+    ),
+    ok.
+
+%% Serve up to N requests, then yield so that calls and casts are handled.
+dispatch(State, 0) ->
+    schedule(State);
+dispatch(#{queue := Queue0} = State0, N) ->
+    case queue:out(Queue0) of
+        {empty, _} ->
+            State0;
+        {{value, #fetch{target = Target} = Request}, Queue} ->
+            case is_target_alive(Target) of
+                false ->
+                    dispatch(dequeued(Queue, State0), N - 1);
+                true ->
+                    case serve(Request, State0) of
+                        {served, State} -> dispatch(dequeued(Queue, State), N - 1);
+                        {paused, State} -> State
+                    end
+            end
+    end.
+
+dequeued(Queue, #{queue_len := Len} = State) ->
+    State#{queue := Queue, queue_len := Len - 1}.
+
+%% Pay for the previous read, then read. A worker can exceed the limit by one batch.
+%% Read the settings for each request: workers restart before a config update is saved.
+serve(Request, State) ->
+    #{batch_read_number := BatchReadNumber, batch_deliver_limiter := Limiter} =
+        emqx_config:get([retainer, flow_control]),
+    Capacity = limiter_capacity(Limiter),
+    serve(Request, Capacity, batch_size(BatchReadNumber, Capacity), State).
+
+serve(Request, infinity, BatchSize, State) ->
+    read(Request, BatchSize, State);
+serve(Request, _Capacity, BatchSize, #{next_demand := 0} = State) ->
+    read(Request, BatchSize, State);
+serve(#fetch{topic = Topic} = Request, Capacity, BatchSize, State0) ->
+    #{limiter := Limiter0, next_demand := Demand} = State0,
+    %% An amount above the capacity succeeds only after the shared bucket is idle for more
+    %% than one interval, and other workers can prevent that. Pay in parts of at most half
+    %% the capacity, so that each part succeeds when the bucket is half full.
+    Amount = max(1, min(Capacity div 2, Demand)),
+    case emqx_limiter_client:try_consume(Limiter0, Amount) of
+        {true, Limiter} ->
+            serve(Request, Capacity, BatchSize, State0#{
+                limiter := Limiter, next_demand := Demand - Amount
+            });
+        {false, Limiter, Reason} ->
+            ?tp(retained_fetch_rate_limit_exceeded, #{topic => Topic}),
+            ?SLOG_THROTTLE(
+                warning,
+                #{
+                    msg => retained_fetch_rate_limit_exceeded,
+                    reason => Reason,
+                    topic => Topic
+                },
+                #{tag => "RETAINER"}
+            ),
+            _ = erlang:send_after(?LIMITER_RETRY_INTERVAL_MS, self(), #dispatch{}),
+            {paused, State0#{limiter := Limiter, scheduled := true}}
+    end.
+
+read(
+    #fetch{
+        target = Target, request_ref = RequestRef, topic = Topic, words = Words, cursor = Cursor0
+    },
+    BatchSize,
+    State
+) ->
+    {Messages, Cursor, Cost} = read_batch(Topic, Words, Cursor0, BatchSize),
+    ok = reply(Target, Topic, RequestRef, Messages, Cursor),
+    ?tp(retainer_dispatcher_batch, #{topic => Topic, cost => Cost}),
+    {served, State#{next_demand := Cost}}.
+
+is_target_alive(Pid) when is_pid(Pid) ->
+    is_process_alive(Pid);
+is_target_alive(Target) ->
+    emqx_extsub_handler:is_target_alive(Target).
+
+reply(Target, Topic, RequestRef, Messages, Cursor) ->
+    Batch = #retained_batch{
+        topic_filter = Topic, request_ref = RequestRef, messages = Messages, cursor = Cursor
+    },
+    send(Target, Batch).
+
+send(Pid, Batch) when is_pid(Pid) ->
+    _ = erlang:send(Pid, Batch),
+    ok;
+send(Target, Batch) ->
+    emqx_extsub_handler:send(Target, Batch).
+
+%% A failed read ends delivery for its subscription only.
+read_batch(Topic, Words, Cursor, BatchSize) ->
+    try
+        do_read_batch(Topic, Words, Cursor, BatchSize)
+    catch
+        Class:Reason:Stacktrace ->
+            ?SLOG(error, #{
+                msg => "retained_message_read_failed",
+                topic => Topic,
+                class => Class,
+                reason => Reason,
+                stacktrace => Stacktrace
+            }),
+            {[], done, 1}
+    end.
+
+do_read_batch(Topic, Words, Cursor0, BatchSize) ->
+    Opts = #{batch_read_number => BatchSize, tokens => Words},
+    Context = emqx_retainer:context(),
+    Mod = emqx_retainer:backend_module(Context),
+    BackendState = emqx_retainer:backend_state(Context),
+    {ok, Messages, Cursor, Cost} =
+        case emqx_topic:wildcard(Words) of
+            true ->
+                Mod:match_messages(BackendState, Topic, Cursor0, Opts);
+            false ->
+                {ok, Msgs} = Mod:read_message(BackendState, Topic),
+                {ok, Msgs, undefined, length(Msgs)}
+        end,
+    case Cursor of
+        undefined ->
+            {Messages, done, Cost};
+        _ ->
+            {Messages, Cursor, Cost}
+    end.
+
+%% Limit each worker's read to its share of the limiter capacity.
+%% `batch_read_number = 0' reads all remaining messages, which is capped at the default.
+batch_size(BatchReadNumber, Capacity) ->
+    MaxBatchSize =
+        case BatchReadNumber of
+            0 -> ?DEFAULT_BATCH_SIZE;
+            N -> N
+        end,
+    case Capacity of
+        infinity ->
+            MaxBatchSize;
+        _ ->
+            Share = Capacity div emqx_vm:schedulers(),
+            min(MaxBatchSize, max(?MIN_BATCH_SIZE, Share))
+    end.
+
+limiter_capacity(infinity) ->
+    infinity;
+limiter_capacity({Capacity, _Interval}) ->
+    Capacity.

@@ -1,0 +1,1205 @@
+%%--------------------------------------------------------------------
+%% Copyright (c) 2023-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
+%%--------------------------------------------------------------------
+
+-module(emqx_conf_schema_tests).
+
+-include_lib("eunit/include/eunit.hrl").
+
+%% erlfmt-ignore
+-define(BASE_CONF,
+    "
+             node {
+                name = \"emqx1@127.0.0.1\"
+                cookie = \"emqxsecretcookie\"
+                data_dir = \"data\"
+                max_ports = 2048
+                process_limit = 10240
+             }
+             cluster {
+                name = emqxcl
+                discovery_strategy = static
+                static.seeds = ~p
+             }
+    ").
+
+array_nodes_test() ->
+    ensure_acl_conf(),
+    ExpectNodes = ['emqx1@127.0.0.1', 'emqx2@127.0.0.1'],
+    lists:foreach(
+        fun(Nodes) ->
+            ConfFile = to_bin(?BASE_CONF, [Nodes]),
+            {ok, Conf} = hocon:binary(ConfFile, #{format => richmap}),
+            ConfList = hocon_tconf:generate(emqx_conf_schema, Conf),
+            VMArgs = proplists:get_value(vm_args, ConfList),
+            ProcLimit = proplists:get_value('+P', VMArgs),
+            MaxPort = proplists:get_value('+Q', VMArgs),
+            ?assertEqual(2048, MaxPort),
+            %% node.process_limit = 10240 in BASE_CONF overrides the derived
+            %% 2 * max_ports = 4096 because the override is honored only when
+            %% strictly larger than the derived value.
+            ?assertEqual(10240, ProcLimit),
+
+            ClusterDiscovery = proplists:get_value(
+                cluster_discovery, proplists:get_value(ekka, ConfList)
+            ),
+            ?assertEqual(
+                {static, [{seeds, ExpectNodes}]},
+                ClusterDiscovery,
+                Nodes
+            )
+        end,
+        [["emqx1@127.0.0.1", "emqx2@127.0.0.1"], "emqx1@127.0.0.1, emqx2@127.0.0.1"]
+    ),
+    ok.
+
+%% The node cookie must NOT be emitted into the generated vm.args. It is passed
+%% to the Erlang VM via the `-setcookie` command-line flag from `bin/emqx`
+%% instead, so the secret is never persisted to the vm.<time>.args file on disk.
+cookie_not_in_vm_args_test() ->
+    ensure_acl_conf(),
+    ConfFile = to_bin(?BASE_CONF, [["emqx1@127.0.0.1"]]),
+    {ok, Conf} = hocon:binary(ConfFile, #{format => richmap}),
+    ConfList = hocon_tconf:generate(emqx_conf_schema, Conf),
+    VMArgs = proplists:get_value(vm_args, ConfList),
+    ?assertEqual(undefined, proplists:get_value('-setcookie', VMArgs)),
+    ok.
+
+%% `node.dirty_io_schedulers = auto' (the default) resolves to the historical
+%% fixed default of 8 when the resolved `node.schedulers' value is above 2,
+%% and to 4 otherwise -- see `resolve_dirty_io_schedulers/2'.
+dirty_io_schedulers_test() ->
+    ensure_acl_conf(),
+    Cases = [
+        %% {node.schedulers, node.dirty_io_schedulers, expected "+SDio"}
+        {1, auto, "4"},
+        {2, auto, "4"},
+        {3, auto, "8"},
+        {20, auto, "8"},
+        {2, 5, "5"}
+    ],
+    lists:foreach(
+        fun({Schedulers, DirtyIo, Expected}) ->
+            ?assertEqual(Expected, get_dirty_io_schedulers_from_conf(Schedulers, DirtyIo))
+        end,
+        Cases
+    ),
+    ok.
+
+%% `node.schedulers = auto' resolves to the smaller of the available logical
+%% processors and the CPU quota.
+auto_schedulers_test() ->
+    Cases = [
+        %% {logical_processors_available, cpu_quota, expected}
+        {20, unknown, 20},
+        {20, 4, 4},
+        {20, 1, 1},
+        {4, 4, 4},
+        {4, 8, 4}
+    ],
+    lists:foreach(
+        fun({Available, Quota, Expected}) ->
+            ?assertEqual(Expected, emqx_conf_schema:auto_schedulers(Available, Quota))
+        end,
+        Cases
+    ),
+    ok.
+
+get_dirty_io_schedulers_from_conf(Schedulers, DirtyIo) ->
+    Extra = to_bin("node { schedulers = ~p, dirty_io_schedulers = ~p }", [Schedulers, DirtyIo]),
+    BaseConf = to_bin(?BASE_CONF, [["emqx1@127.0.0.1"]]),
+    ConfFile = <<BaseConf/binary, Extra/binary>>,
+    {ok, Conf} = hocon:binary(ConfFile, #{format => richmap}),
+    ConfList = hocon_tconf:generate(emqx_conf_schema, Conf),
+    VMArgs = proplists:get_value(vm_args, ConfList),
+    proplists:get_value('+SDio', VMArgs).
+
+%% erlfmt-ignore
+-define(OUTDATED_LOG_CONF,
+    "
+log.console_handler {
+  burst_limit {
+    enable = true
+    max_count = 10000
+    window_time = 1s
+  }
+  chars_limit = unlimited
+  drop_mode_qlen = 3000
+  enable = true
+  flush_qlen = 8000
+  formatter = text
+  level = warning
+  max_depth = 100
+  overload_kill {
+    enable = true
+    mem_size = \"30MB\"
+    qlen = 20000
+    restart_after = \"5s\"
+  }
+  single_line = true
+  supervisor_reports = error
+  sync_mode_qlen = 100
+  time_offset = \"+02:00\"
+}
+log.file_handlers {
+  default {
+    burst_limit {
+      enable = true
+      max_count = 10000
+      window_time = 1s
+    }
+    chars_limit = unlimited
+    drop_mode_qlen = 3000
+    enable = true
+    file = \"log/my-emqx.log\"
+    flush_qlen = 8000
+    formatter = text
+    level = debug
+    max_depth = 100
+    max_size = \"1024MB\"
+    overload_kill {
+      enable = true
+      mem_size = \"30MB\"
+      qlen = 20000
+      restart_after = \"5s\"
+    }
+    rotation {count = 20, enable = true}
+    single_line = true
+    supervisor_reports = error
+    sync_mode_qlen = 100
+    time_offset = \"+01:00\"
+  }
+}
+    "
+).
+-define(FORMATTER(TimeOffset),
+    {emqx_logger_textfmt, #{
+        chars_limit => unlimited,
+        depth => 100,
+        single_line => true,
+        template => ["[", level, "] ", msg, "\n"],
+        time_offset => TimeOffset,
+        timestamp_format => auto,
+        with_mfa => false,
+        payload_encode => text
+    }}
+).
+
+-define(FILTERS, [{drop_progress_reports, {fun logger_filters:progress/2, stop}}]).
+-define(LOG_CONFIG,
+    (begin
+        #{
+            burst_limit_enable => true,
+            burst_limit_max_count => 10000,
+            burst_limit_window_time => 1000,
+            drop_mode_qlen => 3000,
+            flush_qlen => 8000,
+            overload_kill_enable => true,
+            overload_kill_mem_size => 31457280,
+            overload_kill_qlen => 20000,
+            overload_kill_restart_after => 5000,
+            sync_mode_qlen => 100
+        }
+    end)
+).
+
+outdated_log_test() ->
+    validate_log(?OUTDATED_LOG_CONF).
+
+validate_log(Conf) ->
+    ensure_acl_conf(),
+    BaseConf = to_bin(?BASE_CONF, ["emqx1@127.0.0.1"]),
+    Conf0 = <<BaseConf/binary, (list_to_binary(Conf))/binary>>,
+    {ok, ConfMap0} = hocon:binary(Conf0, #{format => richmap}),
+    ConfList = hocon_tconf:generate(emqx_conf_schema, ConfMap0),
+    Kernel = proplists:get_value(kernel, ConfList),
+
+    ?assertEqual(silent, proplists:get_value(error_logger, Kernel)),
+    ?assertEqual(debug, proplists:get_value(logger_level, Kernel)),
+    Loggers = proplists:get_value(logger, Kernel),
+    FileHandlers = lists:filter(fun(L) -> element(3, L) =:= logger_disk_log_h end, Loggers),
+    FileHandler = lists:keyfind(default, 2, FileHandlers),
+    ?assertEqual(
+        {handler, default, logger_disk_log_h, #{
+            config => ?LOG_CONFIG#{
+                type => wrap,
+                file => "log/my-emqx.log",
+                max_no_bytes => 1073741824,
+                max_no_files => 20
+            },
+            filesync_repeat_interval => no_repeat,
+            filters => ?FILTERS,
+            formatter => ?FORMATTER("+01:00"),
+            level => debug
+        }},
+        FileHandler
+    ),
+    %% audit is an EE-only feature
+    ?assertNot(lists:keyfind(emqx_audit, 2, FileHandlers)),
+    ConsoleHandler = lists:keyfind(logger_std_h, 3, Loggers),
+    ?assertEqual(
+        {handler, console, logger_std_h, #{
+            config => ?LOG_CONFIG#{type => standard_io},
+            filters => ?FILTERS,
+            formatter => ?FORMATTER("+02:00"),
+            level => warning
+        }},
+        ConsoleHandler
+    ).
+
+%% erlfmt-ignore
+-define(FILE_LOG_BASE_CONF,
+    "
+    log.file.default {
+        enable = true
+        file = \"log/xx-emqx.log\"
+        formatter = text
+        level = debug
+        rotation_count = ~s
+        rotation_size = ~s
+        time_offset = \"+01:00\"
+      }
+    "
+).
+
+file_log_infinity_rotation_size_test_() ->
+    ensure_acl_conf(),
+    BaseConf = to_bin(?BASE_CONF, ["emqx1@127.0.0.1"]),
+    Gen = fun(#{count := Count, size := Size}) ->
+        Conf0 = to_bin(?FILE_LOG_BASE_CONF, [Count, Size]),
+        Conf1 = [BaseConf, Conf0],
+        {ok, Conf} = hocon:binary(Conf1, #{format => richmap}),
+        ConfList = hocon_tconf:generate(emqx_conf_schema, Conf),
+        Kernel = proplists:get_value(kernel, ConfList),
+        Loggers = proplists:get_value(logger, Kernel),
+        FileHandlers = lists:filter(fun(L) -> element(3, L) =:= logger_disk_log_h end, Loggers),
+        lists:keyfind(default, 2, FileHandlers)
+    end,
+    [
+        {"base conf: finite log (type = wrap)",
+            ?_assertMatch(
+                {handler, default, logger_disk_log_h, #{
+                    config := #{
+                        type := wrap,
+                        max_no_bytes := 1073741824,
+                        max_no_files := 20
+                    }
+                }},
+                Gen(#{count => "20", size => "\"1024MB\""})
+            )},
+        {"rotation size = infinity (type = halt)",
+            ?_assertMatch(
+                {handler, default, logger_disk_log_h, #{
+                    config := #{
+                        type := halt,
+                        max_no_bytes := infinity,
+                        max_no_files := 9
+                    }
+                }},
+                Gen(#{count => "9", size => "\"infinity\""})
+            )}
+    ].
+
+%% erlfmt-ignore
+-define(KERNEL_LOG_CONF,
+    "
+    log.console {
+       enable = true
+       formatter = text
+       level = warning
+       time_offset = \"+02:00\"
+    }
+    log.file {
+        enable = false
+        file = \"log/xx-emqx.log\"
+        formatter = text
+        level = debug
+        rotation_count = 20
+        rotation_size = \"1024MB\"
+        time_offset = \"+01:00\"
+      }
+    log.file_handlers.default {
+        enable = true
+        file = \"log/my-emqx.log\"
+      }
+    "
+).
+
+log_test() ->
+    validate_log(?KERNEL_LOG_CONF).
+
+%% erlfmt-ignore
+log_rotation_count_limit_test() ->
+    ensure_acl_conf(),
+    Format =
+    "
+    log.file {
+    enable = true
+    path = \"log/emqx.log\"
+    formatter = text
+    level = debug
+    rotation = {count = ~w}
+    rotation_size = \"1024MB\"
+    }
+    ",
+    BaseConf = to_bin(?BASE_CONF, ["emqx1@127.0.0.1"]),
+    lists:foreach(fun({Conf, Count}) ->
+        Conf0 = <<BaseConf/binary, Conf/binary>>,
+        {ok, ConfMap0} = hocon:binary(Conf0, #{format => richmap}),
+        ConfList = hocon_tconf:generate(emqx_conf_schema, ConfMap0),
+        Kernel = proplists:get_value(kernel, ConfList),
+        Loggers = proplists:get_value(logger, Kernel),
+        ?assertMatch(
+            {handler, default, logger_disk_log_h, #{
+                config := #{max_no_files := Count}
+            }},
+            lists:keyfind(default, 2, Loggers)
+        )
+                  end,
+        [{to_bin(Format, [1]), 1}, {to_bin(Format, [128]), 128}]),
+    lists:foreach(fun({Conf, Count}) ->
+        Conf0 = <<BaseConf/binary, Conf/binary>>,
+        {ok, ConfMap0} = hocon:binary(Conf0, #{format => richmap}),
+        ?assertThrow({emqx_conf_schema,
+            [#{kind := validation_error,
+            mismatches := #{"handler_name" :=
+            #{kind := validation_error,
+                path := "log.file.default.rotation_count",
+                reason := #{expected := "1..128"},
+                value := Count}
+            }}]},
+            hocon_tconf:generate(emqx_conf_schema, ConfMap0))
+                  end, [{to_bin(Format, [0]), 0}, {to_bin(Format, [129]), 129}]).
+
+%% erlfmt-ignore
+-define(BASE_AUTHN_ARRAY,
+    "
+        authentication = [
+          {backend = \"http\"
+          body {password = \"${password}\", username = \"${username}\"}
+          connect_timeout = \"15s\"
+          enable_pipelining = 100
+          headers {\"content-type\" = \"application/json\"}
+          mechanism = \"password_based\"
+          method = \"~p\"
+          pool_size = 8
+          request_timeout = \"5s\"
+          ssl {enable = ~p, verify = \"verify_peer\"}
+          url = \"~ts\"
+        }
+        ]
+    "
+).
+
+-define(ERROR(Error),
+    {emqx_conf_schema, [
+        #{
+            kind := validation_error,
+            reason := #{error := Error}
+        }
+    ]}
+).
+
+authn_validations_test() ->
+    ensure_acl_conf(),
+    BaseConf = to_bin(?BASE_CONF, ["emqx1@127.0.0.1"]),
+
+    OKHttps = to_bin(?BASE_AUTHN_ARRAY, [post, true, <<"https://127.0.0.1:8080">>]),
+    Conf0 = <<BaseConf/binary, OKHttps/binary>>,
+    {ok, ConfMap0} = hocon:binary(Conf0, #{format => richmap}),
+    {_, Res0} = hocon_tconf:map_translate(emqx_conf_schema, ConfMap0, #{format => richmap}),
+    Headers0 = authentication_headers(Res0),
+    ?assertEqual(<<"application/json">>, maps:get(<<"content-type">>, Headers0)),
+    %% accept from converter
+    ?assertNot(maps:is_key(<<"accept">>, Headers0)),
+
+    OKHttp = to_bin(?BASE_AUTHN_ARRAY, [post, false, <<"http://127.0.0.1:8080">>]),
+    Conf1 = <<BaseConf/binary, OKHttp/binary>>,
+    {ok, ConfMap1} = hocon:binary(Conf1, #{format => richmap}),
+    {_, Res1} = hocon_tconf:map_translate(emqx_conf_schema, ConfMap1, #{format => richmap}),
+    Headers1 = authentication_headers(Res1),
+    ?assertEqual(<<"application/json">>, maps:get(<<"content-type">>, Headers1), Headers1),
+    ?assertNot(maps:is_key(<<"accept">>, Headers1)),
+
+    DisableSSLWithHttps = to_bin(?BASE_AUTHN_ARRAY, [post, false, <<"https://127.0.0.1:8080">>]),
+    Conf2 = <<BaseConf/binary, DisableSSLWithHttps/binary>>,
+    {ok, ConfMap2} = hocon:binary(Conf2, #{format => richmap}),
+    ?assertThrow(
+        ?ERROR(invalid_ssl_opts),
+        hocon_tconf:map_translate(emqx_conf_schema, ConfMap2, #{format => richmap})
+    ),
+
+    BadHeader = to_bin(?BASE_AUTHN_ARRAY, [get, true, <<"https://127.0.0.1:8080">>]),
+    Conf3 = <<BaseConf/binary, BadHeader/binary>>,
+    {ok, ConfMap3} = hocon:binary(Conf3, #{format => richmap}),
+    {_, Res3} = hocon_tconf:map_translate(emqx_conf_schema, ConfMap3, #{format => richmap}),
+    Headers3 = authentication_headers(Res3),
+    %% remove the content-type header when get method
+    ?assertNot(maps:is_key(<<"content-type">>, Headers3), Headers3),
+    ?assertNot(maps:is_key(<<"accept">>, Headers3), Headers3),
+
+    BadHeaderWithTuple = binary:replace(BadHeader, [<<"[">>, <<"]">>], <<"">>, [global]),
+    Conf4 = <<BaseConf/binary, BadHeaderWithTuple/binary>>,
+    {ok, ConfMap4} = hocon:binary(Conf4, #{format => richmap}),
+    {_, Res4} = hocon_tconf:map_translate(emqx_conf_schema, ConfMap4, #{}),
+    Headers4 = authentication_headers(Res4),
+    ?assertNot(maps:is_key(<<"content-type">>, Headers4), Headers4),
+    ?assertNot(maps:is_key(<<"accept">>, Headers4), Headers4),
+    ok.
+
+%% erlfmt-ignore
+-define(LISTENERS,
+    "
+        listeners.ssl.default.bind = 9999
+        listeners.wss.default.bind = 9998
+        # on dev-70, certs are no longer committed to the repo.
+        listeners.wss.default.ssl_options.cacertfile = \"/tmp/mycacert.pem\"
+        listeners.wss.new.bind = 9997
+        listeners.wss.new.websocket.mqtt_path = \"/my-mqtt\"
+    "
+).
+
+listeners_test_() ->
+    [
+        {atom_to_list(Profile), fun() ->
+            emqx_common_test_helpers:with_security_profile(Profile, fun() ->
+                Root = emqx_common_test_helpers:proj_root(),
+                %% generate by `scripts/gen-test-certs.sh apps/emqx/etc/certs`
+                CAPath = filename:join([Root, "apps", "emqx", "etc", "certs", "cacert.pem"]),
+                %% {ok, CAContents} = file:read_file(CAPath),
+                try
+                    {ok, _} = file:copy(CAPath, "/tmp/mycacert.pem"),
+                    %% ok = file:write_file("/tmp/mycacert.pem", CAContents),
+                    %% ok = file:delete(CAPath),
+                    listeners_test(Profile)
+                after
+                    %% ok = file:write_file(CAPath, CAContents),
+                    ok = file:delete("/tmp/mycacert.pem")
+                end
+            end)
+        end}
+     || Profile <- [legacy, hardened]
+    ].
+
+listeners_test(Profile) ->
+    ensure_acl_conf(),
+    BaseConf = to_bin(?BASE_CONF, ["emqx1@127.0.0.1"]),
+
+    Conf = <<BaseConf/binary, ?LISTENERS>>,
+    {ok, ConfMap0} = hocon:binary(Conf, #{format => richmap}),
+    {_, ConfMap} = hocon_tconf:map_translate(emqx_conf_schema, ConfMap0, #{format => richmap}),
+    #{<<"listeners">> := Listeners} = hocon_util:richmap_to_map(ConfMap),
+    #{
+        <<"tcp">> := #{<<"default">> := Tcp},
+        <<"ws">> := #{<<"default">> := Ws},
+        <<"wss">> := #{<<"default">> := DefaultWss, <<"new">> := NewWss},
+        <<"ssl">> := #{<<"default">> := Ssl}
+    } = Listeners,
+    TcpBind = expected_default_listener_bind(Profile, 1883),
+    WsBind = expected_default_listener_bind(Profile, 8083),
+    SslBind = expected_configured_listener_bind(Profile, 9999),
+    DefaultWssBind = expected_configured_listener_bind(Profile, 9998),
+    NewWssBind = expected_configured_listener_bind(Profile, 9997),
+    ?assertMatch(
+        #{
+            <<"bind">> := TcpBind,
+            <<"enable">> := true
+        },
+        Tcp
+    ),
+    ?assertMatch(
+        #{
+            <<"bind">> := WsBind,
+            <<"enable">> := true,
+            <<"websocket">> := #{<<"mqtt_path">> := "/mqtt"}
+        },
+        Ws
+    ),
+    %% No certificate defaults: a listener that configures none serves the
+    %% node's own generated bundle instead of a shipped example certificate.
+    ?assertMatch(#{<<"bind">> := SslBind}, Ssl),
+    assert_no_cert_defaults(Ssl),
+    %% What the configuration sets is kept; what it does not set stays unset.
+    ?assertMatch(
+        #{
+            <<"bind">> := DefaultWssBind,
+            <<"websocket">> := #{<<"mqtt_path">> := "/mqtt"},
+            <<"ssl_options">> := #{<<"cacertfile">> := <<"/tmp/mycacert.pem">>}
+        },
+        DefaultWss
+    ),
+    assert_no_cert_defaults(DefaultWss, [<<"certfile">>, <<"keyfile">>]),
+    ?assertMatch(
+        #{
+            <<"bind">> := NewWssBind,
+            <<"websocket">> := #{<<"mqtt_path">> := "/my-mqtt"}
+        },
+        NewWss
+    ),
+    assert_no_cert_defaults(NewWss),
+    ok.
+
+assert_no_cert_defaults(Listener) ->
+    assert_no_cert_defaults(Listener, [<<"cacertfile">>, <<"certfile">>, <<"keyfile">>]).
+
+assert_no_cert_defaults(Listener, Keys) ->
+    SslOpts = maps:get(<<"ssl_options">>, Listener, #{}),
+    lists:foreach(
+        fun(Key) ->
+            ?assertNot(maps:is_key(Key, SslOpts), #{key => Key, ssl_options => SslOpts})
+        end,
+        Keys
+    ).
+
+%% Schema defaults are static bare ports; the profile and the default
+%% address are applied at listener start, not in the schema.
+expected_default_listener_bind(_Profile, Port) -> Port.
+
+expected_configured_listener_bind(_Profile, Port) -> Port.
+
+subscription_message_filter_test() ->
+    ensure_acl_conf(),
+    BaseConf = to_bin(?BASE_CONF, ["emqx1@127.0.0.1"]),
+    {ok, Conf} = hocon:binary(
+        <<BaseConf/binary, "\nmqtt { subscription_message_filter = enable }\n">>,
+        #{format => richmap}
+    ),
+    {_, Parsed} = hocon_tconf:map_translate(emqx_conf_schema, Conf, #{format => richmap}),
+    #{<<"mqtt">> := MQTT} = hocon_util:richmap_to_map(Parsed),
+    ?assertEqual(enable, maps:get(<<"subscription_message_filter">>, MQTT)).
+
+authentication_headers(Conf) ->
+    [#{<<"headers">> := Headers}] = hocon_maps:get("authentication", Conf),
+    Headers.
+
+doc_gen_test() ->
+    ensure_acl_conf(),
+    %% the json file too large to encode.
+    {
+        timeout,
+        60,
+        fun() ->
+            Dir = "tmp",
+            ok = emqx_conf:dump_schema(Dir, emqx_conf_schema)
+        end
+    }.
+
+audit_log_test() ->
+    ensure_acl_conf(),
+    Conf0 = <<"node {cookie = aaa, data_dir = \"/tmp\"}, log.audit.enable=true">>,
+    {ok, ConfMap0} = hocon:binary(Conf0, #{format => richmap}),
+    ConfList = hocon_tconf:generate(emqx_conf_schema, ConfMap0),
+    Kernel = proplists:get_value(kernel, ConfList),
+    Loggers = proplists:get_value(logger, Kernel),
+    FileHandlers = lists:filter(fun(L) -> element(3, L) =:= logger_disk_log_h end, Loggers),
+    AuditHandler = lists:keyfind(emqx_audit, 2, FileHandlers),
+    ?assertMatch(
+        {handler, emqx_audit, logger_disk_log_h, #{
+            config := #{
+                type := wrap,
+                file := "log/audit.log",
+                max_no_bytes := _,
+                max_no_files := _
+            },
+            filesync_repeat_interval := no_repeat,
+            filters := [{filter_audit, {_, stop}}],
+            formatter := _,
+            level := info
+        }},
+        AuditHandler
+    ),
+    ok.
+
+injected_roots_test() ->
+    ExpectedRoots = lists:usort(release_app_schema_roots()),
+    InjectedRoots = lists:usort(get_roots(emqx_conf_schema)),
+    MissingRoots = ExpectedRoots -- InjectedRoots,
+    ?assertEqual([], MissingRoots, #{
+        missing => ExpectedRoots -- InjectedRoots,
+        unknown => InjectedRoots -- ExpectedRoots,
+        hint => <<"maybe there's a missing schema module to be added to `MERGED_CONFIGS'">>
+    }),
+    ok.
+
+release_app_schema_roots() ->
+    #{ee_business_apps := Apps} = emqx_machine_boot:read_apps(),
+    lists:append([release_app_schema_roots(atom_to_list(App)) || App <- Apps]).
+
+release_app_schema_roots(AppName) ->
+    lists:foldl(
+        fun(Filepath, Acc) ->
+            Mod = module(Filepath),
+            case has_roots(Mod) of
+                true ->
+                    get_roots(Mod) ++ Acc;
+                false ->
+                    Acc
+            end
+        end,
+        [],
+        filelib:wildcard("apps/" ++ AppName ++ "/src/**/*_schema.erl")
+    ).
+
+module(Filepath) ->
+    ModStr = filename:basename(Filepath, ".erl"),
+    list_to_atom(ModStr).
+
+get_roots(Mod) ->
+    lists:map(
+        fun
+            ({Root, _Sc}) ->
+                Root;
+            (Root) when is_atom(Root) ->
+                Root
+        end,
+        Mod:roots()
+    ).
+
+has_roots(Mod) ->
+    try
+        Mod:module_info(module),
+        erlang:function_exported(Mod, roots, 0) andalso
+            Mod:roots() =/= []
+    catch
+        error:undef ->
+            false
+    end.
+
+to_bin(Format, Args) ->
+    iolist_to_binary(io_lib:format(Format, Args)).
+
+ensure_acl_conf() ->
+    File = emqx_schema:naive_env_interpolation(<<"${EMQX_ETC_DIR}/acl.conf">>),
+    ok = filelib:ensure_dir(filename:dirname(File)),
+    case filelib:is_regular(File) of
+        true -> ok;
+        false -> file:write_file(File, <<"">>)
+    end.
+
+log_path_test_() ->
+    Fh = fun(Path) ->
+        #{<<"log">> => #{<<"file_handlers">> => #{<<"name1">> => #{<<"file">> => Path}}}}
+    end,
+    Assert = fun(Name, Path, Conf) ->
+        ?assertMatch(#{log := #{file := #{Name := #{path := Path}}}}, Conf)
+    end,
+
+    [
+        {"default-values", fun() -> Assert(default, "${EMQX_LOG_DIR}/emqx.log", check(#{})) end},
+        {"file path with space", fun() -> Assert(name1, "a /b", check(Fh(<<"a /b">>))) end},
+        {"bad utf8", fun() ->
+            ?assertThrow(
+                {emqx_conf_schema, [
+                    #{
+                        kind := validation_error,
+                        mismatches :=
+                            #{
+                                "handler_name" :=
+                                    #{
+                                        kind := validation_error,
+                                        path := "log.file.name1.path",
+                                        reason := {"bad_file_path_string", _}
+                                    }
+                            }
+                    }
+                ]},
+                check(Fh(<<239, 32, 132, 47, 117, 116, 102, 56>>))
+            )
+        end},
+        {"not string", fun() ->
+            ?assertThrow(
+                {emqx_conf_schema, [
+                    #{
+                        kind := validation_error,
+                        mismatches :=
+                            #{
+                                "handler_name" :=
+                                    #{
+                                        kind := validation_error,
+                                        path := "log.file.name1.path",
+                                        reason := {"not_string", _}
+                                    }
+                            }
+                    }
+                ]},
+                check(Fh(#{<<"foo">> => <<"bar">>}))
+            )
+        end}
+    ].
+
+check(Config) ->
+    Schema = emqx_conf_schema,
+    {_, Conf} = hocon_tconf:map(Schema, Config, [log], #{
+        atom_key => false, required => false, format => map
+    }),
+    emqx_utils_maps:unsafe_atom_key_map(Conf).
+
+with_file(Path, Content, F) ->
+    ok = file:write_file(Path, Content),
+    try
+        F()
+    after
+        file:delete(Path)
+    end.
+
+load_and_check_test_() ->
+    [
+        {"non-existing file", fun() ->
+            File = "/tmp/nonexistingfilename.hocon",
+            ?assertEqual(
+                {error, {enoent, File}},
+                emqx_hocon:load_and_check(emqx_conf_schema, File)
+            )
+        end},
+        {"bad syntax", fun() ->
+            %% use abs path to match error return
+            File = "/tmp/emqx-conf-bad-syntax-test.hocon",
+            with_file(
+                File,
+                "{",
+                fun() ->
+                    ?assertMatch(
+                        {error, #{file := File}},
+                        emqx_hocon:load_and_check(emqx_conf_schema, File)
+                    )
+                end
+            )
+        end},
+        {"type-check failure", fun() ->
+            File = "emqx-conf-type-check-failure.hocon",
+            %% typecheck fail because cookie is required field
+            with_file(
+                File,
+                "node {}",
+                fun() ->
+                    ?assertMatch(
+                        {error, #{
+                            kind := validation_error,
+                            path := "node.cookie",
+                            reason := required_field
+                        }},
+                        emqx_hocon:load_and_check(emqx_conf_schema, File)
+                    )
+                end
+            )
+        end},
+        {"ok load", fun() ->
+            File = "emqx-conf-test-tmp-file-load-ok.hocon",
+            with_file(File, "plugins: {}", fun() ->
+                ?assertMatch({ok, _}, emqx_hocon:load_and_check(emqx_conf_schema, File))
+            end)
+        end}
+    ].
+
+%% erlfmt-ignore
+dns_record_conf(NodeName, DnsRecordType) ->
+    "
+             node {
+                name = \"" ++ NodeName ++ "\"
+                data_dir = \"data\"
+                cookie = cookie
+                max_ports = 2048
+                process_limit = 10240
+             }
+             cluster {
+                name = emqxcl
+                discovery_strategy = dns
+                dns.record_type = " ++ atom_to_list(DnsRecordType) ++"
+             }
+    ".
+
+a_record_with_non_ip_node_name_test_() ->
+    Test = fun(DnsRecordType) ->
+        {ok, ConfMap} = hocon:binary(dns_record_conf("emqx@local.host", DnsRecordType), #{
+            format => map
+        }),
+        ?assertThrow(
+            {emqx_conf_schema, [
+                #{
+                    reason := integrity_validation_failure,
+                    result := #{domain := "local.host"},
+                    kind := validation_error,
+                    validation_name := check_node_name_and_discovery_strategy
+                }
+            ]},
+            hocon_tconf:check_plain(emqx_conf_schema, ConfMap, #{required => false}, [node, cluster])
+        )
+    end,
+    [
+        {"a record", fun() -> Test(a) end},
+        {"aaaa record", fun() -> Test(aaaa) end}
+    ].
+
+dns_record_type_incompatiblie_with_node_host_ip_format_test_() ->
+    Test = fun(Ip, DnsRecordType) ->
+        {ok, ConfMap} = hocon:binary(dns_record_conf("emqx@" ++ Ip, DnsRecordType), #{format => map}),
+        ?assertThrow(
+            {emqx_conf_schema, [
+                #{
+                    reason := integrity_validation_failure,
+                    result := #{
+                        record_type := DnsRecordType,
+                        address_type := _
+                    },
+                    kind := validation_error,
+                    validation_name := check_node_name_and_discovery_strategy
+                }
+            ]},
+            hocon_tconf:check_plain(emqx_conf_schema, ConfMap, #{required => false}, [node, cluster])
+        )
+    end,
+    [
+        {"ipv4 address", fun() -> Test("::1", a) end},
+        {"ipv6 address", fun() -> Test("127.0.0.1", aaaa) end}
+    ].
+
+dns_srv_record_is_ok_test() ->
+    {ok, ConfMap} = hocon:binary(dns_record_conf("emqx@local.host", srv), #{format => map}),
+    ?assertMatch(
+        Value when is_map(Value),
+        hocon_tconf:check_plain(emqx_conf_schema, ConfMap, #{required => false}, [node, cluster])
+    ).
+
+invalid_role_test() ->
+    Conf = node_role_conf(dummy),
+    ?assertThrow(
+        {emqx_conf_schema, [#{reason := "Invalid node role: dummy"}]},
+        hocon_tconf:check_plain(emqx_conf_schema, Conf, #{required => false}, [node])
+    ).
+
+unsupported_role_test() ->
+    test_unsupported_role(emqx_release:edition()).
+
+test_unsupported_role(ee) ->
+    %% all roles are supported in ee
+    ok;
+test_unsupported_role(ce) ->
+    %% replicant role is not allowed for ce since 5.8.0
+    Conf = node_role_conf(replicant),
+    ?assertThrow(
+        {emqx_conf_schema, [
+            #{reason := "Node role 'replicant' is only allowed in Enterprise edition since 5.8.0"}
+        ]},
+        hocon_tconf:check_plain(emqx_conf_schema, Conf, #{required => false}, [node])
+    ).
+
+rpc_insecure_fallback_is_ignored_test() ->
+    ensure_acl_conf(),
+    BaseConf = to_bin(?BASE_CONF, ["emqx1@127.0.0.1"]),
+    Conf = <<BaseConf/binary, "\nrpc.insecure_fallback = true\n">>,
+    {ok, ConfMap} = hocon:binary(Conf, #{format => richmap}),
+    ConfList = hocon_tconf:generate(emqx_conf_schema, ConfMap),
+    GenRpcEnv = proplists:get_value(gen_rpc, ConfList),
+    ?assertEqual(
+        undefined,
+        proplists:get_value(insecure_auth_fallback_allowed, GenRpcEnv)
+    ).
+
+rpc_compress_defaults_test() ->
+    GenRpcEnv = gen_rpc_env(""),
+    ?assertEqual(0, proplists:get_value(compress, GenRpcEnv)),
+    ?assertEqual(1024, proplists:get_value(compression_threshold, GenRpcEnv)).
+
+rpc_compress_mapping_test() ->
+    GenRpcEnv = gen_rpc_env("rpc.compress_level = 6\nrpc.compress_threshold = 2KB\n"),
+    ?assertEqual(6, proplists:get_value(compress, GenRpcEnv)),
+    ?assertEqual(2048, proplists:get_value(compression_threshold, GenRpcEnv)),
+    GenRpcEnv0 = gen_rpc_env("rpc.compress_level = 1\nrpc.compress_threshold = 0\n"),
+    ?assertEqual(1, proplists:get_value(compress, GenRpcEnv0)),
+    ?assertEqual(0, proplists:get_value(compression_threshold, GenRpcEnv0)).
+
+rpc_compress_level_range_test() ->
+    ?assertThrow(
+        {emqx_conf_schema, [#{kind := validation_error, path := "rpc.compress_level"}]},
+        gen_rpc_env("rpc.compress_level = 10\n")
+    ),
+    ?assertThrow(
+        {emqx_conf_schema, [#{kind := validation_error, path := "rpc.compress_level"}]},
+        gen_rpc_env("rpc.compress_level = -1\n")
+    ).
+
+gen_rpc_env(Extra) ->
+    ensure_acl_conf(),
+    BaseConf = to_bin(?BASE_CONF, ["emqx1@127.0.0.1"]),
+    Conf = <<BaseConf/binary, "\n", (list_to_binary(Extra))/binary>>,
+    {ok, ConfMap} = hocon:binary(Conf, #{format => richmap}),
+    ConfList = hocon_tconf:generate(emqx_conf_schema, ConfMap),
+    proplists:get_value(gen_rpc, ConfList).
+
+node_role_conf(Role0) ->
+    Role = atom_to_binary(Role0),
+    Hocon = <<"node { role =", Role/binary, ", cookie = \"cookie\", data_dir = \".\" }">>,
+    {ok, ConfMap} = hocon:binary(Hocon, #{format => map}),
+    ConfMap.
+
+validate_cookie_test_() ->
+    [
+        {"empty cookie", fun() ->
+            with_file(
+                "emqx-conf-cookie-empty.hocon",
+                "node {cookie = \"\", data_dir = \".\"}",
+                fun() ->
+                    ?assertMatch(
+                        {error, #{reason := "Cookie must be non-empty string"}},
+                        emqx_hocon:load_and_check(emqx_conf_schema, "emqx-conf-cookie-empty.hocon")
+                    )
+                end
+            )
+        end},
+        {"cookie too long", fun() ->
+            LongCookie = lists:duplicate(256, $a),
+            Conf = io_lib:format("node {cookie = \"~s\", data_dir = \".\"}", [LongCookie]),
+            with_file(
+                "emqx-conf-cookie-long.hocon",
+                Conf,
+                fun() ->
+                    ?assertMatch(
+                        {error, #{reason := "Cookie cannot be more than 255 bytes"}},
+                        emqx_hocon:load_and_check(emqx_conf_schema, "emqx-conf-cookie-long.hocon")
+                    )
+                end
+            )
+        end},
+        {"cookie with backslash", fun() ->
+            with_file(
+                "emqx-conf-cookie-backslash.hocon",
+                "node {cookie = \"my\\\\cookie\", data_dir = \".\"}",
+                fun() ->
+                    ?assertMatch(
+                        {error, #{reason := "Cookie cannot contain character: backslash (\\)"}},
+                        emqx_hocon:load_and_check(
+                            emqx_conf_schema, "emqx-conf-cookie-backslash.hocon"
+                        )
+                    )
+                end
+            )
+        end},
+        {"cookie with single quote", fun() ->
+            with_file(
+                "emqx-conf-cookie-squote.hocon",
+                "node {cookie = \"my'cookie\", data_dir = \".\"}",
+                fun() ->
+                    ?assertMatch(
+                        {error, #{reason := "Cookie cannot contain character: single quote (')"}},
+                        emqx_hocon:load_and_check(emqx_conf_schema, "emqx-conf-cookie-squote.hocon")
+                    )
+                end
+            )
+        end},
+        {"cookie with double quote", fun() ->
+            with_file(
+                "emqx-conf-cookie-dquote.hocon",
+                "node {cookie = \"my\\\"cookie\", data_dir = \".\"}",
+                fun() ->
+                    ?assertMatch(
+                        {error, #{reason := "Cookie cannot contain character: double quote (\")"}},
+                        emqx_hocon:load_and_check(emqx_conf_schema, "emqx-conf-cookie-dquote.hocon")
+                    )
+                end
+            )
+        end},
+        {"cookie with space", fun() ->
+            with_file(
+                "emqx-conf-cookie-space.hocon",
+                "node {cookie = \"my cookie\", data_dir = \".\"}",
+                fun() ->
+                    ?assertMatch(
+                        {error, #{reason := "Cookie cannot contain character: space"}},
+                        emqx_hocon:load_and_check(emqx_conf_schema, "emqx-conf-cookie-space.hocon")
+                    )
+                end
+            )
+        end}
+    ].
+
+validate_tls_stateless_tickets_seed_test_() ->
+    [
+        {"empty seed is ok", fun() ->
+            ?assertEqual(ok, emqx_conf_schema:validate_tls_stateless_tickets_seed(<<>>))
+        end},
+        {"seed with 16+ bytes is ok", fun() ->
+            ?assertEqual(
+                ok, emqx_conf_schema:validate_tls_stateless_tickets_seed(<<"1234567890123456">>)
+            )
+        end},
+        {"seed too short", fun() ->
+            ?assertMatch(
+                {error, "tls_stateless_tickets_seed must be at least 16 bytes" ++ _},
+                emqx_conf_schema:validate_tls_stateless_tickets_seed(<<"short">>)
+            )
+        end},
+        {"seed must be string", fun() ->
+            ?assertEqual(
+                {error, "tls_stateless_tickets_seed must be a string value"},
+                emqx_conf_schema:validate_tls_stateless_tickets_seed(12345)
+            )
+        end}
+    ].
+
+fix_log_dir_path_test() ->
+    ?assertEqual(
+        "/opt/emqx/log/a.log",
+        emqx_conf_schema:fix_bad_log_path("/opt/emqx/log/a.log")
+    ),
+    ?assertEqual(
+        "/var/log/emqx/a.log",
+        emqx_conf_schema:fix_bad_log_path("/var/log/emqx/a.log")
+    ),
+    ?assertEqual(
+        "${SOMEDIR}/a.log",
+        emqx_conf_schema:fix_bad_log_path("${SOMEDIR}/a.log")
+    ),
+    ?assertEqual(
+        <<"${SOMEDIR}/a.log">>,
+        emqx_conf_schema:fix_bad_log_path(<<"${SOMEDIR}/a.log">>)
+    ),
+    try
+        os:putenv("EMQX_LOG_DIR", "foobar"),
+        %% assumption: the two hard coded paths below do not exist in CT test runner
+        ?assertEqual(
+            "${EMQX_LOG_DIR}/a.log",
+            emqx_conf_schema:fix_bad_log_path("/nosuchdir/a.log")
+        ),
+        %% binary in binary out
+        ?assertEqual(
+            <<"${EMQX_LOG_DIR}/a.log">>,
+            emqx_conf_schema:fix_bad_log_path(<<"/nosuchdir/a.log">>)
+        )
+    after
+        os:unsetenv("EMQX_LOG_DIR")
+    end,
+    ok.
+
+%% This test is only to ensure line coverage.
+%% The real check is done as a part of smoke test.
+%% During ct emqx_mgmt_api_data_backup:check_desc() always raises an error exception.
+check_desc_test() ->
+    ?assertError(
+        #{reason := "table_sets_desc_needs_update"},
+        emqx_conf:check_dynamic_desc()
+    ).
+
+%% erlfmt-ignore
+dist_bind_address_test_() ->
+    ensure_acl_conf(),
+    [
+        {"dist_bind_address not set returns undefined", fun() ->
+            DistBindAddr = get_dist_bind_address_from_conf(undefined),
+            ?assertEqual(undefined, DistBindAddr)
+        end},
+        {"dist_bind_address with IPv4 address formats correctly", fun() ->
+            assert_dist_bind_address("192.168.1.100", "{192,168,1,100}")
+        end},
+        {"dist_bind_address with IPv6 localhost formats correctly", fun() ->
+            assert_dist_bind_address("::1", "{0,0,0,0,0,0,0,1}")
+        end},
+        {"dist_bind_address with IPv6 full address formats correctly", fun() ->
+            assert_dist_bind_address("2001:0db8:85a3:0000:0000:8a2e:0370:7334", "{8193,3512,34211,0,0,35374,880,29492}")
+        end},
+        {"dist_bind_address with IPv6 compressed address formats correctly", fun() ->
+            assert_dist_bind_address("2001:db8::1", "{8193,3512,0,0,0,0,0,1}")
+        end},
+        {"dist_bind_address with IPv6 link-local address formats correctly", fun() ->
+            assert_dist_bind_address("fe80::1", "{65152,0,0,0,0,0,0,1}")
+        end},
+        {"dist_bind_address with localhost IPv4 formats correctly", fun() ->
+            assert_dist_bind_address("127.0.0.1", "{127,0,0,1}")
+        end},
+        {"dist_bind_address with invalid address throws error", fun() ->
+            BaseConf = to_bin(?BASE_CONF, ["emqx1@127.0.0.1"]),
+            DistBindConf = "node { dist_bind_address = \"invalid.address\" }",
+            Conf0 = <<BaseConf/binary, (list_to_binary(DistBindConf))/binary>>,
+            {ok, Conf} = hocon:binary(Conf0, #{format => richmap}),
+            ?assertThrow(
+                {emqx_conf_schema, [
+                    #{
+                        kind := translation_error,
+                        path := "vm_args.-kernel inet_dist_use_interface",
+                        reason := #{
+                            bad_ip_address := _,
+                            cause := _
+                        }
+                    }
+                ]},
+                hocon_tconf:generate(emqx_conf_schema, Conf)
+            )
+        end},
+        {"dist_bind_address with binary string input", fun() ->
+            assert_dist_bind_address("10.0.0.1", "{10,0,0,1}")
+        end}
+    ].
+
+get_dist_bind_address_from_conf(Address) ->
+    BaseConf = to_bin(?BASE_CONF, ["emqx1@127.0.0.1"]),
+    Conf0 =
+        case Address of
+            undefined ->
+                BaseConf;
+            _ ->
+                DistBindConf = "node { dist_bind_address = \"" ++ Address ++ "\" }",
+                <<BaseConf/binary, (list_to_binary(DistBindConf))/binary>>
+        end,
+    {ok, Conf} = hocon:binary(Conf0, #{format => richmap}),
+    ConfList = hocon_tconf:generate(emqx_conf_schema, Conf),
+    VMArgs = proplists:get_value(vm_args, ConfList),
+    proplists:get_value('-kernel inet_dist_use_interface', VMArgs).
+
+assert_dist_bind_address(Address, ExpectedAtomStr) ->
+    DistBindAddr = get_dist_bind_address_from_conf(Address),
+    ?assertEqual(ExpectedAtomStr, DistBindAddr).
+
+%% `PUT /configs?mode=merge` normalizes the submitted fragment as a partial
+%% document. An omitted field must stay omitted: its converter must neither
+%% crash on it nor make a value that the merge writes over the stored one.
+partial_merge_empty_roots_test() ->
+    Roots = [emqx_utils_conv:bin(Root) || Root <- get_roots(emqx_conf_schema)],
+    ?assertEqual(
+        [],
+        [
+            {Root, Result}
+         || Root <- Roots,
+            Result <- [normalize_partial(#{Root => #{}})],
+            not is_empty_root(Root, Result)
+        ]
+    ).
+
+partial_merge_connector_without_server_test_() ->
+    [
+        {Type, ?_assertMatch({ok, _}, normalize_partial(connector_fragment(Type)))}
+     || Type <- [<<"elasticsearch">>, <<"datalayers">>, <<"influxdb">>]
+    ].
+
+partial_merge_transformation_without_key_test() ->
+    Fragment = #{
+        <<"message_transformation">> => #{
+            <<"transformations">> => [
+                #{
+                    <<"name">> => <<"t">>,
+                    <<"topics">> => [<<"t/#">>],
+                    <<"operations">> => [#{<<"value">> => <<"1">>}]
+                }
+            ]
+        }
+    },
+    ?assertMatch({ok, _}, normalize_partial(Fragment)).
+
+connector_fragment(Type) ->
+    #{<<"connectors">> => #{Type => #{<<"c">> => #{<<"enable">> => false}}}}.
+
+is_empty_root(Root, {ok, Normalized}) ->
+    case maps:get(Root, Normalized) of
+        #{} = Conf -> map_size(Conf) =:= 0;
+        %% An array root, for which `#{}` is no fragment.
+        Conf -> is_list(Conf)
+    end;
+is_empty_root(_Root, _Result) ->
+    false.
+
+%% Same options as `emqx_config:normalize_raw_conf/1`.
+normalize_partial(Fragment) ->
+    Opts = #{partial => true, make_serializable => true},
+    try hocon_tconf:check_plain(emqx_conf_schema, Fragment, Opts, maps:keys(Fragment)) of
+        Normalized -> {ok, Normalized}
+    catch
+        throw:{_SchemaMod, Errors} -> {error, Errors}
+    end.

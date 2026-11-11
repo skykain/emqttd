@@ -1,42 +1,123 @@
 name: Build slim packages
 
+concurrency:
+  group: slim-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
 on:
-  - pull_request
-  - workflow_dispatch
+  workflow_call:
+  workflow_dispatch:
+    inputs:
+      ref:
+        required: false
+
+permissions:
+  contents: read
 
 jobs:
-  build:
-    runs-on: ubuntu-20.04
+  plugins-linux-amd64:
+    runs-on: ${{ github.repository_owner == 'emqx' && 'aws-ubuntu22.04-amd64' || 'ubuntu-22.04' }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        ref: ${{ github.event.inputs.ref }}
+        fetch-depth: 0
+    - name: Set up environment
+      id: env
+      run: |
+        source env.sh
+        echo "BUILDER=$EMQX_DOCKER_BUILD_FROM" >> "$GITHUB_OUTPUT"
+    - name: build plugins in builder
+      env:
+        BUILDER: ${{ steps.env.outputs.BUILDER }}
+      run: |
+        docker run --rm \
+          -v "$PWD:/emqx" \
+          -w /emqx \
+          "$BUILDER" \
+          bash -lc "git config --global --add safe.directory /emqx && make emqx-enterprise-compile && make plugins && ./scripts/test/plugin-packager-test.sh"
+    - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: "plugins"
+        path: |
+          _build/plugins/*.tar.gz
+          _build/plugins/*.sha256
+        retention-days: 7
+        compression-level: 0
+
+  linux:
+    runs-on: ${{ github.repository_owner == 'emqx' && format('aws-ubuntu22.04-{0}', matrix.arch) || (matrix.arch == 'arm64' && 'ubuntu-22.04-arm' || 'ubuntu-22.04') }}
+    env:
+      PROFILE: ${{ matrix.profile }}
+      ARCH: ${{ matrix.arch }}
+      BUILDER_SYSTEM: force_docker
 
     strategy:
+      fail-fast: false
       matrix:
-        erl_otp:
-        - erl23.2.7.1-emqx-1
-        os:
-        - ubuntu20.04
-        - centos7
-
-    container: emqx/build-env:${{ matrix.erl_otp }}-${{ matrix.os }}
+        profile:
+          - "emqx-enterprise"
+        arch:
+          - "arm64"
+          - "amd64"
 
     steps:
-    - uses: actions/checkout@v1
-    - name: prepare
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        fetch-depth: 0
+    - name: build tgz
       run: |
-        if make emqx-ee --dry-run > /dev/null 2>&1; then
-          echo "https://ci%40emqx.io:${{ secrets.CI_GIT_TOKEN }}@github.com" > $HOME/.git-credentials
-          git config --global credential.helper store
-          echo "${{ secrets.CI_GIT_TOKEN }}" >> ./scripts/git-token
-          echo "EMQX_NAME=emqx-ee" >> $GITHUB_ENV
-        else
-          echo "EMQX_NAME=emqx" >> $GITHUB_ENV
-        fi
-    - name: build packages
-      run: make ${EMQX_NAME}-pkg
-    - name: pakcages test
+        ./scripts/buildx.sh --profile $PROFILE --pkgtype tgz --arch $ARCH
+    - name: build pkg
       run: |
-        export CODE_PATH=$GITHUB_WORKSPACE
-        .ci/build_packages/tests.sh
-    - uses: actions/upload-artifact@v2
+        ./scripts/buildx.sh --profile $PROFILE --pkgtype pkg --arch $ARCH
+    - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: "${{ matrix.profile }}-${{ matrix.arch }}"
+        path: _packages/${{ matrix.profile }}/*
+        retention-days: 7
+        compression-level: 0
+
+  mac:
+    strategy:
+      fail-fast: false
+      matrix:
+        profile:
+        - emqx-enterprise
+        os:
+        - macos-26
+
+    runs-on: ${{ matrix.os }}
+    env:
+      EMQX_NAME: ${{ matrix.profile }}
+
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+    - name: Set up environment
+      id: env
+      run: |
+        source env.sh
+        echo "OTP_VSN=$OTP_VSN" >> "$GITHUB_OUTPUT"
+        echo "ELIXIR_VSN=$ELIXIR_VSN" >> "$GITHUB_OUTPUT"
+    # Keep these inputs the same as the mac job in warm_deps_cache.yaml,
+    # which saves the entry this step restores.
+    - name: Restore dependency cache
+      uses: ./.github/actions/deps-cache-restore
+      with:
+        profiles: ${{ matrix.profile }}
+        toolchain: ${{ matrix.os }}
+        build-inputs: .github/actions/package-macos/action.yaml
+    - uses: ./.github/actions/package-macos
+      with:
+        profile: ${{ matrix.profile }}
+        otp: ${{ steps.env.outputs.OTP_VSN }}
+        elixir: ${{ steps.env.outputs.ELIXIR_VSN }}
+        os: ${{ matrix.os }}
+    - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
       with:
         name: ${{ matrix.os }}
-        path: _packages/**/*.zip
+        path: _packages/**/*
+        retention-days: 7

@@ -1,0 +1,499 @@
+#!/usr/bin/env bash
+
+## This script runs CT (and necessary dependencies) in docker container(s)
+
+set -euo pipefail
+
+# ensure dir
+cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")/../.."
+
+help() {
+    echo
+    echo '-h|--help:              To display this usage info'
+    echo '--app lib_dir/app_name: For which app to run start docker-compose, and run common tests'
+    echo '--console:              Start EMQX in console mode but do not run test cases'
+    echo '--attach:               Attach to the Erlang docker container without running any test case'
+    echo '--stop:                 Stop running containers for the given app'
+    echo '--ps:                   Show docker-compose services for the given app'
+    echo '--only-up:              Only start the testbed but do not run CT'
+    echo '--keep-up:              Keep the testbed running after CT'
+    echo '--ci:                   Set this flag in GitHub action to enforce no tests are skipped'
+    echo '--:                     If any, all args is a conmand to be executed in the Erlang container'
+    echo '                        otherwise it runs the entire app'\''s CT by mix'
+    # shellcheck disable=SC2016
+    echo '                        (will run `make ${WHICH_APP}-ct`)'
+}
+
+set +e
+if docker compose version; then
+    DC='docker compose'
+elif command -v docker-compose; then
+    DC='docker-compose'
+else
+    echo 'Neither "docker compose" or "docker-compose" are available, stop.'
+    exit 1
+fi
+set -e
+
+WHICH_APP='novalue'
+CONSOLE='no'
+KEEP_UP='no'
+ONLY_UP='no'
+ATTACH='no'
+STOP='no'
+PS='no'
+IS_CI='no'
+SQLSERVER_ODBC_REQUEST='no'
+SNOWFLAKE_ODBC_REQUEST='no'
+QUASARDB_ODBC_REQUEST='no'
+DAMENG_ODBC_REQUEST='no'
+UP='up --wait'
+while [ "$#" -gt 0 ]; do
+    case $1 in
+        -h|--help)
+            help
+            exit 0
+            ;;
+        --app)
+            WHICH_APP="${2%/}"
+            shift 2
+            ;;
+        --only-up)
+            ONLY_UP='yes'
+            shift 1
+            ;;
+        --keep-up)
+            KEEP_UP='yes'
+            shift 1
+            ;;
+        --attach)
+            ATTACH='yes'
+            shift 1
+            ;;
+        --stop)
+            STOP='yes'
+            shift 1
+            ;;
+        --ps)
+            PS='yes'
+            shift 1
+            ;;
+        --console)
+            CONSOLE='yes'
+            shift 1
+            ;;
+        --ci)
+            IS_CI='yes'
+            UP='up --wait --quiet-pull'
+            shift 1
+            ;;
+        --)
+            shift 1
+            COMMAND="$*"
+            shift $#
+            ;;
+        *)
+            echo "unknown option $1"
+            exit 1
+            ;;
+    esac
+done
+
+if [ "${WHICH_APP}" = 'novalue' ]; then
+    echo "must provide --app arg"
+    help
+    exit 1
+fi
+
+if [ ! -d "${WHICH_APP}" ]; then
+    echo "must provide an existing path for --app arg"
+    help
+    exit 1
+fi
+
+ERLANG_CONTAINER='erlang'
+DOCKER_CT_ENVS_FILE="${WHICH_APP}/docker-ct"
+PROFILE='emqx-enterprise'
+
+if [ -f "$DOCKER_CT_ENVS_FILE" ]; then
+    # shellcheck disable=SC2002
+    CT_DEPS="$(cat "$DOCKER_CT_ENVS_FILE" | xargs)"
+fi
+CT_DEPS="${ERLANG_CONTAINER} ${CT_DEPS:-}"
+
+FILES=( )
+
+for dep in ${CT_DEPS}; do
+    case "${dep}" in
+        erlang)
+            FILES+=( '.ci/docker-compose-file/docker-compose.yaml' )
+            ;;
+        toxiproxy)
+            FILES+=( '.ci/docker-compose-file/docker-compose-toxiproxy.yaml' )
+            ;;
+        influxdb)
+            FILES+=( '.ci/docker-compose-file/docker-compose-influxdb-tcp.yaml'
+                     '.ci/docker-compose-file/docker-compose-influxdb-tls.yaml'
+                     '.ci/docker-compose-file/docker-compose-influxdb-v3.yaml' )
+            ;;
+        mongo)
+            FILES+=( '.ci/docker-compose-file/docker-compose-mongo-single-tcp.yaml'
+                     '.ci/docker-compose-file/docker-compose-mongo-single-tls.yaml' )
+            ;;
+        mongo_rs_sharded)
+            FILES+=( '.ci/docker-compose-file/docker-compose-mongo-replicaset-tcp.yaml'
+                     '.ci/docker-compose-file/docker-compose-mongo-sharded-tcp.yaml' )
+            ;;
+        redis)
+            FILES+=( '.ci/docker-compose-file/docker-compose-redis-single-tcp.yaml'
+                     '.ci/docker-compose-file/docker-compose-redis-single-tls.yaml'
+                     '.ci/docker-compose-file/docker-compose-redis-sentinel-tcp.yaml'
+                     '.ci/docker-compose-file/docker-compose-redis-sentinel-tls.yaml' )
+            ;;
+        redis_cluster)
+            FILES+=( '.ci/docker-compose-file/docker-compose-redis-cluster-tcp.yaml'
+                     '.ci/docker-compose-file/docker-compose-redis-cluster-tls.yaml' )
+            ;;
+        mysql)
+            FILES+=( '.ci/docker-compose-file/docker-compose-mysql-tcp.yaml'
+                     '.ci/docker-compose-file/docker-compose-mysql-tls.yaml' )
+            ;;
+        pgsql)
+            FILES+=( '.ci/docker-compose-file/docker-compose-pgsql-tcp.yaml'
+                     '.ci/docker-compose-file/docker-compose-pgsql-tls.yaml' )
+            ;;
+        kafka)
+            FILES+=( '.ci/docker-compose-file/docker-compose-kafka.yaml' )
+            ;;
+        tdengine)
+            FILES+=( '.ci/docker-compose-file/docker-compose-tdengine-restful.yaml' )
+            ;;
+        clickhouse)
+            FILES+=( '.ci/docker-compose-file/docker-compose-clickhouse.yaml' )
+            ;;
+        dynamo)
+            FILES+=( '.ci/docker-compose-file/docker-compose-dynamo.yaml' )
+            ;;
+        rocketmq)
+            FILES+=( '.ci/docker-compose-file/docker-compose-rocketmq.yaml'
+                     '.ci/docker-compose-file/docker-compose-rocketmq-ssl.yaml' )
+            ;;
+        cassandra)
+            FILES+=( '.ci/docker-compose-file/docker-compose-cassandra.yaml' )
+            ;;
+        sqlserver)
+            SQLSERVER_ODBC_REQUEST='yes'
+            FILES+=( '.ci/docker-compose-file/docker-compose-sqlserver.yaml' )
+            ;;
+        dameng)
+            DAMENG_ODBC_REQUEST='yes'
+            FILES+=( '.ci/docker-compose-file/docker-compose-dameng.yaml' )
+            ;;
+        opents)
+            FILES+=( '.ci/docker-compose-file/docker-compose-opents.yaml' )
+            ;;
+        nats)
+            FILES+=( '.ci/docker-compose-file/docker-compose-nats.yaml' )
+            ;;
+        nats-bridge)
+            FILES+=( '.ci/docker-compose-file/docker-compose-nats-bridge.yaml' )
+            ;;
+        pulsar)
+            FILES+=( '.ci/docker-compose-file/docker-compose-pulsar.yaml' )
+            ;;
+        oracle)
+            FILES+=( '.ci/docker-compose-file/docker-compose-oracle.yaml' )
+            ;;
+        iotdb)
+            FILES+=( '.ci/docker-compose-file/docker-compose-iotdb.yaml' )
+            ;;
+        rabbitmq)
+            FILES+=( '.ci/docker-compose-file/docker-compose-rabbitmq.yaml' )
+            ;;
+        s3)
+            FILES+=( '.ci/docker-compose-file/docker-compose-seaweedfs-tcp.yaml'
+                     '.ci/docker-compose-file/docker-compose-seaweedfs-tls.yaml' )
+            ;;
+        gcp_emulator_pubsub)
+            FILES+=( '.ci/docker-compose-file/docker-compose-gcp-emulator.yaml' )
+            ;;
+        gcp_emulator_bigtable)
+            FILES+=( '.ci/docker-compose-file/docker-compose-gcp-bigtable.yaml' )
+            ;;
+        kinesis)
+            FILES+=( '.ci/docker-compose-file/docker-compose-kinesis.yaml' )
+            ;;
+        greptimedb)
+            FILES+=( '.ci/docker-compose-file/docker-compose-greptimedb.yaml'
+                     '.ci/docker-compose-file/docker-compose-greptimedb-tls.yaml' )
+            ;;
+        ldap)
+            FILES+=( '.ci/docker-compose-file/docker-compose-ldap.yaml' )
+            ;;
+        dex)
+            FILES+=( '.ci/docker-compose-file/docker-compose-dex-oidc.yaml' )
+            ;;
+        keycloak)
+            FILES+=( '.ci/docker-compose-file/docker-compose-keycloak.yaml' )
+            ;;
+        otel)
+            FILES+=( '.ci/docker-compose-file/docker-compose-otel.yaml' )
+            ;;
+        elasticsearch)
+            FILES+=( '.ci/docker-compose-file/docker-compose-elastic-search-tls.yaml' )
+            ;;
+        azurite)
+            FILES+=( '.ci/docker-compose-file/docker-compose-azurite.yaml' )
+            ;;
+        couchbase)
+            FILES+=( '.ci/docker-compose-file/docker-compose-couchbase.yaml' )
+            ;;
+        kdc)
+            FILES+=( '.ci/docker-compose-file/docker-compose-kdc.yaml' )
+            ;;
+        datalayers)
+            FILES+=( '.ci/docker-compose-file/docker-compose-datalayers-tcp.yaml'
+                     '.ci/docker-compose-file/docker-compose-datalayers-tls.yaml' )
+            ;;
+        snowflake)
+            if [[ -z "${SNOWFLAKE_ACCOUNT_ID:-}" ]]; then
+                echo "Snowflake environment requested, but SNOWFLAKE_ACCOUNT_ID is undefined"
+                echo "Will NOT install Snowflake's ODBC drivers"
+            else
+                SNOWFLAKE_ODBC_REQUEST='yes'
+            fi
+            ;;
+        schema-registry)
+          FILES+=( '.ci/docker-compose-file/docker-compose-confluent-schema-registry.yaml' )
+            ;;
+        iceberg)
+            FILES+=( '.ci/docker-compose-file/docker-compose-iceberg.yaml' )
+            ;;
+        spark-query)
+            FILES+=( '.ci/docker-compose-file/docker-compose-spark-query.yaml' )
+            ;;
+        doris)
+            FILES+=( '.ci/docker-compose-file/docker-compose-doris.yaml'
+                     '.ci/docker-compose-file/docker-compose-doris-tls.yaml' )
+            ;;
+        bigquery)
+            FILES+=( '.ci/docker-compose-file/docker-compose-bigquery.yaml' )
+            ;;
+        alloydb)
+            FILES+=( '.ci/docker-compose-file/docker-compose-alloydb.yaml' )
+            ;;
+        cockroachdb)
+            FILES+=( '.ci/docker-compose-file/docker-compose-cockroachdb.yaml' )
+            ;;
+        quasardb)
+            QUASARDB_ODBC_REQUEST='yes'
+            FILES+=( '.ci/docker-compose-file/docker-compose-quasardb.yaml' )
+            ;;
+        *)
+            echo "unknown_ct_dependency $dep"
+            exit 1
+            ;;
+    esac
+done
+
+if [ "$SQLSERVER_ODBC_REQUEST" = 'yes' ] && [ "$STOP" = 'no' ]; then
+    INSTALL_SQLSERVER_ODBC="./scripts/install-msodbc-driver.sh"
+else
+    INSTALL_SQLSERVER_ODBC="echo 'msodbc driver not requested'"
+fi
+
+if [ "$SNOWFLAKE_ODBC_REQUEST" = 'yes' ] && [ "$STOP" = 'no' ]; then
+    INSTALL_SNOWFLAKE_ODBC="./scripts/install-snowflake-driver.sh"
+else
+    INSTALL_SNOWFLAKE_ODBC="echo 'snowflake driver not requested'"
+fi
+
+if [ "$QUASARDB_ODBC_REQUEST" = 'yes' ] && [ "$STOP" = 'no' ]; then
+    INSTALL_QUASARDB_ODBC="./scripts/install-quasardb-driver.sh"
+else
+    INSTALL_QUASARDB_ODBC="echo 'quasardb driver not requested'"
+fi
+
+if [ "$DAMENG_ODBC_REQUEST" = 'yes' ] && [ "$STOP" = 'no' ]; then
+    INSTALL_DAMENG_ODBC="./scripts/install-dameng-odbc.sh"
+else
+    INSTALL_DAMENG_ODBC="echo 'dameng driver not requested'"
+fi
+
+# Single source of truth for the DM8 endpoint: the same values are used to
+# write the DSN, to prepare the client libraries and to run the CT suite (the
+# suite reads DM_HOST/DM_PORT/DM_USER/DM_PASSWORD), so an override cannot make
+# the installer and the tests target different endpoints or credentials.
+DM_HOST="${DM_HOST:-dameng}"
+DM_PORT="${DM_PORT:-5236}"
+DM_USER="${DM_USER:-SYSDBA}"
+DM_PASSWORD="${DM_PASSWORD:-SYSDBA001}"
+# The DSN is written by the installer on the Erlang container, so it needs the
+# host as seen from that container: the same `DM_HOST' the suite connects to.
+DM_CONN_HOST="${DM_CONN_HOST:-$DM_HOST}"
+DM_ENV_ARGS=()
+if [ "$DAMENG_ODBC_REQUEST" = 'yes' ]; then
+    # Forwarded to the CT run as well, otherwise the suite would silently fall
+    # back to its hard-coded defaults.
+    DM_ENV_ARGS=(
+        -e "DM_HOST=$DM_HOST"
+        -e "DM_PORT=$DM_PORT"
+        -e "DM_USER=$DM_USER"
+        -e "DM_PASSWORD=$DM_PASSWORD"
+    )
+fi
+
+for file in "${FILES[@]}"; do
+    DC="$DC -f $file"
+done
+
+DOCKER_USER="$(id -u)"
+export DOCKER_USER
+
+TTY=''
+if [[ -t 1 ]]; then
+    TTY='-t'
+fi
+
+# ensure directories with secrets are created by current user before running compose
+mkdir -p /tmp/emqx-ci/emqx-shared-secret /tmp/emqx-ci-temp-secrets
+
+# ensure any file-backed secrets exist for elasticsearch-related CT
+# dependencies, and export the matching env vars for compose interpolation.
+./scripts/ct/render-env.sh
+# shellcheck disable=SC1091
+source /tmp/emqx-ci-temp-secrets/passwords.env
+
+if [ "$STOP" = 'no' ] && [ "$PS" = 'no' ]; then
+    # the certificates the TLS services mount from .ci/docker-compose-file/certs
+    ./scripts/ct/gen-compose-certs.sh
+    # some left-over log file has to be deleted before a new docker-compose up
+    rm -f '.ci/docker-compose-file/redis/*.log'
+    set +e
+    # shellcheck disable=2086 # no quotes for UP
+    $DC $UP -d -t 0 --build --remove-orphans
+    RESULT=$?
+    if [ $RESULT -ne 0 ]; then
+        mkdir -p _build/test/logs
+        LOG='_build/test/logs/docker-compose.log'
+        echo "Dumping docker-compose log to $LOG"
+        $DC logs --no-color --timestamps > "$LOG"
+        # The log file is not always collected as an artifact, so print the tail
+        # to the job output as well to make container failures diagnosable.
+        $DC logs --no-color --tail 100
+        exit 1
+    fi
+    set -e
+fi
+
+if [ "$DAMENG_ODBC_REQUEST" = 'yes' ] && [ "$STOP" = 'no' ] && [ "$PS" = 'no' ]; then
+    # The DM8 client libraries are taken from the `dameng' container image: the
+    # vendor download is not reachable from GitHub-hosted runners, and the
+    # driver links against sibling libraries from the same directory.
+    # Run as root: the erlang container may be configured to run as the CI user,
+    # which cannot create /opt/dmdbms.
+    DAMENG_CONTAINER="$($DC ps -q dameng)"
+    echo "Copying the DM8 client libraries from $DAMENG_CONTAINER to $ERLANG_CONTAINER"
+    docker exec -u root:root "$DAMENG_CONTAINER" bash -c \
+        'cd /opt/dmdbms/bin && find . -maxdepth 1 -name "*.so*" -print0 | tar -cf - --null -T -' |
+        docker exec -i -u root:root "$ERLANG_CONTAINER" bash -c \
+            'mkdir -p /opt/dmdbms/bin && tar -xf - -C /opt/dmdbms/bin'
+fi
+
+if [ "$DAMENG_ODBC_REQUEST" = 'yes' ] && [ "$STOP" = 'no' ] && [ "$PS" = 'no' ] && [ "$DOCKER_USER" = 'root' ]; then
+    # The block below only runs for a non-root container user; when the
+    # container runs as root the driver registry must be written here.
+    docker exec -i $TTY -u root:root \
+         -e "DM_CONN_HOST=$DM_CONN_HOST" \
+         -e "DM_PORT=$DM_PORT" \
+         -e "DM_USER=$DM_USER" \
+         -e "DM_PASSWORD=$DM_PASSWORD" \
+         "$ERLANG_CONTAINER" bash -c "$INSTALL_DAMENG_ODBC" || true
+fi
+
+if [ "$DOCKER_USER" != "root" ] && [ "$PS" = 'no' ]; then
+    # the user must exist inside the container for `whoami` to work
+    docker exec -i $TTY -u root:root \
+         -e "SFACCOUNT=${SFACCOUNT:-myorg-myacc}" \
+         -e "DM_CONN_HOST=$DM_CONN_HOST" \
+         -e "DM_PORT=$DM_PORT" \
+         -e "DM_USER=$DM_USER" \
+         -e "DM_PASSWORD=$DM_PASSWORD" \
+         "$ERLANG_CONTAINER" bash -c \
+         "useradd --uid $DOCKER_USER -M -d / emqx || true && \
+          mkdir -p /.cache /.hex /.mix && \
+          chown $DOCKER_USER /.cache /.hex /.mix && \
+          chown $DOCKER_USER -R /usr/local/lib/rustup /usr/local/cargo && \
+          openssl rand -base64 -hex 16 > /.erlang.cookie && \
+          chown $DOCKER_USER /.erlang.cookie && \
+          chmod 0400 /.erlang.cookie && \
+          $INSTALL_SQLSERVER_ODBC && \
+          $INSTALL_SNOWFLAKE_ODBC && \
+          $INSTALL_QUASARDB_ODBC && \
+          $INSTALL_DAMENG_ODBC" || true
+fi
+
+if [ "$DAMENG_ODBC_REQUEST" = 'yes' ] && [ "$STOP" = 'no' ] && [ "$PS" = 'no' ]; then
+    # The commands above are intentionally best-effort for the optional ODBC
+    # drivers, so verify the dameng client setup explicitly: the CT suite fails
+    # (instead of skipping) when `--ci` is passed, and a clear error here beats
+    # a confusing connection error later.
+    if ! docker exec "$ERLANG_CONTAINER" test -f /opt/dmdbms/bin/libdodbc.so; then
+        echo "Dameng ODBC driver is missing in $ERLANG_CONTAINER" >&2
+        exit 1
+    fi
+    if ! docker exec "$ERLANG_CONTAINER" grep -q 'DM8 ODBC DRIVER' /etc/odbcinst.ini; then
+        echo "Dameng ODBC driver is not registered in /etc/odbcinst.ini" >&2
+        exit 1
+    fi
+fi
+
+if [ "$ONLY_UP" = 'yes' ]; then
+    exit 0
+fi
+
+set +e
+
+if [ "$STOP" = 'yes' ]; then
+    $DC down -t 0 --remove-orphans
+elif [ "$PS" = 'yes' ]; then
+    $DC ps
+elif [ "$ATTACH" = 'yes' ]; then
+    docker exec -it "$ERLANG_CONTAINER" bash
+elif [ "$CONSOLE" = 'yes' ]; then
+    docker exec -e PROFILE="$PROFILE" -i $TTY "$ERLANG_CONTAINER" bash -c "make run"
+else
+    if [ -z "${COMMAND:-}" ]; then
+        # Pre-compute PKG_VSN on the host to avoid git issues inside Docker
+        # (worktree .git paths are not valid inside the container)
+        HOST_PKG_VSN="${PKG_VSN:-$(./pkg-vsn.sh 2>/dev/null || echo "0.0.0")}"
+        docker exec -e IS_CI="$IS_CI" \
+                    -e PROFILE="$PROFILE" \
+                    -e SUITEGROUP="${SUITEGROUP:-}" \
+                    -e ENABLE_COVER_COMPILE="${ENABLE_COVER_COMPILE:-}" \
+                    -e CT_COVER_EXPORT_PREFIX="${CT_COVER_EXPORT_PREFIX:-}" \
+                    -e PKG_VSN="$HOST_PKG_VSN" \
+                    ${DM_ENV_ARGS[@]+"${DM_ENV_ARGS[@]}"} \
+                    -i $TTY "$ERLANG_CONTAINER" \
+                    bash -c "MIX_ENV=${PROFILE}-test mix deps.get && make ${WHICH_APP}-ct"
+    else
+        # this is an ad-hoc run
+        HOST_PKG_VSN="${PKG_VSN:-$(./pkg-vsn.sh 2>/dev/null || echo "0.0.0")}"
+        docker exec -e IS_CI="$IS_CI" \
+                    -e PROFILE="$PROFILE" \
+                    -e PKG_VSN="$HOST_PKG_VSN" \
+                    ${DM_ENV_ARGS[@]+"${DM_ENV_ARGS[@]}"} \
+                    -i $TTY "$ERLANG_CONTAINER" \
+                    bash -c "$COMMAND"
+    fi
+    RESULT=$?
+    if [ "$RESULT" -ne 0 ]; then
+        LOG='_build/test/logs/docker-compose.log'
+        echo "Dumping docker-compose log to $LOG"
+        $DC logs --no-color --timestamps > "$LOG"
+    fi
+    if [ "$KEEP_UP" != 'yes' ]; then
+        $DC down
+    fi
+    exit "$RESULT"
+fi

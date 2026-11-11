@@ -1,0 +1,1708 @@
+%%--------------------------------------------------------------------
+%% Copyright (c) 2025-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
+%%--------------------------------------------------------------------
+-module(emqx_mgmt_api_certs_SUITE).
+
+-compile(export_all).
+-compile(nowarn_export_all).
+
+-include_lib("eunit/include/eunit.hrl").
+-include_lib("common_test/include/ct.hrl").
+-include_lib("snabbkaffe/include/snabbkaffe.hrl").
+-include_lib("emqx/include/emqx_config.hrl").
+-include_lib("emqx/include/emqx_managed_certs.hrl").
+-include_lib("emqx_dashboard/include/emqx_dashboard_rbac.hrl").
+-include_lib("emqx/include/emqx_hooks.hrl").
+-include_lib("../../emqx_prometheus/include/emqx_prometheus.hrl").
+
+%%------------------------------------------------------------------------------
+%% Defs
+%%------------------------------------------------------------------------------
+
+-import(emqx_common_test_helpers, [on_exit/1]).
+
+-define(local, local).
+-define(cluster, cluster).
+
+-define(AUTH_HEADER_PD_KEY, {?MODULE, auth_header}).
+
+-define(ON(NODE, BODY), erpc:call(NODE, fun() -> BODY end)).
+-define(ON_ALL(NODES, BODY), erpc:multicall(NODES, fun() -> BODY end)).
+
+-define(FILE_KIND_CA_BIN, atom_to_binary(?FILE_KIND_CA)).
+-define(FILE_KIND_CHAIN_BIN, atom_to_binary(?FILE_KIND_CHAIN)).
+-define(FILE_KIND_KEY_BIN, atom_to_binary(?FILE_KIND_KEY)).
+
+%%------------------------------------------------------------------------------
+%% CT boilerplate
+%%------------------------------------------------------------------------------
+
+all() ->
+    emqx_common_test_helpers:all_with_matrix(?MODULE).
+
+groups() ->
+    emqx_common_test_helpers:groups_with_matrix(?MODULE).
+
+init_per_suite(TCConfig) ->
+    TCConfig.
+
+end_per_suite(_TCConfig) ->
+    ok.
+
+init_per_group(?local, TCConfig) ->
+    Apps = emqx_cth_suite:start(
+        [
+            emqx_conf,
+            {emqx_management, #{
+                after_start => fun() ->
+                    ok = emqx_hooks:add(
+                        'namespace.resource_pre_create',
+                        {?MODULE, on_namespace_resource_pre_create, []},
+                        ?HP_HIGHEST
+                    )
+                end
+            }},
+            {emqx_prometheus,
+                "prometheus.enable_basic_auth = false\n"
+                "prometheus.namespaced_metrics_limiter.rate = infinity"},
+            emqx_mgmt_api_test_util:emqx_dashboard()
+        ],
+        #{work_dir => emqx_cth_suite:work_dir(?local, TCConfig)}
+    ),
+    [
+        {apps, Apps},
+        {nodes, [node()]}
+        | TCConfig
+    ];
+init_per_group(?cluster, TCConfig) ->
+    AppSpecs = [
+        emqx_conf,
+        {emqx_management, #{
+            after_start => fun() ->
+                ok = emqx_hooks:add(
+                    'namespace.resource_pre_create',
+                    {?MODULE, on_namespace_resource_pre_create, []},
+                    ?HP_HIGHEST
+                )
+            end
+        }}
+    ],
+    Nodes = emqx_cth_cluster:start(
+        [
+            {mgmt_api_tls1, #{apps => AppSpecs ++ [emqx_mgmt_api_test_util:emqx_dashboard()]}},
+            {mgmt_api_tls2, #{apps => AppSpecs}}
+        ],
+        #{work_dir => emqx_cth_suite:work_dir(?cluster, TCConfig)}
+    ),
+    [
+        {cluster, Nodes},
+        {nodes, Nodes}
+        | TCConfig
+    ];
+init_per_group(_Group, TCConfig) ->
+    TCConfig.
+
+end_per_group(?local, TCConfig) ->
+    Apps = get_config(apps, TCConfig),
+    ok = emqx_cth_suite:stop(Apps),
+    ok;
+end_per_group(?cluster, TCConfig) ->
+    Nodes = get_config(cluster, TCConfig),
+    ok = emqx_cth_cluster:stop(Nodes),
+    ok;
+end_per_group(_Group, _TCConfig) ->
+    ok.
+
+init_per_testcase(_TestCase, TCConfig) ->
+    maybe
+        [N1 | _] ?= get_config(cluster, TCConfig, undefined),
+        AuthHeader = ?ON(N1, emqx_mgmt_api_test_util:auth_header_()),
+        put_auth_header(AuthHeader)
+    end,
+    %% A node whose TLS listeners have no certificate configured generates its
+    %% own default bundle when they start, so the certs dir is not empty to
+    %% begin with. Clear it here as well as in `end_per_testcase/2', so every
+    %% case sees only what it creates itself.
+    Nodes = get_config(nodes, TCConfig),
+    ?ON_ALL(Nodes, ok = emqx_managed_certs:clean_certs_dir()),
+    ok = give_tls_listeners_own_certs(TCConfig),
+    TCConfig.
+
+end_per_testcase(_TestCase, TCConfig) ->
+    Nodes = get_config(nodes, TCConfig),
+    ?ON_ALL(Nodes, ok = emqx_managed_certs:clean_certs_dir()),
+    ok.
+
+%%------------------------------------------------------------------------------
+%% Helper fns
+%%------------------------------------------------------------------------------
+
+on_namespace_resource_pre_create(#{namespace := _Namespace}, ResCtx) ->
+    {stop, ResCtx#{exists := true}}.
+
+get_config(Key, TCConfig) ->
+    case proplists:get_value(Key, TCConfig, undefined) of
+        undefined ->
+            error({missing_required_config, Key, TCConfig});
+        Value ->
+            Value
+    end.
+
+get_config(Key, TCConfig, Default) ->
+    proplists:get_value(Key, TCConfig, Default).
+
+simple_request(Params) ->
+    AuthHeader = get_auth_header(),
+    emqx_mgmt_api_test_util:simple_request(Params#{auth_header => AuthHeader}).
+
+get_auth_header() ->
+    case get(?AUTH_HEADER_PD_KEY) of
+        undefined -> emqx_mgmt_api_test_util:auth_header_();
+        Header -> Header
+    end.
+
+put_auth_header(Header) ->
+    put(?AUTH_HEADER_PD_KEY, Header).
+
+create_managed_ns(Ns) ->
+    URL = emqx_mgmt_api_test_util:api_path(["mt", "ns", Ns]),
+    simple_request(#{
+        method => post,
+        url => URL
+    }).
+
+bearer_auth_header(Token) ->
+    {"Authorization", iolist_to_binary(["Bearer ", Token])}.
+
+create_superuser() ->
+    emqx_common_test_http:create_default_app(),
+    Username = <<"superuser">>,
+    Password = <<"secretP@ss1">>,
+    {ok, _} = emqx_dashboard_admin:add_user(Username, Password, ?ROLE_SUPERUSER, <<"desc">>),
+    {200, #{<<"token">> := Token}} = login(#{<<"username">> => Username, <<"password">> => Password}),
+    {"Authorization", iolist_to_binary(["Bearer ", Token])}.
+
+login(Params) ->
+    URL = emqx_mgmt_api_test_util:api_path(["login"]),
+    emqx_mgmt_api_test_util:simple_request(#{
+        auth_header => [{"no", "auth"}],
+        method => post,
+        url => URL,
+        body => Params
+    }).
+
+create_user_api(Params, AuthHeader) ->
+    URL = emqx_mgmt_api_test_util:api_path(["users"]),
+    emqx_mgmt_api_test_util:simple_request(#{
+        auth_header => AuthHeader,
+        method => post,
+        url => URL,
+        body => Params
+    }).
+
+list_bundles_global() ->
+    URL = emqx_mgmt_api_test_util:api_path(["certs", "global", "list"]),
+    simple_request(#{
+        method => get,
+        url => URL
+    }).
+
+list_bundles_ns(Ns) ->
+    URL = emqx_mgmt_api_test_util:api_path(["certs", "ns", Ns, "list"]),
+    simple_request(#{
+        method => get,
+        url => URL
+    }).
+
+list_files_global(BundleName) ->
+    URL = emqx_mgmt_api_test_util:api_path(["certs", "global", "name", BundleName]),
+    simple_request(#{
+        method => get,
+        url => URL
+    }).
+
+list_files_ns(Ns, BundleName) ->
+    URL = emqx_mgmt_api_test_util:api_path(["certs", "ns", Ns, "name", BundleName]),
+    simple_request(#{
+        method => get,
+        url => URL
+    }).
+
+delete_bundle_global(BundleName) ->
+    URL = emqx_mgmt_api_test_util:api_path(["certs", "global", "name", BundleName]),
+    simple_request(#{
+        method => delete,
+        url => URL
+    }).
+
+force_delete_bundle_global(BundleName) ->
+    URL = emqx_mgmt_api_test_util:api_path(["certs", "global", "name", BundleName]),
+    simple_request(#{
+        method => delete,
+        url => URL,
+        query_params => #{<<"force_delete">> => <<"true">>}
+    }).
+
+force_delete_file_global(BundleName, Kind) ->
+    URL = emqx_mgmt_api_test_util:api_path(["certs", "global", "name", BundleName]),
+    simple_request(#{
+        method => delete,
+        url => URL,
+        query_params => #{<<"kind">> => Kind, <<"force_delete">> => <<"true">>}
+    }).
+
+force_delete_bundle_ns(Ns, BundleName) ->
+    URL = emqx_mgmt_api_test_util:api_path(["certs", "ns", Ns, "name", BundleName]),
+    simple_request(#{
+        method => delete,
+        url => URL,
+        query_params => #{<<"force_delete">> => <<"true">>}
+    }).
+
+delete_file_global(BundleName, Kind) ->
+    URL = emqx_mgmt_api_test_util:api_path(["certs", "global", "name", BundleName]),
+    simple_request(#{
+        method => delete,
+        url => URL,
+        query_params => #{<<"kind">> => Kind}
+    }).
+
+delete_bundle_ns(Ns, BundleName) ->
+    URL = emqx_mgmt_api_test_util:api_path(["certs", "ns", Ns, "name", BundleName]),
+    simple_request(#{
+        method => delete,
+        url => URL
+    }).
+
+delete_file_ns(Ns, BundleName, Kind) ->
+    URL = emqx_mgmt_api_test_util:api_path(["certs", "ns", Ns, "name", BundleName]),
+    simple_request(#{
+        method => delete,
+        url => URL,
+        query_params => #{<<"kind">> => Kind}
+    }).
+
+upload_file_global(BundleName, Kind, Contents) ->
+    URL = emqx_mgmt_api_test_util:api_path(["certs", "global", "name", BundleName]),
+    Body = #{Kind => Contents},
+    simple_request(#{
+        method => post,
+        url => URL,
+        body => Body
+    }).
+
+upload_file_ns(Ns, BundleName, Kind, Contents) ->
+    URL = emqx_mgmt_api_test_util:api_path(["certs", "ns", Ns, "name", BundleName]),
+    Body = #{Kind => Contents},
+    simple_request(#{
+        method => post,
+        url => URL,
+        body => Body
+    }).
+
+upload_files_multipart_global(BundleName, Files) ->
+    URL = emqx_mgmt_api_test_util:api_path(["certs", "global", "name", BundleName]),
+    Res = emqx_mgmt_api_test_util:upload_request(#{
+        url => URL,
+        files => Files,
+        mime_type => <<"application/octet-stream">>,
+        other_params => [],
+        auth_token => get_auth_header(),
+        method => post
+    }),
+    emqx_mgmt_api_test_util:simplify_decode_result(Res).
+
+upload_files_multipart_ns(Ns, BundleName, Files) ->
+    URL = emqx_mgmt_api_test_util:api_path(["certs", "ns", Ns, "name", BundleName]),
+    Res = emqx_mgmt_api_test_util:upload_request(#{
+        url => URL,
+        files => Files,
+        mime_type => <<"application/octet-stream">>,
+        other_params => [],
+        auth_token => get_auth_header(),
+        method => post
+    }),
+    emqx_mgmt_api_test_util:simplify_decode_result(Res).
+
+clean_pem_cache_api() ->
+    URL = emqx_mgmt_api_test_util:api_path(["certs", "pem_cache_clean"]),
+    simple_request(#{
+        method => post,
+        url => URL
+    }).
+
+ssl_listener_port() ->
+    case emqx_config:get([listeners, ssl, default, bind]) of
+        Port when is_integer(Port) -> Port;
+        {_Addr, Port} -> Port
+    end.
+
+populate_pem_cache() ->
+    %% A TLS handshake against the local default SSL listener makes `ssl` read the
+    %% listener certificate files through `ssl_pem_cache`.
+    Port = ssl_listener_port(),
+    {ok, Sock} = ssl:connect(
+        "127.0.0.1", Port, [{verify, verify_none}, {active, false}], 5_000
+    ),
+    ok = ssl:close(Sock),
+    %% `ssl_pem_cache` inserts entries with async casts; a synchronous call flushes
+    %% its queue so all entries from the handshake are in the table before the test
+    %% proceeds.
+    _ = sys:get_state(ssl_pem_cache),
+    ok.
+
+ssl_listener_certfile() ->
+    %% `ssl_pem_cache` keys entries by the resolved path the listener passes to
+    %% `ssl`; the checked config may still hold `${EMQX_ETC_DIR}`.
+    Raw = emqx_config:get([listeners, ssl, default, ssl_options, certfile]),
+    emqx_utils_conv:bin(emqx_schema:naive_env_interpolation(Raw)).
+
+%% This suite is about managed certificates and the PEM cache, not about the
+%% certificate a node generates for itself.  Give the TLS listeners certificates
+%% of their own so every case starts from the same listener config, and so a case
+%% that reads a listener's `certfile' has one to read.
+give_tls_listeners_own_certs(TCConfig) ->
+    %% Written to a path both cluster nodes can read, and configured as a path
+    %% rather than inline PEM: inline content is saved into each node's own
+    %% mutable certs dir, so the nodes would disagree on where the file is.
+    Dir = filename:join(get_config(priv_dir, TCConfig), "listener_certs"),
+    ok = filelib:ensure_path(Dir),
+    #{cert_key := Root} = gen_cert(#{key => ec, issuer => root}),
+    Certs = lists:map(
+        fun(Type) ->
+            #{cert_pem := Cert, key_pem := Key} = gen_cert(#{key => ec, issuer => Root}),
+            CertFile = filename:join(Dir, atom_to_list(Type) ++ "-cert.pem"),
+            KeyFile = filename:join(Dir, atom_to_list(Type) ++ "-key.pem"),
+            ok = file:write_file(CertFile, Cert),
+            ok = file:write_file(KeyFile, Key),
+            {Type, emqx_utils_conv:bin(CertFile), emqx_utils_conv:bin(KeyFile)}
+        end,
+        [ssl, wss]
+    ),
+    [N1 | _] = get_config(nodes, TCConfig),
+    %% Only the `ssl_options' subtree: a whole-listener update would also push this
+    %% node's `bind' onto the others.
+    ?ON(N1, begin
+        lists:foreach(
+            fun({Type, CertFile, KeyFile}) ->
+                {ok, _} = emqx_conf:update(
+                    [listeners, Type, default],
+                    {update, #{
+                        <<"ssl_options">> => #{
+                            <<"certfile">> => CertFile,
+                            <<"keyfile">> => KeyFile,
+                            <<"managed_certs">> => null
+                        }
+                    }},
+                    #{override_to => cluster}
+                )
+            end,
+            Certs
+        )
+    end),
+    ok.
+
+%% Restores a listener to the config a test started from.
+%%
+%% The update API deep-merges, so a certificate key a test added survives a plain
+%% round-trip of the original body: removing one takes an explicit `null'.  Clear
+%% every certificate key the pristine config did not itself carry.
+restore_listener(Type, Name, Listener) ->
+    SSLOpts0 = maps:get(<<"ssl_options">>, Listener, #{}),
+    SSLOpts = lists:foldl(
+        fun(Key, Acc) ->
+            case is_map_key(Key, Acc) of
+                true -> Acc;
+                false -> Acc#{Key => null}
+            end
+        end,
+        SSLOpts0,
+        [<<"certfile">>, <<"keyfile">>, <<"cacertfile">>, <<"managed_certs">>]
+    ),
+    {200, _} = update_listener_api(Type, Name, Listener#{<<"ssl_options">> => SSLOpts}),
+    ok.
+
+shift_date(Date, Offset) ->
+    calendar:gregorian_days_to_date(calendar:date_to_gregorian_days(Date) + Offset).
+
+gen_cert(Opts) ->
+    #{
+        cert := Cert,
+        key := Key,
+        cert_pem := CertPEM,
+        key_pem := KeyPEM
+    } = emqx_cth_tls:gen_cert_pem(Opts),
+    #{
+        cert_key => {Cert, Key},
+        cert_pem => CertPEM,
+        key_pem => KeyPEM
+    }.
+
+pem_encode(X, undefined = _Password) ->
+    public_key:pem_encode([X]);
+pem_encode(X, Password) when is_binary(Password) ->
+    Y = public_key:pem_entry_decode(X),
+    Type = element(1, X),
+    Salt = crypto:strong_rand_bytes(8),
+    Entry = public_key:pem_entry_encode(Type, Y, {{"DES-EDE3-CBC", Salt}, str(Password)}),
+    public_key:pem_encode([Entry]).
+
+str(X) -> emqx_utils_conv:str(X).
+
+assert_same_bundles(Namespace, TCConfig) ->
+    Nodes = get_config(nodes, TCConfig),
+    Bundles0 = [FirstBundle0 | _] = ?ON_ALL(Nodes, emqx_managed_certs:list_bundles(Namespace)),
+    ?assertEqual([FirstBundle0], lists:usort(Bundles0)),
+    {ok, Bundles1} = FirstBundle0,
+    Bundles2 =
+        [FirstBundle2 | _] = ?ON_ALL(Nodes, begin
+            lists:foldl(
+                fun(BundleName, Acc) ->
+                    Hashes = get_file_hashes(Namespace, BundleName),
+                    Acc#{BundleName => Hashes}
+                end,
+                #{},
+                Bundles1
+            )
+        end),
+    ?assertEqual([FirstBundle2], lists:usort(Bundles2)),
+    ok.
+
+get_file_hashes(Namespace, BundleName) ->
+    maybe
+        {ok, Files0} ?= emqx_managed_certs:list_managed_files(Namespace, BundleName),
+        Files =
+            maps:fold(
+                fun(Kind, #{path := Path}, Acc) ->
+                    {ok, Contents} = file:read_file(Path),
+                    MD5 = md5(Contents),
+                    Acc#{Kind => MD5}
+                end,
+                #{},
+                Files0
+            ),
+        {ok, Files}
+    end.
+
+read_md5(Path) ->
+    {ok, Contents} = file:read_file(Path),
+    md5(Contents).
+
+md5(Data) ->
+    erlang:md5(Data).
+
+get_prometheus_stats(Mode, Format) ->
+    Headers =
+        case Format of
+            json -> [{"accept", "application/json"}];
+            prometheus -> []
+        end,
+    QueryString = uri_string:compose_query([{"mode", atom_to_binary(Mode)}]),
+    URL = emqx_mgmt_api_test_util:api_path(["prometheus", "stats"]),
+    {Status, Response} = emqx_mgmt_api_test_util:simple_request(#{
+        method => get,
+        url => URL,
+        extra_headers => Headers,
+        query_params => QueryString,
+        auth_header => {"no", "auth"}
+    }),
+    case Format of
+        json ->
+            {Status, Response};
+        prometheus when Status == 200 ->
+            {Status, parse_prometheus(Response)};
+        prometheus ->
+            {Status, Response}
+    end.
+
+parse_prometheus(RawData) ->
+    lists:foldl(
+        fun
+            (<<"#", _/binary>>, Acc) ->
+                Acc;
+            (Line, Acc) ->
+                {Name, Labels, Value} = parse_prometheus_line(Line),
+                maps:update_with(
+                    Name,
+                    fun(Old) -> Old#{Labels => Value} end,
+                    #{Labels => Value},
+                    Acc
+                )
+        end,
+        #{},
+        binary:split(iolist_to_binary(RawData), <<"\n">>, [global, trim_all])
+    ).
+
+parse_prometheus_line(Line) ->
+    RE = <<"(?<name>[a-z0-9A-Z_]+)(\\{(?<labels>[^)]*)\\})? *(?<value>[0-9]+(\\.[0-9]+)?)">>,
+    {match, [Name, Labels0, Value0]} = re:run(
+        Line, RE, [{capture, [<<"name">>, <<"labels">>, <<"value">>], binary}]
+    ),
+    Labels = parse_prometheus_labels(Labels0),
+    Value =
+        try
+            binary_to_float(Value0)
+        catch
+            error:badarg ->
+                binary_to_integer(Value0)
+        end,
+    {Name, Labels, Value}.
+
+parse_prometheus_labels(<<"">>) ->
+    #{};
+parse_prometheus_labels(Labels) ->
+    lists:foldl(
+        fun(Label, Acc) ->
+            [K, V0] = binary:split(Label, <<"=">>),
+            V = binary:replace(V0, <<"\"">>, <<"">>, [global]),
+            Acc#{K => V}
+        end,
+        #{},
+        binary:split(Labels, <<",">>, [global])
+    ).
+
+get_listener_api(Type, Name) ->
+    Id0 = emqx_listeners:listener_id(Type, Name),
+    Id = atom_to_binary(Id0),
+    URL = emqx_mgmt_api_test_util:api_path(["listeners", Id]),
+    simple_request(#{
+        method => get,
+        url => URL
+    }).
+
+update_listener_api(Type, Name, Conf) ->
+    Id0 = emqx_listeners:listener_id(Type, Name),
+    Id = atom_to_binary(Id0),
+    URL = emqx_mgmt_api_test_util:api_path(["listeners", Id]),
+    simple_request(#{
+        method => put,
+        url => URL,
+        body => Conf
+    }).
+
+%%------------------------------------------------------------------------------
+%% Test cases
+%%------------------------------------------------------------------------------
+
+%% Some tests for CRUD operations related to global and namespaced certificate files.
+t_crud() ->
+    [{matrix, true}].
+t_crud(matrix) ->
+    [[?local], [?cluster]];
+t_crud(TCConfig) when is_list(TCConfig) ->
+    Ns1 = <<"some_namespace1">>,
+    Ns2 = <<"some_namespace2">>,
+
+    ?assertMatch({200, []}, list_bundles_global()),
+    %% List as empty even if namespace is not explictly created.
+    ?assertMatch({200, []}, list_bundles_ns(Ns1)),
+    assert_same_bundles(?global_ns, TCConfig),
+    assert_same_bundles(Ns1, TCConfig),
+
+    Bundle1 = <<"bundle1">>,
+
+    %% Should we instead return an empty list?
+    ?assertMatch({404, _}, list_files_global(Bundle1)),
+    ?assertMatch({404, _}, list_files_ns(Ns1, Bundle1)),
+
+    ?assertMatch({204, _}, delete_bundle_global(Bundle1)),
+    ?assertMatch({204, _}, delete_bundle_ns(Ns1, Bundle1)),
+
+    %% Still list as empty after namespace is explictly created.
+    %% {204, _} = create_managed_ns(Ns),
+    %% ?assertMatch({200, []}, list_bundles_ns(Ns)),
+    %% ?assertMatch({404, _}, list_files_ns(Ns, Bundle1)),
+    %% ?assertMatch({204, _}, delete_bundle_ns(Ns, Bundle1)),
+
+    %% Upload some files
+    #{
+        cert_key := CertKeyRoot,
+        cert_pem := CA1
+    } = gen_cert(#{key => ec, issuer => root}),
+    #{
+        cert_pem := Cert1,
+        key_pem := Key1
+    } = gen_cert(#{key => ec, issuer => CertKeyRoot}),
+
+    ?assertMatch({204, _}, upload_file_global(Bundle1, ?FILE_KIND_CA, CA1)),
+
+    ?assertMatch({200, [#{<<"name">> := Bundle1}]}, list_bundles_global()),
+    ?assertMatch({200, []}, list_bundles_ns(Ns1)),
+    ?assertMatch(
+        {200, #{<<"ca">> := #{<<"path">> := _}}},
+        list_files_global(Bundle1)
+    ),
+    ?assertMatch({404, _}, list_files_ns(Ns1, Bundle1)),
+    ?assertMatch({404, _}, list_files_ns(Ns2, Bundle1)),
+
+    %% Expected contents found on all nodes.
+    {200, #{<<"ca">> := #{<<"path">> := PathCAGlobal1}}} = list_files_global(Bundle1),
+    ?assertEqual(md5(CA1), read_md5(PathCAGlobal1)),
+    assert_same_bundles(?global_ns, TCConfig),
+    assert_same_bundles(Ns1, TCConfig),
+
+    %% Upload new contents; should replace at the same path
+    #{cert_pem := CA2} = gen_cert(#{key => ec, issuer => root}),
+    ?assertMatch({204, _}, upload_file_global(Bundle1, ?FILE_KIND_CA, CA2)),
+    ?assertMatch(
+        {200, #{<<"ca">> := #{<<"path">> := PathCAGlobal1}}},
+        list_files_global(Bundle1)
+    ),
+    ?assertEqual(md5(CA2), read_md5(PathCAGlobal1)),
+    assert_same_bundles(?global_ns, TCConfig),
+    assert_same_bundles(Ns1, TCConfig),
+
+    %% Upload other files (and original CA, for consistency)
+    ?assertMatch({204, _}, upload_file_global(Bundle1, ?FILE_KIND_CA, CA1)),
+    ?assertMatch({204, _}, upload_file_global(Bundle1, ?FILE_KIND_CHAIN, Cert1)),
+    ?assertMatch({204, _}, upload_file_global(Bundle1, ?FILE_KIND_KEY, Key1)),
+
+    ?assertMatch(
+        {200, #{
+            <<"ca">> := #{<<"path">> := _},
+            <<"chain">> := #{<<"path">> := _},
+            <<"key">> := #{<<"path">> := _}
+        }},
+        list_files_global(Bundle1)
+    ),
+    {200, #{
+        <<"chain">> := #{<<"path">> := PathCertGlobal1},
+        <<"key">> := #{<<"path">> := PathKeyGlobal1}
+    }} = list_files_global(Bundle1),
+    ?assertEqual(md5(Cert1), read_md5(PathCertGlobal1)),
+    ?assertEqual(md5(Key1), read_md5(PathKeyGlobal1)),
+    assert_same_bundles(?global_ns, TCConfig),
+
+    %% Upload stuff to namespaced bundle
+    #{
+        cert_key := CertKeyRoot3,
+        cert_pem := CA3
+    } = gen_cert(#{key => ec, issuer => root}),
+    #{
+        cert_pem := Cert2,
+        key_pem := Key2
+    } = gen_cert(#{key => ec, issuer => CertKeyRoot3}),
+
+    ?assertMatch({204, _}, upload_file_ns(Ns1, Bundle1, ?FILE_KIND_CA, CA3)),
+    ?assertMatch({204, _}, upload_file_ns(Ns1, Bundle1, ?FILE_KIND_CHAIN, Cert2)),
+    ?assertMatch({204, _}, upload_file_ns(Ns1, Bundle1, ?FILE_KIND_KEY, Key2)),
+    ?assertMatch(
+        {200, #{
+            <<"ca">> := #{<<"path">> := _},
+            <<"chain">> := #{<<"path">> := _},
+            <<"key">> := #{<<"path">> := _}
+        }},
+        list_files_ns(Ns1, Bundle1)
+    ),
+    {200, #{
+        <<"ca">> := #{<<"path">> := PathCANs1},
+        <<"chain">> := #{<<"path">> := PathCertNs1},
+        <<"key">> := #{<<"path">> := PathKeyNs1}
+    }} = list_files_ns(Ns1, Bundle1),
+    ?assertEqual(md5(CA3), read_md5(PathCANs1)),
+    ?assertEqual(md5(Cert2), read_md5(PathCertNs1)),
+    ?assertEqual(md5(Key2), read_md5(PathKeyNs1)),
+
+    %% Other existing files are untouched
+    ?assertEqual(md5(CA1), read_md5(PathCAGlobal1)),
+    ?assertEqual(md5(Cert1), read_md5(PathCertGlobal1)),
+    ?assertEqual(md5(Key1), read_md5(PathKeyGlobal1)),
+
+    ?assertMatch({404, _}, list_files_ns(Ns2, Bundle1)),
+
+    %% Different namespaces and bundles are independent
+    #{
+        cert_key := CertKeyRoot4,
+        cert_pem := CA4
+    } = gen_cert(#{key => ec, issuer => root}),
+    #{
+        cert_pem := Cert3,
+        key_pem := Key3
+    } = gen_cert(#{key => ec, issuer => CertKeyRoot4}),
+
+    Bundle2 = <<"bundle2">>,
+
+    ?assertMatch({204, _}, upload_file_ns(Ns2, Bundle1, ?FILE_KIND_CA, CA4)),
+
+    ?assertMatch({204, _}, upload_file_ns(Ns2, Bundle2, ?FILE_KIND_CHAIN, Cert3)),
+    ?assertMatch({204, _}, upload_file_ns(Ns2, Bundle2, ?FILE_KIND_KEY, Key3)),
+
+    ?assertNotMatch(
+        {200, #{
+            <<"chain">> := #{<<"path">> := _},
+            <<"key">> := #{<<"path">> := _}
+        }},
+        list_files_ns(Ns2, Bundle1)
+    ),
+    ?assertNotMatch(
+        {200, #{<<"ca">> := #{<<"path">> := _}}},
+        list_files_ns(Ns2, Bundle2)
+    ),
+
+    ?assertMatch({200, [#{<<"name">> := Bundle1}]}, list_bundles_global()),
+    ?assertMatch({200, [#{<<"name">> := Bundle1}]}, list_bundles_ns(Ns1)),
+    ?assertMatch({200, [#{<<"name">> := Bundle1}, #{<<"name">> := Bundle2}]}, list_bundles_ns(Ns2)),
+
+    %% Delete
+    ?assertMatch({204, _}, delete_bundle_ns(Ns2, Bundle1)),
+    ?assertMatch({404, _}, list_files_ns(Ns2, Bundle1)),
+    ?assertMatch({200, _}, list_files_ns(Ns2, Bundle2)),
+    ?assertMatch({200, _}, list_files_ns(Ns1, Bundle1)),
+    ?assertMatch({200, _}, list_files_global(Bundle1)),
+
+    %% Deleting specific files
+    ?assertMatch({204, _}, delete_file_ns(Ns2, Bundle2, ?FILE_KIND_KEY_BIN)),
+    KindCABin = ?FILE_KIND_CA_BIN,
+    KindKeyBin = ?FILE_KIND_KEY_BIN,
+    KindChainBin = ?FILE_KIND_CHAIN_BIN,
+    ?assertMatch(
+        {200, Files} when
+            not is_map_key(KindKeyBin, Files) andalso
+                is_map_key(KindChainBin, Files),
+        list_files_ns(Ns2, Bundle2)
+    ),
+    %% Idempotency
+    ?assertMatch({204, _}, delete_file_ns(Ns2, Bundle2, ?FILE_KIND_KEY_BIN)),
+    ?assertMatch(
+        {200, Files} when
+            not is_map_key(KindKeyBin, Files) andalso
+                is_map_key(KindChainBin, Files),
+        list_files_ns(Ns2, Bundle2)
+    ),
+
+    ?assertMatch({204, _}, delete_bundle_ns(Ns2, Bundle2)),
+    ?assertMatch({404, _}, list_files_ns(Ns2, Bundle1)),
+    ?assertMatch({404, _}, list_files_ns(Ns2, Bundle2)),
+    ?assertMatch({200, _}, list_files_ns(Ns1, Bundle1)),
+    ?assertMatch({200, _}, list_files_global(Bundle1)),
+
+    ?assertMatch({200, [#{<<"name">> := Bundle1}]}, list_bundles_global()),
+    ?assertMatch({200, [#{<<"name">> := Bundle1}]}, list_bundles_ns(Ns1)),
+    ?assertMatch({200, []}, list_bundles_ns(Ns2)),
+
+    %% Other existing files are untouched
+    ?assertEqual(md5(CA3), read_md5(PathCANs1)),
+    ?assertEqual(md5(Cert2), read_md5(PathCertNs1)),
+    ?assertEqual(md5(Key2), read_md5(PathKeyNs1)),
+    assert_same_bundles(?global_ns, TCConfig),
+    assert_same_bundles(Ns1, TCConfig),
+    assert_same_bundles(Ns2, TCConfig),
+
+    %% Cleanup other bundles
+    ?assertMatch({204, _}, delete_bundle_ns(Ns1, Bundle1)),
+
+    %% Deleting specific files (global)
+    ?assertMatch({204, _}, delete_file_global(Bundle1, ?FILE_KIND_KEY_BIN)),
+    ?assertMatch(
+        {200, Files} when
+            not is_map_key(KindKeyBin, Files) andalso
+                is_map_key(KindChainBin, Files),
+        list_files_global(Bundle1)
+    ),
+    %% Idempotency
+    ?assertMatch({204, _}, delete_file_global(Bundle1, ?FILE_KIND_CA_BIN)),
+    ?assertMatch(
+        {200, Files} when
+            not is_map_key(KindCABin, Files) andalso
+                is_map_key(KindChainBin, Files),
+        list_files_global(Bundle1)
+    ),
+
+    ?assertMatch({204, _}, delete_bundle_global(Bundle1)),
+    %% Idempotent responses
+    ?assertMatch({204, _}, delete_bundle_ns(Ns1, Bundle1)),
+    ?assertMatch({204, _}, delete_bundle_global(Bundle1)),
+
+    ?assertMatch({200, []}, list_bundles_global()),
+    ?assertMatch({200, []}, list_bundles_ns(Ns1)),
+    ?assertMatch({200, []}, list_bundles_ns(Ns2)),
+
+    assert_same_bundles(?global_ns, TCConfig),
+    assert_same_bundles(Ns1, TCConfig),
+    assert_same_bundles(Ns2, TCConfig),
+
+    %% Upload password protected key
+    #{cert_key := CertKeyRoot5} = gen_cert(#{key => ec, issuer => root}),
+    Password4 = <<"secretP@s$">>,
+    #{key_pem := Key4} = gen_cert(#{
+        key => ec,
+        issuer => CertKeyRoot5,
+        password => Password4
+    }),
+    ?assertMatch({204, _}, upload_file_global(Bundle1, ?FILE_KIND_KEY, Key4)),
+    ?assertMatch({204, _}, upload_file_global(Bundle1, ?FILE_KIND_KEY_PASSWORD, Password4)),
+    ?assertMatch(
+        {200, #{
+            <<"key">> := #{<<"path">> := _},
+            <<"key_password">> := #{<<"path">> := _}
+        }},
+        list_files_global(Bundle1)
+    ),
+    assert_same_bundles(?global_ns, TCConfig),
+
+    ?assertMatch({204, _}, delete_bundle_global(Bundle1)),
+
+    %% Upload account key before others.  The other files should be rejected, since they
+    %% will be controlled by the ACME client.  We still allow updating CA and the account
+    %% key itself, though.
+    ?assertMatch({204, _}, upload_file_global(Bundle1, ?FILE_KIND_ACC_KEY, Key3)),
+    ?assertMatch({400, _}, upload_file_global(Bundle1, ?FILE_KIND_KEY, Key4)),
+    ?assertMatch({400, _}, upload_file_global(Bundle1, ?FILE_KIND_CHAIN, Cert3)),
+    %% Update allowed
+    ?assertMatch({204, _}, upload_file_global(Bundle1, ?FILE_KIND_ACC_KEY, Key3)),
+    ?assertMatch({204, _}, upload_file_global(Bundle1, ?FILE_KIND_CA, CA4)),
+
+    %% Uploading an unknown kind
+    ?assertMatch({400, _}, upload_file_global(Bundle1, some_unknown_type, Key3)),
+    ?assertMatch({400, _}, upload_file_ns(Ns1, Bundle1, some_unknown_type, Key3)),
+
+    ok.
+
+-doc """
+Checks that we restrict the bundle name to a valid format.
+""".
+t_bundle_name_validation() ->
+    [{matrix, true}].
+t_bundle_name_validation(matrix) ->
+    [[?local]];
+t_bundle_name_validation(TCConfig) when is_list(TCConfig) ->
+    Ns = <<"some_ns">>,
+    BadBundleNames = [
+        binary:copy(<<"a">>, 255),
+        <<"-">>,
+        <<":">>,
+        <<"*">>,
+        <<"ç"/utf8>>
+    ],
+    #{cert_pem := CA} = gen_cert(#{key => ec, issuer => root}),
+    lists:foreach(
+        fun(BadBundleName0) ->
+            ct:pal("bad bundle name: ~ts", [BadBundleName0]),
+            BadBundleName = uri_string:quote(BadBundleName0),
+            ?assertMatch(
+                {400, #{
+                    <<"message">> := #{
+                        <<"kind">> := <<"validation_error">>,
+                        <<"path">> := <<"name">>,
+                        <<"value">> := BadBundleName0
+                    }
+                }},
+                upload_file_global(BadBundleName, ?FILE_KIND_CA, CA),
+                #{bundle_name => BadBundleName}
+            ),
+            ?assertMatch(
+                {400, #{
+                    <<"message">> := #{
+                        <<"kind">> := <<"validation_error">>,
+                        <<"path">> := <<"name">>,
+                        <<"value">> := BadBundleName0
+                    }
+                }},
+                upload_file_ns(Ns, BadBundleName, ?FILE_KIND_CA, CA),
+                #{bundle_name => BadBundleName}
+            ),
+            ok
+        end,
+        BadBundleNames
+    ),
+
+    ok.
+
+-doc """
+Checks that we can list the contents of namespaced bundle dirs when escaping/quoting is
+necessary.
+
+Namespaces currently have no restriction on them, so they need to be escaped.
+""".
+t_escape_namespace_in_dirs() ->
+    [{matrix, true}].
+t_escape_namespace_in_dirs(matrix) ->
+    [[?local]];
+t_escape_namespace_in_dirs(TCConfig) when is_list(TCConfig) ->
+    NsThatNeedsQuoting = <<":bad*nś-!">>,
+    %% We need to quote it here, otherwise it's not a valid HTTP request path.
+    NsQuoted = uri_string:quote(NsThatNeedsQuoting),
+    BundleName = <<"a">>,
+    #{cert_pem := CA} = gen_cert(#{key => ec, issuer => root}),
+    ?assertMatch({204, _}, upload_file_ns(NsQuoted, BundleName, ?FILE_KIND_CA, CA)),
+    ?assertMatch({200, [#{<<"name">> := BundleName}]}, list_bundles_ns(NsQuoted)),
+    ?assertMatch(
+        {200, #{<<"ca">> := #{<<"path">> := _}}},
+        list_files_ns(NsQuoted, BundleName)
+    ),
+    {200, #{<<"ca">> := #{<<"path">> := Path}}} = list_files_ns(NsQuoted, BundleName),
+    %% Path segments are quoted to avoid bad characters.
+    ?assertEqual(match, re:run(Path, NsQuoted, [{capture, none}]), #{path => Path}),
+    ok.
+
+-doc """
+A namespace whose name is not a single safe path component (`.`, `..`) must
+not reach another namespace's or the global certificate directory. Managed
+namespace creation on 6.3 rejects such names, but implicit and pre-existing
+namespaces are not validated, so `emqx_managed_certs` guards the path itself.
+""".
+t_namespace_path_traversal_rejected() ->
+    [{matrix, true}].
+t_namespace_path_traversal_rejected(matrix) ->
+    [[?local]];
+t_namespace_path_traversal_rejected(TCConfig) when is_list(TCConfig) ->
+    Victim = <<"victim">>,
+    #{cert_pem := CA} = gen_cert(#{key => ec, issuer => root}),
+    %% A global bundle that a traversing namespace must not be able to reach.
+    ?assertMatch({204, _}, upload_file_global(Victim, ?FILE_KIND_CA, CA)),
+    ?assertMatch({200, [#{<<"name">> := Victim}]}, list_bundles_global()),
+    {200, #{<<"ca">> := #{<<"path">> := VictimPath}}} = list_files_global(Victim),
+    VictimMd5 = read_md5(VictimPath),
+    lists:foreach(
+        fun(Ns) ->
+            ?assertEqual(
+                {error, bad_namespace},
+                emqx_managed_certs:list_bundles(Ns),
+                #{ns => Ns}
+            ),
+            ?assertEqual(
+                {error, bad_namespace},
+                emqx_managed_certs:list_managed_files(Ns, Victim),
+                #{ns => Ns}
+            ),
+            ?assertEqual(
+                {error, bad_namespace},
+                emqx_managed_certs:add_managed_files_v1(Ns, Victim, #{?FILE_KIND_CA => CA}),
+                #{ns => Ns}
+            ),
+            ?assertEqual(
+                {error, bad_namespace},
+                emqx_managed_certs:delete_managed_file_v1(Ns, Victim, ?FILE_KIND_CA),
+                #{ns => Ns}
+            ),
+            ?assertEqual(
+                {error, bad_namespace},
+                emqx_managed_certs:delete_bundle_v1(Ns, Victim),
+                #{ns => Ns}
+            )
+        end,
+        [<<"..">>, <<".">>, <<>>, <<"../..">>, <<"./..">>]
+    ),
+    %% The global bundle survived every attempt with its content intact.
+    ?assertMatch({200, [#{<<"name">> := Victim}]}, list_bundles_global()),
+    ?assertEqual(VictimMd5, read_md5(VictimPath)),
+    ok.
+
+-doc """
+Smoke tests for multipart, multi-file uploads.
+""".
+t_smoke_multipart() ->
+    [{matrix, true}].
+t_smoke_multipart(matrix) ->
+    [[?local], [?cluster]];
+t_smoke_multipart(TCConfig) when is_list(TCConfig) ->
+    #{
+        cert_key := CertKeyRoot1,
+        cert_pem := CA1
+    } = gen_cert(#{key => ec, issuer => root}),
+    #{
+        cert_pem := Cert1,
+        key_pem := Key1
+    } = gen_cert(#{key => ec, issuer => CertKeyRoot1}),
+
+    Bundle1 = <<"bundle1">>,
+    Files1 = [
+        {?FILE_KIND_CA_BIN, <<"unused_ca_filename.pem">>, CA1},
+        {?FILE_KIND_CHAIN_BIN, <<"unused_chain_filename.pem">>, Cert1},
+        {?FILE_KIND_KEY_BIN, <<"unused_key_filename.pem">>, Key1}
+    ],
+    ?assertMatch({204, _}, upload_files_multipart_global(Bundle1, Files1)),
+    assert_same_bundles(?global_ns, TCConfig),
+
+    {200, #{
+        <<"ca">> := #{<<"path">> := PathCAGlobal1},
+        <<"chain">> := #{<<"path">> := PathCertGlobal1},
+        <<"key">> := #{<<"path">> := PathKeyGlobal1}
+    }} = list_files_global(Bundle1),
+    ?assertEqual(md5(CA1), read_md5(PathCAGlobal1)),
+    ?assertEqual(md5(Cert1), read_md5(PathCertGlobal1)),
+    ?assertEqual(md5(Key1), read_md5(PathKeyGlobal1)),
+
+    Ns2 = <<"ns2">>,
+    Bundle2 = <<"bundle2">>,
+    #{
+        cert_key := CertKeyRoot2,
+        cert_pem := CA2
+    } = gen_cert(#{key => ec, issuer => root}),
+    #{
+        cert_pem := Cert2,
+        key_pem := Key2
+    } = gen_cert(#{key => ec, issuer => CertKeyRoot2}),
+    Files2 = [
+        {?FILE_KIND_CA_BIN, <<"unused_ca_filename.pem">>, CA2},
+        {?FILE_KIND_CHAIN_BIN, <<"unused_chain_filename.pem">>, Cert2},
+        {?FILE_KIND_KEY_BIN, <<"unused_key_filename.pem">>, Key2}
+    ],
+    ?assertMatch({204, _}, upload_files_multipart_ns(Ns2, Bundle2, Files2)),
+    assert_same_bundles(Ns2, TCConfig),
+
+    {200, #{
+        <<"ca">> := #{<<"path">> := PathCANs2},
+        <<"chain">> := #{<<"path">> := PathCertNs2},
+        <<"key">> := #{<<"path">> := PathKeyNs2}
+    }} = list_files_ns(Ns2, Bundle2),
+    ?assertEqual(md5(CA2), read_md5(PathCANs2)),
+    ?assertEqual(md5(Cert2), read_md5(PathCertNs2)),
+    ?assertEqual(md5(Key2), read_md5(PathKeyNs2)),
+
+    %% Uploading nothing
+    ?assertMatch({400, _}, upload_files_multipart_global(Bundle2, [])),
+    ?assertMatch({400, _}, upload_files_multipart_ns(Ns2, Bundle2, [])),
+
+    ok.
+
+-doc """
+Smoke tests that verify that a namespaced admin can operate on managed bundles in its own
+namespace, but not others.
+""".
+t_namespaced_admin_crud() ->
+    [{matrix, true}].
+t_namespaced_admin_crud(matrix) ->
+    [[?local]];
+t_namespaced_admin_crud(TCConfig) when is_list(TCConfig) ->
+    GlobalAdminHeader = create_superuser(),
+    Username1 = <<"iminans">>,
+    Password1 = <<"superSecureP@ss">>,
+    Ns1 = <<"ns1">>,
+    AdminRole1 = <<"ns:", Ns1/binary, "::", ?ROLE_SUPERUSER/binary>>,
+    ?assertMatch(
+        {200, _},
+        create_user_api(
+            #{
+                <<"username">> => Username1,
+                <<"password">> => Password1,
+                <<"role">> => AdminRole1,
+                <<"description">> => <<"namespaced person">>
+            },
+            GlobalAdminHeader
+        )
+    ),
+    {200, #{<<"token">> := Token1, <<"namespace">> := Ns1}} =
+        login(#{<<"username">> => Username1, <<"password">> => Password1}),
+    put_auth_header(bearer_auth_header(Token1)),
+
+    #{cert_pem := CA1} = gen_cert(#{key => ec, issuer => root}),
+
+    Bundle1 = <<"bundle1">>,
+
+    ?assertMatch({200, _}, list_bundles_ns(Ns1)),
+    ?assertMatch({204, _}, upload_file_ns(Ns1, Bundle1, ?FILE_KIND_CA, CA1)),
+    ?assertMatch({200, _}, list_files_ns(Ns1, Bundle1)),
+    ?assertMatch({204, _}, delete_bundle_ns(Ns1, Bundle1)),
+
+    Ns2 = <<"ns2">>,
+    %% This one is fine to work because it's read-only.
+    ?assertMatch({200, _}, list_bundles_ns(Ns2)),
+    ?assertMatch({403, _}, upload_file_ns(Ns2, Bundle1, ?FILE_KIND_CA, CA1)),
+    %% This one is fine to work because it's read-only.
+    ?assertMatch({404, _}, list_files_ns(Ns2, Bundle1)),
+    ?assertMatch({403, _}, delete_bundle_ns(Ns2, Bundle1)),
+
+    %% This one is fine to work because it's read-only.
+    ?assertMatch({200, _}, list_bundles_global()),
+    %% This one is fine to work because it's read-only.
+    ?assertMatch({404, _}, list_files_global(Bundle1)),
+    ?assertMatch({403, _}, delete_bundle_global(Bundle1)),
+    ?assertMatch({403, _}, upload_file_global(Bundle1, ?FILE_KIND_CA, CA1)),
+
+    ok.
+
+-doc """
+Verifies that we take into account managed certs when constructing the
+`emqx_cert_expiry_at` prometheus gauge.
+""".
+t_managed_certs_prometheus_expiry_date() ->
+    [{matrix, true}].
+t_managed_certs_prometheus_expiry_date(matrix) ->
+    [[?local]];
+t_managed_certs_prometheus_expiry_date(_TCConfig) ->
+    on_exit(fun meck:unload/0),
+    meck:new(emqx_license_checker, [non_strict, passthrough, no_link]),
+    meck:expect(emqx_license_checker, expiry_epoch, fun() -> 1859673600 end),
+
+    %% At first, TLS and WSS listeners are using the same certificates
+    {200, Metrics0} = get_prometheus_stats(
+        ?PROM_DATA_MODE__ALL_NODES_UNAGGREGATED, prometheus
+    ),
+    Expiry0 = maps:get(<<"emqx_cert_expiry_at">>, Metrics0),
+    TLSExpiry0 = maps:get(
+        #{
+            <<"listener_name">> => <<"default">>,
+            <<"listener_type">> => <<"ssl">>
+        },
+        Expiry0
+    ),
+    WSSExpiry0 = maps:get(
+        #{
+            <<"listener_name">> => <<"default">>,
+            <<"listener_type">> => <<"wss">>
+        },
+        Expiry0
+    ),
+    ?assertEqual(WSSExpiry0, TLSExpiry0),
+
+    #{
+        cert_key := CertKeyRoot1,
+        cert_pem := CA1
+    } = gen_cert(#{key => ec, issuer => root}),
+    %% An explicit validity, so this certificate's expiry differs from the one the
+    %% listeners start with whatever the generator's default window is.
+    #{
+        cert_pem := Cert1,
+        key_pem := Key1
+    } = gen_cert(#{
+        key => ec,
+        issuer => CertKeyRoot1,
+        validity => {shift_date(date(), -1), shift_date(date(), +30)}
+    }),
+
+    Bundle1 = <<"my_bundle">>,
+    Files1 = [
+        {?FILE_KIND_CA_BIN, <<"unused_ca_filename.pem">>, CA1},
+        {?FILE_KIND_CHAIN_BIN, <<"unused_chain_filename.pem">>, Cert1},
+        {?FILE_KIND_KEY_BIN, <<"unused_key_filename.pem">>, Key1}
+    ],
+    ?assertMatch({204, _}, upload_files_multipart_global(Bundle1, Files1)),
+
+    {200, TLSListener0} = get_listener_api(<<"ssl">>, <<"default">>),
+    TLSListener1 = emqx_utils_maps:deep_put(
+        [<<"ssl_options">>, <<"managed_certs">>],
+        TLSListener0,
+        [#{<<"bundle_name">> => Bundle1}]
+    ),
+    on_exit(fun() -> restore_listener(<<"ssl">>, <<"default">>, TLSListener0) end),
+    {200, _} = update_listener_api(<<"ssl">>, <<"default">>, TLSListener1),
+
+    %% Now, they are no longer the same: TLS listener is using the fresh managed cert bundle.
+    {200, Metrics1} = get_prometheus_stats(
+        ?PROM_DATA_MODE__ALL_NODES_UNAGGREGATED, prometheus
+    ),
+    Expiry1 = maps:get(<<"emqx_cert_expiry_at">>, Metrics1),
+    TLSExpiry1 = maps:get(
+        #{
+            <<"listener_name">> => <<"default">>,
+            <<"listener_type">> => <<"ssl">>
+        },
+        Expiry1
+    ),
+    WSSExpiry1 = maps:get(
+        #{
+            <<"listener_name">> => <<"default">>,
+            <<"listener_type">> => <<"wss">>
+        },
+        Expiry1
+    ),
+    ?assertNotEqual(WSSExpiry1, TLSExpiry1),
+
+    ok.
+
+-doc """
+Verifies that a listener using a managed certificate bundle can be switched to
+file-based certificates even after the bundle has been deleted out-of-band. The
+stale `managed_certs` reference must not survive the update and block it.
+""".
+t_switch_off_deleted_managed_bundle() ->
+    [{matrix, true}].
+t_switch_off_deleted_managed_bundle(matrix) ->
+    [[?local]];
+t_switch_off_deleted_managed_bundle(_TCConfig) ->
+    #{cert_key := CertKeyRoot} = gen_cert(#{key => ec, issuer => root}),
+    #{cert_pem := CA} = gen_cert(#{key => ec, issuer => root}),
+    #{cert_pem := Cert, key_pem := Key} = gen_cert(#{key => ec, issuer => CertKeyRoot}),
+
+    Bundle = <<"switch_off_bundle">>,
+    Files = [
+        {?FILE_KIND_CA_BIN, <<"ca.pem">>, CA},
+        {?FILE_KIND_CHAIN_BIN, <<"chain.pem">>, Cert},
+        {?FILE_KIND_KEY_BIN, <<"key.pem">>, Key}
+    ],
+    ?assertMatch({204, _}, upload_files_multipart_global(Bundle, Files)),
+
+    %% Original config names no certificate of its own.
+    {200, TLSListener0} = get_listener_api(<<"ssl">>, <<"default">>),
+    on_exit(fun() -> restore_listener(<<"ssl">>, <<"default">>, TLSListener0) end),
+
+    %% Switch the listener to the managed bundle.
+    TLSListenerManaged = emqx_utils_maps:deep_put(
+        [<<"ssl_options">>, <<"managed_certs">>],
+        TLSListener0,
+        [#{<<"bundle_name">> => Bundle}]
+    ),
+    ?assertMatch({200, _}, update_listener_api(<<"ssl">>, <<"default">>, TLSListenerManaged)),
+
+    %% Delete the bundle out-of-band while the listener still references it; the API
+    %% refuses to delete a referenced bundle.
+    ok = emqx_managed_certs:delete_bundle(?global_ns, Bundle),
+
+    %% Naming file certificates switches the source away from the bundle. This must
+    %% succeed even though the bundle is gone, and the resulting config must no
+    %% longer reference managed certs.
+    TLSListenerFiles = emqx_utils_maps:deep_merge(
+        TLSListener0,
+        #{<<"ssl_options">> => #{<<"certfile">> => Cert, <<"keyfile">> => Key}}
+    ),
+    ?assertMatch({200, _}, update_listener_api(<<"ssl">>, <<"default">>, TLSListenerFiles)),
+    {200, TLSListenerFinal} = get_listener_api(<<"ssl">>, <<"default">>),
+    ?assertNot(
+        is_map_key(<<"managed_certs">>, maps:get(<<"ssl_options">>, TLSListenerFinal)),
+        TLSListenerFinal
+    ),
+
+    ok.
+
+-doc """
+Verifies that a listener using a managed certificate bundle can be switched back to
+no certificate of its own while the bundle still exists, by clearing
+`managed_certs`.  The switch must actually take effect (the stale reference must be
+dropped), not silently keep using the bundle.
+""".
+t_switch_off_existing_managed_bundle() ->
+    [{matrix, true}].
+t_switch_off_existing_managed_bundle(matrix) ->
+    [[?local]];
+t_switch_off_existing_managed_bundle(_TCConfig) ->
+    #{cert_key := CertKeyRoot} = gen_cert(#{key => ec, issuer => root}),
+    #{cert_pem := CA} = gen_cert(#{key => ec, issuer => root}),
+    #{cert_pem := Cert, key_pem := Key} = gen_cert(#{key => ec, issuer => CertKeyRoot}),
+
+    Bundle = <<"switch_off_existing_bundle">>,
+    Files = [
+        {?FILE_KIND_CA_BIN, <<"ca.pem">>, CA},
+        {?FILE_KIND_CHAIN_BIN, <<"chain.pem">>, Cert},
+        {?FILE_KIND_KEY_BIN, <<"key.pem">>, Key}
+    ],
+    ?assertMatch({204, _}, upload_files_multipart_global(Bundle, Files)),
+
+    {200, TLSListener0} = get_listener_api(<<"ssl">>, <<"default">>),
+    on_exit(fun() -> restore_listener(<<"ssl">>, <<"default">>, TLSListener0) end),
+
+    TLSListenerManaged = emqx_utils_maps:deep_put(
+        [<<"ssl_options">>, <<"managed_certs">>],
+        TLSListener0,
+        [#{<<"bundle_name">> => Bundle}]
+    ),
+    ?assertMatch({200, _}, update_listener_api(<<"ssl">>, <<"default">>, TLSListenerManaged)),
+    {200, TLSListenerManaged1} = get_listener_api(<<"ssl">>, <<"default">>),
+    ?assert(
+        is_map_key(<<"managed_certs">>, maps:get(<<"ssl_options">>, TLSListenerManaged1)),
+        TLSListenerManaged1
+    ),
+
+    %% Clear the bundle while it still exists: the update must take effect and drop
+    %% the managed cert reference.
+    TLSListenerCleared = emqx_utils_maps:deep_put(
+        [<<"ssl_options">>, <<"managed_certs">>],
+        TLSListener0,
+        null
+    ),
+    ?assertMatch({200, _}, update_listener_api(<<"ssl">>, <<"default">>, TLSListenerCleared)),
+    {200, TLSListenerFinal} = get_listener_api(<<"ssl">>, <<"default">>),
+    ?assertNot(
+        is_map_key(<<"managed_certs">>, maps:get(<<"ssl_options">>, TLSListenerFinal)),
+        TLSListenerFinal
+    ),
+
+    ok.
+
+-doc """
+Verifies that an update carrying no certificate material at all keeps the managed
+bundle the listener already uses.  Such a request is indistinguishable from a
+partial update of unrelated fields, so it must not be read as a request to stop
+using managed certificates: clearing takes an explicit `null`.
+""".
+t_update_without_certs_keeps_managed_bundle() ->
+    [{matrix, true}].
+t_update_without_certs_keeps_managed_bundle(matrix) ->
+    [[?local]];
+t_update_without_certs_keeps_managed_bundle(_TCConfig) ->
+    #{cert_key := CertKeyRoot} = gen_cert(#{key => ec, issuer => root}),
+    #{cert_pem := CA} = gen_cert(#{key => ec, issuer => root}),
+    #{cert_pem := Cert, key_pem := Key} = gen_cert(#{key => ec, issuer => CertKeyRoot}),
+
+    Bundle = <<"keep_managed_bundle">>,
+    Files = [
+        {?FILE_KIND_CA_BIN, <<"ca.pem">>, CA},
+        {?FILE_KIND_CHAIN_BIN, <<"chain.pem">>, Cert},
+        {?FILE_KIND_KEY_BIN, <<"key.pem">>, Key}
+    ],
+    ?assertMatch({204, _}, upload_files_multipart_global(Bundle, Files)),
+
+    {200, TLSListener0} = get_listener_api(<<"ssl">>, <<"default">>),
+    on_exit(fun() -> restore_listener(<<"ssl">>, <<"default">>, TLSListener0) end),
+
+    TLSListenerManaged = emqx_utils_maps:deep_put(
+        [<<"ssl_options">>, <<"managed_certs">>],
+        TLSListener0,
+        [#{<<"bundle_name">> => Bundle}]
+    ),
+    ?assertMatch({200, _}, update_listener_api(<<"ssl">>, <<"default">>, TLSListenerManaged)),
+
+    %% A body that names no certificate at all must leave the bundle alone.
+    SSLOpts = maps:get(<<"ssl_options">>, TLSListener0),
+    TLSListenerNoCerts = TLSListener0#{
+        <<"ssl_options">> => maps:without(
+            [<<"certfile">>, <<"keyfile">>, <<"cacertfile">>, <<"managed_certs">>], SSLOpts
+        )
+    },
+    ?assertMatch({200, _}, update_listener_api(<<"ssl">>, <<"default">>, TLSListenerNoCerts)),
+    {200, TLSListenerFinal} = get_listener_api(<<"ssl">>, <<"default">>),
+    ?assertMatch(
+        [#{<<"bundle_name">> := Bundle}],
+        maps:get(<<"managed_certs">>, maps:get(<<"ssl_options">>, TLSListenerFinal), undefined),
+        TLSListenerFinal
+    ),
+
+    ok.
+
+-doc """
+Verifies that updating a listener to reference a non-existent managed certificate
+bundle still fails, so genuine misconfiguration is not masked.
+""".
+t_switch_to_missing_managed_bundle() ->
+    [{matrix, true}].
+t_switch_to_missing_managed_bundle(matrix) ->
+    [[?local]];
+t_switch_to_missing_managed_bundle(_TCConfig) ->
+    {200, TLSListener0} = get_listener_api(<<"ssl">>, <<"default">>),
+    on_exit(fun() -> restore_listener(<<"ssl">>, <<"default">>, TLSListener0) end),
+
+    TLSListenerMissing = emqx_utils_maps:deep_put(
+        [<<"ssl_options">>, <<"managed_certs">>],
+        TLSListener0,
+        [#{<<"bundle_name">> => <<"does_not_exist">>}]
+    ),
+    ?assertMatch(
+        {400, #{<<"message">> := _}},
+        update_listener_api(<<"ssl">>, <<"default">>, TLSListenerMissing)
+    ),
+
+    ok.
+
+-doc """
+Verifies that a listener using a managed certificate bundle can be switched back to
+file-based certificates when the update request clears `managed_certs` by sending it
+as JSON `null` (how the Dashboard clears it), even after the bundle has been deleted
+out-of-band.
+""".
+t_switch_off_deleted_managed_bundle_null() ->
+    [{matrix, true}].
+t_switch_off_deleted_managed_bundle_null(matrix) ->
+    [[?local]];
+t_switch_off_deleted_managed_bundle_null(_TCConfig) ->
+    #{cert_key := CertKeyRoot} = gen_cert(#{key => ec, issuer => root}),
+    #{cert_pem := CA} = gen_cert(#{key => ec, issuer => root}),
+    #{cert_pem := Cert, key_pem := Key} = gen_cert(#{key => ec, issuer => CertKeyRoot}),
+
+    Bundle = <<"switch_off_null_bundle">>,
+    Files = [
+        {?FILE_KIND_CA_BIN, <<"ca.pem">>, CA},
+        {?FILE_KIND_CHAIN_BIN, <<"chain.pem">>, Cert},
+        {?FILE_KIND_KEY_BIN, <<"key.pem">>, Key}
+    ],
+    ?assertMatch({204, _}, upload_files_multipart_global(Bundle, Files)),
+
+    %% Original config uses file-based (default) certs.
+    {200, TLSListener0} = get_listener_api(<<"ssl">>, <<"default">>),
+    on_exit(fun() -> restore_listener(<<"ssl">>, <<"default">>, TLSListener0) end),
+
+    %% Switch the listener to the managed bundle.
+    TLSListenerManaged = emqx_utils_maps:deep_put(
+        [<<"ssl_options">>, <<"managed_certs">>],
+        TLSListener0,
+        [#{<<"bundle_name">> => Bundle}]
+    ),
+    ?assertMatch({200, _}, update_listener_api(<<"ssl">>, <<"default">>, TLSListenerManaged)),
+
+    %% Delete the bundle out-of-band while the listener still references it; the API
+    %% refuses to delete a referenced bundle.
+    ok = emqx_managed_certs:delete_bundle(?global_ns, Bundle),
+
+    %% Switch back to file-based certs with an explicit `managed_certs: null` in the
+    %% request, as the Dashboard sends it.  The update must succeed and the resulting
+    %% config must no longer reference managed certs.
+    TLSListenerNull = emqx_utils_maps:deep_put(
+        [<<"ssl_options">>, <<"managed_certs">>],
+        TLSListener0,
+        null
+    ),
+    ?assertMatch({200, _}, update_listener_api(<<"ssl">>, <<"default">>, TLSListenerNull)),
+    {200, TLSListenerFinal} = get_listener_api(<<"ssl">>, <<"default">>),
+    ?assertNot(
+        is_map_key(<<"managed_certs">>, maps:get(<<"ssl_options">>, TLSListenerFinal)),
+        TLSListenerFinal
+    ),
+
+    ok.
+
+-doc """
+Verifies that a listener update request carrying an empty `managed_certs` list is
+rejected at the API schema boundary with a clear validation error; an empty list
+never reaches the config merge.
+""".
+t_managed_certs_empty_list_rejected() ->
+    [{matrix, true}].
+t_managed_certs_empty_list_rejected(matrix) ->
+    [[?local]];
+t_managed_certs_empty_list_rejected(_TCConfig) ->
+    {200, TLSListener0} = get_listener_api(<<"ssl">>, <<"default">>),
+    on_exit(fun() -> restore_listener(<<"ssl">>, <<"default">>, TLSListener0) end),
+
+    TLSListenerEmpty = emqx_utils_maps:deep_put(
+        [<<"ssl_options">>, <<"managed_certs">>],
+        TLSListener0,
+        []
+    ),
+    ?assertMatch(
+        {400, #{
+            <<"message">> := #{
+                <<"reason">> := <<"must define at least one managed cert bundle">>
+            }
+        }},
+        update_listener_api(<<"ssl">>, <<"default">>, TLSListenerEmpty)
+    ),
+
+    ok.
+
+-doc """
+Verifies that a bundle (or a single file in it) that is still referenced by some
+configuration can never be deleted: the delete endpoint returns 400, and the
+`force_delete` query parameter no longer bypasses the reference check.
+""".
+t_delete_referenced_bundle() ->
+    [{matrix, true}].
+t_delete_referenced_bundle(matrix) ->
+    [[?local]];
+t_delete_referenced_bundle(_TCConfig) ->
+    #{cert_key := CertKeyRoot} = gen_cert(#{key => ec, issuer => root}),
+    #{cert_pem := CA} = gen_cert(#{key => ec, issuer => root}),
+    #{cert_pem := Cert, key_pem := Key} = gen_cert(#{key => ec, issuer => CertKeyRoot}),
+
+    Bundle = <<"referenced_bundle">>,
+    Files = [
+        {?FILE_KIND_CA_BIN, <<"ca.pem">>, CA},
+        {?FILE_KIND_CHAIN_BIN, <<"chain.pem">>, Cert},
+        {?FILE_KIND_KEY_BIN, <<"key.pem">>, Key}
+    ],
+    ?assertMatch({204, _}, upload_files_multipart_global(Bundle, Files)),
+
+    {200, TLSListener0} = get_listener_api(<<"ssl">>, <<"default">>),
+    on_exit(fun() -> restore_listener(<<"ssl">>, <<"default">>, TLSListener0) end),
+    TLSListenerManaged = emqx_utils_maps:deep_put(
+        [<<"ssl_options">>, <<"managed_certs">>],
+        TLSListener0,
+        [#{<<"bundle_name">> => Bundle}]
+    ),
+    ?assertMatch({200, _}, update_listener_api(<<"ssl">>, <<"default">>, TLSListenerManaged)),
+
+    %% While referenced, deletion is refused, with or without `force_delete`.
+    ExpectedRefs = #{<<"global">> => [[<<"listeners">>, <<"ssl">>, <<"default">>]]},
+    ?assertMatch(
+        {400, #{<<"referencing_configs">> := ExpectedRefs}},
+        delete_bundle_global(Bundle)
+    ),
+    ?assertMatch(
+        {400, #{<<"referencing_configs">> := ExpectedRefs}},
+        force_delete_bundle_global(Bundle)
+    ),
+    ?assertMatch(
+        {400, #{<<"referencing_configs">> := ExpectedRefs}},
+        delete_file_global(Bundle, ?FILE_KIND_CA_BIN)
+    ),
+    ?assertMatch(
+        {400, #{<<"referencing_configs">> := ExpectedRefs}},
+        force_delete_file_global(Bundle, ?FILE_KIND_CA_BIN)
+    ),
+
+    %% Once unreferenced, deletion succeeds, with or without the (ignored) parameter.
+    ?assertMatch({200, _}, update_listener_api(<<"ssl">>, <<"default">>, TLSListener0)),
+    ?assertMatch({204, _}, force_delete_file_global(Bundle, ?FILE_KIND_CA_BIN)),
+    ?assertMatch({204, _}, delete_bundle_global(Bundle)),
+
+    ok.
+
+-doc """
+Verifies that a namespaced bundle that is still referenced by some configuration
+cannot be deleted via the namespaced endpoint, even with `force_delete=true`.
+""".
+t_delete_referenced_bundle_ns() ->
+    [{matrix, true}].
+t_delete_referenced_bundle_ns(matrix) ->
+    [[?local]];
+t_delete_referenced_bundle_ns(_TCConfig) ->
+    #{cert_key := CertKeyRoot} = gen_cert(#{key => ec, issuer => root}),
+    #{cert_pem := CA} = gen_cert(#{key => ec, issuer => root}),
+    #{cert_pem := Cert, key_pem := Key} = gen_cert(#{key => ec, issuer => CertKeyRoot}),
+
+    Ns = <<"ns1">>,
+    Bundle = <<"referenced_ns_bundle">>,
+    Files = [
+        {?FILE_KIND_CA_BIN, <<"ca.pem">>, CA},
+        {?FILE_KIND_CHAIN_BIN, <<"chain.pem">>, Cert},
+        {?FILE_KIND_KEY_BIN, <<"key.pem">>, Key}
+    ],
+    ?assertMatch({204, _}, upload_files_multipart_ns(Ns, Bundle, Files)),
+
+    {200, TLSListener0} = get_listener_api(<<"ssl">>, <<"default">>),
+    on_exit(fun() -> restore_listener(<<"ssl">>, <<"default">>, TLSListener0) end),
+    TLSListenerManaged = emqx_utils_maps:deep_put(
+        [<<"ssl_options">>, <<"managed_certs">>],
+        TLSListener0,
+        [#{<<"bundle_name">> => Bundle, <<"namespace">> => Ns}]
+    ),
+    ?assertMatch({200, _}, update_listener_api(<<"ssl">>, <<"default">>, TLSListenerManaged)),
+
+    ?assertMatch({400, #{<<"referencing_configs">> := _}}, delete_bundle_ns(Ns, Bundle)),
+    ?assertMatch({400, #{<<"referencing_configs">> := _}}, force_delete_bundle_ns(Ns, Bundle)),
+
+    ?assertMatch({200, _}, update_listener_api(<<"ssl">>, <<"default">>, TLSListener0)),
+    ?assertMatch({204, _}, delete_bundle_ns(Ns, Bundle)),
+
+    ok.
+
+-doc """
+Verifies that the Prometheus stats scrape does not fail entirely when a listener
+references a managed certificate bundle that no longer exists on disk: the scrape
+returns 200 with the other metrics present, and the affected listener simply
+contributes no cert-expiry point.
+""".
+t_prometheus_stats_dangling_managed_certs() ->
+    [{matrix, true}].
+t_prometheus_stats_dangling_managed_certs(matrix) ->
+    [[?local]];
+t_prometheus_stats_dangling_managed_certs(_TCConfig) ->
+    #{cert_key := CertKeyRoot} = gen_cert(#{key => ec, issuer => root}),
+    #{cert_pem := CA} = gen_cert(#{key => ec, issuer => root}),
+    #{cert_pem := Cert, key_pem := Key} = gen_cert(#{key => ec, issuer => CertKeyRoot}),
+
+    Bundle = <<"dangling_bundle">>,
+    Files = [
+        {?FILE_KIND_CA_BIN, <<"ca.pem">>, CA},
+        {?FILE_KIND_CHAIN_BIN, <<"chain.pem">>, Cert},
+        {?FILE_KIND_KEY_BIN, <<"key.pem">>, Key}
+    ],
+    ?assertMatch({204, _}, upload_files_multipart_global(Bundle, Files)),
+
+    {200, TLSListener0} = get_listener_api(<<"ssl">>, <<"default">>),
+    on_exit(fun() -> restore_listener(<<"ssl">>, <<"default">>, TLSListener0) end),
+    TLSListenerManaged = emqx_utils_maps:deep_put(
+        [<<"ssl_options">>, <<"managed_certs">>],
+        TLSListener0,
+        [#{<<"bundle_name">> => Bundle}]
+    ),
+    ?assertMatch({200, _}, update_listener_api(<<"ssl">>, <<"default">>, TLSListenerManaged)),
+
+    %% Remove the bundle directory behind the API's back, simulating a dangling
+    %% reference (e.g. left behind by an older release that allowed force-deleting a
+    %% referenced bundle).
+    ok = file:del_dir_r(emqx_managed_certs:dir(?global_ns, Bundle)),
+
+    {200, Metrics} = get_prometheus_stats(
+        ?PROM_DATA_MODE__ALL_NODES_UNAGGREGATED, prometheus
+    ),
+    Expiry = maps:get(<<"emqx_cert_expiry_at">>, Metrics),
+    %% The listener with the dangling reference contributes no point.
+    ?assertNot(
+        is_map_key(
+            #{
+                <<"listener_name">> => <<"default">>,
+                <<"listener_type">> => <<"ssl">>
+            },
+            Expiry
+        ),
+        Expiry
+    ),
+    %% Other listeners' points are still collected.
+    ?assert(
+        is_map_key(
+            #{
+                <<"listener_name">> => <<"default">>,
+                <<"listener_type">> => <<"wss">>
+            },
+            Expiry
+        ),
+        Expiry
+    ),
+
+    ok.
+
+-doc """
+Verifies that `POST /certs/pem_cache_clean` returns 204 and evicts cached PEM
+files from the OTP `ssl_pem_cache` table on every node in the cluster, after the
+cache has been populated by real TLS handshakes.
+
+The assertion targets the listener certificate file entry rather than an empty
+table: clearing also refreshes the trusted CA database, which re-inserts CA
+files still referenced by live TLS connections.
+""".
+t_pem_cache_clean() ->
+    [{matrix, true}].
+t_pem_cache_clean(matrix) ->
+    [[?local], [?cluster]];
+t_pem_cache_clean(TCConfig) when is_list(TCConfig) ->
+    Nodes = get_config(nodes, TCConfig),
+    CertFiles = lists:map(
+        fun(Node) ->
+            CertFile = ?ON(Node, begin
+                populate_pem_cache(),
+                CF = ssl_listener_certfile(),
+                ?assertMatch([{CF, _}], ets:lookup(ssl_pem_cache, CF)),
+                CF
+            end),
+            {Node, CertFile}
+        end,
+        Nodes
+    ),
+    ?assertMatch({204, _}, clean_pem_cache_api()),
+    lists:foreach(
+        fun({Node, CertFile}) ->
+            ?assertEqual([], ?ON(Node, ets:lookup(ssl_pem_cache, CertFile)), #{node => Node})
+        end,
+        CertFiles
+    ),
+    ok.
+
+-doc """
+Verifies that an unauthenticated `POST /certs/pem_cache_clean` call is rejected.
+""".
+t_pem_cache_clean_unauthenticated() ->
+    [{matrix, true}].
+t_pem_cache_clean_unauthenticated(matrix) ->
+    [[?local]];
+t_pem_cache_clean_unauthenticated(_TCConfig) ->
+    URL = emqx_mgmt_api_test_util:api_path(["certs", "pem_cache_clean"]),
+    ?assertMatch(
+        {401, _},
+        emqx_mgmt_api_test_util:simple_request(#{
+            method => post,
+            url => URL,
+            auth_header => {"no", "auth"}
+        })
+    ),
+    ok.
+
+-doc """
+Verifies the response shape when cleaning the PEM cache fails on some node: the
+endpoint returns 500 with a per-node failure list.
+""".
+t_pem_cache_clean_bad_node() ->
+    [{matrix, true}].
+t_pem_cache_clean_bad_node(matrix) ->
+    [[?local]];
+t_pem_cache_clean_bad_node(_TCConfig) ->
+    on_exit(fun meck:unload/0),
+    meck:new(emqx, [non_strict, passthrough, no_link]),
+    meck:expect(emqx, running_nodes, 0, [node(), 'fake@nohost']),
+    ?assertMatch(
+        {500, #{
+            <<"code">> := <<"INTERNAL_ERROR">>,
+            <<"message">> := _,
+            <<"node_errors">> := [#{<<"node">> := <<"fake@nohost">>, <<"reason">> := _}]
+        }},
+        clean_pem_cache_api()
+    ),
+    ok.

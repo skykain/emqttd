@@ -1,0 +1,1579 @@
+%%--------------------------------------------------------------------
+%% Copyright (c) 2021-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
+%%--------------------------------------------------------------------
+
+-module(emqx_gateway_api_SUITE).
+
+-compile(export_all).
+-compile(nowarn_export_all).
+
+-import(
+    emqx_gateway_test_utils,
+    [
+        assert_confs/2,
+        assert_fields_exist/2,
+        request/2,
+        request/3
+    ]
+).
+
+-include_lib("eunit/include/eunit.hrl").
+-include_lib("common_test/include/ct.hrl").
+-include_lib("snabbkaffe/include/snabbkaffe.hrl").
+
+%% this parses to #{}, will not cause config cleanup
+%% so we will need call emqx_config:erase
+-define(CONF_DEFAULT, <<"gateway {}">>).
+-define(REDACTED, <<"******">>).
+-define(AUTHN_SECRET, <<"mysecret">>).
+
+%%--------------------------------------------------------------------
+%% Setup
+%%--------------------------------------------------------------------
+
+all() -> [{group, legacy}, {group, hardened}].
+
+groups() ->
+    Tests = emqx_common_test_helpers:all(?MODULE),
+    [{legacy, [], Tests}, {hardened, [], Tests}].
+
+init_per_suite(Config) ->
+    emqx_common_test_helpers:clear_security_profile(),
+    Config.
+
+end_per_suite(_Config) ->
+    emqx_common_test_helpers:clear_security_profile().
+
+init_per_group(Profile, Config) when Profile =:= legacy; Profile =:= hardened ->
+    ok = emqx_common_test_helpers:set_security_profile(Profile),
+    Apps = emqx_cth_suite:start(
+        [
+            emqx_conf,
+            emqx_auth,
+            emqx_auth_mnesia,
+            emqx_management,
+            emqx_mgmt_api_test_util:emqx_dashboard(),
+            {emqx_gateway, ?CONF_DEFAULT}
+            | emqx_gateway_test_utils:all_gateway_apps()
+        ],
+        #{work_dir => emqx_cth_suite:work_dir(Profile, Config)}
+    ),
+    _ = emqx_common_test_http:create_default_app(),
+    [{group_apps, Apps}, {security_profile, Profile} | Config].
+
+end_per_group(_Profile, Config) ->
+    ok = emqx_cth_suite:stop(?config(group_apps, Config)),
+    emqx_common_test_helpers:clear_security_profile().
+
+init_per_testcase(t_gateway_fail, Config) ->
+    meck:expect(
+        emqx_gateway_conf,
+        update_gateway,
+        fun
+            (stomp, V) -> {error, {badconf, #{key => gw, value => V, reason => test_error}}};
+            (coap, V) -> error({badconf, #{key => gw, value => V, reason => test_crash}})
+        end
+    ),
+    Config;
+init_per_testcase(_, Config) ->
+    Config.
+
+end_per_testcase(TestCase, Config) ->
+    case TestCase of
+        t_gateway_fail -> meck:unload(emqx_gateway_conf);
+        _ -> ok
+    end,
+    [emqx_gateway_conf:unload_gateway(GwName) || GwName <- [stomp, mqttsn, coap, lwm2m]],
+    Config.
+
+%%--------------------------------------------------------------------
+%% Cases
+%%--------------------------------------------------------------------
+
+t_gateways(_) ->
+    {200, Gateways} = request(get, "/gateways"),
+    lists:foreach(fun assert_gw_unloaded/1, Gateways),
+    {200, UnloadedGateways} = request(get, "/gateways?status=unloaded"),
+    lists:foreach(fun assert_gw_unloaded/1, UnloadedGateways),
+    {200, NoRunningGateways} = request(get, "/gateways?status=running"),
+    ?assertEqual([], NoRunningGateways),
+    {400, BadReqInvalidStatus} = request(get, "/gateways?status=invalid_status"),
+    assert_bad_request(BadReqInvalidStatus),
+    {400, BadReqUCStatus} = request(get, "/gateways?status=UNLOADED"),
+    assert_bad_request(BadReqUCStatus),
+    ok.
+
+t_gateway(_) ->
+    ?assertMatch({400, #{code := <<"BAD_REQUEST">>}}, request(get, "/gateways/not_a_known_atom")),
+    ?assertMatch({400, #{code := <<"BAD_REQUEST">>}}, request(get, "/gateways/undefined")),
+    {204, _} = request(put, "/gateways/stomp", #{}),
+    {200, StompGw} = request(get, "/gateways/stomp"),
+    assert_fields_exist(
+        [name, status, enable, created_at, started_at],
+        StompGw
+    ),
+    {204, _} = request(put, "/gateways/stomp", #{enable => true}),
+    {200, #{enable := true}} = request(get, "/gateways/stomp"),
+    {204, _} = request(put, "/gateways/stomp", #{enable => false}),
+    {200, #{enable := false}} = request(get, "/gateways/stomp"),
+    ?assertMatch({400, #{code := <<"BAD_REQUEST">>}}, request(put, "/gateways/undefined", #{})),
+    {400, _} = request(put, "/gateways/stomp", #{bad_key => "foo"}),
+    ok.
+
+t_gateway_fail(_) ->
+    {204, _} = request(put, "/gateways/stomp", #{}),
+    {400, _} = request(put, "/gateways/stomp", #{}),
+    {204, _} = request(put, "/gateways/coap", #{}),
+    {400, _} = request(put, "/gateways/coap", #{}),
+    ok.
+
+t_gateway_enable(_) ->
+    {204, _} = request(put, "/gateways/stomp", #{}),
+    {200, #{enable := Enable}} = request(get, "/gateways/stomp"),
+    NotEnable = not Enable,
+    {204, _} = request(put, "/gateways/stomp/enable/" ++ atom_to_list(NotEnable), undefined),
+    {200, #{enable := NotEnable}} = request(get, "/gateways/stomp"),
+    {204, _} = request(put, "/gateways/stomp/enable/" ++ atom_to_list(Enable), undefined),
+    {200, #{enable := Enable}} = request(get, "/gateways/stomp"),
+    ?assertMatch(
+        {400, #{code := <<"BAD_REQUEST">>}},
+        request(put, "/gateways/undefined/enable/true", undefined)
+    ),
+    ?assertMatch(
+        {400, #{code := <<"BAD_REQUEST">>}},
+        request(put, "/gateways/not_a_known_atom/enable/true", undefined)
+    ),
+    {404, _} = request(put, "/gateways/coap/enable/true", undefined),
+    ok.
+
+-doc "The combined OpenAPI specification preserves each gateway's WebSocket defaults.".
+t_gateway_websocket_openapi(_) ->
+    {_, GatewayComponents} = emqx_gateway_api:api_spec(),
+    {_, ListenerComponents} = emqx_gateway_api_listeners:api_spec(),
+    lists:foreach(
+        fun(Components) ->
+            Merged = lists:foldl(fun maps:merge/2, #{}, Components),
+            Schemas = emqx_utils_json:decode(emqx_utils_json:encode_proplist(Merged)),
+            lists:foreach(
+                fun(Type) -> assert_websocket_openapi(Type, Schemas) end,
+                [<<"ws_listener">>, <<"wss_listener">>]
+            )
+        end,
+        [GatewayComponents ++ ListenerComponents, ListenerComponents ++ GatewayComponents]
+    ).
+
+assert_websocket_openapi(Type, Schemas) ->
+    GenericRef = websocket_openapi_ref(<<"emqx_gateway_api.", Type/binary>>, Schemas),
+    NatsRef = websocket_openapi_ref(<<"emqx_gateway_api.nats_", Type/binary>>, Schemas),
+    OcppRef = websocket_openapi_ref(<<"emqx_gateway_api.ocpp_", Type/binary>>, Schemas),
+    ?assertNotEqual(GenericRef, NatsRef),
+    ?assertNotEqual(GenericRef, OcppRef),
+    ?assertNotEqual(NatsRef, OcppRef),
+    assert_websocket_openapi_defaults(
+        GenericRef,
+        #{
+            path => <<>>, supported_subprotocols => <<>>, fail_if_no_subprotocol => false
+        },
+        Schemas
+    ),
+    lists:foreach(
+        fun({Name, Defaults}) ->
+            Ref =
+                case Name of
+                    nats -> NatsRef;
+                    ocpp -> OcppRef
+                end,
+            assert_websocket_openapi_defaults(Ref, Defaults, Schemas)
+        end,
+        websocket_gateway_defaults()
+    ).
+
+websocket_openapi_ref(Listener, Schemas) ->
+    #{<<"properties">> := #{<<"websocket">> := #{<<"$ref">> := Ref}}} = maps:get(Listener, Schemas),
+    Ref.
+
+assert_websocket_openapi_defaults(<<"#/components/schemas/", Component/binary>>, Defaults, Schemas) ->
+    #{<<"properties">> := Properties} = maps:get(Component, Schemas),
+    maps:foreach(
+        fun(Key, Expected) ->
+            #{<<"default">> := Actual} = maps:get(atom_to_binary(Key), Properties),
+            ?assertEqual(Expected, Actual)
+        end,
+        Defaults
+    ).
+
+-doc "The API schema preserves gateway defaults before it translates requests.".
+t_gateway_websocket_schema(_) ->
+    lists:foreach(
+        fun({GwName, Defaults}) ->
+            lists:foreach(
+                fun(Type) ->
+                    assert_websocket_schema_overrides(GwName, Type, Defaults)
+                end,
+                [ws, wss]
+            )
+        end,
+        websocket_gateway_defaults()
+    ).
+
+assert_websocket_schema_overrides(GwName, Type, Defaults) ->
+    lists:foreach(
+        fun(Overrides) ->
+            assert_websocket_schema(GwName, Type, Overrides, Defaults)
+        end,
+        [
+            undefined,
+            #{},
+            #{path => <<"/custom">>},
+            #{supported_subprotocols => <<>>},
+            #{
+                supported_subprotocols => <<"custom.v1, custom.v2">>,
+                fail_if_no_subprotocol => true
+            }
+        ]
+    ).
+
+assert_websocket_schema(GwName, Type, Overrides, Defaults) ->
+    Schema = #{roots => [{gateway, hoconsc:ref(emqx_gateway_api, GwName)}]},
+    {Listener, Expected} =
+        case Overrides of
+            undefined ->
+                {websocket_test_listener(Type), Defaults};
+            _ ->
+                {
+                    (websocket_test_listener(Type))#{websocket => Overrides},
+                    maps:merge(Defaults, Overrides)
+                }
+        end,
+    Conf = #{gateway => #{name => atom_to_binary(GwName), listeners => [Listener]}},
+    #{gateway := #{listeners := [Checked]}} = hocon_tconf:check_plain(
+        Schema,
+        emqx_utils_maps:binary_key_map(Conf),
+        #{required => false, atom_key => true}
+    ),
+    ?assertEqual(Type, maps:get(type, Checked)),
+    #{path := Path, supported_subprotocols := Protocols} = Expected,
+    assert_websocket_options(
+        Expected#{
+            path := binary_to_list(Path),
+            supported_subprotocols := string:tokens(binary_to_list(Protocols), ", ")
+        },
+        Checked
+    ).
+
+-doc "The HTTP API preserves NATS WebSocket defaults.".
+t_gateway_nats_ws_defaults(_) ->
+    assert_gateway_websocket_defaults(nats, ws).
+
+-doc "The HTTP API preserves NATS secure WebSocket defaults.".
+t_gateway_nats_wss_defaults(_) ->
+    assert_gateway_websocket_defaults(nats, wss).
+
+-doc "The HTTP API preserves OCPP WebSocket defaults.".
+t_gateway_ocpp_ws_defaults(_) ->
+    assert_gateway_websocket_defaults(ocpp, ws).
+
+-doc "The HTTP API preserves OCPP secure WebSocket defaults.".
+t_gateway_ocpp_wss_defaults(_) ->
+    assert_gateway_websocket_defaults(ocpp, wss).
+
+assert_gateway_websocket_defaults(GwName, Type) ->
+    Defaults = proplists:get_value(GwName, websocket_gateway_defaults()),
+    assert_gateway_websocket_options(GwName, Type, #{}, Defaults),
+    assert_gateway_websocket_options(
+        GwName,
+        Type,
+        #{websocket => #{path => <<"/custom">>}},
+        Defaults#{path => <<"/custom">>}
+    ).
+
+-doc "The HTTP API preserves explicit empty and custom WebSocket options.".
+t_gateway_websocket_explicit_options(_) ->
+    lists:foreach(
+        fun({GwName, _Defaults}) ->
+            lists:foreach(
+                fun(Protocols) -> assert_explicit_websocket_options(GwName, Protocols) end,
+                [<<>>, <<"custom.v1, custom.v2">>]
+            )
+        end,
+        websocket_gateway_defaults()
+    ).
+
+assert_explicit_websocket_options(GwName, Protocols) ->
+    Options = #{
+        path => <<"/custom">>,
+        supported_subprotocols => Protocols,
+        fail_if_no_subprotocol => true
+    },
+    lists:foreach(
+        fun(Type) ->
+            assert_gateway_websocket_options(GwName, Type, #{websocket => Options}, Options)
+        end,
+        [ws, wss]
+    ).
+
+-doc "The NATS API preserves TCP and SSL options alongside WebSocket listeners.".
+t_gateway_nats_mixed_listeners(_) ->
+    Listeners = [websocket_test_listener(Type) || Type <- [tcp, ssl, ws, wss]],
+    with_websocket_gateway(nats, Listeners, fun(Path) ->
+        {200, #{listeners := Saved}} = request(get, Path),
+        ?assertEqual(4, length(Saved)),
+        lists:foreach(
+            fun(#{type := Type} = Listener) ->
+                case Type of
+                    <<"ws">> -> assert_websocket_options(nats_websocket_defaults(), Listener);
+                    <<"wss">> -> assert_websocket_options(nats_websocket_defaults(), Listener);
+                    _ -> ?assertNot(maps:is_key(websocket, Listener))
+                end
+            end,
+            Saved
+        )
+    end).
+
+-doc "The HTTP API rejects listener transports that the gateway does not support.".
+t_gateway_websocket_listener_types(_) ->
+    lists:foreach(
+        fun({GwName, Type}) ->
+            Path = "/gateways/" ++ atom_to_list(GwName),
+            ?assertMatch(
+                {400, _},
+                request(put, Path, #{
+                    name => atom_to_binary(GwName),
+                    listeners => [websocket_test_listener(Type)]
+                })
+            ),
+            {200, Unloaded} = request(get, Path),
+            assert_gw_unloaded(Unloaded)
+        end,
+        [{nats, udp}, {ocpp, tcp}, {nats, invalid}]
+    ).
+
+-doc "The listener create and update APIs preserve gateway WebSocket defaults.".
+t_gateway_websocket_listener_api(_) ->
+    lists:foreach(
+        fun({GwName, Defaults}) ->
+            with_websocket_gateway(GwName, [], fun(Path) ->
+                Listener = websocket_test_listener(ws),
+                ListenerPath = Path ++ "/listeners",
+                {201, Created} = request(post, ListenerPath, Listener),
+                assert_saved_websocket_options(Path, Defaults),
+                Id = maps:get(id, Created),
+                InstancePath = ListenerPath ++ "/" ++ binary_to_list(Id),
+                {200, _Updated} = request(put, InstancePath, Listener#{
+                    websocket => #{path => <<"/new">>}
+                }),
+                assert_saved_websocket_options(Path, Defaults#{path => <<"/new">>})
+            end)
+        end,
+        websocket_gateway_defaults()
+    ).
+
+websocket_gateway_defaults() ->
+    [
+        {nats, nats_websocket_defaults()},
+        {ocpp, #{
+            path => <<"/ocpp">>,
+            supported_subprotocols => <<"ocpp1.6, ocpp2.0">>,
+            fail_if_no_subprotocol => false
+        }}
+    ].
+
+nats_websocket_defaults() ->
+    #{
+        path => <<>>,
+        supported_subprotocols => <<"NATS/1.0, NATS">>,
+        fail_if_no_subprotocol => false
+    }.
+
+websocket_test_listener(Type) ->
+    maps:merge(
+        #{
+            name => atom_to_binary(Type),
+            type => atom_to_binary(Type),
+            bind => <<"127.0.0.1:39009">>,
+            enable => false
+        },
+        tls_test_options(Type)
+    ).
+
+%% `etc/certs' holds only a README on this branch, so the schema default for
+%% `cacertfile' names a file that is not there and the API rejects every TLS
+%% listener these cases create. The cases are about the WebSocket options, not
+%% about verifying a peer, so leave the CA empty, which `emqx_tls_lib' allows
+%% for `cacertfile'.
+tls_test_options(Type) when Type =:= ssl; Type =:= wss; Type =:= dtls ->
+    #{ssl_options => #{cacertfile => <<>>}};
+tls_test_options(_Type) ->
+    #{}.
+
+assert_gateway_websocket_options(GwName, Type, Overrides, Expected) ->
+    Listener = maps:merge(websocket_test_listener(Type), Overrides),
+    with_websocket_gateway(GwName, [Listener], fun(Path) ->
+        assert_saved_websocket_options(Path, Expected)
+    end).
+
+assert_saved_websocket_options(Path, Expected) ->
+    {200, #{listeners := [Saved]}} = request(get, Path),
+    assert_websocket_options(Expected, Saved).
+
+assert_websocket_options(Expected, #{websocket := Options}) ->
+    ?assertEqual(Expected, maps:with(maps:keys(Expected), Options)).
+
+with_websocket_gateway(GwName, Listeners, Fun) ->
+    Path = "/gateways/" ++ atom_to_list(GwName),
+    try
+        {204, _} = request(put, Path, #{
+            name => atom_to_binary(GwName), enable => false, listeners => Listeners
+        }),
+        Fun(Path)
+    after
+        ok = emqx_gateway_conf:unload_gateway(GwName)
+    end.
+
+t_gateway_stomp(_) ->
+    {200, Gw} = request(get, "/gateways/stomp"),
+    assert_gw_unloaded(Gw),
+    GwConf = #{
+        name => <<"stomp">>,
+        frame => #{
+            max_headers => 5,
+            max_headers_length => 100,
+            max_body_length => 100
+        },
+        listeners => [
+            #{name => <<"def">>, type => <<"tcp">>, bind => <<"61613">>}
+        ]
+    },
+    {204, _} = request(put, "/gateways/stomp", GwConf),
+    {200, ConfResp} = request(get, "/gateways/stomp"),
+    assert_confs(GwConf, ConfResp),
+    GwConf2 = emqx_utils_maps:deep_merge(GwConf, #{frame => #{max_headers => 10}}),
+    {204, _} = request(put, "/gateways/stomp", maps:without([name, listeners], GwConf2)),
+    {200, ConfResp2} = request(get, "/gateways/stomp"),
+    assert_confs(GwConf2, ConfResp2),
+    ok.
+
+t_gateway_mqttsn(_) ->
+    {200, Gw} = request(get, "/gateways/mqttsn"),
+    assert_gw_unloaded(Gw),
+    GwConf = #{
+        name => <<"mqttsn">>,
+        gateway_id => 1,
+        broadcast => true,
+        predefined => [#{id => 1, topic => <<"t/a">>}],
+        enable_qos3 => true,
+        listeners => [
+            #{name => <<"def">>, type => <<"udp">>, bind => <<"1884">>, enable_authn => false}
+        ]
+    },
+    {204, _} = request(put, "/gateways/mqttsn", GwConf),
+    {200, ConfResp} = request(get, "/gateways/mqttsn"),
+    assert_confs(GwConf, ConfResp),
+    GwConf2 = emqx_utils_maps:deep_merge(GwConf, #{predefined => []}),
+    {204, _} = request(put, "/gateways/mqttsn", maps:without([name, listeners], GwConf2)),
+    {200, ConfResp2} = request(get, "/gateways/mqttsn"),
+    assert_confs(GwConf2, ConfResp2),
+    ok.
+
+-doc "Reject non-positive CoAP session byte budgets without changing the saved configuration.".
+t_coap_blockwise_total_size_validation(_) ->
+    assert_blockwise_total_size(coap).
+
+-doc "Reject non-positive LwM2M session byte budgets without changing the saved configuration.".
+t_lwm2m_blockwise_total_size_validation(_) ->
+    assert_blockwise_total_size(lwm2m).
+
+assert_blockwise_total_size(GwName) ->
+    Path = "/gateways/" ++ atom_to_list(GwName),
+    InitialConf = blockwise_total_size_gateway_conf(GwName),
+    InvalidValues = [0, <<"0B">>, <<"0KB">>, -1, <<"-1">>, <<"bad">>],
+    lists:foreach(
+        fun(Value) ->
+            ?assertMatch(
+                {400, _}, request(put, Path, InitialConf#{blockwise => #{max_total_size => Value}})
+            )
+        end,
+        InvalidValues
+    ),
+    {200, Unloaded} = request(get, Path),
+    assert_gw_unloaded(Unloaded),
+    lists:foreach(
+        fun(Value) ->
+            {204, _} = request(put, Path, InitialConf#{blockwise => #{max_total_size => Value}}),
+            {200, Saved} = request(get, Path),
+            assert_total_size_update_rejected(Path, Saved, InvalidValues)
+        end,
+        [1, <<"1B">>, <<"16MB">>]
+    ).
+
+assert_total_size_update_rejected(Path, Saved, InvalidValues) ->
+    lists:foreach(
+        fun(Invalid) ->
+            ?assertMatch(
+                {400, _}, request(put, Path, #{blockwise => #{max_total_size => Invalid}})
+            ),
+            {200, AfterRejectedUpdate} = request(get, Path),
+            ?assertEqual(maps:get(blockwise, Saved), maps:get(blockwise, AfterRejectedUpdate))
+        end,
+        InvalidValues
+    ).
+
+blockwise_total_size_gateway_conf(coap) ->
+    #{name => <<"coap">>};
+blockwise_total_size_gateway_conf(lwm2m) ->
+    #{
+        name => <<"lwm2m">>,
+        xml_dir => list_to_binary(
+            filename:join([
+                emqx_common_test_helpers:proj_root(), "apps", "emqx_gateway_lwm2m", "lwm2m_xml"
+            ])
+        ),
+        translators => #{
+            command => #{topic => <<"dn/#">>},
+            response => #{topic => <<"up/resp">>},
+            notify => #{topic => <<"up/notify">>},
+            register => #{topic => <<"up/register">>},
+            update => #{topic => <<"up/update">>}
+        }
+    }.
+
+-doc "Apply the byte limit configured through HTTP to a real CoAP Block1 upload.".
+t_coap_blockwise_total_size_enforcement(_) ->
+    Port = emqx_common_test_helpers:select_free_port(udp),
+    Conf = #{
+        name => <<"coap">>,
+        connection_required => false,
+        listeners => [#{name => <<"blockwise">>, type => <<"udp">>, bind => Port}],
+        blockwise => #{max_block_size => 16, max_total_size => <<"16B">>}
+    },
+    {204, _} = request(put, "/gateways/coap", Conf),
+    {ok, Sock} = gen_udp:open(0, [binary, {active, false}]),
+    try
+        %% The first full block fits; the next byte exceeds the configured limit.
+        ?assertEqual(95, total_size_block1_reply(Sock, Port, 1, 8, binary:copy(<<"A">>, 16))),
+        ?assertEqual(141, total_size_block1_reply(Sock, Port, 2, 16, <<"B">>)),
+        ?assertMatch(
+            {400, _}, request(put, "/gateways/coap", #{blockwise => #{max_total_size => <<"0B">>}})
+        ),
+        {200, #{blockwise := #{max_total_size := <<"16B">>}}} = request(get, "/gateways/coap"),
+        ?assertEqual(95, total_size_block1_reply(Sock, Port, 3, 8, binary:copy(<<"C">>, 16))),
+        ?assertEqual(141, total_size_block1_reply(Sock, Port, 4, 16, <<"D">>))
+    after
+        gen_udp:close(Sock)
+    end.
+
+total_size_block1_reply(Sock, Port, Id, Block, Payload) ->
+    %% CON POST, Token 1, Uri-Path "limit", Block1 with a 16-byte block size.
+    Packet = <<16#41, 2, Id:16, 1, 16#b5, "limit", 16#d1, 3, Block, 16#ff, Payload/binary>>,
+    ok = gen_udp:send(Sock, {127, 0, 0, 1}, Port, Packet),
+    {ok, {_, _, <<_, Code, Id:16, _/binary>>}} = gen_udp:recv(Sock, 0, 2000),
+    Code.
+
+t_gateway_coap(_) ->
+    {200, Gw} = request(get, "/gateways/coap"),
+    assert_gw_unloaded(Gw),
+    GwConf = #{
+        name => <<"coap">>,
+        heartbeat => <<"60s">>,
+        connection_required => true,
+        listeners => [
+            #{name => <<"def">>, type => <<"udp">>, bind => <<"5683">>}
+        ]
+    },
+    {204, _} = request(put, "/gateways/coap", GwConf),
+    {200, ConfResp} = request(get, "/gateways/coap"),
+    assert_confs(GwConf, ConfResp),
+    GwConf2 = emqx_utils_maps:deep_merge(GwConf, #{heartbeat => <<"10s">>}),
+    {204, _} = request(put, "/gateways/coap", maps:without([name, listeners], GwConf2)),
+    {200, ConfResp2} = request(get, "/gateways/coap"),
+    assert_confs(GwConf2, ConfResp2),
+    ok.
+
+t_gateway_lwm2m(_) ->
+    {200, Gw} = request(get, "/gateways/lwm2m"),
+    assert_gw_unloaded(Gw),
+    XmlDir = filename:join(
+        [
+            emqx_common_test_helpers:proj_root(),
+            "apps",
+            "emqx_gateway_lwm2m",
+            "lwm2m_xml"
+        ]
+    ),
+    GwConf = #{
+        name => <<"lwm2m">>,
+        xml_dir => list_to_binary(XmlDir),
+        lifetime_min => <<"1s">>,
+        lifetime_max => <<"1000s">>,
+        qmode_time_window => <<"30s">>,
+        auto_observe => true,
+        translators => #{
+            command => #{topic => <<"dn/#">>},
+            response => #{topic => <<"up/resp">>},
+            notify => #{topic => <<"up/resp">>},
+            register => #{topic => <<"up/resp">>},
+            update => #{topic => <<"up/resp">>}
+        },
+        listeners => [
+            #{name => <<"def">>, type => <<"udp">>, bind => <<"5783">>}
+        ]
+    },
+    {204, _} = request(put, "/gateways/lwm2m", GwConf),
+    {200, ConfResp} = request(get, "/gateways/lwm2m"),
+    assert_confs(GwConf, ConfResp),
+    GwConf2 = emqx_utils_maps:deep_merge(GwConf, #{qmode_time_window => <<"10s">>}),
+    {204, _} = request(put, "/gateways/lwm2m", maps:without([name, listeners], GwConf2)),
+    {200, ConfResp2} = request(get, "/gateways/lwm2m"),
+    assert_confs(GwConf2, ConfResp2),
+    ok.
+
+-doc "Reject non-positive CoAP block-wise body sizes without changing the saved configuration.".
+t_coap_blockwise_body_size_validation(_) ->
+    assert_positive_blockwise_option(coap, max_body_size, [1, <<"1B">>, <<"4MB">>], [
+        0, <<"0B">>, -1, <<"-1">>, <<"bad">>
+    ]).
+
+-doc "Reject non-positive LwM2M block-wise body sizes without changing the saved configuration.".
+t_lwm2m_blockwise_body_size_validation(_) ->
+    assert_positive_blockwise_option(lwm2m, max_body_size, [1, <<"1B">>, <<"4MB">>], [
+        0, <<"0B">>, -1, <<"-1">>, <<"bad">>
+    ]).
+
+-doc "Keep the CoAP exchange lifetime positive and within the supported timer range.".
+t_coap_blockwise_lifetime_validation(_) ->
+    assert_positive_blockwise_option(coap, exchange_lifetime, [1, <<"1ms">>, <<"247s">>], [
+        0, <<"0ms">>, <<"0s">>, -1, <<"bad">>, <<"4294967296ms">>
+    ]).
+
+-doc "Keep the LwM2M exchange lifetime positive and within the supported timer range.".
+t_lwm2m_blockwise_lifetime_validation(_) ->
+    assert_positive_blockwise_option(lwm2m, exchange_lifetime, [1, <<"1ms">>, <<"247s">>], [
+        0, <<"0ms">>, <<"0s">>, -1, <<"bad">>, <<"4294967296ms">>
+    ]).
+
+assert_positive_blockwise_option(GwName, Field, ValidValues, InvalidValues) ->
+    Path = "/gateways/" ++ atom_to_list(GwName),
+    InitialConf = positive_blockwise_gateway_conf(GwName),
+    lists:foreach(
+        fun(Value) ->
+            ?assertMatch({400, _}, request(put, Path, InitialConf#{blockwise => #{Field => Value}}))
+        end,
+        InvalidValues
+    ),
+    {200, Unloaded} = request(get, Path),
+    assert_gw_unloaded(Unloaded),
+    lists:foreach(
+        fun(Value) ->
+            {204, _} = request(put, Path, InitialConf#{blockwise => #{Field => Value}}),
+            {200, Saved} = request(get, Path),
+            assert_positive_blockwise_update_rejected(Path, Field, Saved, InvalidValues)
+        end,
+        ValidValues
+    ).
+
+assert_positive_blockwise_update_rejected(Path, Field, Saved, InvalidValues) ->
+    lists:foreach(
+        fun(Invalid) ->
+            ?assertMatch({400, _}, request(put, Path, #{blockwise => #{Field => Invalid}})),
+            {200, AfterRejectedUpdate} = request(get, Path),
+            ?assertEqual(maps:get(blockwise, Saved), maps:get(blockwise, AfterRejectedUpdate))
+        end,
+        InvalidValues
+    ).
+
+positive_blockwise_gateway_conf(coap) ->
+    #{name => <<"coap">>};
+positive_blockwise_gateway_conf(lwm2m) ->
+    #{
+        name => <<"lwm2m">>,
+        xml_dir => list_to_binary(
+            filename:join([
+                emqx_common_test_helpers:proj_root(), "apps", "emqx_gateway_lwm2m", "lwm2m_xml"
+            ])
+        ),
+        translators => #{
+            command => #{topic => <<"dn/#">>},
+            response => #{topic => <<"up/resp">>},
+            notify => #{topic => <<"up/notify">>},
+            register => #{topic => <<"up/register">>},
+            update => #{topic => <<"up/update">>}
+        }
+    }.
+
+-doc "Apply the byte limit configured through HTTP to a real CoAP Block1 upload.".
+t_coap_blockwise_body_size_enforcement(_) ->
+    Port = emqx_common_test_helpers:select_free_port(udp),
+    Conf = #{
+        name => <<"coap">>,
+        connection_required => false,
+        listeners => [#{name => <<"blockwise">>, type => <<"udp">>, bind => Port}],
+        blockwise => #{max_block_size => 16, max_body_size => <<"16B">>}
+    },
+    {204, _} = request(put, "/gateways/coap", Conf),
+    {ok, Sock} = gen_udp:open(0, [binary, {active, false}]),
+    try
+        %% The first full block fits; the next byte exceeds the configured limit.
+        ?assertEqual(95, body_size_block1_reply(Sock, Port, 1, 8, binary:copy(<<"A">>, 16))),
+        ?assertEqual(141, body_size_block1_reply(Sock, Port, 2, 16, <<"B">>)),
+        ?assertMatch(
+            {400, _}, request(put, "/gateways/coap", #{blockwise => #{max_body_size => <<"0B">>}})
+        ),
+        {200, #{blockwise := #{max_body_size := <<"16B">>}}} = request(get, "/gateways/coap"),
+        ?assertEqual(95, body_size_block1_reply(Sock, Port, 3, 8, binary:copy(<<"C">>, 16))),
+        ?assertEqual(141, body_size_block1_reply(Sock, Port, 4, 16, <<"D">>))
+    after
+        gen_udp:close(Sock)
+    end.
+
+body_size_block1_reply(Sock, Port, Id, Block, Payload) ->
+    %% CON POST, Token 1, Uri-Path "limit", Block1 with a 16-byte block size.
+    Packet = <<16#41, 2, Id:16, 1, 16#b5, "limit", 16#d1, 3, Block, 16#ff, Payload/binary>>,
+    ok = gen_udp:send(Sock, {127, 0, 0, 1}, Port, Packet),
+    {ok, {_, _, <<_, Code, Id:16, _/binary>>}} = gen_udp:recv(Sock, 0, 2000),
+    Code.
+
+t_authn(_) ->
+    init_gw("stomp"),
+    AuthConf = #{
+        mechanism => <<"password_based">>,
+        backend => <<"built_in_database">>,
+        autogenerate_password => false,
+        user_id_type => <<"clientid">>
+    },
+    {201, _} = request(post, "/gateways/stomp/authentication", AuthConf),
+    {200, ConfResp} = request(get, "/gateways/stomp/authentication"),
+    assert_confs(AuthConf, ConfResp),
+
+    AuthConf2 = maps:merge(AuthConf, #{user_id_type => <<"username">>}),
+    {200, _} = request(put, "/gateways/stomp/authentication", AuthConf2),
+
+    {200, ConfResp2} = request(get, "/gateways/stomp/authentication"),
+    assert_confs(AuthConf2, ConfResp2),
+
+    {204, _} = request(delete, "/gateways/stomp/authentication"),
+    {204, _} = request(get, "/gateways/stomp/authentication"),
+    ok.
+
+t_authn_redacts_secret(_) ->
+    init_gw("stomp"),
+    AuthConf = jwt_authn_conf(?AUTHN_SECRET),
+    {201, PostResp} = request(post, "/gateways/stomp/authentication", AuthConf),
+    assert_authn_secret_redacted(PostResp),
+
+    {200, GetResp} = request(get, "/gateways/stomp/authentication"),
+    assert_authn_secret_redacted(GetResp),
+    ?assertMatch(
+        #{<<"secret">> := ?AUTHN_SECRET},
+        emqx:get_raw_config([gateway, stomp, authentication])
+    ),
+
+    RedactedUpdate = maps:without(
+        [id, chain_name],
+        GetResp#{verify_claims => #{<<"username">> => <<"${clientid}">>}}
+    ),
+    {200, PutResp} = request(put, "/gateways/stomp/authentication", RedactedUpdate),
+    assert_authn_secret_redacted(PutResp),
+    ?assertMatch(
+        #{
+            <<"secret">> := ?AUTHN_SECRET,
+            <<"verify_claims">> := #{<<"username">> := <<"${clientid}">>}
+        },
+        emqx:get_raw_config([gateway, stomp, authentication])
+    ),
+    {204, _} = request(delete, "/gateways/stomp/authentication"),
+    ok.
+
+t_authn_oauth2_client_secret_redacted(_) ->
+    Secret = <<"gateway-topsecret">>,
+    init_gw("stomp"),
+    AuthConf = http_oauth2_authn_conf(Secret),
+    {201, PostResp} = request(post, "/gateways/stomp/authentication", AuthConf),
+    assert_authn_oauth2_secret_redacted(PostResp, Secret),
+
+    {200, GetResp} = request(get, "/gateways/stomp/authentication"),
+    assert_authn_oauth2_secret_redacted(GetResp, Secret),
+    ?assertMatch(
+        #{<<"oauth2">> := #{<<"client_secret">> := Secret}},
+        emqx:get_raw_config([gateway, stomp, authentication])
+    ),
+
+    RedactedUpdate = maps:without(
+        [id, chain_name],
+        GetResp#{enable => false}
+    ),
+    {200, PutResp} = request(put, "/gateways/stomp/authentication", RedactedUpdate),
+    assert_authn_oauth2_secret_redacted(PutResp, Secret),
+    ?assertMatch(
+        #{
+            <<"oauth2">> := #{<<"client_secret">> := Secret},
+            <<"enable">> := false
+        },
+        emqx:get_raw_config([gateway, stomp, authentication])
+    ),
+    {204, _} = request(delete, "/gateways/stomp/authentication"),
+    ok.
+
+t_authn_data_mgmt(_) ->
+    init_gw("stomp"),
+    AuthConf = #{
+        mechanism => <<"password_based">>,
+        backend => <<"built_in_database">>,
+        autogenerate_password => false,
+        user_id_type => <<"clientid">>
+    },
+    {201, _} = request(post, "/gateways/stomp/authentication", AuthConf),
+    {200, ConfResp} =
+        ?retry(10, 10, {200, _} = request(get, "/gateways/stomp/authentication")),
+    assert_confs(AuthConf, ConfResp),
+
+    User1 = #{
+        user_id => <<"test">>,
+        password => <<"123456">>,
+        is_superuser => false
+    },
+    {201, _} = request(post, "/gateways/stomp/authentication/users", User1),
+    {200, #{data := [UserRespd1]}} = request(get, "/gateways/stomp/authentication/users"),
+    assert_confs(UserRespd1, User1),
+
+    {200, UserRespd2} = request(
+        get,
+        "/gateways/stomp/authentication/users/test"
+    ),
+    assert_confs(UserRespd2, User1),
+
+    {200, UserRespd3} = request(
+        put,
+        "/gateways/stomp/authentication/users/test",
+        #{
+            password => <<"654321">>,
+            is_superuser => true
+        }
+    ),
+    ?assertMatch(
+        #{user_id := <<"test">>, is_superuser := true, namespace := null}, UserRespd3
+    ),
+    ?assertNot(maps:is_key(password, UserRespd3)),
+
+    {200, UserRespd4} = request(
+        get,
+        "/gateways/stomp/authentication/users/test"
+    ),
+    assert_confs(UserRespd4, User1#{is_superuser => true}),
+
+    {204, _} = request(delete, "/gateways/stomp/authentication/users/test"),
+
+    {200, #{data := []}} = request(
+        get,
+        "/gateways/stomp/authentication/users"
+    ),
+
+    ImportUri = emqx_dashboard_api_test_helpers:uri(
+        ["gateways", "stomp", "authentication", "import_users"]
+    ),
+
+    Dir = code:lib_dir(emqx_auth),
+    JSONFileName = filename:join([Dir, <<"test/data/user-credentials.json">>]),
+    {ok, JSONData} = file:read_file(JSONFileName),
+    {ok, 200, ImportedResults} = emqx_dashboard_api_test_helpers:multipart_formdata_request(
+        ImportUri, [], [
+            {filename, "user-credentials.json", JSONData}
+        ]
+    ),
+    ?assertMatch(
+        #{<<"total">> := 2, <<"success">> := 2},
+        emqx_utils_json:decode(ImportedResults)
+    ),
+
+    CSVFileName = filename:join([Dir, <<"test/data/user-credentials.csv">>]),
+    {ok, CSVData} = file:read_file(CSVFileName),
+    {ok, 200, ImportedResults2} = emqx_dashboard_api_test_helpers:multipart_formdata_request(
+        ImportUri, [], [
+            {filename, "user-credentials.csv", CSVData}
+        ]
+    ),
+    ?assertMatch(
+        #{<<"total">> := 2, <<"success">> := 2},
+        emqx_utils_json:decode(ImportedResults2)
+    ),
+
+    {204, _} = request(delete, "/gateways/stomp/authentication"),
+    {204, _} = request(get, "/gateways/stomp/authentication"),
+    ok.
+
+%% Checks generated-password creation and rotation for gateway and listener authenticators.
+t_authn_generated_passwords(_) ->
+    GwConf = #{
+        listeners => [
+            #{name => <<"def">>, type => <<"tcp">>, bind => <<"127.0.0.1:61613">>}
+        ]
+    },
+    init_gw("stomp", GwConf),
+    AuthConf = #{
+        mechanism => <<"password_based">>,
+        backend => <<"built_in_database">>,
+        user_id_type => <<"clientid">>,
+        autogenerate_password => true
+    },
+    {201, _} = request(post, "/gateways/stomp/authentication", AuthConf),
+    ListenerAuthPath = "/gateways/stomp/listeners/stomp:tcp:def/authentication",
+    {201, _} = request(post, ListenerAuthPath, AuthConf),
+
+    assert_generated_password_routes("/gateways/stomp/authentication/users"),
+    assert_generated_password_routes(ListenerAuthPath ++ "/users"),
+    {204, _} = request(delete, ListenerAuthPath),
+    {204, _} = request(delete, "/gateways/stomp/authentication"),
+    ok.
+
+t_listeners_tcp(_) ->
+    {204, _} = request(put, "/gateways/stomp", #{}),
+    {200, []} = request(get, "/gateways/stomp/listeners"),
+    LisConf = #{
+        name => <<"def">>,
+        type => <<"tcp">>,
+        bind => <<"127.0.0.1:61613">>
+    },
+    {201, _} = request(post, "/gateways/stomp/listeners", LisConf),
+    {200, ConfResp} = request(get, "/gateways/stomp/listeners"),
+    assert_confs([LisConf], ConfResp),
+    {200, ConfResp1} = request(get, "/gateways/stomp/listeners/stomp:tcp:def"),
+    assert_confs(LisConf, ConfResp1),
+
+    LisConf2 = maps:merge(LisConf, #{bind => <<"127.0.0.1:61614">>}),
+    {200, _} = request(
+        put,
+        "/gateways/stomp/listeners/stomp:tcp:def",
+        LisConf2
+    ),
+
+    {200, ConfResp2} = request(get, "/gateways/stomp/listeners/stomp:tcp:def"),
+    assert_confs(LisConf2, ConfResp2),
+
+    {204, _} = request(delete, "/gateways/stomp/listeners/stomp:tcp:def"),
+    {404, _} = request(get, "/gateways/stomp/listeners/stomp:tcp:def"),
+    {404, _} = request(delete, "/gateways/stomp/listeners/stomp:tcp:def"),
+    ok.
+
+t_listeners_status_default_address(_) ->
+    %% A bare-port bind is registered under the resolved default address.
+    %% The status API must resolve it the same way, on the node that owns
+    %% the listener, otherwise it reports the listener as not running.
+    emqx_common_test_helpers:with_default_address("loopback", fun() ->
+        {204, _} = request(put, "/gateways/stomp", #{}),
+        LisConf = #{
+            name => <<"def">>,
+            type => <<"tcp">>,
+            bind => 61613
+        },
+        {201, _} = request(post, "/gateways/stomp/listeners", LisConf),
+        {200, [Listener]} = request(get, "/gateways/stomp/listeners"),
+        ?assertMatch(
+            #{
+                bind := <<":61613">>,
+                status := #{running := true, current_connections := 0},
+                %% resolved_address/resolved_address_from are node-local and
+                %% reported per node, not in the cluster-wide status above.
+                node_status := [
+                    #{
+                        status := #{
+                            resolved_address := <<"127.0.0.1">>,
+                            resolved_address_from := <<"127.0.0.1">>
+                        }
+                    }
+                ]
+            },
+            Listener
+        ),
+        %% Stop the listener while the address still resolves the same way.
+        {204, _} = request(delete, "/gateways/stomp/listeners/stomp:tcp:def")
+    end).
+
+t_listener_id_too_long(_) ->
+    {204, _} = request(put, "/gateways/stomp", #{}),
+    ?assertMatch(
+        {400, #{
+            code := <<"BAD_REQUEST">>,
+            message :=
+                <<"Listener name must start with a letter or digit and contain only letters, digits, '-' and '_'">>
+        }},
+        request(post, "/gateways/stomp/listeners", #{
+            name => <<"你好"/utf8>>, type => <<"tcp">>, bind => <<"127.0.0.1:61613">>
+        })
+    ),
+    ?assertMatch(
+        {400, #{
+            code := <<"BAD_REQUEST">>,
+            message :=
+                <<"Listener name must start with a letter or digit and contain only letters, digits, '-' and '_'">>
+        }},
+        request(post, "/gateways/stomp/listeners", #{
+            name => <<"name/with/slash">>, type => <<"tcp">>, bind => <<"127.0.0.1:61613">>
+        })
+    ),
+    ?assertMatch(
+        {400, #{
+            code := <<"BAD_REQUEST">>,
+            message :=
+                <<"Listener name must start with a letter or digit and contain only letters, digits, '-' and '_'">>
+        }},
+        request(post, "/gateways/stomp/listeners", #{
+            name => <<"_leading_underscore">>,
+            type => <<"tcp">>,
+            bind => <<"127.0.0.1:61613">>
+        })
+    ),
+    AllowedName = binary:copy(<<"a">>, 64),
+    AllowedConf = #{
+        name => AllowedName,
+        type => <<"tcp">>,
+        bind => <<"127.0.0.1:61613">>
+    },
+    {201, _} = request(post, "/gateways/stomp/listeners", AllowedConf),
+    AllowedId = atom_to_list(emqx_gateway_utils:listener_id(stomp, tcp, AllowedName)),
+    {204, _} = request(delete, "/gateways/stomp/listeners/" ++ AllowedId),
+
+    ListenerName = binary:copy(<<"a">>, 65),
+    ListenerConf = #{
+        name => ListenerName,
+        type => <<"tcp">>,
+        bind => <<"127.0.0.1:61613">>
+    },
+    {400, #{code := <<"BAD_REQUEST">>, message := Message}} = request(
+        post, "/gateways/stomp/listeners", ListenerConf
+    ),
+    ?assertEqual(<<"Listener name must not exceed 64 bytes">>, Message),
+    {200, []} = request(get, "/gateways/stomp/listeners"),
+    ok.
+
+t_gateway_listener_id_too_long(_) ->
+    ListenerName = binary:copy(<<"a">>, 65),
+    GatewayConf = #{
+        listeners => [
+            #{
+                name => ListenerName,
+                type => <<"tcp">>,
+                bind => <<"127.0.0.1:61613">>
+            }
+        ]
+    },
+    {400, #{code := <<"BAD_REQUEST">>, message := Message}} = request(
+        put, "/gateways/stomp", GatewayConf
+    ),
+    ?assertEqual(<<"Listener name must not exceed 64 bytes">>, Message),
+    ?assertEqual(undefined, emqx_gateway:lookup(stomp)),
+    ok.
+
+t_listeners_max_conns(_) ->
+    {204, _} = request(put, "/gateways/stomp", #{}),
+    {200, []} = request(get, "/gateways/stomp/listeners"),
+    LisConf = #{
+        name => <<"def">>,
+        type => <<"tcp">>,
+        bind => <<"127.0.0.1:61613">>,
+        max_connections => 1024
+    },
+    {201, _} = request(post, "/gateways/stomp/listeners", LisConf),
+    {200, ConfResp} = request(get, "/gateways/stomp/listeners"),
+    assert_confs([LisConf], ConfResp),
+    {200, ConfResp1} = request(get, "/gateways/stomp/listeners/stomp:tcp:def"),
+    assert_confs(LisConf, ConfResp1),
+
+    LisConf2 = maps:merge(LisConf, #{max_connections => <<"infinity">>}),
+    {200, _} = request(
+        put,
+        "/gateways/stomp/listeners/stomp:tcp:def",
+        LisConf2
+    ),
+
+    {200, ConfResp2} = request(get, "/gateways/stomp/listeners/stomp:tcp:def"),
+    assert_confs(LisConf2, ConfResp2),
+
+    {200, [Listeners]} = request(get, "/gateways/stomp/listeners"),
+    ?assertMatch(#{max_connections := <<"infinity">>}, Listeners),
+
+    {200, Gateways} = request(get, "/gateways"),
+    [StompGwOverview] = lists:filter(
+        fun(Gw) -> maps:get(name, Gw) =:= <<"stomp">> end,
+        Gateways
+    ),
+    ?assertMatch(#{max_connections := <<"infinity">>}, StompGwOverview),
+
+    {204, _} = request(delete, "/gateways/stomp/listeners/stomp:tcp:def"),
+    {404, _} = request(get, "/gateways/stomp/listeners/stomp:tcp:def"),
+    ok.
+
+t_listeners_authn(_) ->
+    GwConf = #{
+        name => <<"stomp">>,
+        listeners => [
+            #{
+                name => <<"def">>,
+                type => <<"tcp">>,
+                bind => <<"127.0.0.1:61613">>
+            }
+        ]
+    },
+    ConfResp = init_gw("stomp", GwConf),
+    assert_confs(GwConf, ConfResp),
+
+    AuthConf = #{
+        mechanism => <<"password_based">>,
+        backend => <<"built_in_database">>,
+        autogenerate_password => false,
+        user_id_type => <<"clientid">>
+    },
+    Path = "/gateways/stomp/listeners/stomp:tcp:def/authentication",
+    {201, _} = request(post, Path, AuthConf),
+    {200, ConfResp2} = request(get, Path),
+    assert_confs(AuthConf, ConfResp2),
+
+    AuthConf2 = maps:merge(AuthConf, #{user_id_type => <<"username">>}),
+    {200, _} = request(put, Path, AuthConf2),
+
+    {200, ConfResp3} = request(get, Path),
+    assert_confs(AuthConf2, ConfResp3),
+
+    {404, _} = request(get, Path ++ "/users/not_exists"),
+    {404, _} = request(delete, Path ++ "/users/not_exists"),
+
+    {204, _} = request(delete, Path),
+    %% FIXME: 204?
+    {204, _} = request(get, Path),
+
+    BadPath = "/gateways/stomp/listeners/stomp:tcp:not_exists/authentication/users/foo",
+    {404, _} = request(get, BadPath),
+    {404, _} = request(delete, BadPath),
+
+    {404, _} = request(get, "/gateways/stomp/listeners/not_exists"),
+    {404, _} = request(delete, "/gateways/stomp/listeners/not_exists"),
+    ok.
+
+t_listeners_authn_redacts_secret(_) ->
+    GwConf = #{
+        name => <<"stomp">>,
+        listeners => [
+            #{
+                name => <<"def">>,
+                type => <<"tcp">>,
+                bind => <<"127.0.0.1:61613">>
+            }
+        ]
+    },
+    ConfResp = init_gw("stomp", GwConf),
+    assert_confs(GwConf, ConfResp),
+
+    AuthConf = jwt_authn_conf(?AUTHN_SECRET),
+    Path = "/gateways/stomp/listeners/stomp:tcp:def/authentication",
+    {204, _} = request(delete, Path),
+    {201, PostResp} = request(post, Path, AuthConf),
+    assert_authn_secret_redacted(PostResp),
+
+    {200, GetResp} = request(get, Path),
+    assert_authn_secret_redacted(GetResp),
+    ?assertMatch(
+        #{<<"secret">> := ?AUTHN_SECRET},
+        emqx:get_raw_config([gateway, stomp, listeners, tcp, def, authentication])
+    ),
+
+    RedactedUpdate = maps:without(
+        [id, chain_name],
+        GetResp#{verify_claims => #{<<"username">> => <<"${clientid}">>}}
+    ),
+    {200, PutResp} = request(put, Path, RedactedUpdate),
+    assert_authn_secret_redacted(PutResp),
+    ?assertMatch(
+        #{
+            <<"secret">> := ?AUTHN_SECRET,
+            <<"verify_claims">> := #{<<"username">> := <<"${clientid}">>}
+        },
+        emqx:get_raw_config([gateway, stomp, listeners, tcp, def, authentication])
+    ),
+
+    {200, ListenerResp} = request(get, "/gateways/stomp/listeners/stomp:tcp:def"),
+    ?assertMatch(
+        #{authentication := #{secret := ?REDACTED}},
+        ListenerResp
+    ),
+    ListenerUpdate = ListenerResp#{bind => <<"127.0.0.1:61614">>},
+    {200, UpdatedListenerResp} = request(
+        put,
+        "/gateways/stomp/listeners/stomp:tcp:def",
+        ListenerUpdate
+    ),
+    ?assertMatch(
+        #{
+            bind := <<"127.0.0.1:61614">>,
+            authentication := #{secret := ?REDACTED}
+        },
+        UpdatedListenerResp
+    ),
+    ?assertMatch(
+        #{
+            <<"bind">> := <<"127.0.0.1:61614">>,
+            <<"authentication">> := #{<<"secret">> := ?AUTHN_SECRET}
+        },
+        emqx:get_raw_config([gateway, stomp, listeners, tcp, def])
+    ),
+    {204, _} = request(delete, Path),
+    ok.
+
+t_listeners_authn_oauth2_client_secret_redacted(_) ->
+    Secret = <<"gateway-listener-topsecret">>,
+    GwConf = #{
+        name => <<"stomp">>,
+        listeners => [
+            #{
+                name => <<"def">>,
+                type => <<"tcp">>,
+                bind => <<"127.0.0.1:61613">>
+            }
+        ]
+    },
+    ConfResp = init_gw("stomp", GwConf),
+    assert_confs(GwConf, ConfResp),
+
+    AuthConf = http_oauth2_authn_conf(Secret),
+    Path = "/gateways/stomp/listeners/stomp:tcp:def/authentication",
+    {204, _} = request(delete, Path),
+    {201, PostResp} = request(post, Path, AuthConf),
+    assert_authn_oauth2_secret_redacted(PostResp, Secret),
+
+    {200, GetResp} = request(get, Path),
+    assert_authn_oauth2_secret_redacted(GetResp, Secret),
+    ?assertMatch(
+        #{<<"oauth2">> := #{<<"client_secret">> := Secret}},
+        emqx:get_raw_config([gateway, stomp, listeners, tcp, def, authentication])
+    ),
+
+    RedactedUpdate = maps:without(
+        [id, chain_name],
+        GetResp#{enable => false}
+    ),
+    {200, PutResp} = request(put, Path, RedactedUpdate),
+    assert_authn_oauth2_secret_redacted(PutResp, Secret),
+    ?assertMatch(
+        #{
+            <<"oauth2">> := #{<<"client_secret">> := Secret},
+            <<"enable">> := false
+        },
+        emqx:get_raw_config([gateway, stomp, listeners, tcp, def, authentication])
+    ),
+
+    %% The listener GET embeds the authentication config as well.
+    {200, ListenerResp} = request(get, "/gateways/stomp/listeners/stomp:tcp:def"),
+    ?assertMatch(
+        #{authentication := #{oauth2 := #{client_secret := ?REDACTED}}},
+        ListenerResp
+    ),
+    ?assertEqual(nomatch, binary:match(term_to_binary(ListenerResp), Secret)),
+
+    %% Updating the listener must restore the embedded (redacted) secret.
+    ListenerUpdate = ListenerResp#{bind => <<"127.0.0.1:61614">>},
+    {200, UpdatedListenerResp} = request(
+        put,
+        "/gateways/stomp/listeners/stomp:tcp:def",
+        ListenerUpdate
+    ),
+    ?assertMatch(
+        #{
+            bind := <<"127.0.0.1:61614">>,
+            authentication := #{oauth2 := #{client_secret := ?REDACTED}}
+        },
+        UpdatedListenerResp
+    ),
+    ?assertMatch(
+        #{
+            <<"bind">> := <<"127.0.0.1:61614">>,
+            <<"authentication">> := #{
+                <<"oauth2">> := #{<<"client_secret">> := Secret}
+            }
+        },
+        emqx:get_raw_config([gateway, stomp, listeners, tcp, def])
+    ),
+    {204, _} = request(delete, Path),
+    ok.
+
+t_listeners_authn_data_mgmt(_) ->
+    GwConf = #{
+        name => <<"stomp">>,
+        listeners => [
+            #{
+                name => <<"def">>,
+                type => <<"tcp">>,
+                bind => <<"127.0.0.1:61613">>
+            }
+        ]
+    },
+    {204, _} = request(put, "/gateways/stomp", GwConf),
+    {200, ConfResp} = request(get, "/gateways/stomp"),
+    assert_confs(GwConf, ConfResp),
+
+    AuthConf = #{
+        mechanism => <<"password_based">>,
+        backend => <<"built_in_database">>,
+        autogenerate_password => false,
+        user_id_type => <<"clientid">>
+    },
+    Path = "/gateways/stomp/listeners/stomp:tcp:def/authentication",
+    {201, _} = request(post, Path, AuthConf),
+    {200, ConfResp2} = request(get, Path),
+    assert_confs(AuthConf, ConfResp2),
+
+    User1 = #{
+        user_id => <<"test">>,
+        password => <<"123456">>,
+        is_superuser => false
+    },
+    {201, _} = request(
+        post,
+        "/gateways/stomp/listeners/stomp:tcp:def/authentication/users",
+        User1
+    ),
+
+    {200, #{data := [UserRespd1]}} = request(
+        get,
+        Path ++ "/users"
+    ),
+    assert_confs(UserRespd1, User1),
+
+    {200, UserRespd2} = request(
+        get,
+        Path ++ "/users/test"
+    ),
+    assert_confs(UserRespd2, User1),
+
+    {200, UserRespd3} = request(
+        put,
+        Path ++ "/users/test",
+        #{password => <<"654321">>, is_superuser => true}
+    ),
+    ?assertMatch(
+        #{user_id := <<"test">>, is_superuser := true, namespace := null}, UserRespd3
+    ),
+    ?assertNot(maps:is_key(password, UserRespd3)),
+
+    {200, UserRespd4} = request(
+        get,
+        Path ++ "/users/test"
+    ),
+    assert_confs(UserRespd4, User1#{is_superuser => true}),
+
+    {204, _} = request(
+        delete,
+        Path ++ "/users/test"
+    ),
+
+    {200, #{data := []}} = request(
+        get,
+        Path ++ "/users"
+    ),
+
+    ImportUri = emqx_dashboard_api_test_helpers:uri(
+        ["gateways", "stomp", "listeners", "stomp:tcp:def", "authentication", "import_users"]
+    ),
+
+    Dir = code:lib_dir(emqx_auth),
+    JSONFileName = filename:join([Dir, <<"test/data/user-credentials.json">>]),
+    {ok, JSONData} = file:read_file(JSONFileName),
+    {ok, 200, ImportedResults} = emqx_dashboard_api_test_helpers:multipart_formdata_request(
+        ImportUri, [], [
+            {filename, "user-credentials.json", JSONData}
+        ]
+    ),
+    ?assertMatch(
+        #{<<"total">> := 2, <<"success">> := 2},
+        emqx_utils_json:decode(ImportedResults)
+    ),
+
+    CSVFileName = filename:join([Dir, <<"test/data/user-credentials.csv">>]),
+    {ok, CSVData} = file:read_file(CSVFileName),
+    {ok, 200, ImportedResults2} = emqx_dashboard_api_test_helpers:multipart_formdata_request(
+        ImportUri, [], [
+            {filename, "user-credentials.csv", CSVData}
+        ]
+    ),
+    ?assertMatch(
+        #{<<"total">> := 2, <<"success">> := 2},
+        emqx_utils_json:decode(ImportedResults2)
+    ),
+
+    {204, _} = request(delete, Path),
+    ok.
+
+t_clients(_) ->
+    GwConf = #{
+        name => <<"mqttsn">>,
+        gateway_id => 1,
+        broadcast => true,
+        predefined => [#{id => 1, topic => <<"t/a">>}],
+        enable_qos3 => true,
+        listeners => [
+            #{name => <<"def">>, type => <<"udp">>, bind => <<"1884">>}
+        ]
+    },
+    init_gw("mqttsn", GwConf),
+    ok = emqx_gateway_test_utils:set_gateway_listeners_authn(<<"mqttsn">>, false),
+    Path = "/gateways/mqttsn/clients",
+    MyClient = Path ++ "/my_client",
+    MyClientSubscriptions = MyClient ++ "/subscriptions",
+    {200, NoClients} = request(get, Path),
+    ?assertMatch(#{data := []}, NoClients),
+
+    ClientSocket = emqx_gateway_test_utils:sn_client_connect(<<"my_client">>),
+    {200, _} = request(get, MyClient),
+    {200, Clients} = request(get, Path),
+    ?assertMatch(#{data := [#{clientid := <<"my_client">>}]}, Clients),
+
+    {201, _} = request(post, MyClientSubscriptions, #{topic => <<"test/topic">>}),
+    {200, Subscriptions} = request(get, MyClientSubscriptions),
+    ?assertMatch([#{topic := <<"test/topic">>}], Subscriptions),
+    {204, _} = request(delete, MyClientSubscriptions ++ "/test%2Ftopic"),
+    {200, []} = request(get, MyClientSubscriptions),
+    {404, _} = request(delete, MyClientSubscriptions ++ "/test%2Ftopic"),
+
+    {204, _} = request(delete, MyClient),
+    ?retry(500, 10, {404, _} = request(delete, MyClient)),
+    {404, _} = request(get, MyClient),
+    {404, _} = request(get, MyClientSubscriptions),
+    {404, _} = request(post, MyClientSubscriptions, #{topic => <<"foo">>}),
+    {404, _} = request(delete, MyClientSubscriptions ++ "/topic"),
+    {200, NoClients2} = request(get, Path),
+    ?assertMatch(#{data := []}, NoClients2),
+    emqx_gateway_test_utils:sn_client_disconnect(ClientSocket),
+    ok.
+
+t_authn_fuzzy_search(_) ->
+    init_gw("stomp"),
+    AuthConf = #{
+        mechanism => <<"password_based">>,
+        backend => <<"built_in_database">>,
+        autogenerate_password => false,
+        user_id_type => <<"clientid">>
+    },
+    {201, _} = request(post, "/gateways/stomp/authentication", AuthConf),
+    {200, ConfResp} = request(get, "/gateways/stomp/authentication"),
+    assert_confs(AuthConf, ConfResp),
+
+    Checker = fun({User, Fuzzy}) ->
+        {200, #{data := [UserRespd]}} = request(
+            get, "/gateways/stomp/authentication/users", Fuzzy
+        ),
+        assert_confs(UserRespd, User)
+    end,
+
+    Create = fun(User) ->
+        {201, _} = request(post, "/gateways/stomp/authentication/users", User)
+    end,
+
+    UserDatas = [
+        #{
+            user_id => <<"test">>,
+            password => <<"123456">>,
+            is_superuser => false
+        },
+        #{
+            user_id => <<"foo">>,
+            password => <<"123456">>,
+            is_superuser => true
+        }
+    ],
+
+    FuzzyDatas = [[{<<"like_user_id">>, <<"test">>}], [{<<"is_superuser">>, <<"true">>}]],
+
+    lists:foreach(Create, UserDatas),
+    lists:foreach(Checker, lists:zip(UserDatas, FuzzyDatas)),
+
+    {204, _} = request(delete, "/gateways/stomp/authentication"),
+    {204, _} = request(get, "/gateways/stomp/authentication"),
+    ok.
+
+t_cluster_status_if_gateway_sup_is_not_running(_) ->
+    application:stop(emqx_gateway),
+    ?assertEqual(
+        [#{node => node(), status => unloaded}],
+        emqx_gateway_http:cluster_gateway_status(<<"stomp">>)
+    ),
+    application:start(emqx_gateway),
+    ok.
+
+%%--------------------------------------------------------------------
+%% Helpers
+
+init_gw(GwName) ->
+    init_gw(GwName, #{}).
+
+init_gw(GwName, GwConf) ->
+    {204, _} = request(put, "/gateways/" ++ GwName, GwConf),
+    ?retry(
+        10,
+        10,
+        begin
+            {200, #{status := Status} = RespConf} = request(get, "/gateways/" ++ GwName),
+            false = (Status == <<"unloaded">>),
+            RespConf
+        end
+    ).
+
+%%--------------------------------------------------------------------
+%% Asserts
+
+jwt_authn_conf(Secret) ->
+    #{
+        mechanism => <<"jwt">>,
+        use_jwks => false,
+        algorithm => <<"hmac-based">>,
+        secret => Secret,
+        secret_base64_encoded => false,
+        verify_claims => #{<<"username">> => <<"${username}">>},
+        enable => true
+    }.
+
+assert_authn_secret_redacted(Conf) ->
+    ?assertEqual(?REDACTED, maps:get(secret, Conf)).
+
+http_oauth2_authn_conf(Secret) ->
+    #{
+        mechanism => <<"password_based">>,
+        backend => <<"http">>,
+        method => <<"post">>,
+        url => <<"http://127.0.0.1:1/auth">>,
+        oauth2 => #{
+            enable => true,
+            grant_type => <<"client_credentials">>,
+            token_endpoint => <<"http://127.0.0.1:1/token">>,
+            client_id => <<"cid">>,
+            client_secret => Secret
+        },
+        enable => true
+    }.
+
+assert_authn_oauth2_secret_redacted(Conf, Secret) ->
+    ?assertEqual(?REDACTED, maps:get(client_secret, maps:get(oauth2, Conf))),
+    ?assertEqual(nomatch, binary:match(term_to_binary(Conf), Secret)).
+
+assert_gw_unloaded(Gateway) ->
+    ?assertEqual(<<"unloaded">>, maps:get(status, Gateway)).
+
+assert_bad_request(BadReq) ->
+    ?assertEqual(<<"BAD_REQUEST">>, maps:get(code, BadReq)).
+
+assert_generated_password_routes(UsersPath) ->
+    {400, _} = request(post, UsersPath, #{user_id => <<"explicit">>, password => <<"p">>}),
+    {201, Created} = request(post, UsersPath, #{
+        user_id => <<"generated">>, namespace => <<"not-a-gateway-namespace">>
+    }),
+    ?assertEqual(null, maps:get(namespace, Created)),
+    #{password := Password1} = Created,
+    {200, Fetched} = request(get, UsersPath ++ "/generated"),
+    ?assertNot(maps:is_key(password, Fetched)),
+    RotatePath = UsersPath ++ "/generated/password/rotate",
+    {200, Rotated1} = request(post, RotatePath, #{}),
+    #{password := Password2} = Rotated1,
+    ?assertNotEqual(Password1, Password2),
+    {200, Rotated2} = request(post, RotatePath, #{}),
+    #{password := Password3} = Rotated2,
+    ?assertNotEqual(Password2, Password3),
+    {404, _} = request(post, UsersPath ++ "/missing/password/rotate", #{}),
+    ok.
+
+assert_not_found(NotFoundReq) ->
+    ?assertEqual(<<"RESOURCE_NOT_FOUND">>, maps:get(code, NotFoundReq)).

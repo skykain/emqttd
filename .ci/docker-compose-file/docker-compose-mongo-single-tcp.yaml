@@ -1,0 +1,44 @@
+services:
+  mongo_server:
+    container_name: mongo
+    image: public.ecr.aws/docker/library/mongo:${MONGO_TAG_SINGLE_TCP}
+    restart: always
+    networks:
+      - emqx_bridge
+    ports:
+      - "27017:27017"
+    env_file:
+      - .env
+      - credentials.env
+    command:
+      --ipv6
+      --bind_ip_all
+
+  mongo_single_setup:
+    image: public.ecr.aws/docker/library/mongo:${MONGO_TAG_SINGLE_TCP}
+    container_name: mongo_single_setup
+    networks:
+      - emqx_bridge
+    depends_on:
+      - mongo_server
+    restart: on-failure:3
+    command:
+      - /bin/bash
+      - -c
+      - |
+        while ! mongosh --host mongo --quiet --eval 'db.runCommand({ping: 1}).ok' > /dev/null 2>&1; do
+            sleep 1
+        done
+        mongosh --host mongo -u emqx -p passw0rd --authenticationDatabase admin --quiet <<'EOF'
+        db.getSiblingDB("mqtt").createRole({role: "role1", privileges: [], roles: []})
+        db.getSiblingDB("mqtt").createUser({user: "user1", pwd: "abc123", roles: [{role: "role1", db: "mqtt"}]})
+        EOF
+
+  mongo_single_setup_done:
+    image: public.ecr.aws/docker/library/mongo:${MONGO_TAG_SINGLE_TCP}
+    networks:
+      - emqx_bridge
+    restart: no
+    depends_on:
+      mongo_single_setup:
+        condition: service_completed_successfully

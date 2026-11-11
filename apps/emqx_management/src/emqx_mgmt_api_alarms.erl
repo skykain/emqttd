@@ -1,137 +1,205 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_mgmt_api_alarms).
 
--include("emqx_mgmt.hrl").
+-behaviour(minirest_api).
 
+-include_lib("hocon/include/hoconsc.hrl").
 -include_lib("emqx/include/emqx.hrl").
+-include_lib("typerefl/include/types.hrl").
+-include_lib("emqx_utils/include/emqx_api_key_scopes.hrl").
 
--rest_api(#{name   => list_all_alarms,
-            method => 'GET',
-            path   => "/alarms",
-            func   => list,
-            descr  => "List all alarms in the cluster"}).
+-export([api_spec/0, paths/0, schema/1, fields/1, namespace/0]).
 
--rest_api(#{name   => list_node_alarms,
-            method => 'GET',
-            path   => "nodes/:atom:node/alarms",
-            func   => list,
-            descr  => "List all alarms on a node"}).
+-export([alarms/2, format_alarm/2, force_deactivate_alarm/2]).
 
--rest_api(#{name   => list_all_activated_alarms,
-            method => 'GET',
-            path   => "/alarms/activated",
-            func   => list_activated,
-            descr  => "List all activated alarm in the cluster"}).
+%% RPC targets (`emqx_mgmt_api_alarms_proto_v1`)
+-export([safe_deactivate_v1/1]).
 
--rest_api(#{name   => list_node_activated_alarms,
-            method => 'GET',
-            path   => "nodes/:atom:node/alarms/activated",
-            func   => list_activated,
-            descr  => "List all activated alarm on a node"}).
+-define(TAGS, [<<"Alarms">>]).
+-define(BPAPI_NAME, emqx_mgmt_api_alarms).
 
--rest_api(#{name   => list_all_deactivated_alarms,
-            method => 'GET',
-            path   => "/alarms/deactivated",
-            func   => list_deactivated,
-            descr  => "List all deactivated alarm in the cluster"}).
+%% internal export (for query)
+-export([qs2ms/2]).
+-export([scopes/0]).
 
--rest_api(#{name   => list_node_deactivated_alarms,
-            method => 'GET',
-            path   => "nodes/:atom:node/alarms/deactivated",
-            func   => list_deactivated,
-            descr  => "List all deactivated alarm on a node"}).
+namespace() ->
+    undefined.
 
--rest_api(#{name   => deactivate_alarm,
-            method => 'POST',
-            path   => "/alarms/deactivated",
-            func   => deactivate,
-            descr  => "Delete the special alarm on a node"}).
+api_spec() ->
+    emqx_dashboard_swagger:spec(?MODULE, #{check_schema => true}).
 
--rest_api(#{name   => delete_all_deactivated_alarms,
-            method => 'DELETE',
-            path   => "/alarms/deactivated",
-            func   => delete_deactivated,
-            descr  => "Delete all deactivated alarm in the cluster"}).
+scopes() -> ?SCOPE_MONITORING.
 
--rest_api(#{name   => delete_node_deactivated_alarms,
-            method => 'DELETE',
-            path   => "nodes/:atom:node/alarms/deactivated",
-            func   => delete_deactivated,
-            descr  => "Delete all deactivated alarm on a node"}).
+paths() ->
+    [
+        "/alarms",
+        "/alarms/force_deactivate"
+    ].
 
--export([ list/2
-        , deactivate/2
-        , list_activated/2
-        , list_deactivated/2
-        , delete_deactivated/2
-        ]).
+schema("/alarms") ->
+    #{
+        'operationId' => alarms,
+        get => #{
+            description => ?DESC(list_alarms_api),
+            tags => ?TAGS,
+            parameters => [
+                hoconsc:ref(emqx_dashboard_swagger, page),
+                hoconsc:ref(emqx_dashboard_swagger, limit),
+                {activated,
+                    hoconsc:mk(boolean(), #{
+                        in => query,
+                        desc => ?DESC(get_alarms_qs_activated),
+                        required => false
+                    })}
+            ],
+            responses => #{
+                200 => [
+                    {data, hoconsc:mk(hoconsc:array(hoconsc:ref(?MODULE, alarm)), #{})},
+                    {meta, hoconsc:mk(hoconsc:ref(emqx_dashboard_swagger, meta), #{})}
+                ]
+            }
+        },
+        delete => #{
+            description => ?DESC(delete_alarms_api),
+            tags => ?TAGS,
+            responses => #{
+                204 => ?DESC(delete_alarms_api_response204)
+            }
+        }
+    };
+schema("/alarms/force_deactivate") ->
+    #{
+        'operationId' => force_deactivate_alarm,
+        post => #{
+            description => ?DESC(force_deactivate_alarm_api),
+            tags => ?TAGS,
+            'requestBody' => hoconsc:ref(?MODULE, force_deactivate_alarm_request),
+            responses => #{
+                204 => ?DESC(force_deactivate_alarm_api_response204),
+                400 => ?DESC(force_deactivate_alarm_api_response400)
+            }
+        }
+    }.
 
-list(Bindings, _Params) when map_size(Bindings) == 0 ->
-    {ok, #{code => ?SUCCESS,
-           data => [#{node => Node, alarms => Alarms} || {Node, Alarms} <- emqx_mgmt:get_alarms(all)]}};
+fields(alarm) ->
+    [
+        {node,
+            hoconsc:mk(
+                binary(),
+                #{desc => ?DESC(node), example => atom_to_list(node())}
+            )},
+        {name,
+            hoconsc:mk(
+                binary(),
+                #{desc => ?DESC(name), example => <<"high_system_memory_usage">>}
+            )},
+        {message,
+            hoconsc:mk(binary(), #{
+                desc => ?DESC(message),
+                example => <<"System memory usage is higher than 70%">>
+            })},
+        {details,
+            hoconsc:mk(map(), #{
+                desc => ?DESC(details),
+                example => #{<<"high_watermark">> => 70}
+            })},
+        {duration, hoconsc:mk(integer(), #{desc => ?DESC(duration), example => 297056})},
+        {activate_at,
+            hoconsc:mk(binary(), #{
+                desc => ?DESC(activate_at),
+                example => <<"2021-10-25T11:52:52.548+08:00">>
+            })},
+        {deactivate_at,
+            hoconsc:mk(binary(), #{
+                desc => ?DESC(deactivate_at),
+                example => <<"2021-10-31T10:52:52.548+08:00">>
+            })}
+    ];
+fields(force_deactivate_alarm_request) ->
+    [
+        {name,
+            hoconsc:mk(binary(), #{
+                desc => ?DESC(name),
+                example => <<"high_system_memory_usage">>
+            })}
+    ].
 
-list(#{node := Node}, _Params) ->
-    {ok, #{code => ?SUCCESS,
-           data => emqx_mgmt:get_alarms(Node, all)}}.
-
-list_activated(Bindings, _Params) when map_size(Bindings) == 0 ->
-    {ok, #{code => ?SUCCESS,
-           data => [#{node => Node, alarms => Alarms} || {Node, Alarms} <- emqx_mgmt:get_alarms(activated)]}};
-
-list_activated(#{node := Node}, _Params) ->
-    {ok, #{code => ?SUCCESS,
-           data => emqx_mgmt:get_alarms(Node, activated)}}.
-
-list_deactivated(Bindings, _Params) when map_size(Bindings) == 0 ->
-    {ok, #{code => ?SUCCESS,
-           data => [#{node => Node, alarms => Alarms} || {Node, Alarms} <- emqx_mgmt:get_alarms(deactivated)]}};
-
-list_deactivated(#{node := Node}, _Params) ->
-    {ok, #{code => ?SUCCESS,
-           data => emqx_mgmt:get_alarms(Node, deactivated)}}.
-
-deactivate(_Bindings, Params) ->
-    Node = get_node(Params),
-    Name = get_name(Params),
-    do_deactivate(Node, Name).
-
-delete_deactivated(Bindings, _Params) when map_size(Bindings) == 0 ->
+%%%==============================================================================================
+%% parameters trans
+alarms(get, #{query_string := QString}) ->
+    Table =
+        case maps:get(<<"activated">>, QString, true) of
+            true -> ?ACTIVATED_ALARM;
+            false -> ?DEACTIVATED_ALARM
+        end,
+    case
+        emqx_mgmt_api:cluster_query(
+            Table,
+            QString,
+            [],
+            fun ?MODULE:qs2ms/2,
+            fun ?MODULE:format_alarm/2
+        )
+    of
+        {error, page_limit_invalid} ->
+            {400, #{code => <<"INVALID_PARAMETER">>, message => <<"page_limit_invalid">>}};
+        {error, Node, Error} ->
+            Message = list_to_binary(io_lib:format("bad rpc call ~p, Reason ~p", [Node, Error])),
+            {500, #{code => <<"NODE_DOWN">>, message => Message}};
+        Response ->
+            {200, Response}
+    end;
+alarms(delete, _Params) ->
     _ = emqx_mgmt:delete_all_deactivated_alarms(),
-    {ok, #{code => ?SUCCESS}};
+    {204}.
 
-delete_deactivated(#{node := Node}, _Params) ->
-    emqx_mgmt:delete_all_deactivated_alarms(Node),
-    {ok, #{code => ?SUCCESS}}.
-
-get_node(Params) ->
-    binary_to_atom(proplists:get_value(<<"node">>, Params, undefined), utf8).
-
-get_name(Params) ->
-    binary_to_atom(proplists:get_value(<<"name">>, Params, undefined), utf8).
-
-do_deactivate(undefined, _) ->
-    minirest:return({error, missing_param});
-do_deactivate(_, undefined) ->
-    minirest:return({error, missing_param});
-do_deactivate(Node, Name) ->
-    case emqx_mgmt:deactivate(Node, Name) of
-        ok ->
-            minirest:return();
-        {error, Reason} ->
-            minirest:return({error, Reason})
+force_deactivate_alarm(post, #{body := Body}) ->
+    Name = maps:get(<<"name">>, Body, undefined),
+    case Name =:= undefined orelse Name =:= <<>> of
+        true ->
+            {400, #{code => <<"INVALID_PARAMETER">>, message => <<"name is required">>}};
+        false ->
+            Nodes = emqx_bpapi:nodes_supporting_bpapi_version(?BPAPI_NAME, 1),
+            Timeout = 15_000,
+            Result = emqx_mgmt_api_alarms_proto_v1:safe_deactivate(Nodes, Name, Timeout),
+            AnyOk = [ok || {ok, NRes} <- Result, ok <- NRes],
+            case AnyOk of
+                [ok | _] ->
+                    {204};
+                [] ->
+                    {400, #{
+                        code => <<"NOT_FOUND">>,
+                        message => <<"Alarm not found or already deactivated">>
+                    }}
+            end
     end.
+
+%%%==============================================================================================
+%% RPC Targets
+
+-spec safe_deactivate_v1(emqx_alarm:name()) -> [ok | {error, term()}].
+safe_deactivate_v1(Name) ->
+    lists:map(fun emqx_alarm:safe_deactivate/1, convert_alarm_names(Name)).
+
+%%%==============================================================================================
+%% internal
+
+-spec qs2ms(atom(), {list(), list()}) -> emqx_mgmt_api:match_spec_and_filter().
+qs2ms(_Tab, {_Qs, _Fuzzy}) ->
+    #{match_spec => [{'$1', [], ['$1']}], fuzzy_fun => undefined}.
+
+format_alarm(WhichNode, Alarm) ->
+    emqx_alarm:format(WhichNode, Alarm).
+
+convert_alarm_names(Name) when is_binary(Name) ->
+    try
+        [binary_to_existing_atom(Name, utf8), Name]
+    catch
+        error:badarg ->
+            [Name]
+    end;
+convert_alarm_names(Name) when is_atom(Name) ->
+    [Name].

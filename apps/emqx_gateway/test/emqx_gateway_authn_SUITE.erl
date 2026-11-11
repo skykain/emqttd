@@ -1,0 +1,249 @@
+%%--------------------------------------------------------------------
+%% Copyright (c) 2020-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
+%%--------------------------------------------------------------------
+
+-module(emqx_gateway_authn_SUITE).
+
+-compile(nowarn_export_all).
+-compile(export_all).
+
+-include_lib("eunit/include/eunit.hrl").
+-include_lib("common_test/include/ct.hrl").
+
+-import(emqx_gateway_auth_ct, [with_resource/3]).
+
+-define(checkMatch(Guard),
+    (fun(Expr) ->
+        case (Expr) of
+            Guard ->
+                ok;
+            X__V ->
+                erlang:error(
+                    {assertMatch, [
+                        {module, ?MODULE},
+                        {line, ?LINE},
+                        {expression, (??Expr)},
+                        {pattern, (??Guard)},
+                        {value, X__V}
+                    ]}
+                )
+        end
+    end)
+).
+-define(FUNCTOR(Expr), fun() -> Expr end).
+-define(FUNCTOR(Arg, Expr), fun(Arg) -> Expr end).
+
+-define(AUTHNS, [authn_http]).
+
+all() ->
+    [{group, legacy}, {group, hardened}].
+
+groups() ->
+    AuthGroups = emqx_gateway_auth_ct:group_names(?AUTHNS),
+    [
+        {legacy, [], AuthGroups},
+        {hardened, [], AuthGroups}
+        | emqx_gateway_auth_ct:init_groups(?MODULE, ?AUTHNS)
+    ].
+
+init_per_group(Profile, Config) when Profile =:= legacy; Profile =:= hardened ->
+    ok = emqx_common_test_helpers:set_security_profile(Profile),
+    {ok, Apps1} = application:ensure_all_started(grpc),
+    {ok, Apps2} = application:ensure_all_started(cowboy),
+    {ok, _} = emqx_gateway_auth_ct:start(),
+    [{profile_apps, Apps1 ++ Apps2}, {security_profile, Profile} | Config];
+init_per_group(AuthName, Conf) ->
+    Apps = emqx_cth_suite:start(
+        [
+            emqx_conf,
+            emqx_auth_http,
+            emqx_management,
+            {emqx_dashboard, "dashboard.listeners.http { enable = true, bind = 18083 }"},
+            {emqx_gateway, emqx_gateway_auth_ct:list_gateway_conf()}
+            | emqx_gateway_test_utils:all_gateway_apps()
+        ],
+        #{work_dir => emqx_cth_suite:work_dir(Conf)}
+    ),
+    _ = emqx_common_test_http:create_default_app(),
+    ok = emqx_gateway_auth_ct:start_auth(AuthName),
+    [{group_apps, Apps} | Conf].
+
+end_per_group(Profile, Config) when Profile =:= legacy; Profile =:= hardened ->
+    ok = emqx_gateway_auth_ct:stop(),
+    ok = emqx_cth_suite:stop_apps(?config(profile_apps, Config)),
+    emqx_common_test_helpers:clear_security_profile();
+end_per_group(AuthName, Conf) ->
+    ok = emqx_gateway_auth_ct:stop_auth(AuthName),
+    _ = emqx_common_test_http:delete_default_app(),
+    emqx_config:delete_override_conf_files(),
+    ok = emqx_cth_suite:stop(?config(group_apps, Conf)),
+    Conf.
+
+init_per_suite(Config) ->
+    emqx_common_test_helpers:clear_security_profile(),
+    Config.
+
+end_per_suite(_Config) ->
+    emqx_common_test_helpers:clear_security_profile().
+
+%%------------------------------------------------------------------------------
+%% Tests
+%%------------------------------------------------------------------------------
+
+t_case_coap(_) ->
+    emqx_coap_SUITE:update_coap_with_connection_mode(false),
+    Login = fun(URI, Checker) ->
+        Action = fun(Channel) ->
+            Req = emqx_coap_SUITE:make_req(post),
+            Checker(emqx_coap_SUITE:do_request(Channel, URI, Req))
+        end,
+        emqx_coap_SUITE:do(Action)
+    end,
+    Prefix = emqx_coap_SUITE:mqtt_prefix(),
+    RightUrl =
+        Prefix ++
+            "/connection?clientid=client1&username=admin&password=public",
+    Login(RightUrl, ?checkMatch({ok, created, _Data})),
+
+    LeftUrl =
+        Prefix ++
+            "/connection?clientid=client1&username=bad&password=bad",
+    Login(LeftUrl, ?checkMatch({error, bad_request, _Data})),
+
+    disable_authn(coap),
+    NowRightUrl =
+        Prefix ++
+            "/connection?clientid=client1&username=bad&password=bad",
+    Login(NowRightUrl, ?checkMatch({ok, created, _Data})),
+    ok.
+
+-record(coap_content, {content_format, payload = <<>>}).
+
+t_case_lwm2m(_) ->
+    MsgId = 12,
+    Mod = emqx_lwm2m_SUITE,
+    Epn = "urn:oma:lwm2m:oma:3",
+    Port = emqx_lwm2m_SUITE:default_port(),
+    Login = fun(URI, Checker) ->
+        with_resource(
+            ?FUNCTOR(gen_udp:open(0, [binary, {active, false}])),
+            ?FUNCTOR(Socket, gen_udp:close(Socket)),
+            fun(Socket) ->
+                Mod:test_send_coap_request(
+                    Socket,
+                    post,
+                    Mod:sprintf(URI, [Port, Epn]),
+                    #coap_content{
+                        content_format = <<"text/plain">>,
+                        payload = <<"</1>, </2>, </3>, </4>, </5>">>
+                    },
+                    [],
+                    MsgId
+                ),
+
+                Checker(Mod:test_recv_coap_response(Socket))
+            end
+        )
+    end,
+
+    MakeCheker = fun(Type, Method) ->
+        fun(Msg) ->
+            ?assertEqual(Type, emqx_coap_SUITE:get_field(type, Msg)),
+            ?assertEqual(Method, emqx_coap_SUITE:get_field(method, Msg))
+        end
+    end,
+
+    RightUrl = "coap://127.0.0.1:~b/rd?ep=~ts&lt=345&lwm2m=1&imei=admin&password=public",
+    Login(RightUrl, MakeCheker(ack, {ok, created})),
+
+    LeftUrl = "coap://127.0.0.1:~b/rd?ep=~ts&lt=345&lwm2m=1&imei=bad&password=bad",
+    Login(LeftUrl, MakeCheker(ack, {error, bad_request})),
+
+    NoInfoUrl = "coap://127.0.0.1:~b/rd?ep=~ts&lt=345&lwm2m=1",
+    Login(NoInfoUrl, MakeCheker(ack, {error, bad_request})),
+
+    disable_authn(lwm2m),
+    NowRightUrl = "coap://127.0.0.1:~b/rd?ep=~ts&lt=345&lwm2m=1&imei=bad&password=bad",
+    Login(NowRightUrl, MakeCheker(ack, {ok, created})),
+
+    ok.
+
+-define(SN_CONNACK, 16#05).
+
+t_case_mqttsn(_) ->
+    Mod = emqx_sn_protocol_SUITE,
+    Login = fun(Username, Password, Expect) ->
+        RawCfg = emqx_conf:get_raw([gateway, mqttsn], #{}),
+        NewCfg = RawCfg#{
+            <<"clientinfo_override">> => #{
+                <<"username">> => Username,
+                <<"password">> => Password
+            }
+        },
+        emqx_gateway_conf:update_gateway(mqttsn, NewCfg),
+
+        with_resource(
+            ?FUNCTOR(gen_udp:open(0, [binary])),
+            ?FUNCTOR(Socket, gen_udp:close(Socket)),
+            fun(Socket) ->
+                Mod:send_connect_msg(Socket, <<"client_id_test1">>),
+                ?assertEqual(Expect, Mod:receive_response(Socket))
+            end
+        )
+    end,
+    Login(<<"badadmin">>, <<"badpassowrd">>, <<3, ?SN_CONNACK, 16#80>>),
+    Login(<<"admin">>, <<"public">>, <<3, ?SN_CONNACK, 0>>),
+
+    disable_authn(mqttsn),
+    Login(<<"badadmin">>, <<"badpassowrd">>, <<3, ?SN_CONNACK, 0>>),
+    ok.
+
+t_case_stomp(_) ->
+    Mod = emqx_stomp_SUITE,
+    Login = fun(Username, Password, Checker) ->
+        Fun = fun(Sock) ->
+            gen_tcp:send(
+                Sock,
+                Mod:serialize(
+                    <<"CONNECT">>,
+                    [
+                        {<<"accept-version">>, Mod:stomp_ver()},
+                        {<<"host">>, <<"127.0.0.1:61613">>},
+                        {<<"login">>, Username},
+                        {<<"passcode">>, Password},
+                        {<<"heart-beat">>, <<"1000,2000">>}
+                    ]
+                )
+            ),
+            {ok, Data} = gen_tcp:recv(Sock, 0),
+            {ok, Frame, _, _} = Mod:parse(Data),
+            Checker(Frame)
+        end,
+        Mod:with_connection(Fun)
+    end,
+    Login(
+        <<"admin">>,
+        <<"public">>,
+        ?FUNCTOR(
+            Frame,
+            ?assertEqual(<<"CONNECTED">>, Mod:get_field(command, Frame))
+        )
+    ),
+    Login(<<"bad">>, <<"bad">>, fun(Frame) ->
+        ?assertEqual(<<"ERROR">>, Mod:get_field(command, Frame)),
+        ?assertEqual(<<"Login Failed: not_authorized">>, Mod:get_field(body, Frame))
+    end),
+
+    disable_authn(stomp),
+    Login(
+        <<"bad">>,
+        <<"bad">>,
+        ?FUNCTOR(
+            Frame,
+            ?assertEqual(<<"CONNECTED">>, Mod:get_field(command, Frame))
+        )
+    ),
+    ok.
+
+disable_authn(GwName) ->
+    emqx_gateway_test_utils:set_gateway_listeners_authn(GwName, false).

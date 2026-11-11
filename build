@@ -1,32 +1,80 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # This script helps to build release artifacts.
-# arg1: profile, e.g. emqx | emqx-edge | emqx-pkg | emqx-edge-pkg
-# arg2: artifact, e.g. tar | relup | zip | pkg
+# arg1: profile, e.g. emqx-enterprise
+# arg2: artifact, e.g. rel | tgz | pkg
 
 set -euo pipefail
 
-PROFILE="$1"
+if [ "${DEBUG:-0}" -eq 1 ]; then
+    set -x
+    # set this for rebar3
+    export DIAGNOSTIC=1
+fi
+
+log() {
+    local msg="$1"
+    # rebar3 prints ===>, so we print ===<
+    echo "===< $msg"
+}
+
+log_red() {
+    local msg="$1"
+    local RED='\033[0;31m' # Red
+    local NC='\033[0m' # No Color
+    echo -e "${RED}===< ${msg}${NC}"
+}
+
+PROFILE_ARG="$1"
 ARTIFACT="$2"
+
+is_enterprise() {
+    case "$1" in
+        *enterprise*)
+            echo 'yes'
+            ;;
+        *)
+            echo 'no'
+            ;;
+    esac
+}
+PROFILE_ENV="${PROFILE:-${PROFILE_ARG}}"
+case "$(is_enterprise "$PROFILE_ARG"),$(is_enterprise "$PROFILE_ENV")" in
+    'yes,yes')
+        true
+        ;;
+    'no,no')
+        true
+        ;;
+    *)
+        log_red "PROFILE env var is set to '$PROFILE_ENV', but '$0' arg1 is '$PROFILE_ARG'"
+        exit 1
+        ;;
+esac
+
+# make sure PROFILE is exported, it is needed by rebar.config.erl
+PROFILE=$PROFILE_ARG
+export PROFILE
 
 # ensure dir
 cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")"
 
-PKG_VSN="${PKG_VSN:-$(./pkg-vsn.sh)}"
-export PKG_VSN
-
-if [ "$(uname -s)" = 'Darwin' ]; then
-	SYSTEM=macos
-elif [ "$(uname -s)" = 'Linux' ]; then
-    if grep -q -i 'centos' /etc/*-release; then
-        DIST='centos'
-        VERSION_ID="$(rpm --eval '%{centos_ver}')"
-    else
-        DIST="$(sed -n '/^ID=/p' /etc/os-release | sed -r 's/ID=(.*)/\1/g' | sed 's/"//g')"
-        VERSION_ID="$(sed -n '/^VERSION_ID=/p' /etc/os-release | sed -r 's/VERSION_ID=(.*)/\1/g' | sed 's/"//g')"
-    fi
-    SYSTEM="$(echo "${DIST}${VERSION_ID}" | sed -r 's/([a-zA-Z]*)-.*/\1/g')"
+if [ -z "${PKG_VSN:-}" ]; then
+    PKG_VSN="$(./pkg-vsn.sh "$PROFILE")"
+    export PKG_VSN
 fi
+
+SYSTEM="$(./scripts/get-distro.sh)"
+
+case "$SYSTEM" in
+    el7|amzn2)
+        # Both ship OpenSSL 1.x. quicer 0.4.x needs OpenSSL 3 to build
+        # from source, and the el7-named prebuilt (which amzn2 also
+        # resolves to) is not reliable.
+        log_red "WARNING: No QUIC support for $SYSTEM"
+        export BUILD_WITHOUT_QUIC=1
+        ;;
+esac
 
 ARCH="$(uname -m)"
 case "$ARCH" in
@@ -37,7 +85,7 @@ case "$ARCH" in
         ARCH='arm64'
         ;;
     arm*)
-        ARCH=arm
+        ARCH='arm64'
         ;;
 esac
 export ARCH
@@ -46,8 +94,8 @@ export ARCH
 ## Support RPM and Debian based linux systems
 ##
 if [ "$(uname -s)" = 'Linux' ]; then
-    case "${DIST:-}" in
-        ubuntu|debian|raspbian)
+    case "${SYSTEM:-}" in
+        ubuntu*|debian*|raspbian*)
             PKGERDIR='deb'
             ;;
         *)
@@ -56,89 +104,374 @@ if [ "$(uname -s)" = 'Linux' ]; then
     esac
 fi
 
-log() {
-    local msg="$1"
-    # rebar3 prints ===>, so we print ===<
-    echo "===< $msg"
-}
+if [ "${SYSTEM}" = 'windows' ]; then
+    # windows does not like the find
+    FIND="/usr/bin/find"
+    TAR="/usr/bin/tar"
+    export BUILD_WITHOUT_ROCKSDB="on"
+else
+    FIND='find'
+    TAR='tar'
+fi
 
-make_tar() {
-    ./rebar3 as "$PROFILE" tar
-}
-
-## unzip previous version .zip files to _build/$PROFILE/rel/emqx/releases before making relup
-make_relup() {
-    local releases_dir="_build/$PROFILE/rel/emqx/releases"
-    local releases=()
-    if [ -d "$releases_dir" ]; then
-        while read -r dir; do
-            local version
-            version="$(basename "$dir")"
-            # skip current version
-            if [ "$version" != "$PKG_VSN" ]; then
-                releases+=( "$version" )
-            fi
-        done < <(find "_build/$PROFILE/rel/emqx/releases" -maxdepth 1 -name '*.*.*' -type d)
+prepare_erl_libs() {
+    local libs_dir="$1"
+    local erl_libs="${ERL_LIBS:-}"
+    local sep
+    if [ "${SYSTEM}" = 'windows' ]; then
+        sep=';'
+    else
+        sep=':'
     fi
-    if [ ${#releases[@]} -eq 0 ]; then
-        log "No previous release found, relup ignored"
+    for app in "${libs_dir}"/*; do
+        if [ -d "${app}/ebin" ]; then
+            if [ -n "$erl_libs" ]; then
+                erl_libs="${erl_libs}${sep}${app}"
+            else
+                erl_libs="${app}"
+            fi
+        fi
+    done
+    export ERL_LIBS="$erl_libs"
+}
+
+make_docs() {
+    local SCHEMA_MODULE='emqx_conf_schema'
+    prepare_erl_libs "_build/$PROFILE/checkouts"
+    prepare_erl_libs "_build/$PROFILE/lib"
+    local docdir="_build/docgen/$PROFILE"
+    mkdir -p "$docdir"
+    # shellcheck disable=SC2086
+    erl -noshell -eval \
+        "ok = emqx_conf:dump_schema('$docdir', $SCHEMA_MODULE), \
+         halt(0)."
+    local desc="$docdir/desc.en.hocon"
+    if command -v jq &> /dev/null; then
+        log "Generating $desc"
+        scripts/merge-i18n.escript | jq --sort-keys . > "$desc"
+    else
+        # it is not a big deal if we cannot generate the desc
+        log_red "NOT Generated: $desc due to jq command missing."
+    fi
+    local scopes_doc="$docdir/api-scopes.md"
+    if [ -x scripts/gen-api-scopes-doc.escript ]; then
+        log "Generating $scopes_doc"
+        scripts/gen-api-scopes-doc.escript "_build/$PROFILE/lib" "$scopes_doc"
+    fi
+}
+
+## arg1 is the profile for which the following args (as app names) should be excluded
+assert_no_excluded_deps() {
+    local profile="$1"
+    shift 1
+    if [ "$PROFILE" != "$profile" ]; then
+        # not currently building the profile which has apps to be excluded
         return 0
     fi
-    if [ ${#releases[@]} -gt 1 ]; then
-        log "Found more than one previous versions in $releases_dir:"
-        log "${releases[@]}"
-        log "ERROR: So far we can not support multi base-version relup creation"
-        return 1
-    fi
-    local base_version="${releases[0]}"
-    # TODO: comma separate base-versions when supported
-    ./rebar3 as "$PROFILE" relup --relname emqx --relvsn "${PKG_VSN}" --upfrom "$base_version"
+    local rel_dir="_build/$PROFILE/rel/emqx/lib"
+    local excluded_apps=( "$@" )
+    local found
+    for app in "${excluded_apps[@]}"; do
+        found="$($FIND "$rel_dir" -maxdepth 1 -type d -name "$app-*")"
+        if [ -n "${found}" ]; then
+            log_red "ERROR: ${app} should not be included in ${PROFILE}"
+            log_red "ERROR: found ${app} in ${rel_dir}"
+            exit 1
+        fi
+    done
 }
 
-## make_zip turns .tar.gz into a .zip with a slightly different name.
-## It assumes the .tar.gz has been built -- relies on Makefile dependency
-make_zip() {
-    tard="/tmp/emqx_untar_${PKG_VSN}"
-    rm -rf "${tard}"
-    mkdir -p "${tard}/emqx"
-    local relpath="_build/${PROFILE}/rel/emqx"
-    local pkgpath="_packages/${PROFILE}"
-    mkdir -p "${pkgpath}"
-    local tarball="${relpath}/emqx-${PKG_VSN}.tar.gz"
-    if [ ! -f "$tarball" ]; then
-        log "ERROR: $tarball is not found"
+just_compile_elixir() {
+    ./scripts/pre-compile.sh "$PROFILE"
+    rm -f rebar.lock
+    mix local.rebar --if-missing --force
+    mix local.rebar rebar3 "${PWD}/rebar3" --if-missing --force
+    # mix local.hex --if-missing --force
+    mix local.hex 2.2.1 --if-missing --force
+    ./scripts/mix-deps-quiet.sh mix deps.get
+    mix compile
+}
+
+make_elixir_rel() {
+    ./scripts/pre-compile.sh "$PROFILE"
+    export_elixir_release_vars "$PROFILE"
+    ./scripts/mix-deps-quiet.sh mix deps.get
+    mix release --overwrite
+}
+
+cp_dyn_libs() {
+    local rel_dir="$1"
+    local target_dir="${rel_dir}/dynlibs"
+    if ! [ "$(uname -s)" = 'Linux' ]; then
+        return 0;
     fi
-    local zipball
-    zipball="${pkgpath}/${PROFILE}-${SYSTEM}-${PKG_VSN}-${ARCH}.zip"
-    tar zxf "${tarball}" -C "${tard}/emqx"
-    (cd "${tard}" && zip -qr - emqx) > "${zipball}"
+    mkdir -p "$target_dir"
+    while read -r so_file; do
+        cp -L "$so_file" "$target_dir/"
+    done < <("$FIND" "$rel_dir" -type f \( -name "*.so*" -o -name "beam.smp" \) -print0 \
+        | xargs -0 ldd \
+        | grep -E '(libcrypto)|(libtinfo)|(libatomic)' \
+        | awk '{print $3}' \
+        | sort -u)
+}
+
+## Re-pack the relx assembled .tar.gz to EMQX's package naming scheme
+## It assumes the .tar.gz has been built -- relies on Makefile dependency
+make_tgz() {
+    local pkgpath="_packages/${PROFILE}"
+    local src_tarball
+    local target_name
+    local target
+
+    # ensure src_tarball exists
+    ELIXIR_MAKE_TAR=yes make_elixir_rel
+
+    local relpath="_build/${PROFILE}"
+    full_vsn="$(./pkg-vsn.sh "$PROFILE" --long)"
+
+    case "$SYSTEM" in
+        macos*)
+            target_name="${PROFILE}-${full_vsn}.zip"
+            ;;
+        windows*)
+            target_name="${PROFILE}-${full_vsn}.zip"
+            ;;
+        *)
+            target_name="${PROFILE}-${full_vsn}.tar.gz"
+            ;;
+    esac
+
+    target="${pkgpath}/${target_name}"
+
+    src_tarball="${relpath}/emqx-${PKG_VSN}.tar.gz"
+    tard="$(mktemp -d -t emqx.XXXXXXX)"
+    mkdir -p "${tard}/emqx"
+    mkdir -p "${pkgpath}"
+    if [ ! -f "$src_tarball" ]; then
+        log_red "ERROR: $src_tarball is not found"
+    fi
+    $TAR zxf "${src_tarball}" -C "${tard}/emqx"
+    if [ -z "${BUILD_WITHOUT_QUIC:-}" ]; then
+        find "${tard}/emqx"/lib/quicer-*/priv/ -type f ! -name 'libquicer_nif.so' -print -delete
+    fi
+    ## try to be portable for tar.gz packages.
+    ## for DEB and RPM packages the dependencies are resoved by yum and apt
+    cp_dyn_libs "${tard}/emqx"
+    case "$SYSTEM" in
+        macos*)
+            ./scripts/rel/macos-sign-binaries.sh "${tard}/emqx"
+            pushd "${tard}/emqx" >/dev/null
+            ## create zip after change dir
+            ## to avoid creating an extra level of 'emqx' dir in the .zip file
+            zip -r "../${target_name}" -- * >/dev/null
+            popd >/dev/null
+            mv "${tard}/${target_name}" "${target}"
+            ./scripts/rel/macos-notarize-package.sh "${target}"
+            # sha256sum may not be available on macos
+            openssl dgst -sha256 "${target}" | cut -d ' ' -f 2  > "${target}.sha256"
+            ;;
+        windows*)
+            pushd "${tard}" >/dev/null
+            7z a "${target_name}" ./emqx/* >/dev/null
+            popd >/dev/null
+            mv "${tard}/${target_name}" "${target}"
+            sha256sum "${target}" | head -c 64 > "${target}.sha256"
+            ;;
+        *)
+            ## create tar after change dir
+            ## to avoid creating an extra level of 'emqx' dir in the .tar.gz file
+            pushd "${tard}/emqx" >/dev/null
+            $TAR -zcf "../${target_name}" -- *
+            popd >/dev/null
+            mv "${tard}/${target_name}" "${target}"
+            sha256sum "${target}" | head -c 64 > "${target}.sha256"
+            ;;
+    esac
+    log "Archive successfully repacked: ${target}"
+    log "Archive sha256sum: $(cat "${target}.sha256")"
+}
+
+docker_cleanup() {
+    rm -f ./.dockerignore >/dev/null
+    # shellcheck disable=SC2015
+    [ -f ./.dockerignore.bak ] && mv ./.dockerignore.bak ./.dockerignore >/dev/null || true
+}
+
+## Build the default docker image based on debian 13
+make_docker() {
+    if [ "${DOCKER_LOAD:-true}" = true ]; then
+        local docker_driver_status
+        docker_driver_status=$(docker info --format '{{json .DriverStatus}}')
+        case "$docker_driver_status" in
+            *io.containerd.snapshotter.v1*) ;;
+            *)
+                log_red "Loading image attestations requires Docker's containerd image store. Enable it, or build with DOCKER_LOAD=false DOCKER_PUSH=true."
+                return 1
+                ;;
+        esac
+    fi
+    # shellcheck disable=SC1091
+    source ./env.sh
+    local BUILD_FROM="${BUILD_FROM:-${EMQX_DOCKER_BUILD_FROM}}"
+    # shellcheck disable=SC2155
+    local OTP_VSN="$(docker run --rm "${BUILD_FROM}" erl -eval '{ok, Version} = file:read_file(filename:join([code:root_dir(), "releases", erlang:system_info(otp_release), "OTP_VERSION"])), io:fwrite(Version), halt().' -noshell)"
+    # shellcheck disable=SC2155
+    local ELIXIR_VSN="$(docker run --rm "${BUILD_FROM}" elixir --short-version)"
+    local RUN_FROM="${RUN_FROM:-${EMQX_DOCKER_RUN_FROM}}"
+    local DEPS_FROM="${DEPS_FROM:-${EMQX_DOCKER_DEPS_FROM}}"
+    local EMQX_DOCKERFILE="${EMQX_DOCKERFILE:-deploy/docker/Dockerfile}"
+    local EMQX_SOURCE_TYPE="${EMQX_SOURCE_TYPE:-src}"
+    local SUFFIX="${DOCKER_IMAGE_SUFFIX:-}"
+
+    local DOCKER_REGISTRY="${DOCKER_REGISTRY:-docker.io}"
+    local DOCKER_ORG="${DOCKER_ORG:-emqx}"
+    local default_base_tag="${DOCKER_ORG}/${PROFILE}"
+    local EMQX_BASE_IMAGE_TAG="${EMQX_BASE_IMAGE_TAG:-$default_base_tag}"
+
+    DOCKER_IMAGE_TAGS=( "$DOCKER_REGISTRY/$EMQX_BASE_IMAGE_TAG:${PKG_VSN}${SUFFIX}" )
+
+    local EDITION=Enterprise
+    local LICENSE='BSL-1.1'
+    local PRODUCT_URL='https://emqx.com/en/products/emqx'
+    local PRODUCT_DESCRIPTION='Official docker image for EMQX Enterprise, an enterprise MQTT platform at scale.'
+    local DOCUMENTATION_URL='https://docs.emqx.com/en/emqx/latest/'
+    ## extra_deps is a comma separated list of Debian runtime package names
+    local EXTRA_DEPS='libsasl2-2,libsasl2-modules-gssapi-mit'
+    local ISO_8601_DATE GIT_REVISION
+    ISO_8601_DATE="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+    GIT_REVISION="$(git rev-parse HEAD 2>/dev/null || echo "$PKG_VSN")"
+    local DOCKER_BUILDX_ARGS=(
+       --provenance=mode=max \
+       --sbom=true \
+       --build-arg BUILD_FROM="${BUILD_FROM}" \
+       --build-arg RUN_FROM="${RUN_FROM}" \
+       --build-arg DEPS_FROM="${DEPS_FROM}" \
+       --build-arg SOURCE_TYPE="${EMQX_SOURCE_TYPE}" \
+       --build-arg PROFILE="${PROFILE}" \
+       --build-arg SUFFIX="${SUFFIX}" \
+       --build-arg EXTRA_DEPS="${EXTRA_DEPS}" \
+       --build-arg PKG_VSN="${PKG_VSN}" \
+       --file "${EMQX_DOCKERFILE}" \
+       --label org.opencontainers.image.title="${PROFILE}" \
+       --label org.opencontainers.image.edition="${EDITION}" \
+       --label org.opencontainers.image.version="${PKG_VSN}" \
+       --label org.opencontainers.image.revision="${GIT_REVISION}" \
+       --label org.opencontainers.image.created="${ISO_8601_DATE}" \
+       --label org.opencontainers.image.source='https://github.com/emqx/emqx' \
+       --label org.opencontainers.image.url="${PRODUCT_URL}" \
+       --label org.opencontainers.image.description="${PRODUCT_DESCRIPTION}" \
+       --label org.opencontainers.image.documentation="${DOCUMENTATION_URL}" \
+       --label org.opencontainers.image.licenses="${LICENSE}" \
+       --label org.opencontainers.image.otp.version="${OTP_VSN}" \
+       --pull
+    )
+    :> ./.emqx_docker_image_tags
+    for t in "${DOCKER_IMAGE_TAGS[@]}"; do
+        DOCKER_BUILDX_ARGS+=(--tag "${t}")
+        echo "${t}" >> ./.emqx_docker_image_tags
+    done
+    if [ "${DOCKER_BUILD_NOCACHE:-false}" = true ]; then
+        DOCKER_BUILDX_ARGS+=(--no-cache)
+    fi
+    DOCKER_BUILDX_ARGS+=(--label org.opencontainers.image.elixir.version="${ELIXIR_VSN}")
+    if [ "${DOCKER_PLATFORMS:-default}" != 'default' ]; then
+        DOCKER_BUILDX_ARGS+=(--platform "${DOCKER_PLATFORMS}")
+    fi
+    if [ "${DOCKER_PUSH:-false}" = true ]; then
+        DOCKER_BUILDX_ARGS+=(--push)
+    fi
+    if [ "${DOCKER_LOAD:-true}" = true ]; then
+        DOCKER_BUILDX_ARGS+=(--load)
+    fi
+    if [ -d "${REBAR_GIT_CACHE_DIR:-}" ]; then
+        cache_tar="$(pwd)/rebar-git-cache.tar"
+        if [ ! -f "${cache_tar}" ]; then
+            pushd "${REBAR_GIT_CACHE_DIR}" >/dev/null
+            tar -cf "${cache_tar}" .
+            popd >/dev/null
+        fi
+    fi
+    if [ -n "${DEBUG:-}" ]; then
+        DOCKER_BUILDX_ARGS+=(--build-arg DEBUG="${DEBUG}" --progress=plain)
+    fi
+
+    # shellcheck disable=SC2015
+    [ -f ./.dockerignore ] && mv ./.dockerignore ./.dockerignore.bak || true
+    trap docker_cleanup EXIT
+    {
+        echo '_build/'
+        echo 'deps/'
+        echo '*.lock'
+        echo '_packages/'
+        echo '.vs/'
+        echo '.vscode/'
+        echo 'lux_logs/'
+        echo '_upgrade_base/'
+    } >> ./.dockerignore
+    echo "Docker buildx args: ${DOCKER_BUILDX_ARGS[*]}"
+    docker buildx build "${DOCKER_BUILDX_ARGS[@]}" .
+}
+
+function join {
+  local IFS="$1"
+  shift
+  echo "$*"
+}
+
+# used to control the Elixir Mix Release output
+# see docstring in `mix.exs`
+export_elixir_release_vars() {
+  local profile="$1"
+  case "$profile" in
+    emqx-enterprise)
+      export ELIXIR_MAKE_TAR=${ELIXIR_MAKE_TAR:-no}
+      ;;
+    emqx-enterprise-pkg)
+      export ELIXIR_MAKE_TAR=${ELIXIR_MAKE_TAR:-yes}
+      ;;
+    *)
+      log_red "Invalid profile $profile"
+      exit 1
+  esac
+  export MIX_ENV="$profile"
 }
 
 log "building artifact=$ARTIFACT for profile=$PROFILE"
 
 case "$ARTIFACT" in
-    tar)
-        make_tar
+    apps)
+        just_compile_elixir
         ;;
-    relup)
-        make_relup
+    doc|docs)
+        make_docs
         ;;
-    zip)
-        make_zip
+    rel)
+        make_elixir_rel
+        ;;
+    tgz)
+        make_tgz
         ;;
     pkg)
+        # this only affect build artifacts, such as schema doc
+        export EMQX_ETC_DIR='/etc/emqx/'
         if [ -z "${PKGERDIR:-}" ]; then
-            # zip should have been built as a Makefile dependency
             log "Skipped making deb/rpm package for $SYSTEM"
             exit 0
         fi
-        # build the tar which is going to be used as the base of deb and rpm packages
-        make_tar
-        make -C "deploy/packages/${PKGERDIR}" clean
-        EMQX_REL="$(pwd)" EMQX_BUILD="${PROFILE}" SYSTEM="${SYSTEM}" make -C "deploy/packages/${PKGERDIR}"
+        export EMQX_REL_FORM="$PKGERDIR"
+        make_tgz
+        env EMQX_REL="$(pwd)" \
+            EMQX_BUILD="${PROFILE}" \
+            make -C "deploy/packages/${PKGERDIR}" clean
+        env EMQX_REL="$(pwd)" \
+            EMQX_BUILD="${PROFILE}" \
+            make -C "deploy/packages/${PKGERDIR}"
+        ;;
+    docker)
+        make_docker
         ;;
     *)
-        log "Unknown artifact $ARTIFACT"
+        log_red "Unknown artifact $ARTIFACT"
         exit 1
         ;;
 esac

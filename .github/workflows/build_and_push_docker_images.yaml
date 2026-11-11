@@ -1,0 +1,311 @@
+name: Build and push docker images
+
+concurrency:
+  group: docker-build-${{ github.event_name }}-${{ inputs.profile }}-${{ inputs.archs }}-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  workflow_call:
+    inputs:
+      profile:
+        required: true
+        type: string
+      latest:
+        required: false
+        type: string
+        default: false
+      publish:
+        required: false
+        type: boolean
+        default: false
+      pr_build:
+        description: Use public Debian bases for PR validation (ignored when publishing)
+        required: false
+        type: boolean
+        default: false
+      archs:
+        description: 'JSON list of architectures to build. Publishing needs both.'
+        required: false
+        type: string
+        default: '["amd64","arm64"]'
+    secrets:
+      DOCKER_HUB_USER:
+        description: Docker Hub username, required for DHI builds and publishing
+        required: false
+      DOCKER_HUB_TOKEN:
+        description: Token with DHI pull access (and push access when publishing); unused for PR builds
+        required: false
+      AWS_ACCESS_KEY_ID:
+        required: false
+      AWS_SECRET_ACCESS_KEY:
+        required: false
+      AWS_DEFAULT_REGION:
+        required: false
+      AWS_S3_BUCKET:
+        required: false
+      AWS_CLOUDFRONT_ID:
+        required: false
+  workflow_dispatch:
+    inputs:
+      ref:
+        required: false
+      profile:
+        required: false
+        type: string
+        default: 'emqx-enterprise'
+      latest:
+        required: false
+        type: boolean
+        default: false
+      publish:
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  docker:
+    runs-on: ${{ format('aws-ubuntu22.04-{0}', matrix.arch) }}
+    # Both matrix legs build the same commit, so they write the same PKG_VSN.
+    outputs:
+      PKG_VSN: ${{ steps.build.outputs.PKG_VSN }}
+    defaults:
+      run:
+        shell: bash
+
+    strategy:
+      fail-fast: false
+      matrix:
+        profile:
+          - "${{ inputs.profile }}"
+        arch: ${{ fromJSON(inputs.archs || '["amd64","arm64"]') }}
+
+    env:
+      PROFILE: ${{ matrix.profile }}
+      DOCKER_ORG: ${{ github.repository_owner }}
+      ARCH: ${{ matrix.arch }}
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.inputs.ref }}
+
+      - name: Enable Docker containerd image store
+        run: bash scripts/enable-docker-containerd.sh
+
+      - uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003 # v4.4.0
+
+      # Pulling DHI base images requires authentication even for publish=false.
+      # Docker Hub and dhi.io have separate registry credentials on the runner.
+      - name: Login to dhi.io
+        if: inputs.publish || !inputs.pr_build
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: dhi.io
+          username: ${{ secrets.DOCKER_HUB_USER }}
+          password: ${{ secrets.DOCKER_HUB_TOKEN }}
+
+      - name: Build docker image
+        id: build
+        env:
+          DOCKER_PUSH: false
+          DOCKER_BUILD_NOCACHE: true
+          DOCKER_LOAD: true
+          # Fork PRs have no registry secrets. Override both DHI stages for PR
+          # validation; release builds use env.sh's hardened defaults and run
+          # all the tests below against the image that will be published.
+          RUN_FROM: ${{ inputs.pr_build && !inputs.publish && 'debian:13-slim' || '' }}
+          DEPS_FROM: ${{ inputs.pr_build && !inputs.publish && 'debian:13-slim' || '' }}
+        run: |
+          PKG_VSN="$(./pkg-vsn.sh "${PROFILE}")"
+          export PKG_VSN
+          echo "PKG_VSN=${PKG_VSN}" >> "$GITHUB_OUTPUT"
+          ./build ${PROFILE} docker
+          echo "Built tags:"
+          echo "==========="
+          cat .emqx_docker_image_tags
+          echo "==========="
+          echo "_EMQX_DOCKER_IMAGE_TAG=$(head -n 1 .emqx_docker_image_tags)" >> $GITHUB_ENV
+
+      # Tight limit: /opt/emqx is the part of the image that EMQX controls.
+      - name: Verify that size of /opt/emqx is less than 215 MB
+        run: |
+          SIZE=$(docker run --rm --entrypoint du "$_EMQX_DOCKER_IMAGE_TAG" -sb /opt/emqx | cut -f1)
+          echo "/opt/emqx size: ${SIZE}"
+          test "${SIZE}" -lt 215000000
+
+      # Loose limit: the base image layers change size without EMQX changes.
+      - name: Verify that size of exported docker image is less than 210 MB
+        run: |
+          SIZE=$(docker save "$_EMQX_DOCKER_IMAGE_TAG" | gzip -c | wc -c)
+          echo "Image size: ${SIZE}"
+          test "${SIZE}" -lt 210000000
+
+      - name: smoke test
+        timeout-minutes: 5
+        run: |
+          CID=$(docker run -d -p 18083:18083 \
+            -e EMQX_NODE__COOKIE='ci-smoke-test-cookie' \
+            -e EMQX_DASHBOARD__DEFAULT_PASSWORD='CiSm0kePass1' \
+            $_EMQX_DOCKER_IMAGE_TAG)
+          HTTP_PORT=$(docker inspect --format='{{(index (index .NetworkSettings.Ports "18083/tcp") 0).HostPort}}' $CID)
+          EMQX_SMOKE_PASSWORD='CiSm0kePass1' ./scripts/test/emqx-smoke-test.sh localhost $HTTP_PORT
+          docker rm -f $CID
+          ./scripts/test/cluster-smoke-test.sh $_EMQX_DOCKER_IMAGE_TAG
+
+      - name: dashboard tests
+        working-directory: ./scripts/ui-tests
+        timeout-minutes: 5
+        run: |
+          set -eu
+          docker compose up --abort-on-container-exit --exit-code-from selenium
+          docker compose rm -fsv
+
+      - name: test node_dump
+        timeout-minutes: 5
+        run: |
+          CID=$(docker run -d -e EMQX_NODE__COOKIE='ci-smoke-test-cookie' "$_EMQX_DOCKER_IMAGE_TAG")
+          trap 'docker rm -f "$CID"' EXIT
+          docker exec "$CID" curl --fail --silent --show-error \
+            --retry 30 --retry-delay 1 --retry-connrefused --max-time 5 \
+            http://127.0.0.1:18083/status
+          # Test the shipped nonroot image; node_dump tolerates missing netstat.
+          docker exec "$CID" node_dump
+
+      - name: Export docker image
+        env:
+          REQUIRE_DHI: ${{ inputs.publish || !inputs.pr_build }}
+        run: |
+          docker save "${_EMQX_DOCKER_IMAGE_TAG}" | gzip > $PROFILE-docker-${{ matrix.arch }}.tar.gz
+          ARGS=()
+          if [ "$REQUIRE_DHI" = "true" ]; then ARGS+=(--require-dhi); fi
+          python3 scripts/verify-docker-attestations.py \
+            "$PROFILE-docker-${{ matrix.arch }}.tar.gz" --platform "linux/${{ matrix.arch }}" "${ARGS[@]}"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: "${{ matrix.profile }}-docker-${{ matrix.arch }}"
+          path: "${{ matrix.profile }}-docker-${{ matrix.arch }}.tar.gz"
+          retention-days: 7
+
+  publish-docker:
+    runs-on: ubuntu-22.04
+    # Always runs on workflow_dispatch (dry-run when publish=false) so
+    # developers can test the full manifest-assembly flow.
+    # On workflow_call the job only runs when publish=true.
+    if: |
+      !cancelled() && needs.docker.result == 'success'
+      && (inputs.publish || github.event_name == 'workflow_dispatch')
+    needs:
+      - docker
+    defaults:
+      run:
+        shell: bash
+
+    env:
+      PROFILE: ${{ inputs.profile }}
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.inputs.ref }}
+
+      - name: Enable Docker containerd image store
+        run: bash scripts/enable-docker-containerd.sh
+
+      - name: Start staging registry
+        run: docker run -d --name image-staging-registry -p 5000:5000 registry:2
+
+      - uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003 # v4.4.0
+        with:
+          driver-opts: network=host
+
+      - name: Login to hub.docker.com
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        if: inputs.publish
+        with:
+          username: ${{ secrets.DOCKER_HUB_USER }}
+          password: ${{ secrets.DOCKER_HUB_TOKEN }}
+
+      - name: Download docker images
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: "${{ inputs.profile }}-docker-*"
+          path: images/
+          merge-multiple: true
+
+      - name: Publish multi-arch manifest
+        env:
+          OWNER: ${{ github.repository_owner }}
+          LATEST: ${{ inputs.latest }}
+          PUBLISH: ${{ inputs.publish }}
+        run: |
+          set -euo pipefail
+          ARGS=(
+              --amd64 "images/${PROFILE}-docker-amd64.tar.gz"
+              --arm64 "images/${PROFILE}-docker-arm64.tar.gz"
+              --owner "$OWNER"
+              --profile "$PROFILE"
+              --variant base
+              --require-attestations
+          )
+          if [ "$LATEST" = "true" ]; then ARGS+=(--latest); fi
+          if [ "$PUBLISH" = "true" ]; then ARGS+=(--publish); fi
+          ./scripts/publish-docker-multi-arch.sh "${ARGS[@]}"
+
+      - name: Stop staging registry
+        if: always()
+        run: docker rm -f image-staging-registry
+
+  upload:
+    runs-on: ubuntu-22.04
+    if: inputs.publish || github.repository_owner != 'emqx'
+
+    needs:
+      - docker
+
+    strategy:
+      fail-fast: false
+      matrix:
+        profile:
+          - ${{ inputs.profile }}
+        arch: ${{ fromJSON(inputs.archs || '["amd64","arm64"]') }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: "${{ matrix.profile }}-docker-${{ matrix.arch }}"
+
+      - name: Check version and rename tarball
+        env:
+          PKG_VSN: ${{ needs.docker.outputs.PKG_VSN }}
+          PROFILE: ${{ matrix.profile }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          if ! [[ "${PKG_VSN}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta|rc|patch|preview|M[0-9]+)\.[0-9]+)?(-g[0-9a-f]+)?$ ]]; then
+            echo "::error::Invalid PKG_VSN '${PKG_VSN}' from the docker job"
+            exit 1
+          fi
+          FILENAME="${PROFILE}-${PKG_VSN}-docker-${ARCH}.tar.gz"
+          mv "${PROFILE}-docker-${ARCH}.tar.gz" "${FILENAME}"
+          echo "PKG_VSN=${PKG_VSN}" | tee -a "$GITHUB_ENV"
+          echo "FILENAME=${FILENAME}" | tee -a "$GITHUB_ENV"
+
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_DEFAULT_REGION }}
+
+      - name: upload to aws s3
+        env:
+          AWS_S3_BUCKET: ${{ secrets.AWS_S3_BUCKET }}
+          AWS_CLOUDFRONT_ID: ${{ secrets.AWS_CLOUDFRONT_ID }}
+        run: |
+          set -xeuo pipefail
+
+          export s3dir="emqx-ee/$PKG_VSN"
+          aws s3 cp "$FILENAME" "s3://$AWS_S3_BUCKET/$s3dir/"
+          aws cloudfront create-invalidation --distribution-id "$AWS_CLOUDFRONT_ID" --paths "/$s3dir/*docker*"

@@ -1,0 +1,650 @@
+%%--------------------------------------------------------------------
+%% Copyright (c) 2020-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
+%%--------------------------------------------------------------------
+
+-module(emqx_prometheus_api_SUITE).
+
+-compile(export_all).
+-compile(nowarn_export_all).
+
+-include_lib("eunit/include/eunit.hrl").
+-include_lib("common_test/include/ct.hrl").
+-include_lib("emqx/include/emqx_mqtt.hrl").
+-include_lib("emqx/include/emqx.hrl").
+-include_lib("emqx_prometheus/include/emqx_prometheus.hrl").
+-include_lib("snabbkaffe/include/snabbkaffe.hrl").
+
+%%--------------------------------------------------------------------
+%% Setups
+%%--------------------------------------------------------------------
+all() ->
+    [
+        {group, new_config},
+        {group, legacy_config}
+    ].
+
+groups() ->
+    LegacyTCs = legacy_config_test_cases(),
+    AllTCs = emqx_common_test_helpers:all(?MODULE),
+    [
+        {new_config, [sequence], AllTCs -- LegacyTCs},
+        {legacy_config, [sequence], LegacyTCs}
+    ].
+
+legacy_config_test_cases() ->
+    [t_stats_no_auth_api, t_legacy_prometheus_api].
+
+init_per_suite(Config) ->
+    Apps = emqx_cth_suite:start(
+        [
+            emqx,
+            emqx_conf,
+            emqx_management,
+            {emqx_prometheus, #{start => false}},
+            {emqx_license, "license.key = default"},
+            emqx_mgmt_api_test_util:emqx_dashboard()
+        ],
+        #{work_dir => emqx_cth_suite:work_dir(Config)}
+    ),
+    [{suite_apps, Apps} | Config].
+
+end_per_suite(Config) ->
+    ok = emqx_cth_suite:stop(?config(suite_apps, Config)).
+
+init_per_group(new_config, Config) ->
+    Apps = emqx_cth_suite:start_app(
+        emqx_prometheus,
+        #{config => emqx_prometheus_SUITE:config(default)}
+    ),
+    [{group_apps, Apps} | Config];
+init_per_group(legacy_config, Config) ->
+    Apps = emqx_cth_suite:start_app(
+        emqx_prometheus,
+        #{config => emqx_prometheus_SUITE:config(legacy)}
+    ),
+    [{group_apps, Apps} | Config].
+
+end_per_group(_Group, Config) ->
+    ok = emqx_cth_suite:stop_apps(?config(group_apps, Config)).
+
+%%--------------------------------------------------------------------
+%% Cases
+%%--------------------------------------------------------------------
+%% we return recommend config for prometheus even if prometheus is legacy.
+t_legacy_prometheus_api(_) ->
+    Path = emqx_mgmt_api_test_util:api_path(["prometheus"]),
+    Auth = emqx_mgmt_api_test_util:auth_header_(),
+    {ok, Response} = emqx_mgmt_api_test_util:request_api(get, Path, "", Auth),
+
+    OldConf = emqx:get_raw_config([prometheus]),
+    Conf = emqx_utils_json:decode(Response),
+    %% Always return new config.
+    ?assertMatch(
+        #{
+            <<"collectors">> :=
+                #{
+                    <<"mnesia">> := <<"disabled">>,
+                    <<"vm_dist">> := <<"disabled">>,
+                    <<"vm_memory">> := <<"disabled">>,
+                    <<"vm_msacc">> := <<"disabled">>,
+                    <<"vm_statistics">> := <<"disabled">>,
+                    <<"vm_system_info">> := <<"disabled">>
+                },
+            <<"enable_basic_auth">> := false,
+            <<"push_gateway">> :=
+                #{
+                    <<"enable">> := true,
+                    <<"headers">> := #{<<"Authorization">> := <<"******">>},
+                    <<"interval">> := <<"1s">>,
+                    <<"job_name">> := <<"${cluster_name}~${name}~${host}">>,
+                    <<"url">> := <<"http://127.0.0.1:9091">>
+                }
+        },
+        Conf
+    ),
+    #{<<"push_gateway">> := #{<<"enable">> := Enable}} = Conf,
+    ?assertEqual(Enable, undefined =/= erlang:whereis(emqx_prometheus)),
+
+    NewConf = OldConf#{
+        <<"interval">> => <<"2s">>,
+        <<"vm_statistics_collector">> => <<"enabled">>,
+        <<"headers">> => #{
+            <<"test-str1">> => <<"test-value">>,
+            <<"test-str2">> => <<"42">>
+        }
+    },
+    {ok, Response2} = emqx_mgmt_api_test_util:request_api(put, Path, "", Auth, NewConf),
+
+    Conf2 = emqx_utils_json:decode(Response2),
+    ?assertEqual(NewConf, Conf2),
+
+    EnvCollectors = env_collectors(),
+    RegCollectors = prometheus_registry:collectors(default),
+    ?assertEqual([], EnvCollectors),
+    ?assert(lists:member(prometheus_vm_statistics_collector, RegCollectors), RegCollectors),
+
+    lists:foreach(
+        fun({C, Enabled}) ->
+            ?assertEqual(Enabled, lists:member(C, RegCollectors), RegCollectors)
+        end,
+        [
+            {prometheus_vm_dist_collector, false},
+            {prometheus_vm_system_info_collector, false},
+            {prometheus_vm_memory_collector, false},
+            {prometheus_mnesia_collector, false},
+            {prometheus_vm_msacc_collector, false},
+            {prometheus_vm_statistics_collector, true}
+        ]
+    ),
+
+    ?assertMatch(
+        #{
+            <<"headers">> := #{
+                <<"test-str1">> := <<"test-value">>,
+                <<"test-str2">> := <<"42">>
+            }
+        },
+        emqx_config:get_raw([prometheus])
+    ),
+    ?assertMatch(
+        #{
+            headers := [
+                {"test-str2", "42"},
+                {"test-str1", "test-value"}
+            ]
+        },
+        emqx_config:get([prometheus])
+    ),
+
+    NewConf1 = OldConf#{<<"enable">> => (not Enable)},
+    {ok, _Response3} = emqx_mgmt_api_test_util:request_api(put, Path, "", Auth, NewConf1),
+    ?assertEqual((not Enable), undefined =/= erlang:whereis(emqx_prometheus)),
+
+    ConfWithoutScheme = OldConf#{<<"push_gateway_server">> => "127.0.0.1:8081"},
+    ?assertMatch(
+        {error, {"HTTP/1.1", 400, _}},
+        emqx_mgmt_api_test_util:request_api(put, Path, "", Auth, ConfWithoutScheme)
+    ),
+    ok.
+
+t_prometheus_api(_) ->
+    {ok, Response} = get_prometheus_conf(),
+    ?assertMatch(
+        #{
+            <<"push_gateway">> := #{},
+            <<"collectors">> := _,
+            <<"enable_basic_auth">> := _
+        },
+        emqx_utils_json:decode(Response)
+    ).
+
+t_prometheus_config_update_api(_) ->
+    {ok, Response} = get_prometheus_conf(),
+    #{
+        <<"push_gateway">> := PushGateway,
+        <<"collectors">> := Collector
+    } = Conf = emqx_utils_json:decode(Response),
+    #{<<"url">> := Url, <<"enable">> := Enable} = PushGateway,
+    ?assertEqual(
+        #{<<"Authorization">> => <<"******">>},
+        maps:get(<<"headers">>, PushGateway)
+    ),
+    Pid = erlang:whereis(emqx_prometheus),
+    ?assertEqual(Enable, undefined =/= Pid, {Url, Pid}),
+
+    NewConf = Conf#{
+        <<"push_gateway">> => PushGateway#{
+            <<"interval">> => <<"2s">>,
+            <<"headers">> => #{
+                <<"test-str1">> => <<"test-value">>,
+                <<"test-str2">> => <<"42">>
+            }
+        },
+        <<"collectors">> => Collector
+    },
+    {ok, UpdateResponse} = put_prometheus_conf(NewConf),
+    ?assertEqual(NewConf, emqx_utils_json:decode(UpdateResponse)),
+
+    ?assertMatch(
+        #{
+            <<"push_gateway">> := #{
+                <<"headers">> := #{
+                    <<"test-str1">> := <<"test-value">>,
+                    <<"test-str2">> := <<"42">>
+                }
+            }
+        },
+        emqx_config:get_raw([prometheus])
+    ),
+    ?assertMatch(
+        #{
+            push_gateway := #{
+                headers := [
+                    {"test-str2", "42"},
+                    {"test-str1", "test-value"}
+                ]
+            }
+        },
+        emqx_config:get([prometheus])
+    ),
+    ok.
+
+t_prometheus_push_gateway_lifecycle_api(_) ->
+    {ok, Response} = get_prometheus_conf(),
+    #{<<"push_gateway">> := PushGateway} = Conf = emqx_utils_json:decode(Response),
+
+    EnableConf = Conf#{<<"push_gateway">> => PushGateway#{<<"enable">> => true}},
+    {ok, _} = put_prometheus_conf(EnableConf),
+    ?assert(is_pid(erlang:whereis(emqx_prometheus))),
+
+    DisableConf = Conf#{<<"push_gateway">> => PushGateway#{<<"enable">> => false}},
+    {ok, _} = put_prometheus_conf(DisableConf),
+    ?assertEqual(undefined, erlang:whereis(emqx_prometheus)).
+
+t_prometheus_push_gateway_url_validation_api(_) ->
+    {ok, Response} = get_prometheus_conf(),
+    #{<<"push_gateway">> := PushGateway} = Conf = emqx_utils_json:decode(Response),
+    ConfWithoutScheme = Conf#{
+        <<"push_gateway">> => PushGateway#{
+            <<"enable">> => true,
+            <<"url">> => <<"127.0.0.1:8081">>
+        }
+    },
+    ?assertMatch(
+        {error, {"HTTP/1.1", 400, _}},
+        put_prometheus_conf(ConfWithoutScheme)
+    ).
+
+t_prometheus_collectors_api(_) ->
+    {ok, Response} = get_prometheus_conf(),
+    #{<<"collectors">> := Collector} = Conf = emqx_utils_json:decode(Response),
+
+    EnvCollectors = env_collectors(),
+    ?assertEqual([], EnvCollectors),
+
+    VMStatisticsMetric = <<"erlang_vm_statistics_bytes_output_total">>,
+    ?assertEqual(
+        nomatch,
+        string:find(get_stats(), VMStatisticsMetric)
+    ),
+
+    EnableVMStatistics = Conf#{
+        <<"collectors">> => Collector#{<<"vm_statistics">> => <<"enabled">>}
+    },
+    {ok, _} = put_prometheus_conf(EnableVMStatistics),
+    ?assertNotEqual(
+        nomatch,
+        string:find(get_stats(), VMStatisticsMetric)
+    ),
+
+    DisableVMStatistics = Conf#{
+        <<"collectors">> => Collector#{<<"vm_statistics">> => <<"disabled">>}
+    },
+    {ok, _} = put_prometheus_conf(DisableVMStatistics),
+    ?assertEqual(
+        nomatch,
+        string:find(get_stats(), VMStatisticsMetric)
+    ).
+
+t_prometheus_auth_api_aggregated(_) ->
+    Path = emqx_mgmt_api_test_util:api_path(["prometheus", "auth?mode=all_nodes_aggregated"]),
+    Auth = emqx_mgmt_api_test_util:auth_header_(),
+
+    %% Provide some predefined metrics
+    emqx_metrics_worker:reset_metrics(?ACCESS_CONTROL_METRICS_WORKER, 'client.authenticate'),
+    emqx_metrics_worker:reset_metrics(?ACCESS_CONTROL_METRICS_WORKER, 'client.authorize'),
+    emqx_metrics_worker:observe_hist(
+        ?ACCESS_CONTROL_METRICS_WORKER, 'client.authenticate', total_latency, 100
+    ),
+    emqx_metrics_worker:observe_hist(
+        ?ACCESS_CONTROL_METRICS_WORKER, 'client.authorize', total_latency, 100
+    ),
+
+    %% Pretend we have 3 nodes
+    meck:new(mria, [passthrough, no_history]),
+    meck:expect(mria, running_nodes, fun() -> [node(), node(), node()] end),
+
+    %% Get the same single observation duplicated across 3 nodes
+    {ok, Response} = emqx_mgmt_api_test_util:request_api(get, Path, "", Auth),
+    ?assert(
+        lists:member(
+            "emqx_authn_latency_count{name=\"total_latency\"} 3",
+            string:split(Response, "\n", all)
+        )
+    ),
+    ?assert(
+        lists:member(
+            "emqx_authz_latency_count{name=\"total_latency\"} 3",
+            string:split(Response, "\n", all)
+        )
+    ),
+    meck:unload(mria),
+    ok.
+
+t_prometheus_auth_api(_) ->
+    Path = emqx_mgmt_api_test_util:api_path(["prometheus", "auth"]),
+    Auth = emqx_mgmt_api_test_util:auth_header_(),
+    emqx_metrics_worker:reset_metrics(?ACCESS_CONTROL_METRICS_WORKER, 'client.authenticate'),
+    emqx_metrics_worker:reset_metrics(?ACCESS_CONTROL_METRICS_WORKER, 'client.authorize'),
+    emqx_metrics_worker:observe_hist(
+        ?ACCESS_CONTROL_METRICS_WORKER, 'client.authenticate', total_latency, 100
+    ),
+    emqx_metrics_worker:observe_hist(
+        ?ACCESS_CONTROL_METRICS_WORKER, 'client.authorize', total_latency, 100
+    ),
+    {ok, Response} = emqx_mgmt_api_test_util:request_api(get, Path, "", Auth),
+    ?assert(
+        lists:member(
+            "emqx_authn_latency_count{name=\"total_latency\"} 1",
+            string:split(Response, "\n", all)
+        )
+    ),
+    ?assert(
+        lists:member(
+            "emqx_authz_latency_count{name=\"total_latency\"} 1",
+            string:split(Response, "\n", all)
+        )
+    ),
+    ok.
+
+t_stats_no_auth_api(_) ->
+    %% undefined is legacy prometheus
+    case emqx:get_config([prometheus, enable_basic_auth], undefined) of
+        true ->
+            {ok, _} = emqx:update_config([prometheus, enable_basic_auth], false);
+        _ ->
+            ok
+    end,
+    #{started := Started} = emqx_dashboard:listeners_status(),
+    ok = emqx_dashboard_dispatch:regenerate_dispatch(Started),
+    request_stats([], []).
+
+t_stats_auth_api(_) ->
+    {ok, _} = emqx:update_config([prometheus, enable_basic_auth], true),
+    #{started := Started} = emqx_dashboard:listeners_status(),
+    ok = emqx_dashboard_dispatch:regenerate_dispatch(Started),
+    Auth = emqx_mgmt_api_test_util:auth_header_(),
+    request_stats([Auth], Auth),
+    {ok, _} = emqx:update_config([prometheus, enable_basic_auth], false),
+    ok = emqx_dashboard_dispatch:regenerate_dispatch(Started),
+    ok.
+
+-doc """
+Verify the secure-by-default behavior introduced in 6.3.0: with
+`enable_basic_auth` set to its schema default `true`, unauthenticated requests
+to `/api/v5/prometheus/stats` are rejected with 401, and the same request
+succeeds when authenticated or after the operator explicitly opts out by
+setting `enable_basic_auth = false`.
+""".
+t_stats_default_basic_auth_enabled(_) ->
+    {ok, _} = emqx:update_config([prometheus, enable_basic_auth], true),
+    #{started := Started} = emqx_dashboard:listeners_status(),
+    ok = emqx_dashboard_dispatch:regenerate_dispatch(Started),
+    NoAuthHeaders = [{"accept", "text/plain"}],
+    try
+        Path = emqx_mgmt_api_test_util:api_path(["prometheus", "stats"]),
+        ?assertMatch(
+            {error, {"HTTP/1.1", 401, _}},
+            emqx_mgmt_api_test_util:request_api(get, Path, "", NoAuthHeaders)
+        ),
+        Auth = emqx_mgmt_api_test_util:auth_header_(),
+        {ok, AuthedBody} = emqx_mgmt_api_test_util:request_api(
+            get, Path, "", [Auth]
+        ),
+        ?assertEqual(match, re:run(AuthedBody, "emqx_", [{capture, none}])),
+        {ok, _} = emqx:update_config([prometheus, enable_basic_auth], false),
+        ok = emqx_dashboard_dispatch:regenerate_dispatch(Started),
+        {ok, NoAuthBody} = emqx_mgmt_api_test_util:request_api(
+            get, Path, "", NoAuthHeaders
+        ),
+        ?assertEqual(match, re:run(NoAuthBody, "emqx_", [{capture, none}]))
+    after
+        case emqx:get_config([prometheus, enable_basic_auth], undefined) of
+            false ->
+                ok;
+            _ ->
+                {ok, _} = emqx:update_config([prometheus, enable_basic_auth], false),
+                ok = emqx_dashboard_dispatch:regenerate_dispatch(Started)
+        end
+    end.
+
+emqtt_connect(ClientId) ->
+    {ok, C0} = emqtt:start_link(#{clientid => ClientId}),
+    %% temp unlink to avoid self (tester) exit due to server_unavailable race
+    unlink(C0),
+    try emqtt:connect(C0) of
+        {ok, _} ->
+            %% link again
+            link(C0),
+            {ok, C0};
+        {error, {server_unavailable, _}} ->
+            ct:sleep(100),
+            emqtt_connect(ClientId)
+    catch
+        exit:{shutdown, server_unavailable} ->
+            ct:sleep(100),
+            emqtt_connect(ClientId)
+    end.
+
+%% Simple smoke test for verifying reason code labels in `emqx_client_disconnected_reason'
+%% counter metric.
+t_listener_shutdown_count(_Config) ->
+    ClientId1 = fresh_clientid(?FUNCTION_NAME),
+    {ok, C1} = emqtt_connect(ClientId1),
+    %% Takeover
+    unlink(C1),
+    {ok, C2} = emqtt_connect(ClientId1),
+    %% Kick
+    unlink(C2),
+    ok = emqx_cm:kick_session(ClientId1),
+    %% Normal disconnect
+    ClientId2 = fresh_clientid(?FUNCTION_NAME),
+    {ok, C3} = emqtt_connect(ClientId2),
+    ok = emqtt:stop(C3),
+    %% Wait until C3's channel is fully deregistered before reconnecting with the
+    %% same clientid. emqtt:stop/1 closes the socket, but the broker records
+    %% tcp_closed asynchronously when it detects the peer close. If C4's CONNECT
+    %% (same clientid) races ahead of C3's reaping, C4 takes over C3's lingering
+    %% session and the event is miscounted as "discarded" instead of "tcp_closed".
+    ?retry(100, 20, [] = emqx_cm:lookup_channels(ClientId2)),
+    %% Disconnect with reason code
+    {ok, C4} = emqtt_connect(ClientId2),
+    ok = emqtt:disconnect(C4, ?RC_IMPLEMENTATION_SPECIFIC_ERROR),
+    NodeBin = atom_to_binary(node()),
+    AssertExpectedLines = fun(L, ExpectedLines, Output) ->
+        lists:foreach(
+            fun(ExpectedLine) ->
+                ?assertEqual(
+                    match,
+                    re:run(Output, ExpectedLine, [global, {capture, none}]),
+                    #{
+                        expected => ExpectedLine,
+                        output => string:split(Output, <<"\n">>, all),
+                        line => L
+                    }
+                )
+            end,
+            ExpectedLines
+        )
+    end,
+    %% Verify that disabling unrelated listener does not affect anything.
+    ok = emqx_listeners:stop_listener('ssl:default'),
+    PromClientStatsNode = get_stats(prometheus, ?PROM_DATA_MODE__NODE),
+    ExpectedLines1 = [
+        iolist_to_binary(
+            io_lib:format(
+                "emqx_client_disconnected_reason{"
+                "listener_type=\"tcp\",listener_name=\"default\","
+                "reason=\"~s\"} ~b",
+                [Reason, N]
+            )
+        )
+     || {Reason, N} <- [
+            {"discarded", 1},
+            {"kicked", 1},
+            {"tcp_closed", 1}
+        ]
+    ],
+    AssertExpectedLines(?LINE, ExpectedLines1, PromClientStatsNode),
+    PromClientStatsAgg = get_stats(prometheus, ?PROM_DATA_MODE__ALL_NODES_AGGREGATED),
+    AssertExpectedLines(?LINE, ExpectedLines1, PromClientStatsAgg),
+    PromClientStatsUnagg = get_stats(prometheus, ?PROM_DATA_MODE__ALL_NODES_UNAGGREGATED),
+    ExpectedLines2 = [
+        iolist_to_binary(
+            io_lib:format(
+                "emqx_client_disconnected_reason{"
+                "node=\"~s\",listener_type=\"tcp\",listener_name=\"default\","
+                "reason=\"~s\"} ~b",
+                [NodeBin, Reason, N]
+            )
+        )
+     || {Reason, N} <- [
+            {"discarded", 1},
+            {"kicked", 1},
+            {"tcp_closed", 1}
+        ]
+    ],
+    AssertExpectedLines(?LINE, ExpectedLines2, PromClientStatsUnagg),
+    ok.
+
+-doc """
+Check that `emqx_client_accept_result` exports every esockd accept result of
+the TCP listener in all data modes, and that a connected client is counted as
+accepted.
+""".
+t_listener_accept_result(_Config) ->
+    %% Disconnect normally: a closed socket would add to the `tcp_closed`
+    %% shutdown count that `t_listener_shutdown_count` checks.
+    {ok, C} = emqtt_connect(fresh_clientid(?FUNCTION_NAME)),
+    ok = emqtt:disconnect(C),
+    Results = lists:sort([
+        <<"accepted">>,
+        <<"closed_sys_limit">>,
+        <<"closed_max_limit">>,
+        <<"closed_overloaded">>,
+        <<"closed_rate_limited">>,
+        <<"closed_early">>,
+        <<"closed_forbidden">>,
+        <<"closed_other_reasons">>
+    ]),
+    NodeLabel = iolist_to_binary(["node=\"", atom_to_binary(node()), "\","]),
+    lists:foreach(
+        fun({Mode, Prefix}) ->
+            Counts = accept_result_counts(get_stats(prometheus, Mode), Prefix),
+            ?assertEqual(Results, lists:sort(maps:keys(Counts)), #{mode => Mode}),
+            ?assert(maps:get(<<"accepted">>, Counts) >= 1, #{mode => Mode})
+        end,
+        [
+            {?PROM_DATA_MODE__NODE, <<>>},
+            {?PROM_DATA_MODE__ALL_NODES_AGGREGATED, <<>>},
+            {?PROM_DATA_MODE__ALL_NODES_UNAGGREGATED, NodeLabel}
+        ]
+    ).
+
+accept_result_counts(Output, Prefix) ->
+    Re = [
+        "^emqx_client_accept_result\\{",
+        Prefix,
+        "listener_type=\"tcp\",listener_name=\"default\",result=\"(\\w+)\"\\} (\\d+)$"
+    ],
+    {match, Matches} = re:run(Output, Re, [global, multiline, {capture, all_but_first, binary}]),
+    maps:from_list([{R, binary_to_integer(N)} || [R, N] <- Matches]).
+
+t_latency_metrics(_) ->
+    Path = emqx_mgmt_api_test_util:api_path(["prometheus"]),
+    Auth = emqx_mgmt_api_test_util:auth_header_(),
+
+    {ok, Response} = emqx_mgmt_api_test_util:request_api(get, Path, "", Auth),
+    Conf = emqx_utils_json:decode(Response, [return_maps]),
+
+    NewConf = Conf#{
+        <<"latency_buckets">> => <<"13ms, 123s">>
+    },
+    {ok, _} = emqx_mgmt_api_test_util:request_api(put, Path, "", Auth, NewConf),
+
+    lists:foreach(
+        fun(Id) ->
+            Hists = emqx_metrics_worker:get_hists(?ACCESS_CONTROL_METRICS_WORKER, Id),
+            lists:foreach(
+                fun({_Name, Value}) ->
+                    ?assertMatch(
+                        #{bucket_counts := [{13, 0}, {123000, 0}, {infinity, 0}]},
+                        Value
+                    )
+                end,
+                maps:to_list(Hists)
+            )
+        end,
+        ['client.authenticate', 'client.authorize']
+    ).
+
+%% The JSON metrics format has been dropped; requesting it must be rejected.
+t_stats_json_not_supported(_) ->
+    Auth = emqx_mgmt_api_test_util:auth_header_(),
+    lists:foreach(
+        fun(Endpoint) ->
+            Path = emqx_mgmt_api_test_util:api_path(["prometheus", Endpoint]),
+            ?assertMatch(
+                {error, {"HTTP/1.1", 400, _}},
+                emqx_mgmt_api_test_util:request_api(
+                    get, Path, "", [Auth | accept_json_header()]
+                ),
+                #{endpoint => Endpoint}
+            )
+        end,
+        ["stats", "auth", "schema_validation", "message_transformation"]
+    ).
+
+%%--------------------------------------------------------------------
+%% Helper functions
+%%--------------------------------------------------------------------
+
+api_path(Components) ->
+    emqx_mgmt_api_test_util:api_path(["prometheus" | Components]).
+
+get_prometheus_conf() ->
+    Auth = emqx_mgmt_api_test_util:auth_header_(),
+    emqx_mgmt_api_test_util:request_api(get, api_path([]), Auth).
+
+put_prometheus_conf(Conf) ->
+    Auth = emqx_mgmt_api_test_util:auth_header_(),
+    emqx_mgmt_api_test_util:request_api(put, api_path([]), "", Auth, Conf).
+
+accept_json_header() ->
+    [{"accept", "application/json"}].
+
+request_stats(Headers, Auth) ->
+    Path = emqx_mgmt_api_test_util:api_path(["prometheus", "stats"]),
+    {ok, Response} = emqx_mgmt_api_test_util:request_api(get, Path, "", Headers),
+    %% Only the Prometheus text format is supported.
+    ?assertEqual(match, re:run(Response, "emqx_", [{capture, none}])),
+    {ok, _} = emqx_mgmt_api_test_util:request_api(get, Path, "", Auth),
+    ok = meck:expect(mria_rlog, backend, fun() -> rlog end),
+    {ok, _} = emqx_mgmt_api_test_util:request_api(get, Path, "", Auth).
+
+env_collectors() ->
+    do_env_collectors(application:get_env(prometheus, collectors, []), []).
+
+do_env_collectors([], Acc) ->
+    lists:reverse(Acc);
+do_env_collectors([{_Registry, Collector} | Rest], Acc) when is_atom(Collector) ->
+    do_env_collectors(Rest, [Collector | Acc]);
+do_env_collectors([Collector | Rest], Acc) when is_atom(Collector) ->
+    do_env_collectors(Rest, [Collector | Acc]).
+
+get_stats() ->
+    get_stats(prometheus, ?PROM_DATA_MODE__NODE).
+
+get_stats(prometheus, Mode) ->
+    Auth = emqx_mgmt_api_test_util:auth_header_(),
+    QueryString = uri_string:compose_query([{"mode", atom_to_binary(Mode)}]),
+    Path = emqx_mgmt_api_test_util:api_path(["prometheus", "stats"]),
+    {ok, Response} = emqx_mgmt_api_test_util:request_api(get, Path, QueryString, [Auth]),
+    Response.
+
+fresh_clientid(TestCase) ->
+    iolist_to_binary([
+        atom_to_binary(TestCase),
+        "-",
+        integer_to_binary(erlang:unique_integer([positive, monotonic]))
+    ]).

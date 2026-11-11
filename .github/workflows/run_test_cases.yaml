@@ -1,151 +1,320 @@
 name: Run test case
 
+concurrency:
+  group: test-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
 on:
-  push:
-    tags:
-      - v*
-      - e*
-  release:
-    types:
-      - published
-  pull_request:
+  workflow_call:
+    inputs:
+      builder:
+        required: true
+        type: string
+      ct-matrix:
+        required: true
+        type: string
+      ct-host:
+        required: true
+        type: string
+      ct-docker:
+        required: true
+        type: string
+    secrets:
+      CODECOV_TOKEN:
+        required: false
 
+permissions:
+  contents: read
+
+env:
+  IS_CI: "yes"
+
+# Every job below sets `timeout-minutes: 30`.
+#
+# The slowest test job measured takes 18 minutes and the 90th percentile is
+# under 10, so 30 minutes is a wide margin. Without it a job inherits the
+# GitHub default of 360 minutes, and a hung suite holds a runner for hours.
+#
+# When a job that passes needs more than 30 minutes, split or refactor the
+# suite. Do not raise the limit.
 jobs:
-    run_static_analysis:
-        runs-on: ubuntu-20.04
-        container: emqx/build-env:erl23.2.7.1-emqx-1-ubuntu20.04
+  eunit_and_proper:
+    if: inputs.ct-matrix != '[]'
+    timeout-minutes: 30
+    runs-on: ${{ github.repository_owner == 'emqx' && 'aws-ubuntu22.04-amd64' || 'ubuntu-22.04' }}
+    name: "eunit_and_proper"
+    strategy:
+      fail-fast: false
+      matrix:
+        # GitHub validates strategy.matrix before job-level if, so keep include non-empty and let the job skip.
+        include: ${{ inputs.ct-matrix == '[]' && fromJson('[{"profile":"skip"}]') || fromJson(inputs.ct-matrix) }}
 
-        steps:
-        - uses: actions/checkout@v2
-        - name: set git credentials
-          run: |
-            if make emqx-ee --dry-run > /dev/null 2>&1; then
-              echo "https://ci%40emqx.io:${{ secrets.CI_GIT_TOKEN }}@github.com" > $HOME/.git-credentials
-              git config --global credential.helper store
-            fi
-        - name: xref
-          run: make xref
-        - name: dialyzer
-          run: make dialyzer
+    defaults:
+      run:
+        shell: bash
+    container: ${{ inputs.builder }}
 
-    run_proper_test:
-        runs-on: ubuntu-20.04
-        container: emqx/build-env:erl23.2.7.1-emqx-1-ubuntu20.04
+    env:
+      PROFILE: ${{ matrix.profile }}
+      ENABLE_COVER_COMPILE: 1
+      CT_COVER_EXPORT_PREFIX: ${{ matrix.profile }}
 
-        steps:
-        - uses: actions/checkout@v2
-        - name: set git credentials
-          run: |
-            if make emqx-ee --dry-run > /dev/null 2>&1; then
-              echo "https://ci%40emqx.io:${{ secrets.CI_GIT_TOKEN }}@github.com" > $HOME/.git-credentials
-              git config --global credential.helper store
-            fi
-        - name: proper
-          run: make proper
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ matrix.profile }}-test
 
-    run_common_test:
-        runs-on: ubuntu-20.04
+      - name: extract artifact
+        run: |
+          unzip -o -q ${{ matrix.profile }}-test.zip
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
-        steps:
-        - uses: actions/checkout@v2
-        - name: set edition
-          id: set_edition
-          run: |
-            if make emqx-ee --dry-run > /dev/null 2>&1; then
-                echo "EDITION=enterprise" >> $GITHUB_ENV
-            else
-                echo "EDITION=opensource" >> $GITHUB_ENV
-            fi
-        - name: docker compose up
-          if: env.EDITION == 'opensource'
-          env:
-            MYSQL_TAG: 8
-            REDIS_TAG: 6
-            MONGO_TAG: 4
-            PGSQL_TAG: 13
-            LDAP_TAG: 2.4.50
-            GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          run: |
-            docker-compose \
-                -f .ci/docker-compose-file/docker-compose.yaml \
-                -f .ci/docker-compose-file/docker-compose-ldap-tcp.yaml \
-                -f .ci/docker-compose-file/docker-compose-mongo-tcp.yaml \
-                -f .ci/docker-compose-file/docker-compose-mysql-tcp.yaml \
-                -f .ci/docker-compose-file/docker-compose-pgsql-tcp.yaml \
-                -f .ci/docker-compose-file/docker-compose-redis-single-tcp.yaml \
-                up -d --build
-        - name: docker compose up
-          if: env.EDITION == 'enterprise'
-          env:
-            MYSQL_TAG: 8
-            REDIS_TAG: 6
-            MONGO_TAG: 4
-            PGSQL_TAG: 13
-            LDAP_TAG: 2.4.50
-            OPENTSDB_TAG: latest
-            INFLUXDB_TAG: 1.7.6
-            DYNAMODB_TAG: 1.11.477
-            TIMESCALE_TAG: latest-pg11
-            CASSANDRA_TAG: 3.11.6
-            RABBITMQ_TAG: 3.7
-            KAFKA_TAG: 2.5.0
-            PULSAR_TAG: 2.3.2
-            GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          timeout-minutes: 20
-          run: |
-            docker-compose \
-                -f .ci/docker-compose-file/docker-compose.yaml \
-                -f .ci/docker-compose-file/docker-compose-ldap-tcp.yaml \
-                -f .ci/docker-compose-file/docker-compose-mongo-tcp.yaml \
-                -f .ci/docker-compose-file/docker-compose-mysql-tcp.yaml \
-                -f .ci/docker-compose-file/docker-compose-pgsql-tcp.yaml \
-                -f .ci/docker-compose-file/docker-compose-redis-single-tcp.yaml \
-                -f .ci/docker-compose-file/docker-compose-enterprise.yaml \
-                -f .ci/docker-compose-file/docker-compose-enterprise-cassandra-tcp.yaml \
-                -f .ci/docker-compose-file/docker-compose-enterprise-dynamodb-tcp.yaml \
-                -f .ci/docker-compose-file/docker-compose-enterprise-influxdb-tcp.yaml \
-                -f .ci/docker-compose-file/docker-compose-enterprise-kafka-tcp.yaml \
-                -f .ci/docker-compose-file/docker-compose-enterprise-opentsdb-tcp.yaml \
-                -f .ci/docker-compose-file/docker-compose-enterprise-pulsar-tcp.yaml \
-                -f .ci/docker-compose-file/docker-compose-enterprise-rabbit-tcp.yaml \
-                -f .ci/docker-compose-file/docker-compose-enterprise-timescale-tcp.yaml \
-                -f .ci/docker-compose-file/docker-compose-enterprise-mysql-client.yaml \
-                -f .ci/docker-compose-file/docker-compose-enterprise-pgsql-and-timescale-client.yaml \
-                up -d --build
-            docker exec -i erlang bash -c "echo \"https://ci%40emqx.io:${{ secrets.CI_GIT_TOKEN }}@github.com\" > /root/.git-credentials && git config --global credential.helper store"
-            while [ $(docker ps -a --filter name=client --filter exited=0 | wc -l) \
-                 != $(docker ps -a --filter name=client | wc -l) ]; do
-              sleep 5
-            done
-        - name: run eunit
-          run: |
-            docker exec -i erlang bash -c "make eunit"
-        - name: run common test
-          run: |
-            docker exec -i erlang bash -c "make ct"
-        - name: run cover
-          run: |
-            printenv > .env
-            docker exec -i erlang bash -c "make cover"
-            docker exec --env-file .env -i erlang bash -c "make coveralls"
-        - uses: actions/upload-artifact@v1
-          if: failure()
-          with:
-            name: logs
-            path: _build/test/logs
-        - uses: actions/upload-artifact@v1
-          with:
-            name: cover
-            path: _build/test/cover
+      - name: generate test certificates
+        run: ./scripts/gen-test-certs.sh apps/emqx/etc/certs
 
-    finish:
-      needs: run_common_test
-      runs-on: ubuntu-20.04
-      steps:
-        - name: Coveralls Finished
-          env:
-            GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          run: |
-            curl -v -k https://coveralls.io/webhook \
-                 --header "Content-Type: application/json" \
-                 --data "{\"repo_name\":\"$GITHUB_REPOSITORY\",\"repo_token\":\"$GITHUB_TOKEN\",\"payload\":{\"build_num\":$GITHUB_RUN_ID,\"status\":\"done\"}}"
+        # produces eunit.coverdata
+      - run: make eunit
+
+        # produces proper.coverdata
+      - run: make proper
+
+      # upload coverdata as artifact
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: coverdata-${{ matrix.profile }}-eunit-proper
+          path: _build/${{ matrix.profile }}-test/cover/*.coverdata
+          compression-level: 0
+          retention-days: 1
+
+  ct_docker:
+    if: inputs.ct-docker != '[]'
+    timeout-minutes: 30
+    runs-on: ${{ github.repository_owner == 'emqx' && 'aws-ubuntu22.04-amd64' || 'ubuntu-22.04' }}
+    name: "${{ matrix.app }}-${{ matrix.suitegroup }}"
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(inputs.ct-docker) }}
+
+    defaults:
+      run:
+        shell: bash
+
+    env:
+      PROFILE: ${{ matrix.profile }}
+
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ matrix.profile }}-test
+      - name: extract artifact
+        run: |
+          unzip -o -q ${{ matrix.profile }}-test.zip
+
+      - name: prepare shared secrets directory
+        run: |
+          mkdir -p /tmp/emqx-ci/emqx-shared-secret
+          chmod 0777 /tmp/emqx-ci/emqx-shared-secret
+
+        # produces $PROFILE-<app-name>-<otp-vsn>-sg<suitegroup>.coverdata
+      - name: run common tests
+        env:
+          DOCKER_CT_RUNNER_IMAGE: ${{ inputs.builder }}
+          MONGO_TAG: "5"
+          MONGO_TAG_SINGLE_TCP: "8"
+          MYSQL_TAG: "8"
+          PGSQL_TAG: "13"
+          REDIS_TAG: "7.0"
+          DATALAYERS_TAG: "v2.3.21"
+          SUITEGROUP: ${{ matrix.suitegroup }}
+          ENABLE_COVER_COMPILE: 1
+          CT_COVER_EXPORT_PREFIX: ${{ matrix.profile }}-sg${{ matrix.suitegroup }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: ./scripts/ct/run.sh --ci --app ${{ matrix.app }} --keep-up
+
+      - name: make cover
+        run: |
+          docker exec -e PROFILE="$PROFILE" -t erlang make cover
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: coverdata-${{ matrix.profile }}-${{ matrix.prefix }}-${{ matrix.suitegroup }}
+          path: _build/${{ matrix.profile }}-test/cover/*.coverdata
+          compression-level: 0
+          retention-days: 1
+
+      - name: compress logs
+        if: failure()
+        run: tar -czf logs.tar.gz _build/${{ matrix.profile }}-test/logs
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: failure()
+        with:
+          name: logs-${{ matrix.profile }}-${{ matrix.prefix }}-sg${{ matrix.suitegroup }}
+          path: logs.tar.gz
+          compression-level: 0
+          retention-days: 7
+
+  ct:
+    if: inputs.ct-host != '[]'
+    timeout-minutes: 30
+    runs-on: ${{ github.repository_owner == 'emqx' && 'aws-ubuntu22.04-amd64' || 'ubuntu-22.04' }}
+    name: "${{ matrix.app }}-${{ matrix.suitegroup }}"
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(inputs.ct-host) }}
+
+    container: ${{ inputs.builder }}
+    defaults:
+      run:
+        shell: bash
+
+    env:
+      PROFILE: ${{ matrix.profile }}
+      SUITEGROUP: ${{ matrix.suitegroup }}
+      ENABLE_COVER_COMPILE: 1
+      CT_COVER_EXPORT_PREFIX: ${{ matrix.profile }}-sg${{ matrix.suitegroup }}
+
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ matrix.profile }}-test
+      - name: extract artifact
+        run: |
+          unzip -o -q ${{ matrix.profile }}-test.zip
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      # The plugin CT suites install a prebuilt plugin package. Only the plugin
+      # apps read it, and the packages are small, so download them for every
+      # app in the matrix.
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ matrix.profile }}-plugin-packages
+          path: _build/plugins
+
+      - name: generate test certificates
+        run: ./scripts/gen-test-certs.sh apps/emqx/etc/certs
+
+        # produces $PROFILE-<app-name>-<otp-vsn>-sg<suitegroup>.coverdata
+      - name: run common tests
+        run: make "${{ matrix.app }}-ct"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: coverdata-${{ matrix.profile }}-${{ matrix.prefix }}-${{ matrix.suitegroup }}
+          path: _build/${{ matrix.profile }}-test/cover/*.coverdata
+          compression-level: 0
+          retention-days: 1
+
+      - name: compress logs
+        if: failure()
+        run: tar -czf logs.tar.gz _build/${{ matrix.profile }}-test/logs
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: failure()
+        with:
+          name: logs-${{ matrix.profile }}-${{ matrix.prefix }}-sg${{ matrix.suitegroup }}
+          path: logs.tar.gz
+          compression-level: 0
+          retention-days: 7
+  # note when syncing dev-62 -> dev-63: `ct_plugins` is supposed to be deleted, as each
+  # plugin is run independently like normal umbrella apps.
+
+  pytest_boot_tests:
+    timeout-minutes: 30
+    runs-on: ${{ github.repository_owner == 'emqx' && 'aws-ubuntu22.04-amd64' || 'ubuntu-22.04' }}
+    name: "pytest_boot_tests"
+    strategy:
+      fail-fast: false
+      matrix:
+        profile:
+          - emqx-enterprise
+
+    container: ${{ inputs.builder }}
+    defaults:
+      run:
+        shell: bash
+
+    env:
+      PROFILE: ${{ matrix.profile }}
+
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ matrix.profile }}-release
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ matrix.profile }}-rel
+      - name: extract artifact
+        run: |
+          unzip -o -q ${{ matrix.profile }}-release.zip
+          unzip -o -q ${{ matrix.profile }}-rel.zip
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - name: verify release is present
+        run: |
+          if [ ! -x "_build/${PROFILE}/rel/emqx/bin/emqx" ]; then
+            echo "::error::_build/${PROFILE}/rel/emqx is missing from the downloaded artifacts"
+            exit 1
+          fi
+      - name: install pytest
+        run: |
+          apt-get update && apt-get install -y python3-venv
+          python3 -m venv venv
+          source venv/bin/activate
+          pip install --upgrade pip
+          pip install pytest
+      - name: run pytest boot tests
+        run: |
+          useradd -m testuser
+          chown -R testuser:testuser .
+          su testuser -c "PROFILE=$PROFILE venv/bin/pytest scripts/test/test_emqx_boot.py -v -s"
+
+  tests_passed:
+    timeout-minutes: 30
+    needs:
+      - eunit_and_proper
+      - ct
+      - ct_docker
+      - pytest_boot_tests
+    runs-on: 'ubuntu-22.04'
+    strategy:
+      fail-fast: false
+    container: ${{ inputs.builder }}
+
+    permissions:
+      pull-requests: write
+
+    steps:
+      # download emqx-enterprise source code
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: emqx-enterprise-test
+      - name: extract artifact
+        run: |
+          unzip -o -q emqx-enterprise-test.zip
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      # download coverdata artifacts
+      - name: download coverdata
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: 'coverdata-*'
+      - name: extract coverdata and move to _build/test/cover/
+        shell: bash
+        run: |
+          mkdir -p _build/test/cover/
+          # Find and move coverdata files
+          coverdata_files=$(find . -name "*.coverdata")
+          echo "coverdata_files: $coverdata_files"
+          if [ -n "$coverdata_files" ]; then
+            while IFS= read -r file; do
+              mv "$file" _build/test/cover/
+            done <<< "$coverdata_files"
+          fi
+      - name: convert coverdata to cobertura
+        run: |
+          ./scripts/cover-to-cobertura.escript -cover _build/test/cover -appname emqx -lookup apps
+      - name: Upload coverage reports to Codecov
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}

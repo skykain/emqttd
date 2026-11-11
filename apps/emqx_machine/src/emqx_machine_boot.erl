@@ -1,0 +1,365 @@
+%%--------------------------------------------------------------------
+%% Copyright (c) 2021-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
+%%--------------------------------------------------------------------
+-module(emqx_machine_boot).
+
+-include_lib("emqx/include/logger.hrl").
+-include_lib("snabbkaffe/include/snabbkaffe.hrl").
+
+-export([post_boot/0]).
+-export([stop_apps/0, ensure_apps_started/0]).
+-export([sorted_reboot_apps/0]).
+-export([start_autocluster/0]).
+-export([stop_port_apps/0]).
+-export([read_apps/0]).
+
+%% internal export only for companion module `emqx_machine_features`
+-export([reboot_apps_with_deps/0, full_sorted_reboot_apps/0, is_umbrella_app/1]).
+
+-dialyzer({no_match, [basic_reboot_apps/0]}).
+
+-ifdef(TEST).
+-export([sorted_reboot_apps/1, reboot_apps/0, runtime_deps/0]).
+-endif.
+
+%% These apps are always (re)started by emqx_machine:
+-define(BASIC_REBOOT_APPS, [
+    esockd,
+    ranch,
+    cowboy,
+    emqx_bpapi,
+    emqx_durable_storage,
+    emqx_ds_backends,
+    emqx_durable_timer,
+    emqx
+]).
+
+%% If any of these applications crash, the entire EMQX node shuts down:
+-define(BASIC_PERMANENT_APPS, [mria, ekka, esockd, emqx, emqx_license]).
+
+%% These apps are optional, they may or may not be present in the
+%% release, depending on the build flags:
+-define(OPTIONAL_APPS, [bcrypt, observer]).
+
+-define(UMBRELLA_APPS_PT_KEY, {?MODULE, umbrella_apps}).
+
+post_boot() ->
+    ok = unset_boot_configs(),
+    ok = ensure_apps_started(),
+    ok = print_vsn(),
+    ?SLOG(info, #{
+        msg => "emqx_is_running",
+        description => emqx_app:get_description(),
+        release => emqx_app:get_release(),
+        security_profile => emqx_security_profile:profile()
+    }),
+    ok = start_autocluster(),
+    %% Boot is complete and the ekka join callbacks are registered
+    %% (start_autocluster/0 above): joining is safe from here on.
+    ok = emqx_cluster:set_booting(false),
+    ignore.
+
+%% `bin/emqx' exports this variable for its own recursive call. The VM does not
+%% read it, so OS processes that the node starts from here on do not inherit it.
+unset_boot_configs() ->
+    true = os:unsetenv("EMQX_BOOT_CONFIGS"),
+    ok.
+
+-ifdef(TEST).
+print_vsn() -> ok.
+% TEST
+-else.
+print_vsn() ->
+    ?ULOG("~ts ~ts is running now!~n", [emqx_app:get_description(), emqx_app:get_release()]).
+% TEST
+-endif.
+
+start_autocluster() ->
+    ekka:callback(stop, fun emqx_machine_boot:stop_apps/0),
+    ekka:callback(start, fun emqx_machine_boot:ensure_apps_started/0),
+    %% returns 'ok' or a pid or 'any()' as in spec
+    _ = ekka:autocluster(emqx),
+    ok.
+
+stop_apps() ->
+    ?SLOG(notice, #{msg => "stopping_emqx_apps"}),
+    %% Shut the readiness gate first: `GET /status' reports not_running
+    %% (HTTP 503) so load balancers stop routing to this node, and
+    %% connections accepted before the listen sockets close are refused.
+    %% `ensure_apps_started/0' marks the node ready again after a reboot.
+    ok = emqx_node_readiness:mark_not_ready(),
+    %% Stop listeners next, so no client traffic reaches hook callbacks
+    %% while the apps behind them (plugins, rule engine, ...) are stopped.
+    ok = stop_listeners(),
+    _ = emqx_alarm_handler:unload(),
+    ok = emqx_conf_app:unset_config_loaded(),
+    ok = emqx_plugins:ensure_stopped(),
+    lists:foreach(fun stop_one_app/1, lists:reverse(sorted_reboot_apps())).
+
+%% Listeners are stopped again from `emqx_app:prep_stop/1' when the `emqx'
+%% app stops; `emqx_listeners:stop/0' is idempotent.
+stop_listeners() ->
+    try
+        _ = emqx_boot:is_enabled(listeners) andalso emqx_listeners:stop(),
+        ok
+    catch
+        C:E:Stacktrace ->
+            ?SLOG(error, #{
+                msg => "failed_to_stop_listeners",
+                exception => C,
+                reason => E,
+                stacktrace => Stacktrace
+            }),
+            ok
+    end.
+
+%% Those port apps are terminated after the main apps
+%% Don't need to stop when reboot.
+stop_port_apps() ->
+    Loaded = application:loaded_applications(),
+    lists:foreach(
+        fun(App) ->
+            case lists:keymember(App, 1, Loaded) of
+                true -> stop_one_app(App);
+                false -> ok
+            end
+        end,
+        [os_mon, jq]
+    ).
+
+stop_one_app(App) ->
+    ?SLOG(debug, #{msg => "stopping_app", app => App}),
+    ?tp(machine_stopping_app, #{app => App}),
+    try
+        _ = application:stop(App)
+    catch
+        C:E ->
+            ?SLOG(error, #{
+                msg => "failed_to_stop_app",
+                app => App,
+                exception => C,
+                reason => E
+            })
+    end.
+
+ensure_apps_started() ->
+    ?SLOG(notice, #{msg => "(re)starting_emqx_apps"}),
+    %% Refuse MQTT connections until all apps and plugins are started,
+    %% so no client connects before plugin hooks are registered.
+    ok = emqx_node_readiness:mark_not_ready(),
+    lists:foreach(fun start_one_app/1, sorted_reboot_apps()),
+    %% Start plugin applications only after all EMQX applications are up,
+    %% so a plugin may depend on any of them.  Plugin apps are not part of
+    %% `sorted_reboot_apps/0'; `stop_apps/0' stops them explicitly via
+    %% `emqx_plugins:ensure_stopped/0'.
+    %% Note: this function is also the ekka cluster join/leave callback,
+    %% so plugins restart after a join as well (see `start_autocluster/0').
+    ok = emqx_plugins:ensure_started(),
+    ok = emqx_node_readiness:mark_ready(),
+    ?tp(emqx_machine_boot_apps_started, #{}).
+
+start_one_app(App) ->
+    ?SLOG(debug, #{msg => "starting_app", app => App}),
+    Type = restart_type(App),
+    case application:ensure_all_started(App, Type) of
+        {ok, Apps} ->
+            ?SLOG(debug, #{msg => "started_apps", apps => Apps});
+        {error, Reason} when Type =:= permanent ->
+            %% log debug and wait for application_master to terminate the node
+            ?SLOG(debug, #{msg => "failed_to_start_app", app => App, reason => Reason});
+        {error, Reason} ->
+            %% this is unexpected, fail loudly (this also results in a crash dump)
+            ?SLOG(critical, #{msg => "failed_to_start_app", app => App, reason => Reason}),
+            error({failed_to_start_app, App, Reason})
+    end.
+
+restart_type(App) ->
+    PermanentApps =
+        ?BASIC_PERMANENT_APPS ++ application:get_env(emqx_machine, permanent_applications, []),
+    case lists:member(App, PermanentApps) of
+        true ->
+            permanent;
+        false ->
+            temporary
+    end.
+
+%% list of app names which should be rebooted when:
+%% 1. due to static config change
+%% 2. after join a cluster
+
+%% the list of (re)started apps depends on release type/edition
+reboot_apps() ->
+    ConfigApps0 = application:get_env(emqx_machine, applications, []),
+    BaseRebootApps = basic_reboot_apps(),
+    ConfigApps = lists:filter(fun(App) -> not lists:member(App, BaseRebootApps) end, ConfigApps0),
+    BaseRebootApps ++ ConfigApps.
+
+basic_reboot_apps() ->
+    #{
+        common_business_apps := CommonBusinessApps,
+        ee_business_apps := EEBusinessApps
+    } = read_apps(),
+    BusinessApps = CommonBusinessApps ++ EEBusinessApps,
+    ?BASIC_REBOOT_APPS ++ (BusinessApps -- excluded_apps()).
+
+%% @doc Read business apps belonging to the current profile/edition.
+read_apps() ->
+    PrivDir = code:priv_dir(emqx_machine),
+    RebootListPath = filename:join([PrivDir, "reboot_lists.eterm"]),
+    {ok, [Apps]} = file:consult(RebootListPath),
+    Apps.
+
+excluded_apps() ->
+    %% Optional apps _should_ be (re)started automatically, but only
+    %% when they are found in the release:
+    [App || App <- ?OPTIONAL_APPS, not is_app(App)].
+
+is_app(Name) ->
+    case application:load(Name) of
+        ok -> true;
+        {error, {already_loaded, _}} -> true;
+        _ -> false
+    end.
+
+sorted_reboot_apps() ->
+    Apps0 = reboot_apps_with_deps(),
+    Apps = filter_allowed_umbrella_apps(Apps0),
+    sorted_reboot_apps(Apps).
+
+%% sorted, full list of apps to reboot; not feature-filtered
+full_sorted_reboot_apps() ->
+    Apps = reboot_apps_with_deps(),
+    sorted_reboot_apps(Apps).
+
+%% internal export only for companion module `emqx_machine_features`
+reboot_apps_with_deps() ->
+    RebootApps = reboot_apps(),
+    Apps0 = [{App, app_deps(App, RebootApps)} || App <- RebootApps],
+    emqx_machine_boot_runtime_deps:inject(Apps0, runtime_deps()).
+
+app_deps(App, RebootApps) ->
+    case application:get_key(App, applications) of
+        undefined -> undefined;
+        {ok, List} -> lists:filter(fun(A) -> lists:member(A, RebootApps) end, List)
+    end.
+
+runtime_deps() ->
+    [
+        %% `emqx_bridge' is special in that it needs all the bridges apps to
+        %% be started before it, so that, when it loads the bridges from
+        %% configuration, the bridge app and its dependencies need to be up.
+        {emqx_bridge, fun(App) -> lists:prefix("emqx_bridge_", atom_to_list(App)) end},
+        %% `emqx_connector' also needs to start all connector dependencies for the same reason.
+        %% Since standalone apps like `emqx_mongodb' are already dependencies of `emqx_bridge_*'
+        %% apps, we may apply the same tactic for `emqx_connector' and inject individual bridges
+        %% as its dependencies.
+        {emqx_connector, fun(App) -> lists:prefix("emqx_bridge_", atom_to_list(App)) end},
+        %% emqx_ds_builtin is an EE app
+        {emqx_ds_backends, emqx_ds_builtin_raft},
+        {emqx_dashboard, emqx_license},
+        %% Cluster link reads `emqx_cluster:is_single_node_mode/0' at boot to
+        %% decide whether to start configured links; the license checker is
+        %% what writes the underlying `cluster_mode' env, so it must boot first.
+        {emqx_cluster_link, emqx_license}
+    ].
+
+sorted_reboot_apps(Apps) ->
+    G = digraph:new(),
+    try
+        NoDepApps = add_apps_to_digraph(G, Apps),
+        case digraph_utils:topsort(G) of
+            Sorted when is_list(Sorted) ->
+                %% ensure emqx_conf boot up first
+                AllApps = Sorted ++ (NoDepApps -- Sorted),
+                [emqx_conf | lists:delete(emqx_conf, AllApps)];
+            false ->
+                Loops = find_loops(G),
+                error({circular_application_dependency, Loops})
+        end
+    after
+        digraph:delete(G)
+    end.
+
+%% Build a dependency graph from the provided application list.
+%% Return top-sort result of the apps.
+%% Isolated apps without which are not dependency of any other apps are
+%% put to the end of the list in the original order.
+add_apps_to_digraph(G, Apps) ->
+    lists:foldl(
+        fun
+            ({App, undefined}, Acc) ->
+                ?SLOG(debug, #{msg => "app_is_not_loaded", app => App}),
+                Acc;
+            ({App, []}, Acc) ->
+                %% use '++' to keep the original order
+                Acc ++ [App];
+            ({App, Deps}, Acc) ->
+                add_app_deps_to_digraph(G, App, Deps),
+                Acc
+        end,
+        [],
+        Apps
+    ).
+
+add_app_deps_to_digraph(G, App, undefined) ->
+    ?SLOG(debug, #{msg => "app_is_not_loaded", app => App}),
+    %% not loaded
+    add_app_deps_to_digraph(G, App, []);
+add_app_deps_to_digraph(_G, _App, []) ->
+    ok;
+add_app_deps_to_digraph(G, App, [Dep | Deps]) ->
+    digraph:add_vertex(G, App),
+    digraph:add_vertex(G, Dep),
+    %% dep -> app as dependency
+    digraph:add_edge(G, Dep, App),
+    add_app_deps_to_digraph(G, App, Deps).
+
+find_loops(G) ->
+    lists:filtermap(
+        fun(App) ->
+            case digraph:get_short_cycle(G, App) of
+                false -> false;
+                Apps -> {true, Apps}
+            end
+        end,
+        digraph:vertices(G)
+    ).
+
+get_umbrella_apps() ->
+    case persistent_term:get(?UMBRELLA_APPS_PT_KEY, undefined) of
+        undefined ->
+            cache_umbrella_apps();
+        Apps ->
+            Apps
+    end.
+
+cache_umbrella_apps() ->
+    LibDir = code:lib_dir(emqx_machine),
+    File = filename:join([LibDir, "priv", "umbrella_apps.txt"]),
+    {ok, Raw} = file:read_file(File),
+    AppsBin = binary:split(Raw, [<<"\n">>], [global, trim_all]),
+    AppsMap = maps:from_keys(AppsBin, true),
+    persistent_term:put(?UMBRELLA_APPS_PT_KEY, AppsMap),
+    AppsMap.
+
+is_umbrella_app(App) ->
+    AppBin = atom_to_binary(App, utf8),
+    case get_umbrella_apps() of
+        #{AppBin := _} ->
+            true;
+        _ ->
+            false
+    end.
+
+filter_allowed_umbrella_apps(Apps0) ->
+    lists:filter(
+        fun({App, _Deps}) ->
+            case is_umbrella_app(App) of
+                false ->
+                    true;
+                true ->
+                    emqx_machine_features:is_umbrella_application_enabled(App)
+            end
+        end,
+        Apps0
+    ).

@@ -1,0 +1,1510 @@
+%%--------------------------------------------------------------------
+%% Copyright (c) 2020-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
+%%--------------------------------------------------------------------
+-module(emqx_mgmt_cli_SUITE).
+
+-compile(export_all).
+-compile(nowarn_export_all).
+
+-include_lib("eunit/include/eunit.hrl").
+-include_lib("common_test/include/ct.hrl").
+-include_lib("emqx/include/emqx_cm.hrl").
+-include_lib("snabbkaffe/include/test_macros.hrl").
+-include_lib("emqx/include/emqx_cm.hrl").
+
+-define(CHURN_DUMP_KEY, {<<"test-churn-dump-15">>, undefined}).
+
+-define(ON(NODES, BODY),
+    emqx_ds_test_helpers:on(NODES, fun() -> BODY end)
+).
+
+all() ->
+    emqx_common_test_helpers:all(?MODULE).
+
+init_per_suite(Config) ->
+    Apps = emqx_cth_suite:start(
+        [
+            emqx_conf,
+            emqx_modules,
+            emqx_management,
+            emqx_mgmt_api_test_util:emqx_dashboard()
+        ],
+        #{work_dir => emqx_cth_suite:work_dir(Config)}
+    ),
+    ok = emqx_mgmt_cli:load(),
+    [{apps, Apps} | Config].
+
+end_per_suite(Config) ->
+    ok = emqx_cth_suite:stop(?config(apps, Config)).
+
+init_per_testcase(TC, Config) ->
+    try
+        emqx_common_test_helpers:init_per_testcase(?MODULE, TC, Config)
+    catch
+        throw:{skip, Reason} -> {skip, Reason}
+    end.
+
+end_per_testcase(TC, Config) ->
+    emqx_common_test_helpers:end_per_testcase(?MODULE, TC, Config).
+
+t_status(_Config) ->
+    emqx_ctl:run_command([]),
+    emqx_ctl:run_command(["status"]),
+    ok.
+
+t_audit_args_not_commands(_Config) ->
+    ?assertEqual(
+        [],
+        [
+            Cmd
+         || {Cmd, emqx_mgmt_cli, _} <- emqx_ctl:get_commands(),
+            lists:suffix("_audit_args", atom_to_list(Cmd))
+        ]
+    ).
+
+t_broker(_Config) ->
+    %% broker         # Show broker version, uptime and description
+    ?assertEqual(ok, emqx_ctl:run_command(["broker"])),
+    %% broker stats   # Show broker statistics of clients, topics, subscribers
+    ?assertEqual(ok, emqx_ctl:run_command(["broker", "stats"])),
+    %% broker metrics # Show broker metrics
+    ?assertEqual(ok, emqx_ctl:run_command(["broker", "metrics"])),
+    ok.
+
+-doc """
+`topics show` prints the route of a topic that has a subscriber.
+""".
+t_topics_show(_Config) ->
+    {ok, C} = emqtt:start_link([{clientid, <<"topics_show_test">>}]),
+    {ok, _} = emqtt:connect(C),
+    try
+        {ok, _, _} = emqtt:subscribe(C, <<"topics/show/test">>, 1),
+        {Res, Prints} = emqx_common_test_helpers:capture_io_format(fun() ->
+            emqx_ctl:run_command(["topics", "show", "topics/show/test"])
+        end),
+        Expected = iolist_to_binary(io_lib:format("topics/show/test -> ~ts~n", [node()])),
+        ?assertEqual(Expected, iolist_to_binary(Prints)),
+        ?assertEqual(ok, Res)
+    after
+        ok = emqtt:disconnect(C)
+    end.
+
+-doc """
+A successful `broker metrics`, whose handler ends in a print comprehension,
+is audited at `info` level, not `error`.
+""".
+t_print_command_audit_level(_Config) ->
+    Self = self(),
+    ok = meck:new(emqx_conf_cli, [passthrough, no_history, no_link]),
+    ok = meck:expect(emqx_conf_cli, audit, fun(Level, _From, #{cmd := Cmd, args := Args}) ->
+        Self ! {audit, Level, Cmd, Args},
+        ok
+    end),
+    try
+        ?assertEqual(ok, emqx_ctl:run_command(["broker", "metrics"])),
+        receive
+            {audit, Level, broker, [<<"metrics">>]} -> ?assertEqual(info, Level)
+        after 1000 -> ct:fail(no_audit_log)
+        end
+    after
+        meck:unload(emqx_conf_cli)
+    end.
+
+-doc "An unknown command still returns an error, so `emqx ctl` exits 1.".
+t_unknown_command(_Config) ->
+    ?assertMatch({error, _}, emqx_ctl:run_command(["pr18794_unknown_command"])).
+
+t_cluster(_Config) ->
+    SelfNode = node(),
+    FakeNode = 'fake@127.0.0.1',
+    MFA = {?MODULE, format, [""]},
+    meck:new(mria_mnesia, [non_strict, passthrough, no_link]),
+    meck:expect(mria_mnesia, running_nodes, 0, [SelfNode, FakeNode]),
+    {atomic, {ok, TnxId, _}} =
+        mria:transaction(
+            emqx_cluster_rpc_shard,
+            fun emqx_cluster_rpc:init_mfa/2,
+            [SelfNode, MFA]
+        ),
+    emqx_cluster_rpc:maybe_init_tnx_id(FakeNode, TnxId),
+    ?assertMatch(
+        {atomic, [
+            #{
+                node := SelfNode,
+                mfa := MFA,
+                created_at := _,
+                tnx_id := TnxId,
+                initiator := SelfNode
+            },
+            #{
+                node := FakeNode,
+                mfa := MFA,
+                created_at := _,
+                tnx_id := TnxId,
+                initiator := SelfNode
+            }
+        ]},
+        emqx_cluster_rpc:status()
+    ),
+    %% cluster join <Node>        # Join the cluster
+    %% cluster leave              # Leave the cluster
+    %% cluster force-leave <Node> # Force the node leave from cluster
+    %% cluster status             # Cluster status
+    emqx_ctl:run_command(["cluster", "status"]),
+
+    ?assertEqual(
+        {error, {node_down, 'nosuchnode@127.0.0.1'}},
+        emqx_ctl:run_command(["cluster", "join", "nosuchnode@127.0.0.1"])
+    ),
+
+    emqx_ctl:run_command(["cluster", "force-leave", atom_to_list(FakeNode)]),
+    ?assertMatch(
+        {atomic, [
+            #{
+                node := SelfNode,
+                mfa := MFA,
+                created_at := _,
+                tnx_id := TnxId,
+                initiator := SelfNode
+            }
+        ]},
+        emqx_cluster_rpc:status()
+    ),
+    meck:unload(mria_mnesia),
+    ok.
+
+-doc """
+Verifies that `cluster join' is refused with a readable error while node
+boot is still in progress, and allowed again once boot is complete.
+""".
+t_cluster_join_refused_while_booting(_Config) ->
+    ok = emqx_cluster:set_booting(true),
+    try
+        ?assertMatch(
+            {error, "This node has not fully booted" ++ _},
+            emqx_ctl:run_command(["cluster", "join", "nosuchnode@127.0.0.1"])
+        )
+    after
+        ok = emqx_cluster:set_booting(false)
+    end,
+    %% after boot completes the same command proceeds to the peer check
+    ?assertEqual(
+        {error, {node_down, 'nosuchnode@127.0.0.1'}},
+        emqx_ctl:run_command(["cluster", "join", "nosuchnode@127.0.0.1"])
+    ),
+    ok.
+
+-doc """
+Verifies that on a replicant node `cluster join' is NOT refused while boot is
+in progress: a replicant cannot finish booting without a core node, so a
+mid-boot join is what bootstraps it under manual cluster discovery. The
+command must proceed past the boot guard to the peer check.
+""".
+t_cluster_join_allowed_while_booting_on_replicant(_Config) ->
+    ok = meck:new(mria_rlog, [passthrough, no_history]),
+    ok = meck:expect(mria_rlog, role, fun() -> replicant end),
+    ok = emqx_cluster:set_booting(true),
+    try
+        ?assertEqual(
+            {error, {node_down, 'nosuchnode@127.0.0.1'}},
+            emqx_ctl:run_command(["cluster", "join", "nosuchnode@127.0.0.1"])
+        )
+    after
+        ok = emqx_cluster:set_booting(false),
+        ok = meck:unload(mria_rlog)
+    end,
+    ok.
+
+t_clients(_Config) ->
+    %% clients list            # List all clients
+    emqx_ctl:run_command(["clients", "list"]),
+    %% clients show <ClientId> # Show a client
+    %% clients kick <ClientId> # Kick out a client
+    ok.
+
+-doc """
+`clients show` prints 0 for the stats of an idle client, which the channel info
+table does not store.
+""".
+t_clients_show_idle_client(_Config) ->
+    ClientId = <<"test-clients-show-idle">>,
+    C = start_link_client(ClientId),
+    try
+        {ok, Output} = capture_ctl(["clients", "show", binary_to_list(ClientId)]),
+        lists:foreach(
+            fun(Field) ->
+                ?assertEqual(
+                    match,
+                    re:run(Output, <<", ", Field/binary, "=0,">>, [{capture, none}]),
+                    {Field, Output}
+                )
+            end,
+            [
+                <<"subscriptions">>,
+                <<"inflight">>,
+                <<"awaiting_rel">>,
+                <<"delivered_msgs">>,
+                <<"enqueued_msgs">>,
+                <<"dropped_msgs">>
+            ]
+        )
+    after
+        stop_client(C)
+    end.
+
+-doc "`clients stats` writes 0 in the session columns of an idle client.".
+t_clients_dump_stats_idle_client(_Config) ->
+    ClientId = <<"test-clients-stats-idle">>,
+    C = start_link_client(ClientId),
+    TestFile = "/tmp/test_dump_stats_idle.csv",
+    _ = file:delete(TestFile),
+    try
+        ok = dump_client_stats(TestFile, 1000, 0),
+        {ok, Content} = file:read_file(TestFile),
+        [Row] = [
+            L
+         || L <- binary:split(Content, <<"\n">>, [global]),
+            binary:match(L, ClientId) =/= nomatch
+        ],
+        [_Ts, ClientId, _RecvOct, _RecvCnt, _SendOct, _SendCnt | SessionCols] =
+            binary:split(Row, <<",">>, [global]),
+        ?assertEqual([<<"0">>, <<"0">>, <<"0">>, <<"0">>], SessionCols)
+    after
+        _ = file:delete(TestFile),
+        stop_client(C)
+    end.
+
+t_a_session_top_status_idle(_Config) ->
+    {ok, Output} = capture_ctl(["session-top", "status"]),
+    ?assertEqual(match, re:run(Output, <<"Status: idle">>, [{capture, none}])),
+    ?assertEqual(
+        match,
+        re:run(Output, <<"No session-top scan is running">>, [{capture, none}])
+    ).
+
+t_session_top_status_running_labels(_Config) ->
+    emqx_common_test_helpers:with_mock(
+        emqx_session_top_collector,
+        status,
+        fun() ->
+            #{
+                status => running,
+                count => 10,
+                sort => total_payload_bytes,
+                batch_size => 100,
+                sleep_ms => 1,
+                cluster_nodes => 3
+            }
+        end,
+        fun() ->
+            {ok, Output} = capture_ctl(["session-top", "status"]),
+            ?assertEqual(match, re:run(Output, <<"Status: running">>, [{capture, none}])),
+            ?assertEqual(match, re:run(Output, <<"Limit: 10">>, [{capture, none}])),
+            ?assertEqual(
+                match, re:run(Output, <<"Sort by: total_payload_bytes">>, [{capture, none}])
+            ),
+            ?assertEqual(match, re:run(Output, <<"Batch size: 100">>, [{capture, none}])),
+            ?assertEqual(match, re:run(Output, <<"Sleep: 1 ms">>, [{capture, none}])),
+            ?assertEqual(match, re:run(Output, <<"Cluster nodes: 3">>, [{capture, none}])),
+            ?assertEqual(nomatch, re:run(Output, <<"Count:">>, [{capture, none}])),
+            ?assertEqual(nomatch, re:run(Output, <<"Sort:">>, [{capture, none}]))
+        end
+    ).
+
+t_session_top_status_completed_prints_bad_replies(_Config) ->
+    emqx_common_test_helpers:with_mock(
+        emqx_session_top_collector,
+        status,
+        fun() ->
+            #{
+                status => completed,
+                rows => 5,
+                bad_replies => [{badnode, timeout}]
+            }
+        end,
+        fun() ->
+            {ok, Output} = capture_ctl(["session-top", "status"]),
+            ?assertEqual(match, re:run(Output, <<"Status: completed">>, [{capture, none}])),
+            ?assertEqual(match, re:run(Output, <<"Result rows: 5">>, [{capture, none}])),
+            ?assertEqual(nomatch, re:run(Output, <<"Bad nodes:">>, [{capture, none}])),
+            ?assertEqual(match, re:run(Output, <<"Bad replies:">>, [{capture, none}])),
+            ?assertEqual(nomatch, re:run(Output, <<"Partial result:">>, [{capture, none}]))
+        end
+    ).
+
+t_session_top_invalid_args(_Config) ->
+    {ok, MissingOut} = capture_ctl(["session-top"]),
+    ?assertEqual(match, re:run(MissingOut, <<"session-top --out <File>">>, [{capture, none}])),
+    ?assertEqual(
+        match,
+        re:run(MissingOut, <<"session-top --out <File>[ ]+# Write cluster top sessions">>, [
+            {capture, none}
+        ])
+    ),
+    ?assertEqual(
+        match,
+        re:run(MissingOut, <<"  \\[--count <K>\\][ ]+# Result row limit">>, [
+            {capture, none}
+        ])
+    ),
+    ?assertEqual(
+        match,
+        re:run(MissingOut, <<"  \\[--sort <SortBy>\\][ ]+# SortBy:">>, [{capture, none}])
+    ),
+    ?assertEqual(
+        match,
+        re:run(MissingOut, <<"  \\[--batch <Size>\\][ ]+# Rows per local scan batch">>, [
+            {capture, none}
+        ])
+    ),
+    ?assertEqual(
+        match,
+        re:run(MissingOut, <<"  \\[--sleep <Ms>\\][ ]+# Delay between batches">>, [
+            {capture, none}
+        ])
+    ),
+    ?assertEqual(
+        nomatch,
+        re:run(MissingOut, <<"\\[--sort <mqueue_length\\|total_payload_bytes>\\]">>, [
+            {capture, none}
+        ])
+    ),
+    ?assertEqual(nomatch, re:run(MissingOut, <<"\\[error\\]">>, [{capture, none}])),
+
+    {ok, InvalidCount} = capture_ctl([
+        "session-top",
+        "--out",
+        "/tmp/session-top.csv",
+        "--count",
+        "1001"
+    ]),
+
+    {ok, InvalidSort} = capture_ctl([
+        "session-top",
+        "--out",
+        "/tmp/session-top.csv",
+        "--sort",
+        "mailbox_len"
+    ]),
+
+    {ok, InvalidBatch} = capture_ctl([
+        "session-top",
+        "--out",
+        "/tmp/session-top.csv",
+        "--batch",
+        "0"
+    ]),
+
+    {ok, InvalidSleep} = capture_ctl([
+        "session-top",
+        "--out",
+        "/tmp/session-top.csv",
+        "--sleep",
+        "-1"
+    ]),
+    lists:foreach(
+        fun({Output, ErrorPattern}) ->
+            ?assertEqual(match, re:run(Output, <<"\\[error\\]">>, [{capture, none}])),
+            ?assertEqual(match, re:run(Output, ErrorPattern, [{capture, none}])),
+            ?assertEqual(
+                match,
+                re:run(Output, <<"session-top --out <File>[ ]+# Write cluster top sessions">>, [
+                    {capture, none}
+                ])
+            )
+        end,
+        [
+            {InvalidCount, <<"Invalid count: maximum is 1000">>},
+            {InvalidSort, <<"Invalid sort key">>},
+            {InvalidBatch, <<"Invalid batch size">>},
+            {InvalidSleep, <<"Invalid sleep value">>}
+        ]
+    ).
+
+t_session_top_usage(_Config) ->
+    {_Result, UsageOutputChunks} =
+        emqx_common_test_helpers:capture_io_format(fun() -> emqx_mgmt_cli:'session-top'(usage) end),
+    UsageOutput = iolist_to_binary(UsageOutputChunks),
+    ?assertEqual(nomatch, re:run(UsageOutput, <<"\\[error\\]">>, [{capture, none}])),
+    ?assertEqual(
+        match,
+        re:run(UsageOutput, <<"session-top --out <File>[ ]+# Write cluster top sessions">>, [
+            {capture, none}
+        ])
+    ),
+    ?assertEqual(
+        match,
+        re:run(UsageOutput, <<"latest finished status is kept until the next scan starts">>, [
+            caseless,
+            {capture, none}
+        ])
+    ),
+    lists:foreach(
+        fun(Args) ->
+            {ok, Output} = capture_ctl(Args),
+            ?assertEqual(nomatch, re:run(Output, <<"\\[error\\]">>, [{capture, none}])),
+            ?assertEqual(
+                match,
+                re:run(Output, <<"session-top --out <File>[ ]+# Write cluster top sessions">>, [
+                    {capture, none}
+                ])
+            ),
+            ?assertEqual(
+                match,
+                re:run(Output, <<"  \\[--sort <SortBy>\\][ ]+# SortBy:">>, [
+                    {capture, none}
+                ])
+            )
+        end,
+        [["session-top", "usage"], ["session-top", "help"], ["session-top", "unknown"]]
+    ).
+
+t_session_top(Config) ->
+    OutFile = filename:join(?config(priv_dir, Config), "session-top.csv"),
+    _ = file:delete(OutFile),
+    Rows = [
+        {<<"session-top-c1">>, 10, 1000000001, 1},
+        {<<"session-top-c2">>, 5, 1000000003, 2},
+        {<<"session-top-c3">>, 20, 1000000002, 3}
+    ],
+    lists:foreach(fun insert_session_top_row/1, Rows),
+    try
+        {ok, StartOutput} = capture_ctl([
+            "session-top",
+            "--out",
+            OutFile,
+            "--count",
+            "2",
+            "--sort",
+            "total_payload_bytes",
+            "--batch",
+            "1",
+            "--sleep",
+            "0"
+        ]),
+        ?assertEqual(match, re:run(StartOutput, <<"Session top scan started">>, [{capture, none}])),
+        ?assertEqual(match, re:run(StartOutput, <<"Status: running">>, [{capture, none}])),
+        ?assertEqual(match, re:run(StartOutput, <<"session-top status">>, [{capture, none}])),
+        {ok, CSV} = wait_csv_rows(OutFile, 3, 100),
+        StatusOutput = wait_session_top_status(<<"Status: completed">>, 100),
+        ?assertEqual(match, re:run(StatusOutput, <<"Status: completed">>, [{capture, none}])),
+        ?assertEqual(match, re:run(StatusOutput, <<"Result rows: 2">>, [{capture, none}])),
+        ?assertEqual(nomatch, re:run(StatusOutput, <<"Partial result:">>, [{capture, none}])),
+        ?assertEqual(nomatch, re:run(StatusOutput, <<"Rows:">>, [{capture, none}])),
+        ?assertEqual(nomatch, re:run(StatusOutput, <<"Partial:">>, [{capture, none}])),
+        {ok, RepeatedStatusOutput} = capture_ctl(["session-top", "status"]),
+        ?assertEqual(
+            match,
+            re:run(RepeatedStatusOutput, <<"Status: completed">>, [{capture, none}])
+        ),
+        ?assertEqual(
+            match,
+            re:run(RepeatedStatusOutput, <<"Result rows: 2">>, [{capture, none}])
+        ),
+        [
+            <<"clientid,node,mqueue_length,total_payload_bytes,inflight_count">>,
+            Row1,
+            Row2
+        ] = binary:split(CSV, <<"\n">>, [global, trim_all]),
+        ?assertEqual(
+            [
+                <<"session-top-c2">>,
+                atom_to_binary(node(), utf8),
+                <<"5">>,
+                <<"1000000003">>,
+                <<"2">>
+            ],
+            binary:split(Row1, <<",">>, [global])
+        ),
+        ?assertEqual(
+            [
+                <<"session-top-c3">>,
+                atom_to_binary(node(), utf8),
+                <<"20">>,
+                <<"1000000002">>,
+                <<"3">>
+            ],
+            binary:split(Row2, <<",">>, [global])
+        )
+    after
+        [ets:delete(?CHAN_INFO_TAB, {ClientId, self()}) || {ClientId, _, _, _} <- Rows],
+        _ = file:delete(OutFile)
+    end.
+
+t_session_top_rejects_existing_out_file(Config) ->
+    OutFile = filename:join(?config(priv_dir, Config), "session-top-existing.csv"),
+    ok = file:write_file(OutFile, <<"keep">>),
+    try
+        {ok, Output} = capture_ctl(["session-top", "--out", OutFile]),
+        ?assertEqual(match, re:run(Output, <<"already exists">>, [{capture, none}])),
+        ?assertEqual({ok, <<"keep">>}, file:read_file(OutFile))
+    after
+        _ = file:delete(OutFile)
+    end.
+
+t_session_top_reports_scanner_owner(Config) ->
+    OutFile = filename:join(?config(priv_dir, Config), "session-top-busy.csv"),
+    Collector = 'other@127.0.0.1',
+    emqx_common_test_helpers:with_mock(
+        emqx_session_top_collector,
+        run,
+        fun(_Opts, _Completion) -> {error, {busy, Collector}} end,
+        fun() ->
+            {ok, Output} = capture_ctl(["session-top", "--out", OutFile]),
+            ?assertEqual(match, re:run(Output, atom_to_binary(Collector), [{capture, none}]))
+        end
+    ).
+
+t_session_top_cancel(_Config) ->
+    emqx_common_test_helpers:with_mock(
+        emqx_session_top_collector,
+        cancel,
+        fun() -> {ok, cancelled} end,
+        fun() ->
+            {ok, Output} = capture_ctl(["session-top", "cancel"]),
+            ?assertEqual(match, re:run(Output, <<"Session top scan cancelled">>, [{capture, none}]))
+        end
+    ).
+
+t_routes(_Config) ->
+    %% routes list         # List all routes
+    emqx_ctl:run_command(["routes", "list"]),
+    %% routes show <Topic> # Show a route
+    ok.
+
+t_subscriptions(_Config) ->
+    %% subscriptions list                         # List all subscriptions
+    emqx_ctl:run_command(["subscriptions", "list"]),
+    %% subscriptions show <ClientId>              # Show subscriptions of a client
+    %% subscriptions add <ClientId> <Topic> <QoS> # Add a static subscription manually
+    %% subscriptions del <ClientId> <Topic>       # Delete a static subscription manually
+    ok.
+
+-doc """
+`subscriptions show` finds a subscriber that is not in the `emqx_cm` channel
+table, as a gateway channel is not, and reports an unknown clientid as not found.
+""".
+t_subscriptions_show(_Config) ->
+    ClientId = <<"t_subscriptions_show">>,
+    Topic = <<"t/subscriptions/show">>,
+    ok = emqx_broker:subscribe(Topic, ClientId, #{qos => 1}),
+    %% Wait for emqx_broker_helper to process the registration.
+    ignored = gen_server:call(emqx_broker_helper, sync, infinity),
+    try
+        {ok, Output} = capture_ctl(["subscriptions", "show", binary_to_list(ClientId)]),
+        ?assertEqual(match, re:run(Output, Topic, [{capture, none}])),
+        {ok, NotFound} = capture_ctl(["subscriptions", "show", "no_such_client"]),
+        ?assertEqual(match, re:run(NotFound, <<"Not Found">>, [{capture, none}]))
+    after
+        emqx_broker:unsubscribe(Topic)
+    end.
+
+t_subscriptions_shared_topic_list(_Config) ->
+    SubPid = self(),
+    Topic =
+        {share, <<"fos_device_data_service">>,
+            <<"spBv1.0/flnc246/DBIRTH/A_C039_N001_DAC01/Inverter">>},
+    Key = {Topic, SubPid},
+    true = ets:insert(
+        emqx_suboption, {Key, #{subid => <<"test_client">>, qos => 0, nl => 0, rh => 0, rap => 0}}
+    ),
+    try
+        ?assertEqual(ok, emqx_ctl:run_command(["subscriptions", "list"]))
+    after
+        true = ets:delete(emqx_suboption, Key)
+    end.
+
+t_plugins(_Config) ->
+    %% plugins <command> [Name-Vsn]          # e.g. 'start emqx_plugin_template-5.0-rc.1'
+    %% plugins list                          # List all installed plugins
+    emqx_ctl:run_command(["plugins", "list"]),
+    %% plugins describe  Name-Vsn            # Describe an installed plugins
+    %% plugins install   Name-Vsn            # Install a plugin package placed
+    %%                                       # in plugin'sinstall_dir
+    %% plugins uninstall Name-Vsn            # Uninstall a plugin. NOTE: it deletes
+    %%                                       # all files in install_dir/Name-Vsn
+    %% plugins start     Name-Vsn            # Start a plugin
+    %% plugins stop      Name-Vsn            # Stop a plugin
+    %% plugins restart   Name-Vsn            # Stop then start a plugin
+    %% plugins disable   Name-Vsn            # Disable auto-boot
+    %% plugins enable    Name-Vsn [Position] # Enable auto-boot at Position in the boot list, where Position could be
+    %%                                       # 'front', 'rear', or 'before Other-Vsn' to specify a relative position.
+    %%                                       # The Position parameter can be used to adjust the boot order.
+    %%                                       # If no Position is given, an already configured plugin
+    %%                                       # will stay at is old position; a newly plugin is appended to the rear
+    %%                                       # e.g. plugins disable foo-0.1.0 front
+    %%                                       #      plugins enable bar-0.2.0 before foo-0.1.0
+    ok.
+
+t_vm(_Config) ->
+    %% vm all     # Show info of Erlang VM
+    ?assertEqual(ok, emqx_ctl:run_command(["vm", "all"])),
+    %% vm load    # Show load of Erlang VM
+    ?assertEqual(ok, emqx_ctl:run_command(["vm", "load"])),
+    %% vm memory  # Show memory of Erlang VM
+    ?assertEqual(ok, emqx_ctl:run_command(["vm", "memory"])),
+    %% vm process # Show process of Erlang VM
+    ?assertEqual(ok, emqx_ctl:run_command(["vm", "process"])),
+    %% vm io      # Show IO of Erlang VM
+    ?assertEqual(ok, emqx_ctl:run_command(["vm", "io"])),
+    %% vm ports   # Show Ports of Erlang VM
+    ?assertEqual(ok, emqx_ctl:run_command(["vm", "ports"])),
+    ok.
+
+t_mnesia(_Config) ->
+    %% mnesia # Mnesia system info
+    ?assertEqual(ok, emqx_ctl:run_command(["mnesia"])),
+    ok.
+
+t_log(_Config) ->
+    %% log set-level <Level>                      # Set the overall log level
+    %% log primary-level                          # Show the primary log level now
+    emqx_ctl:run_command(["log", "primary-level"]),
+    %% log primary-level <Level>                  # Set the primary log level
+    %% log handlers list                          # Show log handlers
+    emqx_ctl:run_command(["log", "handlers", "list"]),
+    %% log handlers start <HandlerId>             # Start a log handler
+    %% log handlers stop  <HandlerId>             # Stop a log handler
+    %% log handlers set-level <HandlerId> <Level> # Set log level of a log handler
+    ok.
+
+t_trace(_Config) ->
+    %% trace list                                        # List all traces started on local node
+    ok = emqx_ctl:run_command(["trace", "list"]),
+    %% trace start client <ClientId> <File> [<Level>]    # Traces for a client on local node
+    %% trace stop  client <ClientId>                     # Stop tracing for a client on local node
+    ok = emqx_ctl:run_command(["trace", "start", "client", ?MODULE_STRING, "trace/t1.log"]),
+    ok = emqx_ctl:run_command(["trace", "list"]),
+    ok = emqx_ctl:run_command(["trace", "stop", "client", ?MODULE_STRING]),
+    %% trace start topic  <Topic>    <File> [<Level>]    # Traces for a topic on local node
+    %% trace stop  topic  <Topic>                        # Stop tracing for a topic on local node
+    %% trace start ip_address  <IP>    <File> [<Level>]  # Traces for a client ip on local node
+    %% trace stop  ip_addresss  <IP>                     # Stop tracing for a client ip on local node
+    ok.
+
+t_traces(_Config) ->
+    %% traces list                             # List all cluster traces started
+    ?assertEqual(ok, emqx_ctl:run_command(["traces", "list"])),
+    ?assertEqual(0, cluster_trace_count()),
+    %% traces start <Name> client <ClientId>   # Traces for a client in cluster
+    %% traces start <Name> topic <Topic>       # Traces for a topic in cluster
+    %% traces start <Name> ip_address <IPAddr> # Traces for a IP in cluster
+    %% traces stop  <Name>                     # Stop trace in cluster
+    %% traces delete  <Name>                   # Delete trace in cluster
+    ok.
+
+t_traces_client(_Config) ->
+    Name = "TraceNameClientID",
+    ok = emqx_ctl:run_command(["traces", "start", Name, "client", "ClientID"]),
+    ok = emqx_ctl:run_command(["traces", "list"]),
+    ?assertEqual(1, cluster_trace_count()),
+    ok = emqx_ctl:run_command(["traces", "stop", Name]),
+    ok = emqx_ctl:run_command(["traces", "delete", Name]).
+
+t_traces_client_with_duration(_Config) ->
+    Name = "TraceNameClientID",
+    Duration = "1000",
+    ok = emqx_ctl:run_command(["traces", "start", Name, "client", "ClientID", Duration]),
+    ok = emqx_ctl:run_command(["traces", "list"]),
+    ?assertEqual(1, cluster_trace_count()),
+    ok = emqx_ctl:run_command(["traces", "stop", Name]),
+    ok = emqx_ctl:run_command(["traces", "delete", Name]).
+
+t_traces_topic(_Config) ->
+    Name = "TraceNameTopic",
+    ok = emqx_ctl:run_command(["traces", "start", Name, "topic", "a/b"]),
+    ok = emqx_ctl:run_command(["traces", "list"]),
+    ?assertEqual(1, cluster_trace_count()),
+    ok = emqx_ctl:run_command(["traces", "stop", Name]),
+    ok = emqx_ctl:run_command(["traces", "delete", Name]).
+
+t_traces_ip(_Config) ->
+    Name = "TraceNameIP",
+    ok = emqx_ctl:run_command(["traces", "start", Name, "ip_address", "127.0.0.1"]),
+    ok = emqx_ctl:run_command(["traces", "list"]),
+    ?assertEqual(1, cluster_trace_count()),
+    ok = emqx_ctl:run_command(["traces", "stop", Name]),
+    ok = emqx_ctl:run_command(["traces", "delete", Name]).
+
+t_traces_rule(_Config) ->
+    Name = "TraceNameRule",
+    ok = emqx_ctl:run_command(["traces", "start", Name, "ruleid", "rule:42"]),
+    ok = emqx_ctl:run_command(["traces", "list"]),
+    ?assertEqual(1, cluster_trace_count()),
+    ok = emqx_ctl:run_command(["traces", "stop", Name]),
+    ok = emqx_ctl:run_command(["traces", "delete", Name]).
+
+t_listeners(_Config) ->
+    %% listeners                      # List listeners
+    emqx_ctl:run_command(["listeners"]),
+    %% listeners stop    <Identifier> # Stop a listener
+    %% listeners start   <Identifier> # Start a listener
+    %% listeners restart <Identifier> # Restart a listener
+    ok.
+
+-doc """
+Check that `listeners` prints the shutdown counts and the non-zero accept
+stats of a TCP listener as indented blocks, and that `running` stays the 5th
+line.
+""".
+t_listeners_accept_stats(_Config) ->
+    Id = "tcp:default",
+    Block0 = listener_block(Id),
+    ?assertMatch({match, _}, re:run(lists:nth(5, Block0), <<"^  running +: true$">>)),
+    ?assert(lists:member(<<"  shutdown_count        :">>, Block0)),
+    Stats0 = accept_stats_lines(Block0),
+    %% A connected client is counted as accepted.
+    {ok, C} = emqtt:start_link([{clientid, <<"t_listeners_accept_stats">>}]),
+    {ok, _} = emqtt:connect(C),
+    ok = emqtt:disconnect(C),
+    ?retry(
+        100,
+        20,
+        ?assert(
+            proplists:get_value(accepted, accept_stats_lines(listener_block(Id))) >
+                proplists:get_value(accepted, Stats0, 0)
+        )
+    ),
+    %% A peer denied by the access rules is counted as forbidden.
+    [ListenerRef] = [Ref || {{'tcp:default', _} = Ref, _} <- esockd:listeners()],
+    {'tcp:default', {_, Port}} = ListenerRef,
+    ok = esockd:deny(ListenerRef, "127.0.0.1"),
+    try
+        {ok, Sock} = gen_tcp:connect({127, 0, 0, 1}, Port, [binary, {active, false}]),
+        ?assertMatch({error, _}, gen_tcp:recv(Sock, 0, 5000)),
+        ok = gen_tcp:close(Sock),
+        ?retry(
+            100,
+            20,
+            ?assert(
+                proplists:get_value(closed_forbidden, accept_stats_lines(listener_block(Id))) >
+                    proplists:get_value(closed_forbidden, Stats0, 0)
+            )
+        )
+    after
+        ok = emqx_listeners:restart_listener('tcp:default')
+    end,
+    %% A kicked client is counted in the shutdown counts.
+    {ok, C2} = emqtt:start_link([{clientid, <<"t_listeners_accept_stats_kick">>}]),
+    unlink(C2),
+    {ok, _} = emqtt:connect(C2),
+    ok = emqx_cm:kick_session(<<"t_listeners_accept_stats_kick">>),
+    ?retry(
+        100,
+        20,
+        ?assertMatch(
+            [_ | _],
+            [N || {kicked, N} <- shutdown_count_lines(listener_block(Id))]
+        )
+    ).
+
+-doc """
+Check that `listeners` prints a disabled listener with `running` as the 5th
+line and without the counters, which exist only for a running listener.
+""".
+t_listeners_disabled(_Config) ->
+    Conf = #{<<"bind">> => <<"127.0.0.1:21884">>, <<"enable">> => false},
+    {ok, _} = emqx:update_config([listeners, tcp, cli_disabled], {create, Conf}),
+    try
+        Block = listener_block("tcp:cli_disabled"),
+        ?assertEqual(
+            [
+                <<"  listen_on             : 127.0.0.1:21884">>,
+                <<"  acceptors             : 16">>,
+                <<"  proxy_protocol        : false">>,
+                <<"  enable                : false">>,
+                <<"  running               : false">>,
+                <<"  resolved_address      : 127.0.0.1">>,
+                <<"  resolved_address_from : bind">>
+            ],
+            Block
+        )
+    after
+        emqx:remove_config([listeners, tcp, cli_disabled])
+    end.
+
+-doc """
+`listeners enable` on a listener that does not exist reports it as not found.
+""".
+t_listeners_enable_not_found(_Config) ->
+    {Res, Prints} = emqx_common_test_helpers:capture_io_format(fun() ->
+        emqx_ctl:run_command(["listeners", "enable", "tcp:nosuch", "true"])
+    end),
+    ?assertEqual(ok, Res),
+    ?assertEqual(<<"Listener not found: \"tcp:nosuch\"\n">>, iolist_to_binary(Prints)).
+
+t_authz(_Config) ->
+    %% authz cache-clean all         # Clears authorization cache on all nodes
+    ?assertMatch(ok, emqx_ctl:run_command(["authz", "cache-clean", "all"])),
+    %% "cache-clean all" relies on an inserted timestamp in persistent term; we need to
+    %% sleep to avoid considering a freshly inserted cache entry as stale.
+    ct:sleep(1),
+    ClientId = "authz_clean_test",
+    ClientIdBin = list_to_binary(ClientId),
+    %% authz cache-clean <ClientId>  # Clears authorization cache for given client
+    ?assertMatch({error, not_found}, emqx_ctl:run_command(["authz", "cache-clean", ClientId])),
+    {ok, C} = emqtt:start_link([{clean_start, true}, {clientid, ClientId}]),
+    {ok, _} = emqtt:connect(C),
+    %% NOTE: subscribe authz results are not cached, use publish instead
+    {ok, _} = emqtt:publish(C, <<"topic/1">>, <<"payload">>, 1),
+    [Pid] = emqx_cm:lookup_channels(ClientIdBin),
+    ?assertMatch([_], gen_server:call(Pid, list_authz_cache)),
+
+    ?assertMatch(ok, emqx_ctl:run_command(["authz", "cache-clean", ClientId])),
+    ?assertMatch([], gen_server:call(Pid, list_authz_cache)),
+    %% authz cache-clean node <Node> # Clears authorization cache on given node
+    {ok, _} = emqtt:publish(C, <<"topic/2">>, <<"payload">>, 1),
+    ?assertMatch([_], gen_server:call(Pid, list_authz_cache)),
+    ?assertMatch(ok, emqx_ctl:run_command(["authz", "cache-clean", "node", atom_to_list(node())])),
+    ?assertMatch([], gen_server:call(Pid, list_authz_cache)),
+    ok = emqtt:disconnect(C),
+    ok.
+
+t_olp(_Config) ->
+    %% olp status  # Return OLP status if system is overloaded
+    emqx_ctl:run_command(["olp", "status"]),
+    %% olp enable  # Enable overload protection
+    %% olp disable # Disable overload protection
+    ok.
+
+t_admin(_Config) ->
+    %% admins add <Username> <Password> <Description> # Add dashboard user
+    %% admins passwd <Username> <Password>            # Reset dashboard user password
+    %% admins del <Username>                          # Delete dashboard user
+    ok.
+
+t_autocluster_leave('init', Config) ->
+    [Core1, Core2, Repl1, Repl2] =
+        Nodes = [
+            t_autocluster_leave_core1,
+            t_autocluster_leave_core2,
+            t_autocluster_leave_replicant1,
+            t_autocluster_leave_replicant2
+        ],
+    NodeNames = [emqx_cth_cluster:node_name(N) || N <- Nodes],
+    AppSpec = [
+        emqx,
+        {emqx_conf, #{
+            config => #{
+                cluster => #{
+                    discovery_strategy => static,
+                    static => #{seeds => NodeNames}
+                }
+            }
+        }},
+        emqx_management
+    ],
+    Cluster = emqx_cth_cluster:start(
+        [
+            {Core1, #{role => core, apps => AppSpec}},
+            {Core2, #{role => core, apps => AppSpec}},
+            {Repl1, #{role => replicant, apps => AppSpec}},
+            {Repl2, #{role => replicant, apps => AppSpec}}
+        ],
+        #{work_dir => emqx_cth_suite:work_dir(?FUNCTION_NAME, Config)}
+    ),
+    [{cluster, Cluster} | Config];
+t_autocluster_leave('end', Config) ->
+    emqx_cth_cluster:stop(?config(cluster, Config)).
+
+t_autocluster_leave(Config) ->
+    [Core1, Core2, Repl1, Repl2] = Cluster = ?config(cluster, Config),
+    ClusterView = [lists:sort(rpc:call(N, emqx, running_nodes, [])) || N <- Cluster],
+    [View1, View2, View3, View4] = ClusterView,
+    ?assertEqual(lists:sort(Cluster), View1),
+    ?assertEqual(View1, View2),
+    ?assertEqual(View1, View3),
+    ?assertEqual(View1, View4),
+
+    rpc:call(Core2, emqx_mgmt_cli, cluster, [["leave"]]),
+    timer:sleep(1000),
+    %% Replicant nodes can discover Core2 which is now split from [Core1, Core2],
+    %% but they are  expected to ignore Core2,
+    %% since mria_lb must filter out core nodes that disabled discovery.
+    ?assertMatch([Core2], rpc:call(Core2, emqx, running_nodes, [])),
+    ?assertEqual(undefined, rpc:call(Core1, erlang, whereis, [ekka_autocluster])),
+    ?assertEqual(lists:sort([Core1, Repl1, Repl2]), rpc:call(Core1, emqx, running_nodes, [])),
+    ?assertEqual(lists:sort([Core1, Repl1, Repl2]), rpc:call(Repl1, emqx, running_nodes, [])),
+    ?assertEqual(lists:sort([Core1, Repl1, Repl2]), rpc:call(Repl2, emqx, running_nodes, [])),
+
+    rpc:call(Repl1, emqx_mgmt_cli, cluster, [["leave"]]),
+    timer:sleep(1000),
+    ?assertEqual(lists:sort([Core1, Repl2]), rpc:call(Core1, emqx, running_nodes, [])),
+
+    ct:pal("enabling discovery for core2"),
+    rpc:call(Core2, emqx_mgmt_cli, cluster, [["discovery", "enable"]]),
+    ct:pal("enabling discovery for repl1"),
+    rpc:call(Repl1, emqx_mgmt_cli, cluster, [["discovery", "enable"]]),
+    %% nodes will join and restart asyncly, may need more time to re-cluster
+    ct:pal("waiting recovery"),
+    ?retry(
+        1_000,
+        30,
+        ?assertEqual(
+            {ClusterView, []},
+            rpc:multicall(Cluster, emqx, running_nodes, [])
+        )
+    ).
+
+t_leave_rejected_ds_nonempty('init', Config) ->
+    ok = snabbkaffe:start_trace(),
+    AppSpec = [
+        emqx_conf,
+        {emqx, """
+        durable_sessions.enable = true
+        durable_storage.messages.backend = builtin_raft
+        durable_storage.sessions.backend = builtin_raft
+        durable_storage.timers.backend = builtin_raft
+        durable_storage.n_sites = 2
+        """},
+        emqx_management
+    ],
+    NodeSpecs = emqx_cth_cluster:mk_nodespecs(
+        [
+            {t_leave_rejected_ds_nonempty1, #{role => core, apps => AppSpec}},
+            {t_leave_rejected_ds_nonempty2, #{role => core, apps => AppSpec}}
+        ],
+        #{work_dir => emqx_cth_suite:work_dir(?FUNCTION_NAME, Config)}
+    ),
+    Cluster = emqx_cth_cluster:start(NodeSpecs),
+    [{cluster, Cluster}, {nodespecs, NodeSpecs} | Config];
+t_leave_rejected_ds_nonempty('end', Config) ->
+    ok = snabbkaffe:stop(),
+    emqx_cth_cluster:stop(?config(cluster, Config)).
+
+%% This testcase verifies that `emqx_ctl leave` command checks if the
+%% leaving node holds replicas of DS DBs. Node hosting the replicas of
+%% DS shards should not be able to leave the cluster.
+t_leave_rejected_ds_nonempty(Config) ->
+    _Specs = [_, NS2] = ?config(nodespecs, Config),
+    Nodes = [N1, N2] = ?config(cluster, Config),
+
+    %% Ensure DSs have been bootstrapped.
+    DBs = [messages, sessions],
+    [?ON(Nodes, emqx_ds:wait_db(DB, all, infinity)) || DB <- DBs],
+    [?ON(Nodes, emqx_ds_builtin_raft:wait_replicas(DB, infinity)) || DB <- DBs],
+
+    S2 = ?ON(N2, emqx_ds_builtin_raft_meta:this_site()),
+    S2Arg = binary_to_list(S2),
+
+    ?ON(N1, emqx_mgmt_cli:ds(["info"])),
+
+    %% Should not be possible to leave, because there are shard replicas.
+    ct:pal("N2 attempts to leave", []),
+    ?assertEqual(
+        {error, [nonempty_ds_site]},
+        ?ON(N2, emqx_mgmt_cli:cluster(["leave"]))
+    ),
+
+    %% Ask to leave DS DB replication, wait until transitions are finished.
+    ?assertEqual(ok, ?ON(N1, emqx_mgmt_cli:ds(["leave", "all", S2Arg]))),
+    ?assertEqual(ok, ?ON(N1, emqx_ds_raft_test_helpers:wait_db_transitions_done(messages))),
+    ?assertEqual(ok, ?ON(N1, emqx_ds_raft_test_helpers:wait_db_transitions_done(sessions))),
+    ?assertEqual(ok, ?ON(N1, emqx_ds_raft_test_helpers:wait_db_transitions_done(timers))),
+
+    %% Now leave the cluster again.
+    ct:pal("N2 attempts to leave again", []),
+    ?retry(
+        1000,
+        10,
+        ?assertEqual(ok, ?ON(N2, emqx_mgmt_cli:cluster(["leave"])))
+    ),
+    %% Make N1 forget about S2
+    ct:pal("N2 is forgotten", []),
+    LostSite = binary_to_list(S2),
+    ?assertEqual(ok, ?ON(N1, emqx_mgmt_cli:ds(["forget", LostSite]))),
+    ?retry(500, 10, undefined = ?ON(N1, emqx_ds_builtin_raft_meta:node(S2))),
+    ?ON(N1, emqx_mgmt_cli:ds(["info"])),
+
+    %% Join the cluster again.
+    ct:pal("N2 joins again", []),
+    ?assertEqual(ok, ?ON(N2, emqx_mgmt_cli:cluster(["join", atom_to_list(N1)]))),
+    [N2] = emqx_cth_cluster:restart(NS2),
+    ?ON(N1, emqx_mgmt_cli:ds(["info"])),
+
+    %% Ask to be DS DB replication site again.
+    ?assertEqual(ok, ?ON(N1, emqx_mgmt_cli:ds(["join", "all", S2Arg]))),
+    %% Should not be possible to leave, even if transitions are still in-progress.
+    ct:pal("N1 attempts to leave", []),
+    ?assertEqual(
+        {error, [nonempty_ds_site]},
+        ?ON(N1, emqx_mgmt_cli:cluster(["leave"]))
+    ).
+
+t_exclusive(_Config) ->
+    emqx_ctl:run_command(["exclusive", "list"]),
+    emqx_ctl:run_command(["exclusive", "delete", "t/1"]),
+    ok.
+
+-doc """
+`node_dump' backs `bin/node_dump'. Each sub-command must print non-empty
+output and return `ok', or `collect' in the shell script falls through to
+its `|| echo "Unavailable"' branch. The command is registered visibly, so
+it must also show up in `emqx ctl help'.
+""".
+t_node_dump(_Config) ->
+    {ok, SysInfoOut} = capture_ctl(["node_dump", "sys_info"]),
+    ?assertEqual(match, re:run(SysInfoOut, <<"release">>, [{capture, none}])),
+    ?assertEqual(match, re:run(SysInfoOut, <<"otp_version">>, [{capture, none}])),
+    {ok, AppEnvOut} = capture_ctl(["node_dump", "app_env"]),
+    ?assert(byte_size(AppEnvOut) > 0),
+    {ok, ConfOut} = capture_ctl(["node_dump", "conf"]),
+    ?assert(byte_size(ConfOut) > 0),
+    {ok, UsageOut} = capture_ctl(["node_dump", "unknown"]),
+    ?assertEqual(match, re:run(UsageOut, <<"node_dump sys_info">>, [{capture, none}])),
+    ?assertEqual(match, re:run(UsageOut, <<"node_dump app_env">>, [{capture, none}])),
+    ?assertEqual(match, re:run(UsageOut, <<"node_dump conf">>, [{capture, none}])),
+    {ok, HelpOut} = capture_ctl([]),
+    ?assertEqual(match, re:run(HelpOut, <<"node_dump sys_info">>, [{capture, none}])),
+    ok.
+
+-doc """
+`clients list` skips a channel that has a row in the channel table but no
+channel info, as a channel that disconnects during the listing has. The
+command prints the other clients and does not fail.
+""".
+t_clients_list_channel_gone(init, Config) ->
+    Pid = start_link_client(<<"test-list-alive">>),
+    meck:new(emqx_ctl, [passthrough, no_link]),
+    [{clients, [Pid]} | Config];
+t_clients_list_channel_gone('end', Config) ->
+    meck:unload(emqx_ctl),
+    ets:match_delete(?CHAN_TAB, {<<"test-list-gone">>, '_'}),
+    lists:foreach(fun stop_client/1, ?config(clients, Config)),
+    ok.
+t_clients_list_channel_gone(_Config) ->
+    Tester = self(),
+    meck:expect(
+        emqx_ctl,
+        print,
+        fun(Fmt, Args) ->
+            Tester ! {print, iolist_to_binary(io_lib:format(Fmt, Args))},
+            meck:passthrough([Fmt, Args])
+        end
+    ),
+    GonePid = spawn(fun() -> ok end),
+    true = ets:insert(?CHAN_TAB, {<<"test-list-gone">>, GonePid}),
+    ?assertEqual(ok, emqx_ctl:run_command(["clients", "list"])),
+    Printed = collect_printed([]),
+    ?assertMatch([_], [L || L <- Printed, binary:match(L, <<"test-list-alive">>) =/= nomatch]),
+    ?assertEqual([], [L || L <- Printed, binary:match(L, <<"test-list-gone">>) =/= nomatch]),
+    ok.
+
+-doc """
+`clients list` prints every client when each client's row is deleted from
+the channel table right after the command prints it, as happens when the
+client disconnects during the listing.
+""".
+t_clients_list_row_deleted_during_walk(init, Config) ->
+    Pids = [
+        start_link_client(<<"test-list-walk-", (integer_to_binary(I))/binary>>)
+     || I <- lists:seq(1, 3)
+    ],
+    meck:new(emqx_ctl, [passthrough, no_link]),
+    [{clients, Pids} | Config];
+t_clients_list_row_deleted_during_walk('end', Config) ->
+    meck:unload(emqx_ctl),
+    lists:foreach(fun stop_client/1, ?config(clients, Config)),
+    ok.
+t_clients_list_row_deleted_during_walk(_Config) ->
+    Tester = self(),
+    meck:expect(
+        emqx_ctl,
+        print,
+        fun
+            ("Client(" ++ _ = Fmt, [ClientId | _] = Args) ->
+                Tester ! {printed, ClientId},
+                true = ets:delete(?CHAN_TAB, ClientId),
+                meck:passthrough([Fmt, Args]);
+            (Fmt, Args) ->
+                meck:passthrough([Fmt, Args])
+        end
+    ),
+    ?assertEqual(ok, emqx_ctl:run_command(["clients", "list"])),
+    Printed = collect_printed_ids([]),
+    Expected = [<<"test-list-walk-", (integer_to_binary(I))/binary>> || I <- lists:seq(1, 3)],
+    ?assertEqual([], Expected -- Printed, Printed),
+    ok.
+
+-doc """
+`exclusive list` prints every topic when each topic's row is deleted from
+the exclusive subscription table right after the command prints it, as
+happens when the subscriber unsubscribes during the listing.
+""".
+t_exclusive_list_row_deleted_during_walk(init, Config) ->
+    meck:new(emqx_ctl, [passthrough, no_link]),
+    Config;
+t_exclusive_list_row_deleted_during_walk('end', _Config) ->
+    meck:unload(emqx_ctl),
+    ok = emqx_exclusive_subscription:clear(),
+    ok.
+t_exclusive_list_row_deleted_during_walk(_Config) ->
+    Tester = self(),
+    Topics = [<<"t/walk/", (integer_to_binary(I))/binary>> || I <- lists:seq(1, 3)],
+    lists:foreach(
+        fun(Topic) ->
+            ok = mria:dirty_write(
+                emqx_exclusive_subscription,
+                {exclusive_subscription, Topic, <<"c-", Topic/binary>>}
+            )
+        end,
+        Topics
+    ),
+    meck:expect(
+        emqx_ctl,
+        print,
+        fun
+            ("topic:" ++ _ = Fmt, [Topic | _] = Args) ->
+                Tester ! {printed, Topic},
+                ok = mria:dirty_delete(emqx_exclusive_subscription, Topic),
+                meck:passthrough([Fmt, Args]);
+            (Fmt, Args) ->
+                meck:passthrough([Fmt, Args])
+        end
+    ),
+    ?assertEqual(ok, emqx_ctl:run_command(["exclusive", "list"])),
+    Printed = collect_printed_ids([]),
+    ?assertEqual([], Topics -- Printed, Printed),
+    ok.
+
+collect_printed_ids(Acc) ->
+    receive
+        {printed, Id} -> collect_printed_ids([Id | Acc])
+    after 0 ->
+        lists:reverse(Acc)
+    end.
+
+%% Test default stats command
+t_clients_dump_stats_default(init, Config) ->
+    %% Start a test client
+    Pid = start_link_client(<<"test_client_stats_dump-1">>),
+    [{clients, [Pid]} | Config];
+t_clients_dump_stats_default('end', Config) ->
+    %% Stop the test client
+    Pids = proplists:get_value(clients, Config),
+    lists:foreach(fun stop_client/1, Pids),
+    ok.
+t_clients_dump_stats_default(_Config) ->
+    TestFile = "/tmp/test_dump_stats_default.csv",
+    _ = file:delete(TestFile),
+
+    %% Run the command directly
+    dump_client_stats(TestFile, 1000, 10),
+
+    %% Verify file was created and contains expected content
+    ?assert(filelib:is_file(TestFile)),
+    {ok, Content} = file:read_file(TestFile),
+    Lines = string:tokens(binary_to_list(Content), "\n"),
+    % At least header
+    ?assert(length(Lines) >= 1),
+    ?assert(
+        lists:prefix(
+            "timestamp,clientid,recv_oct,recv_cnt,send_oct,send_cnt,"
+            "subscriptions_cnt,awaiting_rel_cnt,mqueue_len,mqueue_dropped",
+            hd(Lines)
+        )
+    ),
+    %% The `recv_cnt` and `send_cnt` columns hold the packet counters.
+    ClientId = "test_client_stats_dump-1",
+    [Row] = [L || L <- tl(Lines), lists:member(ClientId, string:split(L, ",", all))],
+    [_Ts, ClientId, _RecvOct, RecvCnt, _SendOct, SendCnt | _] = string:split(Row, ",", all),
+    Stats = emqx_cm:get_chan_stats(list_to_binary(ClientId)),
+    ?assertEqual(proplists:get_value(recv_pkt, Stats), list_to_integer(RecvCnt), Row),
+    ?assertEqual(proplists:get_value(send_pkt, Stats), list_to_integer(SendCnt), Row),
+
+    %% Clean up
+    ok = file:delete(TestFile),
+    ok.
+
+%% Test stats with --batch option
+t_clients_dump_stats_with_batch(init, Config) ->
+    %% Start test clients
+    Pids = lists:map(
+        fun(I) ->
+            ClientId = iolist_to_binary(["test-batch-dump-", integer_to_list(I)]),
+            start_link_client(ClientId)
+        end,
+        lists:seq(1, 100)
+    ),
+    [{clients, Pids} | Config];
+t_clients_dump_stats_with_batch('end', Config) ->
+    %% Stop the test clients
+    Pids = proplists:get_value(clients, Config),
+    lists:foreach(fun stop_client/1, Pids),
+    ok.
+
+t_clients_dump_stats_with_batch(_Config) ->
+    TestFile = "/tmp/test_dump_stats_batch.csv",
+    _ = file:delete(TestFile),
+
+    %% Run the command with custom batch size
+    dump_client_stats(TestFile, 10, 10),
+
+    %% Verify file was created
+    ?assert(filelib:is_file(TestFile)),
+    {ok, Content} = file:read_file(TestFile),
+    ?assert(length(string:tokens(binary_to_list(Content), "\n")) > 1),
+
+    %% Clean up
+    ok = file:delete(TestFile),
+    ok.
+
+%% Test stats with --sleep option
+t_clients_dump_stats_with_sleep(init, Config) ->
+    %% Start a test client
+    Pid = start_link_client(atom_to_binary(?FUNCTION_NAME)),
+    [{clients, [Pid]} | Config];
+t_clients_dump_stats_with_sleep('end', Config) ->
+    %% Stop the test client
+    Pids = proplists:get_value(clients, Config),
+    lists:foreach(fun stop_client/1, Pids),
+    ok.
+t_clients_dump_stats_with_sleep(_Config) ->
+    TestFile = "/tmp/test_dump_stats_sleep.csv",
+    _ = file:delete(TestFile),
+
+    %% Run the command with custom sleep
+    dump_client_stats(TestFile, 1, 25),
+
+    %% Verify file was created
+    ?assert(filelib:is_file(TestFile)),
+    {ok, Content} = file:read_file(TestFile),
+    ?assert(length(string:tokens(binary_to_list(Content), "\n")) >= 1),
+
+    %% Clean up
+    ok = file:delete(TestFile),
+    ok.
+
+-doc """
+A client connects while the dump sleeps between two batches. The dump
+continues from the key after the last written row, so it writes the new
+client and every client that was already in the table.
+""".
+t_clients_dump_stats_table_changes_during_sleep(init, Config) ->
+    Pids = [
+        start_link_client(<<"test-churn-dump-", (integer_to_binary(I))/binary>>)
+     || I <- lists:seq(1, 3)
+    ],
+    meck:new(emqx_ctl, [passthrough, no_link]),
+    [{clients, Pids} | Config];
+t_clients_dump_stats_table_changes_during_sleep('end', Config) ->
+    meck:unload(emqx_ctl),
+    true = ets:delete(?CHAN_INFO_TAB, ?CHURN_DUMP_KEY),
+    lists:foreach(fun stop_client/1, ?config(clients, Config)),
+    ok.
+t_clients_dump_stats_table_changes_during_sleep(_Config) ->
+    Tester = self(),
+    %% The command prints a progress line right before it sleeps. On the
+    %% first one, insert a row whose key sorts between the first two
+    %% clients, as a client connecting during the sleep would.
+    meck:expect(
+        emqx_ctl,
+        print,
+        fun(Fmt, Args) ->
+            Line = iolist_to_binary(io_lib:format(Fmt, Args)),
+            Tester ! {print, Line},
+            case Line of
+                <<"Progress: 1/", _/binary>> ->
+                    _ = emqx_chan_stats:new([]),
+                    true = ets:insert(
+                        ?CHAN_INFO_TAB, {?CHURN_DUMP_KEY, #{}, emqx_chan_stats:ref()}
+                    );
+                _ ->
+                    ok
+            end,
+            meck:passthrough([Fmt, Args])
+        end
+    ),
+    TestFile = "/tmp/test_dump_stats_churn.csv",
+    _ = file:delete(TestFile),
+    ok = dump_client_stats(TestFile, 1, 10),
+    Printed = collect_printed([]),
+    ?assertEqual([], [L || <<"[error]", _/binary>> = L <- Printed]),
+    {ok, Content} = file:read_file(TestFile),
+    ClientIds = [
+        lists:nth(2, binary:split(Line, <<",">>, [global]))
+     || Line <- tl(binary:split(Content, <<"\n">>, [global, trim_all]))
+    ],
+    Expected = [
+        <<"test-churn-dump-1">>,
+        <<"test-churn-dump-15">>,
+        <<"test-churn-dump-2">>,
+        <<"test-churn-dump-3">>
+    ],
+    ?assertEqual([], Expected -- ClientIds, ClientIds),
+    ok = file:delete(TestFile),
+    ok.
+
+collect_printed(Acc) ->
+    receive
+        {print, Line} -> collect_printed([Line | Acc])
+    after 0 ->
+        lists:reverse(Acc)
+    end.
+
+%% Test error handling for invalid batch size
+t_clients_dump_stats_invalid_args(init, Config) ->
+    meck:new(emqx_ctl, [passthrough, no_link]),
+    Config;
+t_clients_dump_stats_invalid_args('end', _Config) ->
+    meck:unload(emqx_ctl),
+    ok.
+t_clients_dump_stats_invalid_args(_Config) ->
+    Tester = self(),
+    meck:expect(
+        emqx_ctl,
+        print,
+        fun(Fmt, Msg) ->
+            Tester ! {print, iolist_to_binary(io_lib:format(Fmt, Msg))},
+            meck:passthrough([Fmt, Msg])
+        end
+    ),
+    TestFile = "/tmp/test_dump_stats_invalid.csv",
+    _ = file:delete(TestFile),
+
+    AssertErr = fun() ->
+        receive
+            {print, <<"[error]", _/binary>>} ->
+                ok;
+            Other ->
+                error({unexpected_msg, Other})
+        after 1000 ->
+            error(timeout)
+        end
+    end,
+
+    TestFn = fun(Batch, Sleep) ->
+        ok = dump_client_stats(TestFile, Batch, Sleep),
+        AssertErr()
+    end,
+    TestFn(-1, 0),
+    TestFn(1, -1),
+    TestFn("not number", 1),
+    TestFn(100, "not number"),
+    TestFn(100, "1.1"),
+    emqx_mgmt_cli:clients(["stats", TestFile, "--unknown", "foo"]),
+    AssertErr(),
+    %% Verify file was not created
+    ?assertNot(filelib:is_file(TestFile)),
+    ok.
+
+%%
+
+format(Str, Opts) ->
+    io:format("str:~s: Opts:~p", [Str, Opts]).
+
+start_link_client(ClientId) ->
+    {ok, C} = emqtt:start_link([{clean_start, true}, {clientid, ClientId}]),
+    {ok, _} = emqtt:connect(C),
+    C.
+
+stop_client(Pid) ->
+    ok = emqtt:disconnect(Pid).
+
+dump_client_stats(File, Batch, Sleep) ->
+    emqx_mgmt_cli:clients([
+        "stats",
+        File,
+        "--batch",
+        str(Batch),
+        "--sleep",
+        str(Sleep)
+    ]).
+
+%% Return the lines printed for one listener, without the listener id line.
+listener_block(Id) ->
+    {ok, Output} = capture_ctl(["listeners"]),
+    Lines = binary:split(Output, <<"\n">>, [global, trim_all]),
+    [_ | Rest] = lists:dropwhile(fun(L) -> L =/= list_to_binary(Id) end, Lines),
+    lists:takewhile(fun(L) -> binary:first(L) =:= $\s end, Rest).
+
+%% Return the nested counters printed under `accept_stats`. Check that they
+%% are non-zero, follow the esockd order and have their colon in column 24.
+accept_stats_lines(Block) ->
+    Stats = counter_lines(<<"accept_stats">>, 20, Block),
+    Order = [
+        accepted,
+        closed_sys_limit,
+        closed_max_limit,
+        closed_overloaded,
+        closed_rate_limited,
+        closed_early,
+        closed_forbidden,
+        closed_other_reasons
+    ],
+    Keys = [K || {K, _} <- Stats],
+    ?assertEqual([K || K <- Order, lists:member(K, Keys)], Keys),
+    Stats.
+
+%% Return the nested counters printed under `shutdown_count`. Check that they
+%% are non-zero and have their colon in column 31.
+shutdown_count_lines(Block) ->
+    counter_lines(<<"shutdown_count">>, 27, Block).
+
+counter_lines(Parent, Width, Block) ->
+    Header = iolist_to_binary(["  ", string:pad(Parent, 22), ":"]),
+    [_ | Rest] = lists:dropwhile(fun(L) -> L =/= Header end, Block),
+    Nested = lists:takewhile(fun(L) -> binary:part(L, 0, 4) =:= <<"    ">> end, Rest),
+    Counters = lists:map(
+        fun(L) ->
+            ?assertEqual({4 + Width, 1}, binary:match(L, <<":">>), L),
+            {match, [K, V]} = re:run(L, <<"^    (\\w+) *: (\\d+)$">>, [
+                {capture, all_but_first, binary}
+            ]),
+            {binary_to_atom(K), binary_to_integer(V)}
+        end,
+        Nested
+    ),
+    ?assertEqual([], [KV || {_, 0} = KV <- Counters]),
+    Counters.
+
+cluster_trace_count() ->
+    {200, List} = emqx_mgmt_api_trace:trace(get, #{}),
+    length(List).
+
+capture_ctl(Args) ->
+    {Result, OutputChunks} =
+        emqx_common_test_helpers:capture_io_format(fun() -> emqx_ctl:run_command(Args) end),
+    {Result, iolist_to_binary(OutputChunks)}.
+
+wait_session_top_status(Expected, Attempts) when Attempts > 0 ->
+    {ok, Output} = capture_ctl(["session-top", "status"]),
+    case re:run(Output, Expected, [{capture, none}]) of
+        match ->
+            Output;
+        nomatch ->
+            timer:sleep(10),
+            wait_session_top_status(Expected, Attempts - 1)
+    end;
+wait_session_top_status(_Expected, 0) ->
+    {ok, Output} = capture_ctl(["session-top", "status"]),
+    Output.
+
+insert_session_top_row({ClientId, MqueueLength, TotalPayloadBytes, InflightCount}) ->
+    StatsRef = emqx_chan_stats:new([]),
+    ok = emqx_chan_stats:put([
+        {mqueue_len, MqueueLength},
+        {total_payload_bytes, TotalPayloadBytes},
+        {inflight_cnt, InflightCount}
+    ]),
+    ok = emqx_cm:insert_channel_info(ClientId, #{}, StatsRef).
+
+wait_csv_rows(File, ExpectedRows, Attempts) when Attempts > 0 ->
+    case file:read_file(File) of
+        {ok, Bin} ->
+            case length(binary:split(Bin, <<"\n">>, [global, trim_all])) >= ExpectedRows of
+                true ->
+                    {ok, Bin};
+                false ->
+                    timer:sleep(10),
+                    wait_csv_rows(File, ExpectedRows, Attempts - 1)
+            end;
+        _ ->
+            timer:sleep(10),
+            wait_csv_rows(File, ExpectedRows, Attempts - 1)
+    end;
+wait_csv_rows(File, _ExpectedRows, 0) ->
+    file:read_file(File).
+
+str(I) when is_integer(I) -> integer_to_list(I);
+str(L) when is_list(L) -> L.

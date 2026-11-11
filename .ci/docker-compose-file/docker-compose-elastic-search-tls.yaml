@@ -1,0 +1,52 @@
+# hint: run the following if the container fails to start locally
+# sysctl -w vm.max_map_count=262144
+#
+# ELASTIC_PASSWORD is generated at runtime by scripts/ct/render-env.sh and
+# exported into this process via /tmp/emqx-ci-temp-secrets/passwords.env.
+# The file under /tmp/emqx-ci-temp-secrets/ is also bind-mounted into the
+# erlang container so the test suite can read the same value via
+# file:///tmp/emqx-ci-temp-secrets/elastic_password.
+services:
+  elasticsearch:
+    image: public.ecr.aws/elastic/elasticsearch:${ELASTIC_TAG}
+    container_name: elasticsearch
+    hostname: elasticsearch
+    volumes:
+      - ./certs/cacert.pem:/usr/share/elasticsearch/config/certs/ca.crt:ro
+      - ./certs/cert.pem:/usr/share/elasticsearch/config/certs/server.crt:ro
+      - ./certs/key.pem:/usr/share/elasticsearch/config/certs/server.key:ro
+      - esdata:/usr/share/elasticsearch/data
+    # ports:
+    #   - 9200:9200
+    environment:
+      - node.name=elasticsearch
+      - ELASTIC_PASSWORD=${ELASTIC_PASSWORD:?ELASTIC_PASSWORD is not set, run via scripts/ct/run.sh or source /tmp/emqx-ci-temp-secrets/passwords.env}
+      - bootstrap.memory_lock=true
+      - discovery.type=single-node
+      - xpack.security.enabled=true
+      - xpack.security.http.ssl.enabled=true
+      - xpack.security.http.ssl.key=certs/server.key
+      - xpack.security.http.ssl.certificate=certs/server.crt
+      - xpack.security.http.ssl.certificate_authorities=certs/ca.crt
+      - xpack.license.self_generated.type=${LICENSE}
+    mem_limit: 4G
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -s --cacert config/certs/ca.crt https://localhost:9200 | grep -q 'missing authentication credentials'",
+        ]
+      interval: 10s
+      timeout: 10s
+      retries: 120
+    restart: always
+    networks:
+      - emqx_bridge
+
+volumes:
+  esdata:
+    driver: local

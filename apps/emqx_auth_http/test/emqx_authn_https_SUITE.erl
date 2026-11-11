@@ -1,0 +1,268 @@
+%%--------------------------------------------------------------------
+%% Copyright (c) 2020-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
+%%--------------------------------------------------------------------
+
+-module(emqx_authn_https_SUITE).
+
+-compile(nowarn_export_all).
+-compile(export_all).
+
+-include_lib("emqx_auth/include/emqx_authn.hrl").
+-include_lib("eunit/include/eunit.hrl").
+-include_lib("common_test/include/ct.hrl").
+-include_lib("emqx/include/emqx_placeholder.hrl").
+
+-define(PATH, [?CONF_NS_ATOM]).
+
+-define(HTTPS_PATH, "/auth").
+-define(CREDENTIALS, #{
+    username => <<"plain">>,
+    password => <<"plain">>,
+    listener => 'tcp:default',
+    protocol => mqtt
+}).
+
+all() ->
+    [{group, legacy}, {group, hardened}].
+
+groups() ->
+    Tests = emqx_common_test_helpers:all(?MODULE),
+    [{legacy, [], Tests}, {hardened, [], Tests}].
+
+init_per_suite(TCConfig) ->
+    emqx_common_test_helpers:clear_security_profile(),
+    TCConfig.
+
+end_per_suite(_TCConfig) ->
+    emqx_common_test_helpers:clear_security_profile().
+
+init_per_group(Profile, TCConfig) when Profile =:= legacy; Profile =:= hardened ->
+    emqx_common_test_helpers:set_security_profile(Profile),
+    Apps = emqx_cth_suite:start(
+        [
+            cowboy,
+            {emqx_conf, emqx_authn_test_lib:emqx_appspec()},
+            emqx_auth,
+            emqx_auth_http
+        ],
+        #{work_dir => emqx_cth_suite:work_dir(Profile, TCConfig)}
+    ),
+    [{apps, Apps}, {security_profile, Profile} | TCConfig].
+
+end_per_group(_Profile, TCConfig) ->
+    emqx_authn_test_lib:delete_authenticators([authentication], ?GLOBAL),
+    emqx_cth_suite:stop(?config(apps, TCConfig)),
+    emqx_common_test_helpers:clear_security_profile().
+
+init_per_testcase(_Case, TCConfig) ->
+    {ok, _} = emqx_cluster_rpc:start_link(node(), emqx_cluster_rpc, 1000),
+    emqx_authn_test_lib:delete_authenticators(
+        [authentication],
+        ?GLOBAL
+    ),
+    HTTPSPort = emqx_common_test_helpers:select_free_port(tcp),
+    %% Issued for `authn-server', not for the address the client connects to:
+    %% the cases below choose between passing and failing hostname verification
+    %% with `server_name_indication'.
+    MockCerts = emqx_common_test_helpers:mock_server_certs(
+        ?config(priv_dir, TCConfig), "authn-server"
+    ),
+    {ok, _} = emqx_utils_http_test_server:start_link(
+        HTTPSPort, ?HTTPS_PATH, server_ssl_opts(MockCerts)
+    ),
+    ok = emqx_utils_http_test_server:set_handler(fun cowboy_handler/2),
+    [{https_port, HTTPSPort}, {mock_certs, MockCerts} | TCConfig].
+
+end_per_testcase(_Case, _TCConfig) ->
+    ok = emqx_utils_http_test_server:stop().
+
+%%------------------------------------------------------------------------------
+%% Tests
+%%------------------------------------------------------------------------------
+
+t_create(TCConfig) ->
+    {ok, _} = create_https_auth_with_ssl_opts(
+        TCConfig,
+        #{
+            <<"server_name_indication">> => <<"authn-server">>,
+            <<"verify">> => <<"verify_peer">>,
+            <<"versions">> => [<<"tlsv1.2">>],
+            <<"ciphers">> => [<<"ECDHE-RSA-AES256-GCM-SHA384">>]
+        }
+    ),
+
+    ?assertMatch(
+        {ok, _},
+        emqx_access_control:authenticate(?CREDENTIALS)
+    ).
+
+t_create_invalid_domain(TCConfig) ->
+    {ok, _} = create_https_auth_with_ssl_opts(
+        TCConfig,
+        #{
+            <<"server_name_indication">> => <<"authn-server-unknown-host">>,
+            <<"verify">> => <<"verify_peer">>,
+            <<"versions">> => [<<"tlsv1.2">>],
+            <<"ciphers">> => [<<"ECDHE-RSA-AES256-GCM-SHA384">>]
+        }
+    ),
+
+    ?assertEqual(
+        {error, not_authorized},
+        emqx_access_control:authenticate(?CREDENTIALS)
+    ).
+
+t_create_invalid_version(TCConfig) ->
+    {ok, _} = create_https_auth_with_ssl_opts(
+        TCConfig,
+        #{
+            <<"server_name_indication">> => <<"authn-server">>,
+            <<"verify">> => <<"verify_peer">>,
+            <<"versions">> => [<<"tlsv1.1">>]
+        }
+    ),
+
+    ?assertEqual(
+        {error, not_authorized},
+        emqx_access_control:authenticate(?CREDENTIALS)
+    ).
+
+t_create_invalid_ciphers(TCConfig) ->
+    {ok, _} = create_https_auth_with_ssl_opts(
+        TCConfig,
+        #{
+            <<"server_name_indication">> => <<"authn-server">>,
+            <<"verify">> => <<"verify_peer">>,
+            <<"versions">> => [<<"tlsv1.2">>],
+            <<"ciphers">> => [<<"ECDHE-ECDSA-AES256-SHA384">>]
+        }
+    ),
+
+    ?assertEqual(
+        {error, not_authorized},
+        emqx_access_control:authenticate(?CREDENTIALS)
+    ).
+
+-doc """
+TLS client options (verify_peer, SNI) are applied to one-off requests when the
+URL host is templated.
+""".
+t_templated_host_https(TCConfig) ->
+    {ok, _} = create_templated_https_auth_with_ssl_opts(
+        TCConfig,
+        #{
+            <<"server_name_indication">> => <<"authn-server">>,
+            <<"verify">> => <<"verify_peer">>,
+            <<"versions">> => [<<"tlsv1.2">>],
+            <<"ciphers">> => [<<"ECDHE-RSA-AES256-GCM-SHA384">>]
+        }
+    ),
+    ?assertMatch(
+        {ok, _},
+        emqx_access_control:authenticate(templated_host_credentials())
+    ).
+
+-doc """
+When no server_name_indication is configured, the one-off request derives both
+SNI and the hostname verification reference from the per-request rendered
+host: the test server certificate is issued for 'authn-server', so peer
+verification against the rendered host ('localhost') fails closed.
+""".
+t_templated_host_https_default_sni(TCConfig) ->
+    {ok, _} = create_templated_https_auth_with_ssl_opts(
+        TCConfig,
+        #{
+            <<"verify">> => <<"verify_peer">>,
+            <<"versions">> => [<<"tlsv1.2">>],
+            <<"ciphers">> => [<<"ECDHE-RSA-AES256-GCM-SHA384">>]
+        }
+    ),
+    ?assertEqual(
+        {error, not_authorized},
+        emqx_access_control:authenticate(templated_host_credentials())
+    ).
+
+-doc """
+Peer verification failures (SNI mismatch) fail the one-off templated-host
+request closed.
+""".
+t_templated_host_https_verify_fail(TCConfig) ->
+    {ok, _} = create_templated_https_auth_with_ssl_opts(
+        TCConfig,
+        #{
+            <<"server_name_indication">> => <<"authn-server-unknown-host">>,
+            <<"verify">> => <<"verify_peer">>,
+            <<"versions">> => [<<"tlsv1.2">>],
+            <<"ciphers">> => [<<"ECDHE-RSA-AES256-GCM-SHA384">>]
+        }
+    ),
+    ?assertEqual(
+        {error, not_authorized},
+        emqx_access_control:authenticate(templated_host_credentials())
+    ).
+
+%%------------------------------------------------------------------------------
+%% Helpers
+%%------------------------------------------------------------------------------
+
+create_templated_https_auth_with_ssl_opts(TCConfig, SpecificSSLOpts) ->
+    HTTPSPortBin = integer_to_binary(?config(https_port, TCConfig)),
+    AuthConfig = (raw_https_auth_config(TCConfig, SpecificSSLOpts))#{
+        <<"url">> =>
+            <<"https://${client_attrs.group}:", HTTPSPortBin/binary, "/auth">>,
+        <<"hostname_resolution">> => <<"dynamic">>,
+        <<"allowed_hosts">> => [<<"localhost">>]
+    },
+    emqx:update_config(?PATH, {create_authenticator, ?GLOBAL, AuthConfig}).
+
+templated_host_credentials() ->
+    maps:merge(?CREDENTIALS, #{client_attrs => #{<<"group">> => <<"localhost">>}}).
+
+create_https_auth_with_ssl_opts(TCConfig, SpecificSSLOpts) ->
+    AuthConfig = raw_https_auth_config(TCConfig, SpecificSSLOpts),
+    emqx:update_config(?PATH, {create_authenticator, ?GLOBAL, AuthConfig}).
+
+raw_https_auth_config(TCConfig, SpecificSSLOpts) ->
+    %% Trust the mock server's CA. The client certificate is any valid one:
+    %% the mock server does not verify its peer.
+    #{cacertfile := CaCertFile} = ?config(mock_certs, TCConfig),
+    SSLOpts = #{
+        <<"enable">> => <<"true">>,
+        <<"keyfile">> => bin(emqx_common_test_helpers:test_cert("client-key.pem")),
+        <<"certfile">> => bin(emqx_common_test_helpers:test_cert("client-cert.pem")),
+        <<"cacertfile">> => bin(CaCertFile)
+    },
+    HTTPSPortBin = integer_to_binary(?config(https_port, TCConfig)),
+    #{
+        <<"mechanism">> => <<"password_based">>,
+        <<"enable">> => <<"true">>,
+
+        <<"backend">> => <<"http">>,
+        <<"method">> => <<"get">>,
+        <<"url">> => <<"https://127.0.0.1:", HTTPSPortBin/binary, "/auth">>,
+        <<"body">> => #{<<"username">> => ?PH_USERNAME, <<"password">> => ?PH_PASSWORD},
+        <<"headers">> => #{<<"X-Test-Header">> => <<"Test Value">>},
+        <<"ssl">> => maps:merge(SSLOpts, SpecificSSLOpts)
+    }.
+
+bin(Path) ->
+    iolist_to_binary(Path).
+
+cowboy_handler(Req0, State) ->
+    Req = cowboy_req:reply(
+        200,
+        #{<<"content-type">> => <<"application/json">>},
+        emqx_utils_json:encode(#{result => allow, is_superuser => false}),
+        Req0
+    ),
+    {ok, Req, State}.
+
+server_ssl_opts(#{cacertfile := CaCertFile, certfile := CertFile, keyfile := KeyFile}) ->
+    [
+        {keyfile, KeyFile},
+        {certfile, CertFile},
+        {cacertfile, CaCertFile},
+        {verify, verify_none},
+        {versions, ['tlsv1.2', 'tlsv1.3']},
+        {ciphers, ["ECDHE-RSA-AES256-GCM-SHA384", "TLS_CHACHA20_POLY1305_SHA256"]}
+    ].

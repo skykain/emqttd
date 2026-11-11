@@ -1,0 +1,1236 @@
+%%--------------------------------------------------------------------
+%% Copyright (c) 2025-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
+%%--------------------------------------------------------------------
+-module(emqx_bridge_greptimedb_SUITE).
+
+-compile(nowarn_export_all).
+-compile(export_all).
+
+-include_lib("eunit/include/eunit.hrl").
+-include_lib("common_test/include/ct.hrl").
+-include_lib("snabbkaffe/include/snabbkaffe.hrl").
+-include_lib("emqx/include/asserts.hrl").
+-include_lib("emqx_resource/include/emqx_resource.hrl").
+
+%%------------------------------------------------------------------------------
+%% Defs
+%%------------------------------------------------------------------------------
+
+-import(emqx_common_test_helpers, [on_exit/1]).
+
+-define(CONNECTOR_TYPE, greptimedb).
+-define(CONNECTOR_TYPE_BIN, <<"greptimedb">>).
+-define(ACTION_TYPE, greptimedb).
+-define(ACTION_TYPE_BIN, <<"greptimedb">>).
+
+-define(PROXY_NAME_GRPC, "greptimedb_grpc").
+-define(PROXY_NAME_TLS_GRPC, "greptimedb_tls_grpc").
+-define(PROXY_HOST, "toxiproxy").
+-define(PROXY_PORT, 8474).
+
+-define(tcp, tcp).
+-define(tls, tls).
+-define(async, async).
+-define(sync, sync).
+-define(with_batch, with_batch).
+-define(without_batch, without_batch).
+
+%%------------------------------------------------------------------------------
+%% CT boilerplate
+%%------------------------------------------------------------------------------
+
+all() ->
+    emqx_common_test_helpers:all_with_matrix(?MODULE).
+
+groups() ->
+    emqx_common_test_helpers:groups_with_matrix(?MODULE).
+
+init_per_suite(TCConfig) ->
+    reset_proxy(),
+    Apps = emqx_cth_suite:start(
+        [
+            emqx,
+            emqx_conf,
+            emqx_bridge_greptimedb,
+            emqx_bridge,
+            emqx_rule_engine,
+            emqx_management,
+            emqx_mgmt_api_test_util:emqx_dashboard()
+        ],
+        #{work_dir => emqx_cth_suite:work_dir(TCConfig)}
+    ),
+    EHttpcPoolName = <<(atom_to_binary(?MODULE))/binary, "_http">>,
+    [
+        {apps, Apps},
+        {ehttpc_pool_name, EHttpcPoolName},
+        {query_server, <<"toxiproxy:4000">>}
+        | TCConfig
+    ].
+
+end_per_suite(TCConfig) ->
+    reset_proxy(),
+    Apps = get_config(apps, TCConfig),
+    emqx_cth_suite:stop(Apps),
+    ok.
+
+init_per_group(?tcp, TCConfig) ->
+    [
+        {query_server, <<"toxiproxy:4000">>},
+        {server, <<"toxiproxy:4001">>},
+        {enable_tls, false},
+        {proxy_name, ?PROXY_NAME_GRPC},
+        {proxy_host, ?PROXY_HOST},
+        {proxy_port, ?PROXY_PORT}
+        | TCConfig
+    ];
+init_per_group(?tls, TCConfig) ->
+    [
+        {server, <<"toxiproxy:4003">>},
+        {enable_tls, true},
+        {proxy_name, ?PROXY_NAME_TLS_GRPC},
+        {proxy_host, ?PROXY_HOST},
+        {proxy_port, ?PROXY_PORT}
+        | TCConfig
+    ];
+init_per_group(?async, TCConfig) ->
+    [{query_mode, async} | TCConfig];
+init_per_group(?sync, TCConfig) ->
+    [{query_mode, sync} | TCConfig];
+init_per_group(?with_batch, TCConfig0) ->
+    [{batch_size, 100}, {batch_time, <<"200ms">>} | TCConfig0];
+init_per_group(?without_batch, TCConfig0) ->
+    [{batch_size, 1}, {batch_time, <<"0ms">>} | TCConfig0];
+init_per_group(_Group, TCConfig) ->
+    TCConfig.
+
+end_per_group(_Group, _TCConfig) ->
+    ok.
+
+init_per_testcase(TestCase, TCConfig) ->
+    reset_proxy(),
+    Path = group_path(TCConfig, no_groups),
+    ct:pal(asciiart:visible($%, "~p - ~s", [Path, TestCase])),
+    ConnectorName = atom_to_binary(TestCase),
+    ConnectorConfig = connector_config(#{
+        <<"server">> => get_config(server, TCConfig, <<"toxiproxy:4001">>),
+        <<"ssl">> => tls_opts(TCConfig)
+    }),
+    ActionName = ConnectorName,
+    ActionConfig = action_config(#{
+        <<"connector">> => ConnectorName,
+        <<"resource_opts">> => #{
+            <<"batch_size">> => get_config(batch_size, TCConfig, 1),
+            <<"batch_time">> => get_config(batch_time, TCConfig, <<"0ms">>),
+            <<"query_mode">> => get_config(query_mode, TCConfig, <<"sync">>)
+        }
+    }),
+    ok = start_ehttpc_pool(TCConfig),
+    drop_table(TCConfig),
+    snabbkaffe:start_trace(),
+    [
+        {bridge_kind, action},
+        {connector_type, ?CONNECTOR_TYPE},
+        {connector_name, ConnectorName},
+        {connector_config, ConnectorConfig},
+        {action_type, ?ACTION_TYPE},
+        {action_name, ActionName},
+        {action_config, ActionConfig}
+        | TCConfig
+    ].
+
+end_per_testcase(_TestCase, TCConfig) ->
+    snabbkaffe:stop(),
+    reset_proxy(),
+    drop_table(TCConfig),
+    emqx_bridge_v2_testlib:delete_all_rules(),
+    emqx_bridge_v2_testlib:delete_all_bridges_and_connectors(),
+    emqx_common_test_helpers:call_janitor(),
+    stop_ehttpc_pool(TCConfig),
+    ok.
+
+%%------------------------------------------------------------------------------
+%% Helper fns
+%%------------------------------------------------------------------------------
+
+connector_config(Overrides) ->
+    emqx_bridge_schema_testlib:greptimedb_connector_config(Overrides).
+
+action_config(Overrides) ->
+    emqx_bridge_schema_testlib:greptimedb_action_config(Overrides).
+
+example_write_syntax() ->
+    %% N.B.: this single space character is relevant
+    %% the measurement name should not be the topic
+    %% from greptimedb:
+    %% error => {error,{case_clause,{error,{<<"3">>,<<"Invalid%20table%20name:%20test/greptimedb">
+    <<"mqtt,clientid=${clientid}", " ", "payload=${payload},",
+        "${clientid}_int_value=${payload.int_key}i,",
+        "uint_value=${payload.uint_key}u,"
+        "float_value=${payload.float_key},", "undef_value=${payload.undef},",
+        "${undef_key}=\"hard-coded-value\",", "bool=${payload.bool}">>.
+
+get_config(K, TCConfig) -> emqx_bridge_v2_testlib:get_value(K, TCConfig).
+get_config(K, TCConfig, Default) -> proplists:get_value(K, TCConfig, Default).
+
+group_path(TCConfig, Default) ->
+    case emqx_common_test_helpers:group_path(TCConfig) of
+        [] -> Default;
+        Path -> Path
+    end.
+
+get_tc_prop(TestCase, Key, Default) ->
+    maybe
+        true ?= erlang:function_exported(?MODULE, TestCase, 0),
+        {Key, Val} ?= proplists:lookup(Key, ?MODULE:TestCase()),
+        Val
+    else
+        _ -> Default
+    end.
+
+reset_proxy() ->
+    emqx_common_test_helpers:reset_proxy(?PROXY_HOST, ?PROXY_PORT).
+
+with_failure(FailureType, TCConfig, Fn) ->
+    ProxyName = get_config(proxy_name, TCConfig),
+    emqx_common_test_helpers:with_failure(FailureType, ProxyName, ?PROXY_HOST, ?PROXY_PORT, Fn).
+
+start_ehttpc_pool(TCConfig) ->
+    #{hostname := Host, port := Port} =
+        emqx_schema:parse_server(get_config(query_server, TCConfig), #{}),
+    EHttpcPoolName = get_config(ehttpc_pool_name, TCConfig),
+    %% HTTP is always plain TCP (no TLS) - only gRPC uses TLS
+    EHttpcPoolOpts = [
+        {host, Host},
+        {port, Port},
+        {pool_size, 1},
+        {transport, tcp},
+        {transport_opts, []}
+    ],
+    {ok, _} = ehttpc_sup:start_pool(EHttpcPoolName, EHttpcPoolOpts),
+    ok.
+
+stop_ehttpc_pool(TCConfig) ->
+    EHttpcPoolName = get_config(ehttpc_pool_name, TCConfig),
+    ehttpc_sup:stop_pool(EHttpcPoolName),
+    ok.
+
+action_metrics(TCConfig) ->
+    #{name := Name} = emqx_bridge_v2_testlib:get_common_values(TCConfig),
+    emqx_bridge_v2_testlib:get_metrics(#{type => ?ACTION_TYPE, name => Name}).
+
+action_counters(TCConfig) ->
+    #{counters := Counters} = action_metrics(TCConfig),
+    Counters.
+
+counter_delta(TCConfig, Before, Counter) ->
+    maps:get(Counter, action_counters(TCConfig)) - maps:get(Counter, Before).
+
+query_by_clientid_and_int_key(ClientId, IntKey, TCConfig) ->
+    IntCol = <<ClientId/binary, "_int_value">>,
+    IntKeyBin = integer_to_binary(IntKey),
+    SQL =
+        <<"select * from \"mqtt\" where clientid='", ClientId/binary, "' and \"", IntCol/binary,
+            "\"=", IntKeyBin/binary>>,
+    query_by_sql(SQL, TCConfig).
+
+clear_table(TCConfig) ->
+    query_by_sql(<<"delete from mqtt">>, TCConfig).
+
+tls_opts(TCConfig) ->
+    case get_config(enable_tls, TCConfig, false) of
+        true ->
+            #{<<"enable">> => true, <<"verify">> => <<"verify_none">>};
+        false ->
+            #{<<"enable">> => false}
+    end.
+
+drop_table(TCConfig) ->
+    query_by_sql(<<"drop table mqtt">>, TCConfig).
+
+query_by_clientid(ClientId, TCConfig) ->
+    SQL = <<"select * from \"mqtt\" where clientid='", ClientId/binary, "'">>,
+    query_by_sql(SQL, TCConfig).
+
+query_by_sql(SQL, TCConfig) ->
+    #{hostname := Host, port := Port} =
+        emqx_schema:parse_server(get_config(query_server, TCConfig), #{}),
+    EHttpcPoolName = get_config(ehttpc_pool_name, TCConfig),
+    Path = <<"/v1/sql?db=public">>,
+    %% HTTP is always plain TCP (no TLS) - only gRPC uses TLS
+    URI = iolist_to_binary([
+        <<"http://">>,
+        list_to_binary(Host),
+        ":",
+        integer_to_binary(Port),
+        Path
+    ]),
+    Headers = [
+        {"Authorization", "Basic Z3JlcHRpbWVfdXNlcjpncmVwdGltZV9wd2Q="},
+        {"Content-Type", "application/x-www-form-urlencoded"}
+    ],
+    Body = <<"sql=", SQL/binary>>,
+    {ok, StatusCode, _Headers, RawBody0} =
+        ehttpc:request(
+            EHttpcPoolName,
+            post,
+            {URI, Headers, Body},
+            _Timeout = 10_000,
+            _Retry = 0
+        ),
+    ct:pal("server: ~s:~b\nquery:\n  ~s\nresult:\n  ~p", [Host, Port, SQL, {StatusCode, RawBody0}]),
+    case emqx_utils_json:decode(RawBody0) of
+        #{
+            <<"output">> := [
+                #{
+                    <<"records">> := #{
+                        <<"rows">> := Rows,
+                        <<"schema">> := Schema
+                    }
+                }
+            ]
+        } when StatusCode >= 200 andalso StatusCode =< 300 ->
+            make_row(Schema, Rows);
+        #{
+            <<"code">> := _Code,
+            <<"error">> := Error
+        } when StatusCode > 300 ->
+            %% TODO(dennis): check the error by code
+            case binary:match(Error, <<"Table not found">>) of
+                nomatch ->
+                    {error, Error};
+                _ ->
+                    %% Table not found
+                    #{}
+            end;
+        #{<<"output">> := _} = Res ->
+            {ok, Res};
+        Error ->
+            {error, Error}
+    end.
+
+make_row(null, _Rows) ->
+    #{};
+make_row(_Schema, []) ->
+    #{};
+make_row(#{<<"column_schemas">> := ColumnsSchemas}, [Row]) ->
+    Columns = lists:map(fun(#{<<"name">> := Name}) -> Name end, ColumnsSchemas),
+    maps:from_list(lists:zip(Columns, Row));
+make_row(#{<<"column_schemas">> := ColumnsSchemas}, Rows) when is_list(Rows) ->
+    Columns = lists:map(fun(#{<<"name">> := Name}) -> Name end, ColumnsSchemas),
+    lists:map(fun(R) -> maps:from_list(lists:zip(Columns, R)) end, Rows).
+
+create_connector_api(TCConfig, Overrides) ->
+    emqx_bridge_v2_testlib:simplify_result(
+        emqx_bridge_v2_testlib:create_connector_api(TCConfig, Overrides)
+    ).
+
+create_action_api(TCConfig, Overrides) ->
+    emqx_bridge_v2_testlib:simplify_result(
+        emqx_bridge_v2_testlib:create_action_api(TCConfig, Overrides)
+    ).
+
+get_connector_api(TCConfig) ->
+    #{connector_type := ConnectorType, connector_name := ConnectorName} =
+        emqx_bridge_v2_testlib:get_common_values(TCConfig),
+    emqx_bridge_v2_testlib:simplify_result(
+        emqx_bridge_v2_testlib:get_connector_api(
+            ConnectorType, ConnectorName
+        )
+    ).
+
+simple_create_rule_api(TCConfig) ->
+    emqx_bridge_v2_testlib:simple_create_rule_api(TCConfig).
+
+start_client() ->
+    start_client(_Opts = #{}).
+
+start_client(Opts0) ->
+    Opts = maps:merge(#{proto_ver => v5}, Opts0),
+    {ok, C} = emqtt:start_link(Opts),
+    on_exit(fun() -> emqtt:stop(C) end),
+    {ok, _} = emqtt:connect(C),
+    C.
+
+unique_payload() ->
+    integer_to_binary(erlang:unique_integer()).
+
+json_encode(X) ->
+    emqx_utils_json:encode(X).
+
+%%------------------------------------------------------------------------------
+%% Test cases
+%%------------------------------------------------------------------------------
+
+t_start_stop(TCConfig) when is_list(TCConfig) ->
+    emqx_bridge_v2_testlib:t_start_stop(TCConfig, greptimedb_client_stopped).
+
+t_on_get_status(TCConfig) when is_list(TCConfig) ->
+    emqx_bridge_v2_testlib:t_on_get_status(TCConfig).
+
+%% Regression test for https://github.com/emqx/emqx/issues/17952.
+%% A health check must not prevent an underfilled async batch from flushing.
+t_async_write_after_health_check() ->
+    [{matrix, true}].
+
+t_async_write_after_health_check(matrix) ->
+    [[?tcp]];
+t_async_write_after_health_check(_TCConfig) ->
+    Pool = iolist_to_binary([
+        "greptimedb_health_check_", integer_to_binary(erlang:unique_integer([positive]))
+    ]),
+    Options = [
+        {endpoints, [{http, ?PROXY_HOST, 4001}]},
+        {pool, Pool},
+        {pool_size, 1},
+        {pool_type, random},
+        {auth, {basic, #{username => <<"greptime_user">>, password => <<"greptime_pwd">>}}}
+    ],
+    {ok, Client} = greptimedb:start_client(Options),
+    try
+        %% grpcbox adds the channel's subchannel after start_client returns.
+        %% Until then, a health check fails with no_endpoints.
+        ?retry(100, 50, true = greptimedb:is_alive(Client)),
+        Ref = make_ref(),
+        TestPid = self(),
+        [{_, PoolWorker}] = ecpool:workers(Pool),
+        {ok, Worker} = ecpool_worker:client(PoolWorker),
+        ResultCallback = {fun(Reply) -> TestPid ! {Ref, Reply} end, []},
+        Points = [
+            #{
+                fields => #{<<"value">> => 1.0},
+                tags => #{<<"source">> => <<"health_check">>},
+                timestamp => erlang:system_time(millisecond)
+            }
+        ],
+        ok = greptimedb:async_write(Client, <<"async_health_check">>, Points, ResultCallback),
+        true = greptimedb:is_alive(Client),
+        Deadline = erlang:monotonic_time(millisecond) + 2000,
+        Flood = fun F() ->
+            case erlang:monotonic_time(millisecond) < Deadline of
+                true ->
+                    _ = sys:get_state(Worker),
+                    F();
+                false ->
+                    TestPid ! {Ref, flood_done}
+            end
+        end,
+        spawn(Flood),
+        receive
+            {Ref, {ok, _}} ->
+                ok;
+            {Ref, flood_done} ->
+                ct:fail(async_write_delayed_by_worker_messages);
+            {Ref, Error} ->
+                ct:fail({async_write_failed, Error})
+        after 5000 ->
+            ct:fail(async_write_not_flushed)
+        end,
+        receive
+            {Ref, flood_done} ->
+                ok
+        after 3000 ->
+            ct:fail(worker_message_flood_not_finished)
+        end
+    after
+        greptimedb:stop_client(Client)
+    end.
+
+t_rule_action() ->
+    [{matrix, true}].
+t_rule_action(matrix) ->
+    [
+        [?tcp, Sync, Batch]
+     || Sync <- [?sync, ?async],
+        Batch <- [?without_batch, ?with_batch]
+    ];
+t_rule_action(TCConfig) when is_list(TCConfig) ->
+    ClientId = atom_to_binary(?FUNCTION_NAME),
+    StartClientOpts = #{
+        clean_start => true,
+        proto_ver => v5,
+        clientid => ClientId
+    },
+    PostPublishFn = fun(Context) ->
+        #{payload := Payload} = Context,
+        ?retry(
+            200,
+            10,
+            ?assertMatch(
+                #{<<"payload">> := Payload},
+                query_by_clientid(ClientId, TCConfig)
+            )
+        ),
+        %% assert table options
+        SQL =
+            <<
+                "SELECT create_options FROM information_schema.tables "
+                "WHERE table_name='mqtt'"
+            >>,
+        TableOpts = query_by_sql(SQL, TCConfig),
+        ?assertEqual(<<"ttl=3years">>, maps:get(<<"create_options">>, TableOpts)),
+        ok
+    end,
+    TraceChecker = fun(Trace0) ->
+        Trace = ?of_kind(greptimedb_connector_send_query, Trace0),
+        ?assertMatch([#{points := [_]}], Trace),
+        [#{points := [Point0]}] = Trace,
+        {Measurement, [Point]} = Point0,
+        ct:pal("sent point: ~p", [Point]),
+        ?assertMatch(#{dbname := _, table := _, timeunit := _}, Measurement),
+        ?assertMatch(
+            #{
+                fields := #{},
+                tags := #{},
+                timestamp := TS
+            } when is_integer(TS),
+            Point
+        ),
+        #{fields := Fields} = Point,
+        ?assert(lists:all(fun is_binary/1, maps:keys(Fields))),
+        ?assertNot(maps:is_key(<<"undefined">>, Fields)),
+        ?assertNot(maps:is_key(<<"undef_value">>, Fields)),
+        #{tags := Tags} = Point,
+        ?assert(lists:all(fun is_binary/1, maps:keys(Tags))),
+        ?assert(maps:is_key(<<"clientid">>, Tags)),
+        ?assertMatch(
+            #{
+                value_data := {string_value, Val}
+            } when is_binary(Val),
+            maps:get(<<"clientid">>, Tags)
+        ),
+        ok
+    end,
+    Opts = #{
+        trace_checkers => [TraceChecker],
+        start_client_opts => StartClientOpts,
+        post_publish_fn => PostPublishFn
+    },
+    emqx_bridge_v2_testlib:t_rule_action(TCConfig, Opts).
+
+t_start_ok_timestamp_write_syntax(TCConfig) ->
+    {201, _} = create_connector_api(TCConfig, #{}),
+    WriteSyntax =
+        %% N.B.: this single space characters are relevant
+        <<"mqtt,clientid=${clientid}", " ", "payload=${payload},",
+            "${clientid}_int_value=${payload.int_key}i,",
+            "uint_value=${payload.uint_key}u,"
+            "bool=${payload.bool}", " ", "${timestamp}">>,
+    ?assertMatch(
+        {201, #{<<"status">> := <<"connected">>}},
+        create_action_api(TCConfig, #{
+            <<"parameters">> => #{<<"write_syntax">> => WriteSyntax}
+        })
+    ),
+    ok.
+
+t_start_ok_no_subject_tags_write_syntax(TCConfig) ->
+    {201, _} = create_connector_api(TCConfig, #{}),
+    WriteSyntax =
+        %% N.B.: this single space characters are relevant
+        <<"mqtt", " ", "payload=${payload},", "${clientid}_int_value=${payload.int_key}i,",
+            "uint_value=${payload.uint_key}u,"
+            "bool=${payload.bool}", " ", "${timestamp}">>,
+    ?assertMatch(
+        {201, #{<<"status">> := <<"connected">>}},
+        create_action_api(TCConfig, #{
+            <<"parameters">> => #{<<"write_syntax">> => WriteSyntax}
+        })
+    ),
+    ok.
+
+t_const_timestamp(TCConfig) ->
+    Const = erlang:system_time(nanosecond),
+    ConstBin = integer_to_binary(Const),
+    WriteSyntax = <<"mqtt,clientid=${clientid} foo=${payload.foo}i,bar=5i ", ConstBin/binary>>,
+    {201, _} = create_connector_api(TCConfig, #{}),
+    ?assertMatch(
+        {201, #{<<"status">> := <<"connected">>}},
+        create_action_api(TCConfig, #{
+            <<"parameters">> => #{<<"write_syntax">> => WriteSyntax}
+        })
+    ),
+    #{topic := Topic} = simple_create_rule_api(TCConfig),
+    ClientId = emqx_guid:to_hexstr(emqx_guid:gen()),
+    C = start_client(#{clientid => ClientId}),
+    Payload = json_encode(#{<<"foo">> => 123}),
+    emqtt:publish(C, Topic, Payload),
+    ?retry(200, 10, begin
+        PersistedData = query_by_clientid(ClientId, TCConfig),
+        ?assertMatch(
+            #{<<"foo">> := 123, <<"greptime_timestamp">> := Const},
+            PersistedData,
+            #{const => Const}
+        ),
+        ok
+    end),
+    ok.
+
+%% Smoke test for using `ts_column`.
+t_ts_column(TCConfig) ->
+    {201, _} = create_connector_api(TCConfig, #{
+        <<"ts_column">> => <<"event_time">>
+    }),
+    {201, _} = create_action_api(TCConfig, #{}),
+    #{topic := Topic} = simple_create_rule_api(TCConfig),
+    ClientId = atom_to_binary(?FUNCTION_NAME),
+    C = start_client(#{clientid => ClientId}),
+    emqtt:publish(C, Topic, <<"hey">>),
+    ?retry(
+        200,
+        10,
+        ?assertMatch(
+            #{<<"event_time">> := _},
+            query_by_clientid(ClientId, TCConfig)
+        )
+    ),
+    ok.
+
+t_boolean_variants(TCConfig) ->
+    {201, _} = create_connector_api(TCConfig, #{}),
+    {201, _} = create_action_api(TCConfig, #{}),
+    #{topic := Topic} = simple_create_rule_api(TCConfig),
+    ClientId = emqx_guid:to_hexstr(emqx_guid:gen()),
+    C = start_client(#{clientid => ClientId}),
+    BoolVariants = #{
+        true => true,
+        false => false,
+        <<"t">> => true,
+        <<"f">> => false,
+        <<"T">> => true,
+        <<"F">> => false,
+        <<"TRUE">> => true,
+        <<"FALSE">> => false,
+        <<"True">> => true,
+        <<"False">> => false
+    },
+    maps:foreach(
+        fun(BoolVariant, Translation) ->
+            ct:pal("testing ~p -> ~p", [BoolVariant, Translation]),
+            Payload = json_encode(#{
+                int_key => -123,
+                bool => BoolVariant,
+                uint_key => 123
+            }),
+            emqtt:publish(C, Topic, Payload),
+            ?retry(
+                _Sleep2 = 500,
+                _Attempts2 = 20,
+                ?assertMatch(
+                    #{
+                        <<"bool">> := Translation
+                    },
+                    query_by_clientid(ClientId, TCConfig),
+                    #{variant => {BoolVariant, Translation}}
+                )
+            ),
+            clear_table(TCConfig),
+            ct:sleep(100)
+        end,
+        BoolVariants
+    ),
+    ok.
+
+t_auto_cast_integer_to_float() ->
+    [{matrix, true}].
+t_auto_cast_integer_to_float(matrix) ->
+    [[?tcp, Mode, ?without_batch] || Mode <- [?sync, ?async]];
+t_auto_cast_integer_to_float(TCConfig) ->
+    {201, _} = create_connector_api(TCConfig, #{}),
+    {201, _} = create_action_api(TCConfig, #{
+        <<"parameters">> => #{
+            <<"write_syntax">> => <<"mqtt,clientid=${clientid} value=${payload.value}">>
+        }
+    }),
+    #{topic := Topic} = simple_create_rule_api(TCConfig),
+    FloatId = emqx_guid:to_hexstr(emqx_guid:gen()),
+    IntegerId = emqx_guid:to_hexstr(emqx_guid:gen()),
+    emqx:publish(emqx_message:make(FloatId, Topic, json_encode(#{value => 24.5}))),
+    emqx:publish(emqx_message:make(IntegerId, Topic, json_encode(#{value => 30}))),
+    ?retry(
+        200,
+        20,
+        begin
+            ?assertMatch(#{<<"value">> := 24.5}, query_by_clientid(FloatId, TCConfig)),
+            ?assertMatch(#{<<"value">> := 30.0}, query_by_clientid(IntegerId, TCConfig))
+        end
+    ).
+
+-doc """
+A tag value is written as the text it renders: numeric and mixed-template tags become
+strings, a literal boolean text tag stays a string, and only a value that is one
+placeholder followed by a literal `i`/`u` token, or a payload boolean, keeps its type.
+""".
+t_tag_values_as_string() ->
+    [{matrix, true}].
+t_tag_values_as_string(matrix) ->
+    [
+        [?tcp, Mode, Batch]
+     || Mode <- [?sync, ?async],
+        Batch <- [?without_batch, ?with_batch]
+    ];
+t_tag_values_as_string(TCConfig) ->
+    BatchSize = tag_value_batch_size(TCConfig),
+    {201, _} = create_connector_api(TCConfig, #{}),
+    {201, _} = create_action_api(TCConfig, tag_value_action_overrides(BatchSize)),
+    #{topic := Topic} = simple_create_rule_api(TCConfig),
+    Samples = [
+        {emqx_guid:to_hexstr(emqx_guid:gen()), Value, TagText}
+     || {Value, TagText} <- tag_value_samples()
+    ],
+    Publish = fun({ClientId, Value, _}) ->
+        Payload = json_encode(tag_value_payload(Value)),
+        emqx:publish(emqx_message:make(ClientId, Topic, Payload))
+    end,
+    Assert = fun({ClientId, _, TagText}) ->
+        ?retry(
+            500,
+            20,
+            assert_tag_value_row(query_by_clientid(ClientId, TCConfig), TagText)
+        )
+    end,
+    case BatchSize of
+        1 ->
+            lists:foreach(Publish, Samples),
+            lists:foreach(Assert, Samples);
+        _ ->
+            ?check_trace(
+                begin
+                    emqx_utils:pmap(Publish, Samples, infinity),
+                    lists:foreach(Assert, Samples),
+                    ok
+                end,
+                fun(Trace) ->
+                    BatchEvents =
+                        ?of_kind(call_batch_query, Trace) ++
+                            ?of_kind(call_batch_query_async, Trace),
+                    ExpectedBatches = (length(Samples) + BatchSize - 1) div BatchSize,
+                    ?assertEqual(ExpectedBatches, length(BatchEvents)),
+                    BatchSizes = [length(Batch) || #{batch := Batch} <- BatchEvents],
+                    IsValidSize = fun(Size) -> Size >= 1 andalso Size =< BatchSize end,
+                    ?assert(lists:all(IsValidSize, BatchSizes)),
+                    ?assertEqual(length(Samples), lists:sum(BatchSizes))
+                end
+            )
+    end,
+    ok.
+
+tag_value_batch_size(TCConfig) ->
+    case get_config(batch_size, TCConfig, 1) of
+        1 -> 1;
+        _ -> 3
+    end.
+
+tag_value_action_overrides(1) ->
+    #{
+        <<"parameters">> => #{<<"write_syntax">> => tag_value_write_syntax()}
+    };
+tag_value_action_overrides(BatchSize) ->
+    #{
+        <<"parameters">> => #{<<"write_syntax">> => tag_value_write_syntax()},
+        <<"resource_opts">> => #{
+            <<"batch_size">> => BatchSize,
+            <<"batch_time">> => <<"5s">>,
+            <<"worker_pool_size">> => 1
+        }
+    }.
+
+tag_value_write_syntax() ->
+    <<
+        "mqtt,clientid=${clientid},int_tag=${payload.int_tag},"
+        "id_tag=id_${payload.pair_a},pair_tag=${payload.pair_a}${payload.pair_b},"
+        "suffix_i_tag=${payload.pair_a}${payload.i_suffix},"
+        "suffix_u_tag=${payload.pair_a}${payload.u_suffix},"
+        "float_tag=pre_${payload.float_tag},big_float_tag=${payload.big_float},"
+        "tiny_float_tag=${payload.tiny_float},"
+        "i_tag=${payload.i_tag}i,u_tag=${payload.u_tag}u,"
+        "lit_bool_tag=T,lit_false_tag=F,pre_bool_tag=pre_${payload.bool_tag},"
+        "bool_tag=${payload.bool_tag} value=${payload.value}"
+    >>.
+
+tag_value_samples() ->
+    [
+        {0, <<"0">>},
+        {11, <<"11">>},
+        {65, <<"65">>},
+        {-7, <<"-7">>},
+        {1790667500572, <<"1790667500572">>},
+        %% 2^53 + 1 is not exactly representable as a float64
+        {9007199254740993, <<"9007199254740993">>},
+        {1 bsl 1024, integer_to_binary(1 bsl 1024)},
+        {<<"abc">>, <<"abc">>},
+        {<<"65">>, <<"65">>}
+    ].
+
+tag_value_payload(IntTag) ->
+    #{
+        <<"int_tag">> => IntTag,
+        <<"pair_a">> => 65,
+        <<"pair_b">> => 66,
+        <<"i_suffix">> => <<"i">>,
+        <<"u_suffix">> => <<"u">>,
+        <<"float_tag">> => 1.5,
+        <<"big_float">> => 1.0e300,
+        <<"tiny_float">> => 1.0e-11,
+        <<"i_tag">> => 123,
+        <<"u_tag">> => 456,
+        <<"bool_tag">> => true,
+        <<"value">> => 1
+    }.
+
+assert_tag_value_row(Row, TagText) ->
+    ?assertMatch(#{<<"int_tag">> := TagText}, Row),
+    ?assertMatch(#{<<"id_tag">> := <<"id_65">>}, Row),
+    ?assertMatch(#{<<"pair_tag">> := <<"6566">>}, Row),
+    %% suffix text contributed by a placeholder is not a type suffix
+    ?assertMatch(#{<<"suffix_i_tag">> := <<"65i">>}, Row),
+    ?assertMatch(#{<<"suffix_u_tag">> := <<"65u">>}, Row),
+    ?assertMatch(#{<<"float_tag">> := <<"pre_1.5">>}, Row),
+    ?assertMatch(#{<<"big_float_tag">> := <<"1.0e300">>}, Row),
+    ?assertMatch(#{<<"tiny_float_tag">> := <<"1.0e-11">>}, Row),
+    ?assertMatch(#{<<"i_tag">> := 123}, Row),
+    ?assertMatch(#{<<"u_tag">> := 456}, Row),
+    %% text that spells a boolean literal stays a string, a payload boolean keeps its type
+    ?assertMatch(#{<<"lit_bool_tag">> := <<"T">>}, Row),
+    ?assertMatch(#{<<"lit_false_tag">> := <<"F">>}, Row),
+    ?assertMatch(#{<<"pre_bool_tag">> := <<"pre_true">>}, Row),
+    ?assertMatch(#{<<"bool_tag">> := true}, Row),
+    ?assertEqual(1.0, maps:get(<<"value">>, Row, undefined)).
+
+-doc """
+A quoted field value is written as the rendered string and omitted when a placeholder is
+unset; an unquoted field template renders its number tokens as text while a single typed
+value keeps the InfluxDB typing, and so does a value that is one placeholder followed by a
+literal `i`/`u` token.
+""".
+t_field_values_as_text() ->
+    [{matrix, true}].
+t_field_values_as_text(matrix) ->
+    [
+        [?tcp, Mode, Batch]
+     || Mode <- [?sync, ?async],
+        Batch <- [?without_batch, ?with_batch]
+    ];
+t_field_values_as_text(TCConfig) ->
+    {201, _} = create_connector_api(TCConfig, #{}),
+    {201, _} = create_action_api(TCConfig, #{
+        <<"parameters">> => #{<<"write_syntax">> => field_value_write_syntax()}
+    }),
+    #{topic := Topic} = simple_create_rule_api(TCConfig),
+    ClientId = emqx_guid:to_hexstr(emqx_guid:gen()),
+    Payload = json_encode(field_value_payload()),
+    emqx:publish(emqx_message:make(ClientId, Topic, Payload)),
+    ?retry(
+        500,
+        20,
+        begin
+            Row = query_by_clientid(ClientId, TCConfig),
+            ?assertMatch(#{<<"literal_field">> := <<"abc">>}, Row),
+            ?assertMatch(#{<<"text_field">> := <<"pre_abc">>}, Row),
+            ?assertMatch(#{<<"number_field">> := <<"n_65">>}, Row),
+            ?assertMatch(#{<<"float_field">> := <<"f_1.0e300">>}, Row),
+            ?assertMatch(#{<<"tiny_field">> := <<"t_1.0e-11">>}, Row),
+            ?assertMatch(#{<<"bool_field">> := <<"true">>}, Row),
+            %% text that spells a boolean literal stays a string
+            ?assertMatch(#{<<"literal_bool_field">> := <<"T">>}, Row),
+            %% an unquoted template also renders its number tokens as text
+            ?assertMatch(#{<<"mixed_field">> := <<"id_65">>}, Row),
+            %% suffix text contributed by a placeholder is not a type suffix
+            ?assertMatch(#{<<"suffix_field">> := <<"65i">>}, Row),
+            %% a literal suffix still declares the type
+            ?assertMatch(#{<<"typed_field">> := 65}, Row),
+            %% the field whose placeholder stays unset is not written
+            ?assertNot(maps:is_key(<<"unset_field">>, Row)),
+            ?assertEqual(1.0, maps:get(<<"value">>, Row, undefined))
+        end
+    ),
+    ok.
+
+field_value_write_syntax() ->
+    <<
+        "mqtt,clientid=${clientid} "
+        "literal_field=\"abc\","
+        "text_field=\"pre_${payload.text}\","
+        "number_field=\"n_${payload.n}\","
+        "float_field=\"f_${payload.f}\","
+        "tiny_field=\"t_${payload.tiny}\","
+        "bool_field=\"${payload.ok}\","
+        "literal_bool_field=\"T\","
+        "mixed_field=id_${payload.n},"
+        "suffix_field=${payload.n}${payload.i_suffix},"
+        "typed_field=${payload.n}i,"
+        "unset_field=\"x${payload.unset}\","
+        "value=${payload.value}"
+    >>.
+
+field_value_payload() ->
+    #{
+        <<"text">> => <<"abc">>,
+        <<"n">> => 65,
+        <<"f">> => 1.0e300,
+        <<"tiny">> => 1.0e-11,
+        <<"ok">> => true,
+        <<"i_suffix">> => <<"i">>,
+        <<"value">> => 1
+    }.
+
+t_invalid_integer_does_not_block_worker() ->
+    [{matrix, true}].
+t_invalid_integer_does_not_block_worker(matrix) ->
+    [[?tcp, Mode, ?without_batch] || Mode <- [?sync, ?async]];
+t_invalid_integer_does_not_block_worker(TCConfig) ->
+    {201, _} = create_connector_api(TCConfig, #{}),
+    {201, _} = create_action_api(TCConfig, #{
+        <<"parameters">> => #{
+            <<"write_syntax">> => <<"mqtt,clientid=${clientid} value=${payload.value}i">>
+        },
+        <<"resource_opts">> => #{
+            <<"worker_pool_size">> => 1,
+            <<"metrics_flush_interval">> => <<"100ms">>
+        }
+    }),
+    #{topic := Topic} = simple_create_rule_api(TCConfig),
+    Before = action_counters(TCConfig),
+    InvalidId = emqx_guid:to_hexstr(emqx_guid:gen()),
+    ValidId = emqx_guid:to_hexstr(emqx_guid:gen()),
+    emqx:publish(emqx_message:make(InvalidId, Topic, json_encode(#{value => 20.5}))),
+    ?retry(
+        100,
+        20,
+        begin
+            ?assertEqual(1, counter_delta(TCConfig, Before, matched)),
+            ?assertEqual(1, counter_delta(TCConfig, Before, failed)),
+            ?assertMatch(#{gauges := #{inflight := 0}}, action_metrics(TCConfig))
+        end
+    ),
+    emqx:publish(emqx_message:make(ValidId, Topic, json_encode(#{value => 42}))),
+    ?retry(200, 20, ?assertMatch(#{<<"value">> := 42}, query_by_clientid(ValidId, TCConfig))),
+    ?assertEqual(#{}, query_by_clientid(InvalidId, TCConfig)),
+    ?retry(
+        100,
+        20,
+        begin
+            ?assertEqual(2, counter_delta(TCConfig, Before, matched)),
+            ?assertEqual(1, counter_delta(TCConfig, Before, success)),
+            ?assertEqual(1, counter_delta(TCConfig, Before, failed))
+        end
+    ).
+
+t_partially_invalid_batch() ->
+    [{matrix, true}].
+t_partially_invalid_batch(matrix) ->
+    [[?tcp, Mode, ?with_batch] || Mode <- [?sync, ?async]];
+t_partially_invalid_batch(TCConfig) ->
+    {201, _} = create_connector_api(TCConfig, #{}),
+    {201, _} = create_action_api(TCConfig, #{
+        <<"parameters">> => #{
+            <<"write_syntax">> => <<"mqtt,clientid=${clientid} value=${payload.value}i">>
+        },
+        <<"resource_opts">> => #{
+            <<"batch_size">> => 3,
+            <<"batch_time">> => <<"5s">>,
+            <<"worker_pool_size">> => 1,
+            <<"metrics_flush_interval">> => <<"100ms">>
+        }
+    }),
+    #{topic := Topic} = simple_create_rule_api(TCConfig),
+    Before = action_counters(TCConfig),
+    [Id1, Id2, Id3] = [emqx_guid:to_hexstr(emqx_guid:gen()) || _ <- lists:seq(1, 3)],
+    ?check_trace(
+        begin
+            emqx_utils:pmap(
+                fun({Id, Value}) ->
+                    emqx:publish(emqx_message:make(Id, Topic, json_encode(#{value => Value})))
+                end,
+                [{Id1, 101}, {Id2, 20.5}, {Id3, 303}],
+                infinity
+            ),
+            ?retry(
+                200,
+                30,
+                begin
+                    ?assertMatch(#{<<"value">> := 101}, query_by_clientid(Id1, TCConfig)),
+                    ?assertEqual(#{}, query_by_clientid(Id2, TCConfig)),
+                    ?assertMatch(#{<<"value">> := 303}, query_by_clientid(Id3, TCConfig)),
+                    ?assertEqual(3, counter_delta(TCConfig, Before, matched)),
+                    ?assertEqual(2, counter_delta(TCConfig, Before, success)),
+                    ?assertEqual(1, counter_delta(TCConfig, Before, failed))
+                end
+            )
+        end,
+        fun(Trace) ->
+            BatchCalls =
+                ?of_kind(call_batch_query, Trace) ++ ?of_kind(call_batch_query_async, Trace),
+            ?assertMatch([#{batch := [_, _, _]}], BatchCalls),
+            ?assertMatch(
+                [#{batch := true, error := points_trans_failed}],
+                ?of_kind(greptimedb_connector_send_query_error, Trace)
+            )
+        end
+    ).
+
+t_bad_timestamp() ->
+    [{matrix, true}].
+t_bad_timestamp(matrix) ->
+    [
+        [?tcp, Sync, Batch]
+     || Sync <- [?sync, ?async],
+        Batch <- [?without_batch, ?with_batch]
+    ];
+t_bad_timestamp(TCConfig) ->
+    {201, _} = create_connector_api(TCConfig, #{}),
+    WriteSyntax =
+        %% N.B.: this single space characters are relevant
+        <<"mqtt", " ", "payload=${payload},", "${clientid}_int_value=${payload.int_key}i,",
+            "uint_value=${payload.uint_key}u,"
+            "bool=${payload.bool}", " ", "bad_timestamp">>,
+    {201, _} = create_action_api(TCConfig, #{
+        <<"parameters">> => #{<<"write_syntax">> => WriteSyntax}
+    }),
+    #{topic := Topic} = simple_create_rule_api(TCConfig),
+    ClientId = emqx_guid:to_hexstr(emqx_guid:gen()),
+    C = start_client(#{clientid => ClientId}),
+    Payload = json_encode(#{
+        int_key => -123,
+        bool => false,
+        uint_key => 123
+    }),
+    ?check_trace(
+        {_, {ok, _}} =
+            ?wait_async_action(
+                emqtt:publish(C, Topic, Payload, [{qos, 1}]),
+                #{?snk_kind := greptimedb_connector_send_query_error},
+                10_000
+            ),
+        fun(Trace) ->
+            ?assertMatch(
+                [
+                    #{
+                        error :=
+                            {points_trans_failed, #{
+                                last_error :=
+                                    {bad_timestamp, <<"bad_timestamp">>}
+                            }}
+                    }
+                    | _
+                ],
+                ?of_kind(greptimedb_connector_send_query_error, Trace)
+            ),
+            ok
+        end
+    ),
+    ok.
+
+t_create_disconnected() ->
+    [{matrix, true}].
+t_create_disconnected(matrix) ->
+    [[?tcp]];
+t_create_disconnected(TCConfig) ->
+    ?check_trace(
+        with_failure(down, TCConfig, fun() ->
+            {201, #{<<"status">> := <<"disconnected">>}} = create_connector_api(TCConfig, #{})
+        end),
+        fun(Trace) ->
+            ?assertMatch(
+                [#{error := greptimedb_client_not_alive, reason := _SomeReason}],
+                ?of_kind(greptimedb_connector_start_failed, Trace)
+            ),
+            ok
+        end
+    ),
+    ?retry(
+        200,
+        10,
+        ?assertMatch(
+            {200, #{<<"status">> := <<"connected">>}},
+            get_connector_api(TCConfig)
+        )
+    ),
+    ok.
+
+t_start_error(TCConfig) ->
+    %% simulate client start error
+    ?check_trace(
+        emqx_common_test_helpers:with_mock(
+            greptimedb,
+            start_client,
+            fun(_Config) -> {error, some_error} end,
+            fun() ->
+                {{201, _}, {ok, _}} =
+                    ?wait_async_action(
+                        create_connector_api(TCConfig, #{}),
+                        #{?snk_kind := greptimedb_connector_start_failed},
+                        10_000
+                    )
+            end
+        ),
+        fun(Trace) ->
+            ?assertMatch(
+                [#{error := some_error}],
+                ?of_kind(greptimedb_connector_start_failed, Trace)
+            ),
+            ok
+        end
+    ),
+    ok.
+
+t_start_exception(TCConfig) ->
+    %% simulate client start exception
+    ?check_trace(
+        emqx_common_test_helpers:with_mock(
+            greptimedb,
+            start_client,
+            fun(_Config) -> error(boom) end,
+            fun() ->
+                {{201, _}, {ok, _}} =
+                    ?wait_async_action(
+                        create_connector_api(TCConfig, #{}),
+                        #{?snk_kind := greptimedb_connector_start_exception},
+                        10_000
+                    )
+            end
+        ),
+        fun(Trace) ->
+            ?assertMatch(
+                [#{error := {error, boom}}],
+                ?of_kind(greptimedb_connector_start_exception, Trace)
+            ),
+            ok
+        end
+    ),
+    ok.
+
+t_missing_field() ->
+    [{matrix, true}].
+t_missing_field(matrix) ->
+    [
+        [?tcp, ?sync, Batch]
+     || Batch <- [?without_batch, ?with_batch]
+    ];
+t_missing_field(TCConfig) ->
+    {201, _} = create_connector_api(TCConfig, #{}),
+    {201, _} = create_action_api(TCConfig, #{
+        <<"parameters">> => #{<<"write_syntax">> => <<"mqtt,clientid=${clientid} foo=${foo}i">>},
+        <<"resource_opts">> => #{<<"worker_pool_size">> => 1}
+    }),
+    %% note: we don't select foo here, but we interpolate it in the
+    %% fields, so it'll become undefined.
+    #{topic := Topic} = simple_create_rule_api(TCConfig),
+    ClientId0 = emqx_guid:to_hexstr(emqx_guid:gen()),
+    ClientId1 = emqx_guid:to_hexstr(emqx_guid:gen()),
+    %% Message with the field that we "forgot" to select in the rule
+    Msg0 = emqx_message:make(ClientId0, Topic, emqx_utils_json:encode(#{foo => 123})),
+    %% Message without any fields
+    Msg1 = emqx_message:make(ClientId1, Topic, emqx_utils_json:encode(#{})),
+    ?check_trace(
+        begin
+            emqx:publish2(Msg0),
+            emqx:publish2(Msg1),
+            NEvents = 1,
+            {ok, _} =
+                snabbkaffe:block_until(
+                    ?match_n_events(NEvents, #{
+                        ?snk_kind := greptimedb_connector_send_query_error
+                    }),
+                    _Timeout1 = 16_000
+                ),
+            ok
+        end,
+        fun(Trace) ->
+            PersistedData0 = query_by_clientid(ClientId0, TCConfig),
+            PersistedData1 = query_by_clientid(ClientId1, TCConfig),
+            ?assertMatch(
+                [
+                    #{error := {points_trans_failed, #{last_error := no_fields}}}
+                    | _
+                ],
+                ?of_kind(greptimedb_connector_send_query_error, Trace)
+            ),
+            %% nothing should have been persisted
+            ?assertEqual(#{}, PersistedData0),
+            ?assertEqual(#{}, PersistedData1),
+            ok
+        end
+    ),
+    ok.
+
+t_authentication_error_on_send_message(TCConfig) ->
+    {201, _} = create_connector_api(TCConfig, #{
+        <<"password">> => <<"wrong_password">>
+    }),
+    {201, _} = create_action_api(TCConfig, #{}),
+    #{topic := Topic} = simple_create_rule_api(TCConfig),
+    C = start_client(),
+    Payload = json_encode(#{
+        int_key => -123,
+        bool => true,
+        float_key => 24.5,
+        uint_key => 123
+    }),
+    ?check_trace(
+        {_, {ok, _}} =
+            ?wait_async_action(
+                emqtt:publish(C, Topic, Payload, [{qos, 1}]),
+                #{?snk_kind := greptimedb_connector_do_query_failure},
+                1_000
+            ),
+        fun(Trace) ->
+            ?assertMatch(
+                [#{error := <<"authorization failure">>} | _],
+                ?of_kind(greptimedb_connector_do_query_failure, Trace)
+            ),
+            ok
+        end
+    ),
+    ok.
+
+-doc """
+Verifies that, if an integer value is given to a value which is not suffixed by an integer
+suffix, we cast it to a float, which is the default InfluxDB Write Syntax value.
+""".
+t_auto_cast_int_to_float(TCConfig) ->
+    {201, _} = create_connector_api(TCConfig, #{}),
+    {201, _} = create_action_api(TCConfig, #{}),
+    #{topic := Topic} = simple_create_rule_api(TCConfig),
+    ClientId = emqx_guid:to_hexstr(emqx_guid:gen()),
+    C = start_client(#{clientid => ClientId}),
+    Payload0 = json_encode(#{
+        %% First, since we're auto-creating tables, let's make the column have a float64
+        %% type.
+        float_key => 24.5
+    }),
+    emqtt:publish(C, Topic, Payload0, [{qos, 1}]),
+    clear_table(TCConfig),
+
+    Payload1 = json_encode(#{
+        %% N.B.: now, an integer value where a float is expected
+        float_key => 30
+    }),
+    emqtt:publish(C, Topic, Payload1, [{qos, 1}]),
+    ?retry(
+        200,
+        10,
+        ?assertMatch(
+            #{<<"float_value">> := 30.0},
+            query_by_clientid(ClientId, TCConfig)
+        )
+    ),
+    ok.
+
+t_create_with_invalid_cipher(TCConfig) ->
+    %% An unknown TLS cipher must be rejected with a clean 400 carrying a
+    %% JSON error body, not crash the API with a 500 while encoding the reason.
+    Res = create_connector_api(TCConfig, #{
+        <<"ssl">> => #{
+            <<"enable">> => true,
+            <<"verify">> => <<"verify_none">>,
+            <<"ciphers">> => [<<"NOT_A_CIPHER">>]
+        }
+    }),
+    ?assertMatch({400, _}, Res),
+    {400, Body} = Res,
+    ?assertMatch(
+        {match, _},
+        re:run(emqx_utils_json:encode(Body), <<"bad_ciphers">>),
+        #{body => Body}
+    ),
+    ok.

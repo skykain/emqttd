@@ -1,0 +1,182 @@
+emqx_dashboard_api {
+
+create_user_api.desc:
+"""Create Dashboard user"""
+create_user_api.label:
+"""Create Dashboard user"""
+
+create_user_api_success.desc:
+"""Create Dashboard user success"""
+create_user_api_success.label:
+"""Create Dashboard user success"""
+
+delete_user_api.desc:
+"""Delete Dashboard user"""
+delete_user_api.label:
+"""Delete Dashboard user"""
+
+license.desc:
+"""EMQX License. opensource or enterprise"""
+
+list_users_api.desc:
+"""Dashboard list users"""
+list_users_api.label:
+"""Dashboard list users"""
+
+login_api.desc:
+"""Get Dashboard Auth Token."""
+login_api.label:
+"""Get Dashboard Auth Token"""
+
+login_failed401.desc:
+"""Login failed. Bad/missing MFA token, or bad username or password"""
+
+login_failed_response400.desc:
+"""Login failed. Bad username or password"""
+
+login_success.desc:
+"""Dashboard Auth Success"""
+
+client_nonce.desc:
+"""SCRAM client nonce. Use 20 to 128 unpadded Base64URL characters: letters, digits, `_`, or `-`."""
+
+combined_nonce.desc:
+"""The client nonce followed by the server nonce returned by the challenge endpoint."""
+
+logout_api.desc:
+"""Dashboard user logout.
+This endpoint is only for the Dashboard, not the `API Key`.
+The token from the `/login` endpoint must be a bearer authorization in the headers."""
+logout_api.label:
+"""Dashboard user logout"""
+
+new_pwd.desc:
+"""New password"""
+
+old_pwd.desc:
+"""Old password"""
+
+password.desc:
+"""Dashboard Password"""
+
+token.desc:
+"""Dashboard Auth Token"""
+
+update_user_api.desc:
+"""Update Dashboard user description"""
+update_user_api.label:
+"""Update Dashboard user description"""
+
+update_user_api200.desc:
+"""Update Dashboard user success"""
+
+user_description.desc:
+"""Dashboard User Description"""
+
+username.desc:
+"""Dashboard Username"""
+
+users_api404.desc:
+"""Dashboard user not found"""
+
+version.desc:
+"""EMQX Version"""
+
+role.desc:
+"""User role. A namespaced role is written as `ns:<namespace>::<role>`. Namespace names listed in `multi_tenancy.deny_namespaces` (default: `global`, `undefined`, `null`, `none`) cannot be used."""
+
+list_user_scopes_api.desc:
+"""List all scope names that a dashboard login user may hold, with their descriptions and an `admin_only` flag indicating whether the scope is restricted to administrator role.
+Returned to any authenticated login user — the endpoint exists to populate the dashboard UI's scope selector and does not itself require a specific scope."""
+
+list_user_scopes_api.label:
+"""List Dashboard user scopes"""
+
+user_scopes_request.desc:
+"""Dashboard user scopes: a fine-grained access list applied in addition to the user's role.
+
+If this field is omitted when a user is created, the server applies the default scopes for the role. An administrator receives all management scopes plus the four login-only scopes. A viewer receives all management scopes. A publisher, where applicable, receives only the `publish` scope. To create a deny-all user, send an explicit empty list `[]`; only anonymous endpoints such as `/status` remain reachable.
+
+On write (create or update) this field also accepts the literal string `unset`, and a scope list that matches the role's implicit default set is treated the same way: both are stored as \"no explicit scopes\", so the user keeps the forward-compatible role default instead of a frozen list. This lets a read-modify-write (for example editing only the description) round-trip the `unset` value or the expanded scope list returned by a `GET` without error.
+
+Login users may be assigned any API key catalog scope plus the four login-only scopes: `user_management`, `mfa_management`, `sso_management`, and `api_key_management`. All four are administrator-only; assigning any of them to a non-administrator is rejected. `mfa_management` means "manage other users' MFA": managing your own MFA is done through `/current_user/mfa` and needs no scope at all."""
+
+user_scopes_response.desc:
+"""Dashboard user scopes: a fine-grained access list applied in addition to the user's role.
+
+The literal string `unset` is a legacy-only sentinel for records upgraded from a release that did not support Dashboard user scopes. At runtime, such records fall back to the default scopes for the role. Clients should treat `unset` as \"no explicit scope policy has been set yet\". An empty list `[]` means deny-all; only anonymous endpoints such as `/status` remain reachable.
+
+Login users may be assigned any API key catalog scope plus the four login-only scopes: `user_management`, `mfa_management`, `sso_management`, and `api_key_management`. All four are administrator-only; assigning any of them to a non-administrator is rejected. `mfa_management` means "manage other users' MFA": managing your own MFA is done through `/current_user/mfa` and needs no scope at all."""
+
+backend.desc:
+"""User account source"""
+
+password_expire_in_seconds.desc:
+"""Time in seconds until the password expires."""
+
+change_mfa.desc:
+"""Set up or reset MFA for another Dashboard user. Calling this endpoint generates a fresh TOTP secret. Requires the `mfa_management` scope and the administrator role. To manage your own MFA, use `/current_user/mfa`."""
+
+delete_mfa.desc:
+"""Disable MFA for another Dashboard user. To reset or re-key TOTP, call the `POST` method. Requires the `mfa_management` scope and the administrator role. To manage your own MFA, use `/current_user/mfa`."""
+
+mfa_token.desc:
+"""Multifactor authentication token."""
+
+mfa_status.desc:
+"""MFA status.
+- `none`: no MFA enabled
+- `disabled`: MFA is disabled for the user
+- Otherwise: The MFA mechanism in use, e.g. `totp`"""
+
+mfa_enrollment_status.desc:
+"""What the account has to do about MFA, derived from its stored state and the
+policy that applies to it.
+- `complete`: enrolled, and one authenticator code has been verified
+- `pending_voluntary`: no MFA and nothing requires it, so the user may opt in
+- `disabled`: opted out, and nothing requires the user to opt back in"""
+
+change_mfa.label:
+"""Change MFA"""
+
+delete_mfa.label:
+"""Delete MFA"""
+
+current_user_api.desc:
+"""Return the signed-in user's own account: username, role, effective permission scopes and MFA status."""
+current_user_api.label:
+"""Get own account"""
+
+change_pwd_api.desc:
+"""Deprecated. Change the signed-in user's own password; the `username` in the path must be the signed-in user, otherwise the request is rejected. Use `/current_user/change_pwd` instead, which takes no username."""
+change_pwd_api.label:
+"""Change own password (deprecated)"""
+
+change_pwd_self_only.desc:
+"""The `username` in the path is not the signed-in user. This endpoint changes your own password only."""
+
+current_user_change_pwd_api.desc:
+"""Change the signed-in user's own password. The current password must be supplied as `old_pwd`. Accounts that sign in through an SSO backend have no local password and are rejected."""
+current_user_change_pwd_api.label:
+"""Change own password"""
+
+current_user_mfa_api.desc:
+"""Set up or rotate MFA for the signed-in user's own account. Calling this endpoint generates a fresh TOTP secret."""
+current_user_mfa_api.label:
+"""Change own MFA"""
+
+delete_current_user_mfa_api.desc:
+"""Disable MFA for the signed-in user's own account. To reset or re-key TOTP, call the `POST` method."""
+delete_current_user_mfa_api.label:
+"""Delete own MFA"""
+
+current_user_mfa_setup_required.desc:
+"""MFA is required for the account but not set up, because the MFA policy or the account's MFA changed after login. All of the account's sessions are ended, and the next login starts the MFA setup."""
+
+current_user_mfa_admin_required.desc:
+"""MFA cannot be turned off on this account because an administrator, `dashboard.default_mfa` or the `force_mfa` of the account's SSO backend requires it. Re-keying it is still allowed."""
+
+effective_user_scopes_response.desc:
+"""The permission scopes the user effectively holds. Unlike the `scopes` field of the user management endpoints, the role default is already expanded here, so this is always a concrete list."""
+
+}
